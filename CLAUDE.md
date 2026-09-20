@@ -12,11 +12,16 @@ does not match. That digest is written by Microsoft's `dxil.dll` validator, not
 by us. Before building any custom shader path we need to know: can we take a
 DXIL container, modify it, and get `dxil.dll` to re-issue a valid digest?
 
-Test: `src/signtest.cpp`
+Test: `src/signtest.cpp` (run with `--target=header|bytecode|both`, default `both`)
 1. Compile a trivial pixel shader with DXC (already produces a signed container).
-2. Flip one byte inside the DXIL bytecode part.
+2. Tamper with one byte:
+   - `bytecode`: flip a byte inside the DXIL bytecode part.
+   - `header`: corrupt the header digest, leave the DXIL intact.
+   In both cases the digest is overwritten with a bogus value first, so any
+   "signed" result must come from the validator recomputing it.
 3. Load `dxil.dll`, create `IDxcValidator`, call `Validate(..., InPlaceEdit)`.
-4. Report whether the container gets re-signed.
+4. Report whether the container gets re-signed. Running `both` shows the two
+   outcomes side by side.
 
 Key facts that frame the result:
 - The DXIL "signature" is a hash (a tweaked MD5 over the container body), not a
@@ -40,9 +45,13 @@ Requires DXC SDK headers plus `dxcompiler.dll` and `dxil.dll` at runtime.
 
     cmake -B build -DDXC_SDK_DIR=C:/path/to/dxc
     cmake --build build --config Release
-    build\Release\signtest.exe   # dxcompiler.dll + dxil.dll must be on PATH
+    build\Release\signtest.exe                 # runs both trials
+    build\Release\signtest.exe --target=bytecode
+    # dxcompiler.dll + dxil.dll must be on PATH
 
-Exit codes: 0 = re-signed, 3 = rejected (not signed), 2 = dxil.dll missing.
+Exit codes: 0 = every trial matched expectation (header re-signed, bytecode
+rejected), 1 = setup/compile error, 2 = dxil.dll missing, 3 = a trial
+contradicted expectation.
 
 ## Notes
 
