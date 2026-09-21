@@ -382,20 +382,104 @@ And as a control in the other direction, DXC's own `traceray_opaque.dxil` pushed
 through the same `--lib` path gives 14450 hits and MATCH. So the path is real,
 it carries the file it is given, and it notices when that file is wrong.
 
+## Pattern 3 lowered by hand: the Proceed loop becomes an any-hit shader
+
+`phase5/hand/make_lib_alpha.py` turns `rayquery_alpha.ll` into a `lib_6_5`
+library. This is the one the project rests on. Pattern 1 had no loop and no
+any-hit shader at all; pattern 3 has both.
+
+    WARP RayQuery (ground truth)               65536 rays, 8117 hits
+    hand-lowered any-hit lib on the GTX 1070   65536 rays, 8117 hits
+
+    hit/miss mismatches: 0
+    value  mismatches  : 0 (tol 0.0010)
+    max |dt| 0.000000    max |dbary| 0.000000
+    RESULT: MATCH
+
+### The numbering problem, and the pass that removes it
+
+Pattern 1 hit the edge of LLVM's positional numbering and worked around it by
+having replacement instructions take the numbers the deleted ones had. Pattern 3
+cannot do that: lowering the loop **deletes six basic blocks** from the raygen,
+which would renumber most of the function.
+
+`phase5/hand/llnorm.py` fixes this once and for all by giving everything an
+explicit name before any editing happens:
+
+    %33 = call ...           ->  %v33 = call ...
+    ; <label>:44             ->  bb44:
+    br i1 %45, label %36     ->  br i1 %v45, label %bb36
+
+After that nothing is positional and blocks can simply be dropped. The
+normaliser was checked on its own first: normalising `rayquery_alpha.ll` and
+reassembling it still validates and signs, unchanged. **Any automated rewriter
+wants this pass**, and it is cheaper than teaching the rewriter to renumber.
+
+### What the lowering actually does
+
+Six blocks disappear from the raygen: the preheader, the loop header, the
+candidate block, the latch, the commit block, and the exit. In their place, a
+payload init and one `traceRay`. The driver now runs the traversal the
+`Proceed` loop was stepping through by hand, and calls the any-hit shader for
+each non-opaque candidate.
+
+The any-hit body is the loop body, re-rooted:
+
+| Proceed loop body | generated any-hit |
+|---|---|
+| `CandidateTriangleBarycentrics(q, 0)` | `extractelement(load attr, 0)` |
+| `fmul fast 4.0`, `Frc`, `fcmp olt 0.5` | identical, unchanged |
+| `CommitNonOpaqueTriangleHit` | fall off the end |
+| fall through to the latch | `IgnoreHit` then `unreachable` |
+
+Two details that are easy to get wrong:
+
+- **The polarity inverts.** Committing is the special path in RayQuery;
+  ignoring is the special path in any-hit. Accept is the fall-through in one and
+  the explicit case in the other.
+- **The `CandidateType()` test is dropped.** The source checks
+  `CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE`, which is a tautology
+  inside an any-hit shader, since that is the only thing it is ever invoked for.
+  A `CANDIDATE_PROCEDURAL_PRIMITIVE` arm would instead have to become an
+  intersection shader, which pattern 3 does not exercise and nothing here has
+  tested.
+
+`IgnoreHit` is `noreturn nounwind`, and a compute module has no attribute group
+for that, so one is appended.
+
+### Checked for sensitivity, including the specific documented trap
+
+The hit count carries a free check: **8117 is not 14450.** If the any-hit shader
+had not been wired into the hit group, or had never run, every triangle hit
+would have been accepted and the count would be the opaque one.
+
+The polarity inversion above is the mistake the recon warned about, so it was
+performed deliberately. Swapping the accept and reject branches:
+
+    polarity inverted    65536 rays, 6333 hits
+    hit/miss mismatches: 14450    RESULT: DIVERGE
+
+And **8117 + 6333 = 14450 exactly.** The accepted and rejected sets partition
+the opaque hit count with nothing left over, which is independent confirmation
+that the alpha test is being evaluated per candidate and that the any-hit shader
+governs the outcome. Neither number was arranged; they fell out.
+
 ## Next
 
-Pattern 1 is proven by hand. The two remaining questions, in order:
+Both patterns the brief names as the early targets now work by hand, so the
+remaining questions are about generality rather than feasibility.
 
-1. **Pattern 3, the any-hit case.** `rayquery_alpha.ll` has the rotated
-   `Proceed` loop, so it exercises the loop-body extraction that pattern 1
-   skipped entirely. That is the part of the transform with no precedent here,
-   and doing it by hand first will expose whatever the recon missed.
-2. **Only then, automate.** The edits above are mechanical but they are keyed to
-   exact instruction text. A rewriter has to find the same sites structurally,
-   by following the query handle and matching opcodes on operand 0, which is
-   what the recon says the IR supports.
+1. **Automate.** The edits in both scripts are keyed to exact instruction text,
+   which is fine for a fixed input and useless for a real one. A rewriter has
+   to find the same sites structurally: follow the query handle, match opcodes
+   on operand 0, and recognise the rotated loop. The recon says the IR supports
+   all three. `llnorm` runs first, `dxilrt asm` is the feedback loop, and
+   `raytest --lib` is the correctness check.
+2. **Pattern 2, shadow rays.** `ACCEPT_FIRST_HIT_AND_END_SEARCH`, miss shader
+   only. Not yet attempted, and expected to be the easiest of the three.
 
-Still unknown, and worth settling before automation: whether an application's
-shader that binds resources differently, uses descriptor tables rather than root
-descriptors, or declares more than one query, still fits this shape. Everything
-here is one shader with three root-level bindings.
+Still untested, and all of it matters before this meets a real shader:
+descriptor tables rather than root descriptors, more than one query in a
+shader, procedural primitives and the intersection shader path, and any of the
+no-valid-lowering cases in the brief's table. Everything proven so far is one
+compute shader with three root-level bindings and a single query.

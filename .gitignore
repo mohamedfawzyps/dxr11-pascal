@@ -36,3 +36,7 @@ rt_after.ll
 # Phase 5 hand-lowering output (regenerate with phase5/hand/make_lib.py)
 phase5/hand/*.ll
 phase5/hand/*.dxil
+
+# Python bytecode cache
+__pycache__/
+*.pyc
