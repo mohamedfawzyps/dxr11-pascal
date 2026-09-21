@@ -51,11 +51,10 @@ Version 1.
   stays open until the application records work that must be ordered after it.
   Worth 15 to 28 percent on eight dispatches.
 
-  Next action: Phase 5, the DXIL rewriter. Note that Phase 4 is NOT finished in
-  the sense the build order means it, because `CheckFeatureSupport` still
-  reports Tier 1.0 on purpose. Flipping it entitles an application to emit
-  RayQuery, so it waits for Phase 5 or for a RayQuery detector that fails
-  clearly.
+  Note that Phase 4 is NOT finished in the sense the build order means it,
+  because `CheckFeatureSupport` still reports Tier 1.0 on purpose. Flipping it
+  entitles an application to emit RayQuery, so it waits for Phase 5 or for a
+  RayQuery detector that fails clearly.
 
   Three architecture findings, each of which cost a wrong design first:
   - **Wrap the command list, hook the queue.** Not symmetric, and both halves
@@ -67,6 +66,17 @@ Version 1.
     heap vtables, so patching the image vtable passes a self-test and then
     never intercepts a real call. Queues do share an image vtable, which is why
     the queue half works; the hook patches slot 10 and self-tests on install.
+
+- Phase 5 recon: DONE, and it changes the plan. See
+  docs/phase5-dxil-recon.md. **DXIL survives a round trip through `.ll` text**,
+  so the rewriter is a text transformation, NOT LLVM 3.7 bitcode surgery. That
+  removes the largest cost in the original estimate and the need for a bitcode
+  writer at all. Measured, then proven on hardware: `raytest.exe --roundtrip`
+  sends every shader out to text and back before D3D12 sees it and still
+  reports ALL MATCH, so a round-tripped `lib_6_3` builds a working state object
+  on the 1070 and renders bit-exactly.
+  Next action: hand-edit `rayquery_opaque.ll` into a library and put it through
+  `dxilrt asm`, before writing any rewriter.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -107,6 +117,10 @@ Dev machine (Windows x64), everything under `C:\DW`:
   feature probes, and takes `-debug` for the debug layer, `-gfxsplit` for
   graphics state across a split, `-batchsplit` for dispatch batching and its
   control, `-time` and `-pipeline` for the split cost.
+  `build_phase5.bat` extracts the Phase 2 shaders and disassembles them into
+  `phase5\dxil\`; `build_phase5_tool.bat` builds `phase5out\dxilrt.exe`, which
+  round-trips a container through text and assembles and signs arbitrary `.ll`.
+  Both outputs are generated and gitignored.
   `build_sample.bat` builds a Microsoft DXR 1.0 sample used to validate the
   proxy, with cl.exe and no NuGet restore, into `sampletest\<SampleName>\`.
   Helpers live in `tools\`.
@@ -381,13 +395,56 @@ Tier 1.1 entitles the app to emit RayQuery, so until phase 5 works, either keep
 reporting 1.0 or detect RayQuery DXIL and fail clearly. A shim that claims 1.1
 and then crashes is worse than one that claims 1.0.
 
-### Phase 5: the DXIL rewriter (months)
+### Phase 5: the DXIL rewriter
 
-Automate phase 2's transform. DXIL is LLVM 3.7 bitcode. Parse, detect
-`dx.op.rayQuery_*` opcodes, generate the raygen/any-hit/closest-hit/miss set,
-synthesize the state object and shader table, re-sign.
+Automate phase 2's transform. Detect `dx.op.rayQuery_*` opcodes, generate the
+raygen/any-hit/closest-hit/miss set, synthesize the state object and shader
+table, re-sign.
 
-Reference implementations to read before writing anything:
+**Recon result (2026-09-21), docs/phase5-dxil-recon.md.** The original plan
+here said "DXIL is LLVM 3.7 bitcode" and budgeted months for parsing and
+emitting it. Measurement says that is not necessary.
+
+`IDxcAssembler::AssembleToContainer` turns `.ll` text back into a DXIL
+container, and Phase 1 already established that `dxil.dll` signs anything that
+validates. `phase5/dxilrt.cpp` measures the round trip. All four Phase 2
+shaders survive it with every instruction and metadata line identical; the
+entire diff is comment lines.
+
+- **Lost:** `STAT` shrinks, so reflection resource names go empty and struct
+  layouts become `[32 x i8]`, and `VERS` is dropped. An app that calls
+  `ID3D12ShaderReflection` on a shader we rewrote would see blank names.
+  Nothing tested so far does that. Known limitation, recorded on purpose.
+- **Preserved byte-identical:** `PSV0` and, critically, `RDAT`, which is what
+  `CreateStateObject` reads to find a library's exports. Had that been damaged
+  the whole approach would be dead.
+- **Proven on hardware, not merely signed:** `raytest.exe --roundtrip` reports
+  ALL MATCH, 14450 and 8117 hits. `--rtpoison` makes one text edit to the ray
+  direction and gives DIVERGE, so the harness genuinely sees IR changes. Note
+  the first version of that check poisoned BOTH sides and reported MATCH, which
+  proved nothing; it has to be asymmetric.
+
+So the route is to **edit the input module in place as text**: change
+`!dx.shaderModel` from `cs` to `lib`, rename `main` to a mangled raygen export,
+replace the rayQuery ops with a `traceRay` call, append three small functions,
+and rewrite `!dx.entryPoints` with `!dx.typeAnnotations`. The application's own
+code never moves between modules, so its resource bindings and handles cannot be
+got wrong in transit. Emitting a container from scratch is pointless when the
+input module already has the right resources, handles and types.
+
+Key facts for the transform, all read off real DXC 1.10 output:
+- `AllocateRayQuery` is 178, confirmed. But **dispatch on the opcode immediate,
+  not the callee name**: 184 and 185 are the same LLVM function, as are 193 and
+  194, so name matching silently confuses committed with candidate accessors.
+- The RayQuery object is a plain `i32` SSA value, not memory.
+- `while (q.Proceed())` is **loop-rotated**, with two `Proceed` calls where the
+  source has one. Nothing looking for "a loop whose condition is Proceed" will
+  find it.
+- `dx.op.threadId` (93) is not legal in a raygen and must become
+  `dx.op.dispatchRaysIndex` (145).
+
+Reference implementations to read before writing anything. Note their front
+ends matter less now that the text level is available:
 - **dxil-spirv** (HansKristian-Work): a DXIL parser with its own lightweight
   LLVM bitcode reader, already handles ray tracing opcodes. Its front end is
   the reusable half; it emits SPIR-V, not DXIL, so the back end is not.
@@ -396,9 +453,13 @@ Reference implementations to read before writing anything:
   level, for the algorithm.
 - **Microsoft's archived D3D12 Raytracing Fallback Layer**: architecture and
   its documented limitations. Note it never supported inline ray tracing.
-- **DXIL specs** for the `dx.op.rayQuery_*` opcode list (AllocateRayQuery is
-  178; verify current numbers against `DxilConstants.h` at your target DXIL
-  version, Microsoft appends opcodes over shader model revisions).
+- **DXIL specs** for the `dx.op.rayQuery_*` opcode list. Microsoft appends
+  opcodes over shader model revisions, so the numbers need verifying against
+  the DXC in use. Note `DxilConstants.h` is NOT in the DXC redist at
+  `C:\DW\DXC\inc`, which ships only the API headers. Easier: the disassembler
+  prints the opcode name as a trailing comment, so `dxc -Fc` on a shader that
+  uses the opcode gives the number directly. That is how the table in
+  docs/phase5-dxil-recon.md was built.
 
 ## Testing
 
