@@ -97,6 +97,28 @@ foreach ($c in $cases) {
     $gt = if ($c.ContainsKey('gt')) { $c.gt } else { @() }
     & .\raytest.exe warp rayquery $c.pat "rw_${n}_a.bin" @($gt) | Out-Null
     & .\raytest.exe hw traceray $c.pat "rw_${n}_b.bin" --lib "phase5\out\$n.dxil" @($c.flags) | Out-Null
+    # The path the PROXY will take: container in, signed container out, with
+    # DXC doing the text conversion at both ends. Everything above works on
+    # .ll files, which is not what D3D12 ever hands over.
+    $srcDxil = [IO.Path]::ChangeExtension($c.src, '.dxil')
+    if ((Test-Path '.\phase5out\dxrw.exe') -and (Test-Path $srcDxil)) {
+        & .\phase5out\dxrw.exe rewrite $srcDxil "phase5\outcpp\$n.dxil" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  container path: REFUSED'
+            $failed++
+        } else {
+            & .\raytest.exe hw traceray $c.pat "rw_${n}_c.bin" --lib "phase5\outcpp\$n.dxil" @($c.flags) | Out-Null
+            $dc = & .\raytest.exe diff "rw_${n}_a.bin" "rw_${n}_c.bin" 2>&1
+            if ($dc -match 'RESULT: MATCH') {
+                Write-Host '  container path (C++ + DXC): MATCH'
+            } else {
+                Write-Host '  container path (C++ + DXC): DIVERGE'
+                $failed++
+            }
+            Remove-Item "rw_${n}_c.bin" -ErrorAction SilentlyContinue
+        }
+    }
+
     $diff = & .\raytest.exe diff "rw_${n}_a.bin" "rw_${n}_b.bin" 2>&1
     $diff | Where-Object { $_ -match 'rays|mismatches|max|RESULT' } |
         ForEach-Object { "  $($_.Trim())" }

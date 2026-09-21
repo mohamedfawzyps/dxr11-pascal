@@ -963,15 +963,81 @@ So the tier flip is still blocked, for the same reason as before. What has
 changed is that the transform itself is now in the language the proxy is
 written in, and is provably the same transform.
 
+## The DXC host: container in, signed container out
+
+`proxy/rewriter/dxc_host.{h,cpp}` closes the gap between what the rewriter
+works on and what D3D12 hands over. The rewriter takes `.ll` TEXT; the proxy
+receives a DXIL CONTAINER.
+
+    container -> text     IDxcCompiler::Disassemble   dxcompiler.dll
+    text -> container     IDxcAssembler               dxcompiler.dll
+    validate and sign     IDxcValidator               dxil.dll
+
+The last step is the Phase 1 mechanism, unchanged: `dxil.dll` signs anything
+that validates, with no secret key.
+
+`dxrw rewrite <in.dxil> <out.dxil>` is the whole path in one call, and it is
+what the proxy will do internally:
+
+    rayquery_opaque   4788 -> 5932 bytes   pattern 1
+    rayquery_alpha    5076 -> 6460 bytes   pattern 3
+    rayquery_indep    5392 -> 6996 bytes   pattern 3
+    rayquery_ids      4696 -> 5912 bytes   pattern 1
+    rayquery_table    4796 -> 5948 bytes   pattern 1
+
+All five render bit-exactly against WARP on the GTX 1070, and the container
+path is now its own line in the regression, separate from the `.ll` path,
+because it is the one that will actually run in an application.
+
+### Three things a DLL in someone else's process has to get right
+
+**Load by full path, never by name.** This is the one that would have been a
+bad surprise. An application may already have its own `dxcompiler.dll` loaded,
+and `LoadLibraryW(L"dxcompiler.dll")` would hand back THEIRS, of whatever
+version. The host finds its own module, via `SetHostModule` from `DllMain`, and
+loads the copies sitting beside it.
+
+Proven rather than asserted. With the copy beside the exe hidden and a
+DIFFERENT `dxcompiler.dll` present in the working directory:
+
+    DXC unavailable: dxcompiler.dll is not next to the shim; the rewriter
+    needs it to convert a DXIL container to text and back
+
+It refused instead of silently loading the wrong one. (The first attempt at
+this test was a no-op, because PowerShell's `Rename-Item` wants a bare name for
+its destination and had quietly failed. The check only means something once it
+has been seen to fail.)
+
+**Never throw, never crash.** Every failure is a returned error. A missing DLL
+is the message above, not a fault in the application's process.
+
+**Load lazily and once.** Nothing is loaded until a shader actually needs
+rewriting. `D3D12RaytracingHelloWorld` runs through the proxy with the whole
+rewriter linked in and loads no DXC at all, still pixel-identical at unchanged
+fps.
+
+### What is left
+
+The rewriter and its host are now linked into the proxy and the transform is
+callable on what the proxy actually receives. **One piece still stands between
+this and the tier flip**, and it is the larger one:
+
+**The dispatch path.** Lowering a compute shader to a library is half the job.
+The application then calls `Dispatch`, which has to become `DispatchRays`
+against a state object and a shader table the shim builds and owns, with the
+root signature and bindings carried across. Nothing of that exists. Until it
+does, a rewritten shader has nowhere to run, which is why detection still only
+logs.
+
 ## Next
 
-1. **The DXC host in C++**: container to text and back, plus signing, loaded
-   from the proxy. Small next to the port, and it makes the rewriter callable
-   on what the proxy actually receives.
-2. **The dispatch path**: `Dispatch` on a lowered compute shader has to become
-   `DispatchRays` against a shim-owned state object and shader table. This is
-   the larger of the two and nothing is written.
-3. Only then the tier flip, with anything refused failing loudly.
+1. **The dispatch path.** `CreateComputePipelineState` on a RayQuery shader has
+   to produce a shim-owned state object and shader table, `SetPipelineState`
+   has to recognise it, and `Dispatch` has to become `DispatchRays` with the
+   thread-group-to-ray-grid mapping worked out. This is the last structural
+   piece, and it is the largest thing left in Phase 5.
+2. **Then the tier flip**, with anything the rewriter refuses failing loudly
+   rather than rendering wrong.
 
-Independent of all that: dynamic descriptor indexing is still refused, and more
-independent shaders are still the cheapest way to find what has been assumed.
+Independent of both: dynamic descriptor indexing is still refused, and more
+independent shaders remain the cheapest way to find what has been assumed.

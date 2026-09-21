@@ -1,7 +1,9 @@
 // CLI for the C++ rewriter port, so it can be held against the Python original.
 //
-//   dxrw lower <in.ll> <out.ll>     lower a RayQuery module
-//   dxrw analyze <in.ll>            print what the analysis found
+//   dxrw lower <in.ll> <out.ll>        lower a RayQuery module
+//   dxrw analyze <in.ll>               print what the analysis found
+//   dxrw rewrite <in.dxil> <out.dxil>  the WHOLE path a proxy would take:
+//                                      container in, signed container out
 //
 // The port's correctness bar is BYTE-IDENTICAL output to
 // phase5/rewriter/dxrewrite.py on every case in the regression. That is a far
@@ -14,6 +16,7 @@
 #include "../proxy/rewriter/ll_model.h"
 #include "../proxy/rewriter/rq_analyze.h"
 #include "../proxy/rewriter/rq_lower.h"
+#include "../proxy/rewriter/dxc_host.h"
 
 static bool ReadAll(const char* path, std::string& out) {
     FILE* f = std::fopen(path, "rb");
@@ -69,6 +72,41 @@ int main(int argc, char** argv) {
         if (!WriteAll(argv[3], l.text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
         std::printf("lowered %s -> %s (pattern %d, %s)\n", argv[2], argv[3],
                     a.query.patternNum, a.query.patternDesc.c_str());
+        return 0;
+    }
+    if (argc >= 4 && std::string(argv[1]) == "rewrite") {
+        // The path the proxy will take: a container arrives, a signed
+        // container comes back, with DXC doing the text conversion at both
+        // ends and nothing touching the filesystem in between.
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        std::string err;
+        if (!dxch::Available(&err)) { std::printf("DXC unavailable: %s\n", err.c_str()); return 1; }
+
+        struct Ctx { int pattern = 0; std::string desc; };
+        Ctx ctx;
+        auto xform = [](const std::string& in, std::string* out, std::string* why,
+                        void* c) -> bool {
+            llm::Module m(llm::Normalize(in));
+            auto a = rq::Analyze(m);
+            if (!a.ok) { *why = a.error; return false; }
+            auto l = rq::Lower(m, a.query);
+            if (!l.ok) { *why = l.error; return false; }
+            static_cast<Ctx*>(c)->pattern = a.query.patternNum;
+            static_cast<Ctx*>(c)->desc = a.query.patternDesc;
+            *out = l.text;
+            return true;
+        };
+        std::vector<uint8_t> outBytes;
+        if (!dxch::RewriteContainer(raw.data(), raw.size(), xform, &ctx, &outBytes, &err)) {
+            std::fprintf(stderr, "REFUSED: %s\n", err.c_str());
+            return 2;
+        }
+        std::string blob(reinterpret_cast<const char*>(outBytes.data()), outBytes.size());
+        if (!WriteAll(argv[3], blob)) { std::printf("cannot write %s\n", argv[3]); return 1; }
+        std::printf("rewrote %s -> %s (%zu -> %zu bytes, pattern %d, %s)\n",
+                    argv[2], argv[3], raw.size(), outBytes.size(), ctx.pattern,
+                    ctx.desc.c_str());
         return 0;
     }
     std::printf("usage:\n  dxrw lower <in.ll> <out.ll>\n  dxrw analyze <in.ll>\n");

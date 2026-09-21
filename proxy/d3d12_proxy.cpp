@@ -27,6 +27,7 @@
 #include <cwchar>
 
 #include "proxy_log.h"
+#include "rewriter/dxc_host.h"
 #include "d3d12_device.h"
 
 // --- real system d3d12.dll -------------------------------------------------
@@ -283,7 +284,15 @@ extern "C" HRESULT WINAPI D3D12GetInterface(REFCLSID rclsid, REFIID riid, void**
     return real ? real(rclsid, riid, pp) : E_NOTIMPL;
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) ProxyLog("[dxr11-proxy] attached to process\n");
+BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        // Remember our own module so the rewriter can load the DXC beside US,
+        // by full path. A bare LoadLibraryW would hand back the application's
+        // own dxcompiler.dll if it has one, of some other version. Nothing is
+        // loaded here: the host loads lazily, so an application that never
+        // uses RayQuery pays nothing for this.
+        dxch::SetHostModule(self);
+        ProxyLog("[dxr11-proxy] attached to process\n");
+    }
     return TRUE;
 }
