@@ -459,3 +459,215 @@ The idle-GPU numbers repeated as well: S1 per split 0.300 then 0.318 ms, S2 per
 early-out thread 0.1007 then 0.0925 ns, break-even G about 3.8x then 4.3x.
 Pipelined break-even recomputed from the repeat run lands at G of about 11.5x,
 matching the first pass.
+
+## Experiment 1 answered: DXGI accepts a wrapped queue
+
+`tier11probe.exe hw -dxgiqueue`:
+
+    real queue     : OK
+    wrapped queue  : OK
+
+**The inference recorded above was wrong.** DXGI does not refuse a foreign
+`ID3D12CommandQueue`. `CreateSwapChainForHwnd` succeeds on a forwarding wrapper
+exactly as it does on the real queue, so **no dxgi.dll proxy is needed** and
+option B loses its main objection.
+
+One design constraint falls out of why it works. The wrapper's
+`QueryInterface` answers for the interfaces an app holds, `IUnknown`,
+`ID3D12Object`, `ID3D12DeviceChild`, `ID3D12Pageable` and `ID3D12CommandQueue`,
+and **forwards everything else to the real queue**. DXGI evidently queries for
+something internal and gets the real object through that fall-through. A wrapper
+that refused unknown IIDs would very likely fail here, so the fall-through is
+load-bearing, not a convenience.
+
+## Architecture decision for S1
+
+Settled: **option B, wrap the command list and the queue**, with no second proxy
+DLL. The build order, each step verifiable on its own:
+
+1. Command queue wrapper, and `CreateCommandQueue` returns it. Pure forwarding,
+   no behaviour change. Verify the whole regression suite still passes; this is
+   the first time the shim wraps anything other than the device, so prove it is
+   transparent before adding logic.
+2. Command list wrapper, and `CreateCommandList` / `CreateCommandList1` return
+   it. Unwrap in `ExecuteCommandLists`. Still pure forwarding, verify again.
+3. `CreateCommandSignature` interception for DISPATCH_RAYS on Tier 1.0.
+4. `ExecuteIndirect` interception, segmentation, and binding-state replay.
+
+## CORRECTION: the wrapped-queue experiment was wrong
+
+The experiment above concluded that DXGI accepts a wrapped queue and that no
+dxgi.dll proxy was needed. **That conclusion was wrong, because the experiment
+only tested swapchain creation.** Creation is not where it fails.
+
+Extended to actually present frames:
+
+    real queue            : OK
+    real queue    Present : OK x3
+    wrapped queue create  : OK
+    wrapped queue Present : ACCESS VIOLATION
+
+`CreateSwapChainForHwnd` succeeds on a wrapped queue and the first `Present`
+faults. The probe now presents on both queues, so it cannot pass on creation
+alone again.
+
+This reproduced end to end before it was understood. With the queue wrapped,
+both Microsoft samples died with `0xC000041D`, STATUS_FATAL_USER_CALLBACK_EXCEPTION,
+as soon as the window was brought to the foreground. That code is what you get
+when an exception escapes a window procedure, and the samples call
+`OnRender` and therefore `Present` and `ThrowIfFailed` directly from `WM_PAINT`.
+`raytest.exe` was unaffected throughout, because it has no swapchain, which is
+what narrowed it to the DXGI path.
+
+Logging QueryInterface on the wrapper showed the mechanism. DXGI probes the
+queue and reaches the real object through the fall-through:
+
+    queue QI forwarded: {54EC77FA-...} hr=0x80004002   (ID3D12Device, refused)
+    queue QI forwarded: {0ADF7D52-...} hr=0x80004002
+    q GetDevice / GetDesc / ExecuteCommandLists / Signal   (all fine)
+    queue QI forwarded: {FFFFFFFF-335A-4BC5-9DE9-43D8FB7777AE} hr=0x00000000
+    <crash>
+
+The last line is a private DXGI interface, queried at Present time and answered
+by the real queue. So DXGI ends up holding the real object while having been
+handed the wrapper, and that split identity is what it trips over.
+
+**The queue wrapper has been reverted.** `CreateCommandQueue` forwards
+unchanged again and the regression suite is green: raytest ALL MATCH, HelloWorld
+0 of 14400 pixels differ, SimpleLighting unchanged fps.
+
+### Architecture, reconsidered again
+
+Option B, wrapping list and queue, now costs what it originally looked like it
+cost: it needs a dxgi.dll proxy to unwrap the queue on the way into
+`CreateSwapChainForHwnd`, since handing DXGI the wrapper is exactly what breaks.
+
+That restores the earlier reasoning, this time on measurement rather than
+inference. The realistic options for S1 are:
+
+- **A. Vtable hooks.** Hook `ExecuteIndirect`, `ExecuteCommandLists` and the
+  binding calls on the real objects. The app and DXGI only ever see real
+  pointers, so this whole class of identity problem does not arise. The cost is
+  patching runtime-owned memory, and it is process-global.
+- **B'. Wrap the command list only, plus a dxgi.dll proxy.** Keeps the wrapper
+  idiom but adds a second proxy DLL and its export table, and still has to
+  unwrap at every boundary.
+
+The measured DXGI failure is a strong argument for A. Wrapping works cleanly for
+the device because nothing outside D3D12 consumes a device pointer; it breaks for
+the queue precisely because something outside D3D12 does.
+
+### Lesson worth keeping
+
+An experiment that stops at the first API call proves only that the first API
+call works. This one cost a full build-and-revert cycle. When testing whether a
+foreign object is acceptable to a system, drive it through the operation that
+actually uses it, not just the one that accepts it.
+
+## Option A measured, and its premise is false
+
+Built the hook with a self-test: patch slot 59 of the command list vtable, then
+call `ExecuteIndirect` on a scratch list and require that our function ran, so a
+wrong slot index could never stay patched. The self-test passed, confirming slot
+59 really is `ExecuteIndirect`.
+
+Then nothing happened. Not one real call was intercepted. A separate probe mode,
+`tier11probe.exe -hooktest`, drives a genuine `ExecuteIndirect` on Tier 1.0 using
+a plain DISPATCH command signature, which every tier supports. The dispatch
+produced the correct result and the hook never fired.
+
+The reason:
+
+| | address | kind |
+|---|---|---|
+| queue vtable | `00007FFFF7ACDD08` | **image**, shared, stable |
+| list vtable while recording | `0000025E07544478` | **heap**, per object |
+| list vtable after Close | `0000025E07544478` | unchanged |
+| list vtable after Reset | `0000025E07544478` | unchanged |
+| vtable patched at CreateCommandList | `00007FFFF7C4F1D0` | image, and abandoned |
+
+**A D3D12 command list uses a per-object, heap-allocated vtable.** The shared
+image vtable it has when `CreateCommandList` returns is not the one it uses once
+the application records into it. So:
+
+- "one patch covers every command list", the main attraction of option A, is
+  false. Vtables are per object.
+- Hooking at creation patches a table the object stops using, which is exactly
+  the silent-no-op observed.
+
+The per-object vtable is at least stable across `Close` and `Reset`, so a hook
+installed on it would hold for that list's lifetime. The difficulty is timing:
+the shim sees `CreateCommandList`, which is too early, and never sees the
+`Reset` calls that begin each frame's recording.
+
+The command list hook has been reverted. The repo is green: raytest ALL MATCH,
+HelloWorld 0 of 14400 pixels differ.
+
+## Where that leaves it: a hybrid, and it fits the evidence
+
+Both pure approaches are now excluded by measurement, but the two failures are
+complementary, and the queue and the list fail for opposite reasons:
+
+- the **queue** must not be wrapped, because DXGI consumes it, but its vtable
+  **is** shared and hookable
+- the **list** cannot be usefully hooked, because its vtable is per object, but
+  wrapping it is fine, since nothing outside D3D12 ever sees a command list
+
+So:
+
+**Wrap the command list, and hook `ExecuteCommandLists` on the queue's vtable.**
+
+- The wrapper gives record-time interception of `ExecuteIndirect` and of the
+  binding calls that segmentation needs to replay. This is the wrapper work that
+  was always required.
+- The queue is left entirely alone as an object, so DXGI keeps getting the real
+  pointer and Present is unaffected.
+- One static vtable patch on the queue, verified by the same self-test approach,
+  unwraps our lists on the way into the real `ExecuteCommandLists`.
+
+That is one hook on a vtable measured to be shared and stable, instead of a
+wrapper on an object measured to break DXGI. Next step is to confirm the queue
+vtable is stable over a longer run and across multiple queues, then build it.
+
+## Queue vtable verified, and the hook works
+
+`tier11probe.exe hw -queuevtable`:
+
+    DIRECT  #0/#1   00007FF80167DD08  (image)
+    COMPUTE #0/#1   00007FF80167DD08  (image)
+    COPY    #0/#1   00007FF80167DD08  (image)
+    after ExecuteCommandLists+Signal: UNCHANGED
+    two DIRECT queues share a vtable : yes
+
+One shared image-address vtable for every queue of every type, unchanged under
+use. Exactly the opposite of a command list, and exactly what a hook needs.
+
+`proxy/queue_hook.{h,cpp}` patches slot 10, `ExecuteCommandLists`, with the same
+self-test discipline as before: call it with zero lists, require that our
+function ran, and unpatch if it did not. It also refuses to proceed if a second
+distinct queue vtable ever appears, since that would mean the shared-vtable
+result no longer holds on that runtime.
+
+Result, and note the second line, which is what the command list hook never
+managed:
+
+    [dxr11-proxy] queue hook installed: vtable 00007FF80167DD08 slot 10, self-test passed
+    [dxr11-proxy] ExecuteCommandLists intercepted (first real call), n=1
+
+Regression with the hook live: raytest ALL MATCH, HelloWorld **0 of 14400 pixels
+differ** at 2125 against 2142 fps, SimpleLighting 1384 against 1381 fps. The
+windowed samples are the meaningful ones here, because Present is precisely what
+the queue *wrapper* broke, and hooking leaves it alone.
+
+### Summary of what is settled
+
+| approach | verdict | evidence |
+|---|---|---|
+| wrap the queue | **no** | DXGI access-violates on first Present |
+| hook the command list vtable | **no** | per-object heap vtable, hook never fires |
+| hook the queue vtable | **yes** | shared, stable, intercepts real calls |
+| wrap the command list | expected yes | nothing outside D3D12 holds one |
+
+Remaining work for S1: the command list wrapper, then `CreateCommandSignature`
+interception for DISPATCH_RAYS, then `ExecuteIndirect` segmentation with
+binding-state replay.

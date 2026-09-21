@@ -34,7 +34,7 @@ cl /nologo /EHsc /std:c++17 /O2 /W4 ^
    /I "%AGILITY%\build\native\include" /I "%DXC%\inc" ^
    /Fo:"%OUT%\obj\\" ^
    phase4\tier11probe.cpp /Fe:"%OUT%\tier11probe.exe" ^
-   /link d3d12.lib dxgi.lib /INCREMENTAL:NO
+   /link d3d12.lib dxgi.lib user32.lib /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
 rem Agility runtime must sit in .\D3D12\ next to the exe.

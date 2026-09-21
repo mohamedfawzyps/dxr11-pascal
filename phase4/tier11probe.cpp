@@ -80,6 +80,9 @@ enum class Adapter { Warp, Hardware };
 static bool g_debug = false;
 static bool g_timing = false;
 static bool g_pipeline = false;
+static bool g_dxgiQueue = false;
+static bool g_hookTest = false;
+static bool g_queueVTable = false;
 static int g_filler = 4;
 static int g_frames = 60;
 static uint32_t g_rayCount = 1u << 20;   // 1M rays, enough that Pascal does real work
@@ -1367,6 +1370,303 @@ static void ProbePipeline(Ctx& c, uint32_t rayCount, int fillerPasses, int frame
 }
 
 // ---------------------------------------------------------------------------
+// Hook test: drive a REAL ExecuteIndirect on Tier 1.0 hardware.
+//
+// The shim hooks ExecuteIndirect in the command list vtable. Its install-time
+// self-test proves the slot index is right, but nothing in the rest of this
+// probe ever calls ExecuteIndirect on Tier 1.0, because CreateCommandSignature
+// refuses DISPATCH_RAYS there. So a broken forward would stay latent until the
+// first real workload hit it.
+//
+// A plain DISPATCH command signature is supported on every tier, so this uses
+// one to put genuine traffic through the hook and check the result is correct.
+// ---------------------------------------------------------------------------
+static const char* kHookTestCS = R"HLSL(
+RWStructuredBuffer<uint> outBuf : register(u0);
+[numthreads(1,1,1)]
+void main(uint3 tid : SV_DispatchThreadID) { outBuf[tid.x] = 0xC0FFEE + tid.x; }
+)HLSL";
+
+static void ProbeHookTest(Ctx& c) {
+    std::printf("\n-- real ExecuteIndirect through a DISPATCH signature --\n");
+
+    std::string err;
+    auto cs = c.dxc.tryCompile(kHookTestCS, L"cs_6_0", {}, err);
+    if (!cs) { std::printf("   [!] compute shader: %s\n", err.c_str()); return; }
+
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    param.Descriptor.ShaderRegister = 0;
+    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 1; rd.pParameters = &param;
+    ComPtr<ID3DBlob> blob, rerr;
+    HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rerr);
+    if (FAILED(hr)) { std::printf("   [!] root sig %s\n", HrStr(hr).c_str()); return; }
+    ComPtr<ID3D12RootSignature> rs;
+    HR(c.g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+        IID_PPV_ARGS(&rs)), "CreateRootSignature(hooktest)");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = rs.Get();
+    pd.CS.pShaderBytecode = cs->GetBufferPointer();
+    pd.CS.BytecodeLength = cs->GetBufferSize();
+    ComPtr<ID3D12PipelineState> pso;
+    hr = c.g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) { std::printf("   [!] compute PSO %s\n", HrStr(hr).c_str()); return; }
+
+    D3D12_INDIRECT_ARGUMENT_DESC arg{};
+    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC csd{};
+    csd.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
+    ComPtr<ID3D12CommandSignature> sig;
+    hr = c.g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig));
+    std::printf("   CreateCommandSignature(DISPATCH) : %s\n",
+                SUCCEEDED(hr) ? "OK" : HrStr(hr).c_str());
+    if (FAILED(hr)) return;
+
+    const UINT kThreads = 8;
+    auto out = CreateBuffer(c.g.device.Get(), kThreads * sizeof(uint32_t),
+        D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto rb = CreateBuffer(c.g.device.Get(), kThreads * sizeof(uint32_t),
+        D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto argBuf = CreateBuffer(c.g.device.Get(), sizeof(D3D12_DISPATCH_ARGUMENTS),
+        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    { void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+      HR(argBuf->Map(0, &none, &p), "map args");
+      D3D12_DISPATCH_ARGUMENTS da{ kThreads, 1, 1 };
+      std::memcpy(p, &da, sizeof(da)); argBuf->Unmap(0, nullptr); }
+
+    // Characterise how stable these vtables are, because vtable hooking only
+    // works if the pointer you patched is the one still in use at call time.
+    auto vt = [](void* obj) { return *reinterpret_cast<void**>(obj); };
+    std::printf("   queue vtable                     : %p\n", vt(c.g.queue.Get()));
+    std::printf("   list vtable now (recording)      : %p\n", vt(c.g.list.Get()));
+    c.g.list->Close();
+    std::printf("   list vtable after Close          : %p\n", vt(c.g.list.Get()));
+    HR(c.g.list->Reset(c.g.alloc.Get(), nullptr), "reset for hooktest");
+    std::printf("   list vtable after Reset          : %p\n", vt(c.g.list.Get()));
+    std::printf("   (image addresses look like 00007FF...; heap ones do not)\n");
+
+    c.g.list->SetComputeRootSignature(rs.Get());
+    c.g.list->SetPipelineState(pso.Get());
+    c.g.list->SetComputeRootUnorderedAccessView(0, out->GetGPUVirtualAddress());
+    c.g.list->ExecuteIndirect(sig.Get(), 1, argBuf.Get(), 0, nullptr, 0);
+    UavBarrier(c.g.list.Get(), out.Get());
+    Transition(c.g.list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    c.g.list->CopyResource(rb.Get(), out.Get());
+    c.g.flush();
+
+    std::vector<uint32_t> got(kThreads);
+    void* rp = nullptr; D3D12_RANGE full{ 0, kThreads * sizeof(uint32_t) };
+    HR(rb->Map(0, &full, &rp), "map readback");
+    std::memcpy(got.data(), rp, kThreads * sizeof(uint32_t));
+    D3D12_RANGE nowrite{ 0, 0 }; rb->Unmap(0, &nowrite);
+
+    bool ok = true;
+    for (UINT i = 0; i < kThreads; ++i) if (got[i] != 0xC0FFEE + i) ok = false;
+    std::printf("   ExecuteIndirect result           : %s (first value 0x%X, expected 0x%X)\n",
+                ok ? "CORRECT" : "WRONG", got[0], 0xC0FFEE);
+    std::printf("   -> with the proxy present, the log should show the hook\n");
+    std::printf("      intercepting this call and forwarding it intact.\n");
+}
+
+// ---------------------------------------------------------------------------
+// Is the command queue vtable shared and stable?
+//
+// The hybrid design hooks ExecuteCommandLists in the queue vtable. That is only
+// sound if the vtable is shared between queues rather than per object, and does
+// not change under the object's feet the way a command list's does. Command
+// lists turned out to use a per-object heap vtable, so this is not a safe
+// assumption to make twice.
+// ---------------------------------------------------------------------------
+static void ProbeQueueVTable(Ctx& c) {
+    std::printf("\n-- is the command queue vtable shared and stable? --\n");
+    auto vt = [](void* o) { return *reinterpret_cast<void**>(o); };
+
+    struct QT { D3D12_COMMAND_LIST_TYPE type; const char* name; };
+    const QT types[] = {
+        { D3D12_COMMAND_LIST_TYPE_DIRECT,  "DIRECT " },
+        { D3D12_COMMAND_LIST_TYPE_COMPUTE, "COMPUTE" },
+        { D3D12_COMMAND_LIST_TYPE_COPY,    "COPY   " },
+    };
+
+    std::vector<ComPtr<ID3D12CommandQueue>> keep;
+    void* firstDirect = nullptr;
+    for (const auto& t : types) {
+        for (int i = 0; i < 2; ++i) {
+            D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = t.type;
+            ComPtr<ID3D12CommandQueue> q;
+            if (FAILED(c.g.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)))) continue;
+            void* v = vt(q.Get());
+            bool image = ((uintptr_t)v >> 40) != 0 && ((uintptr_t)v & 0xFFFF000000000000ull) == 0
+                         && (uintptr_t)v > 0x00007F0000000000ull;
+            std::printf("   %s #%d vtable %p  %s\n", t.name, i, v,
+                        image ? "(image)" : "(heap)");
+            if (t.type == D3D12_COMMAND_LIST_TYPE_DIRECT && i == 0) firstDirect = v;
+            keep.push_back(q);
+        }
+    }
+
+    // Now use one, the way an app would, and re-read the pointer. A command list
+    // swaps its vtable somewhere between creation and recording; check a queue
+    // does not do the same across submit and signal.
+    if (!keep.empty()) {
+        ID3D12CommandQueue* q = keep[0].Get();
+        void* before = vt(q);
+        ComPtr<ID3D12CommandAllocator> alloc;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        HR(c.g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "alloc");
+        HR(c.g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)), "list");
+        HR(list->Close(), "close");
+        ID3D12CommandList* ls[] = { list.Get() };
+        q->ExecuteCommandLists(1, ls);
+        ComPtr<ID3D12Fence> fence;
+        HR(c.g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "fence");
+        q->Signal(fence.Get(), 1);
+        void* after = vt(q);
+        std::printf("   after ExecuteCommandLists+Signal: %p  %s\n", after,
+                    (after == before) ? "UNCHANGED" : "CHANGED");
+        std::printf("   two DIRECT queues share a vtable : %s\n",
+                    (keep.size() > 1 && vt(keep[0].Get()) == vt(keep[1].Get())) ? "yes" : "NO");
+        (void)firstDirect;
+    }
+    std::printf("   -> hooking the queue vtable is sound only if shared and unchanged.\n");
+}
+
+// ---------------------------------------------------------------------------
+// Experiment: will DXGI accept a wrapped ID3D12CommandQueue?
+//
+// This decides the shape of the whole indirect DispatchRays implementation.
+// Intercepting ExecuteIndirect means wrapping the command list, which forces
+// wrapping the queue, and the app hands its queue straight to
+// IDXGIFactory::CreateSwapChainForHwnd (DeviceResources.cpp:321 in the
+// Microsoft sample). We proxy d3d12.dll only. If DXGI refuses a foreign queue,
+// the shim also needs a dxgi.dll proxy to unwrap at that boundary, which is a
+// second proxy DLL and a whole extra export table.
+//
+// The stub below is a genuine forwarding wrapper, not a null implementation,
+// because that is exactly what the shim would hand over.
+// ---------------------------------------------------------------------------
+namespace {
+class QueueWrapper : public ID3D12CommandQueue {
+public:
+    explicit QueueWrapper(ID3D12CommandQueue* real) : m_real(real), m_refs(1) { m_real->AddRef(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        // Answer for ourselves on the interfaces an app holds, which is what
+        // makes this a realistic test rather than a trivially-passing one.
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+            riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
+            riid == __uuidof(ID3D12CommandQueue)) {
+            AddRef(); *ppv = static_cast<ID3D12CommandQueue*>(this); return S_OK;
+        }
+        return m_real->QueryInterface(riid, ppv);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&m_refs); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG n = InterlockedDecrement(&m_refs);
+        if (n == 0) { m_real->Release(); delete this; }
+        return (ULONG)n;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* s, void* d) override { return m_real->GetPrivateData(g, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT s, const void* d) override { return m_real->SetPrivateData(g, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) override { return m_real->SetPrivateDataInterface(g, d); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR n) override { return m_real->SetName(n); }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppv) override { return m_real->GetDevice(riid, ppv); }
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* r, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* a, const D3D12_TILE_REGION_SIZE* b, ID3D12Heap* h, UINT nr, const D3D12_TILE_RANGE_FLAGS* f, const UINT* o, const UINT* c, D3D12_TILE_MAPPING_FLAGS fl) override { m_real->UpdateTileMappings(r, n, a, b, h, nr, f, o, c, fl); }
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource* d, const D3D12_TILED_RESOURCE_COORDINATE* dc, ID3D12Resource* s, const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* rs, D3D12_TILE_MAPPING_FLAGS f) override { m_real->CopyTileMappings(d, dc, s, sc, rs, f); }
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT n, ID3D12CommandList* const* l) override { m_real->ExecuteCommandLists(n, l); }
+    void STDMETHODCALLTYPE SetMarker(UINT m, const void* d, UINT s) override { m_real->SetMarker(m, d, s); }
+    void STDMETHODCALLTYPE BeginEvent(UINT m, const void* d, UINT s) override { m_real->BeginEvent(m, d, s); }
+    void STDMETHODCALLTYPE EndEvent() override { m_real->EndEvent(); }
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* f, UINT64 v) override { return m_real->Signal(f, v); }
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* f, UINT64 v) override { return m_real->Wait(f, v); }
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* f) override { return m_real->GetTimestampFrequency(f); }
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* g, UINT64* c) override { return m_real->GetClockCalibration(g, c); }
+    D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return m_real->GetDesc(); }
+private:
+    ~QueueWrapper() = default;
+    ID3D12CommandQueue* m_real;
+    LONG m_refs;
+};
+} // namespace
+
+static void ProbeDxgiQueue(Ctx& c) {
+    std::printf("\n-- can DXGI swap-chain on a WRAPPED command queue? --\n");
+
+    ComPtr<IDXGIFactory4> factory;
+    HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) { std::printf("   CreateDXGIFactory2 %s\n", HrStr(hr).c_str()); return; }
+
+    WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"Dxr11ProbeWnd";
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, L"Dxr11ProbeWnd", L"probe", WS_OVERLAPPEDWINDOW,
+                                0, 0, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) { std::printf("   could not create a window\n"); return; }
+
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = 64; sd.Height = 64;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SampleDesc.Count = 1;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+    // Control: the real queue, to prove the rest of the setup is sound.
+    ComPtr<IDXGISwapChain1> sc1;
+    hr = factory->CreateSwapChainForHwnd(c.g.queue.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
+    std::printf("   real queue     : %s\n", SUCCEEDED(hr) ? "OK" : HrStr(hr).c_str());
+    sc1.Reset();
+
+    // Creation alone is NOT the question. An earlier version of this probe
+    // stopped there and concluded a wrapped queue was fine, which was wrong:
+    // creation succeeds and Present is what fails. Always present a few frames.
+    ShowWindow(hwnd, SW_SHOWNA);
+    auto presentLoop = [&](IDXGISwapChain1* sc, const char* label) {
+        for (int i = 0; i < 3; ++i) {
+            HRESULT ph = sc->Present(0, 0);
+            if (FAILED(ph)) {
+                std::printf("   %s Present[%d] : %s\n", label, i, HrStr(ph).c_str());
+                return ph;
+            }
+            MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        }
+        std::printf("   %s Present    : OK x3\n", label);
+        return S_OK;
+    };
+
+    ComPtr<IDXGISwapChain1> scReal;
+    hr = factory->CreateSwapChainForHwnd(c.g.queue.Get(), hwnd, &sd, nullptr, nullptr, &scReal);
+    if (SUCCEEDED(hr)) presentLoop(scReal.Get(), "real queue    ");
+    scReal.Reset();
+
+    // The actual question.
+    auto* wrapped = new QueueWrapper(c.g.queue.Get());
+    ComPtr<IDXGISwapChain1> sc2;
+    hr = factory->CreateSwapChainForHwnd(wrapped, hwnd, &sd, nullptr, nullptr, &sc2);
+    std::printf("   wrapped queue create : %s\n", SUCCEEDED(hr) ? "OK" : HrStr(hr).c_str());
+    HRESULT ph = E_FAIL;
+    if (SUCCEEDED(hr)) ph = presentLoop(sc2.Get(), "wrapped queue ");
+
+    if (SUCCEEDED(hr) && SUCCEEDED(ph)) {
+        std::printf("   -> a wrapped queue survives creation AND present.\n");
+    } else {
+        std::printf("   -> a wrapped queue does NOT work end to end. Wrapping the queue\n");
+        std::printf("      requires proxying dxgi.dll to unwrap at this boundary, or the\n");
+        std::printf("      queue must not be wrapped at all.\n");
+    }
+    sc2.Reset();
+    wrapped->Release();
+    DestroyWindow(hwnd);
+}
+
+// ---------------------------------------------------------------------------
 static ComPtr<IDXGIAdapter1> PickAdapter(IDXGIFactory6* factory, Adapter which) {
     ComPtr<IDXGIAdapter1> adapter;
     if (which == Adapter::Warp) {
@@ -1463,6 +1763,18 @@ static void RunAdapter(Adapter which) {
     auto addLib = c.dxc.tryCompile(kAddLibHLSL, L"lib_6_3", {}, err);
     if (!addLib) { std::printf("\n[!] addition library failed to compile: %s\n", err.c_str()); return; }
 
+    if (g_queueVTable) {
+        ProbeQueueVTable(c);                            c.drain("queuevtable");
+        return;
+    }
+    if (g_hookTest) {
+        ProbeHookTest(c);                               c.drain("hooktest");
+        return;
+    }
+    if (g_dxgiQueue) {
+        ProbeDxgiQueue(c);                              c.drain("dxgiqueue");
+        return;
+    }
     if (g_pipeline) {
         ProbePipeline(c, g_rayCount, g_filler, g_frames); c.drain("pipeline");
         return;
@@ -1477,6 +1789,9 @@ static void RunAdapter(Adapter which) {
 }
 
 int main(int argc, char** argv) {
+    // Unbuffered: this probe deliberately provokes crashes, and a lost stdout
+    // buffer hides the line that says how far it got.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         bool warp = true, hw = true;
         const char* pick = nullptr;
@@ -1484,6 +1799,9 @@ int main(int argc, char** argv) {
             if (std::strcmp(argv[i], "-debug") == 0) g_debug = true;
             else if (std::strcmp(argv[i], "-time") == 0) g_timing = true;
             else if (std::strcmp(argv[i], "-pipeline") == 0) g_pipeline = true;
+            else if (std::strcmp(argv[i], "-dxgiqueue") == 0) g_dxgiQueue = true;
+            else if (std::strcmp(argv[i], "-hooktest") == 0) g_hookTest = true;
+            else if (std::strcmp(argv[i], "-queuevtable") == 0) g_queueVTable = true;
             else if (std::strcmp(argv[i], "-filler") == 0 && i + 1 < argc) g_filler = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-frames") == 0 && i + 1 < argc) g_frames = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-rays") == 0 && i + 1 < argc) g_rayCount = (uint32_t)std::strtoul(argv[++i], nullptr, 10);

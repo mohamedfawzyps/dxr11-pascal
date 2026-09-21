@@ -10,6 +10,7 @@
 #include "d3d12_device.h"
 #include "proxy_log.h"
 #include "state_object_cache.h"
+#include "queue_hook.h"
 
 #include <windows.h>
 #include <new>
@@ -103,10 +104,42 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::SetName(LPCWSTR Name) { FWD(SetName(Name)
 // --- ID3D12Device -----------------------------------------------------------
 
 UINT STDMETHODCALLTYPE Dxr11Device::GetNodeCount() { FWD(GetNodeCount()); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* pDesc, REFIID riid, void** ppCommandQueue) { FWD(CreateCommandQueue(pDesc, riid, ppCommandQueue)); }
+// NOT wrapped, and this is a measured constraint rather than an oversight.
+// DXGI consumes the queue: the app hands it to CreateSwapChainForHwnd, and with
+// a wrapper in the way the first Present access-violates. See
+// docs/phase4-indirect-design.md and tier11probe.exe -dxgiqueue.
+//
+// Instead the queue's vtable is hooked, once, for ExecuteCommandLists. That is
+// safe here and not for command lists, because every queue of every type shares
+// one image-address vtable that does not change under use, verified with
+// tier11probe.exe -queuevtable.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* pDesc, REFIID riid, void** ppCommandQueue) {
+    HRESULT hr = m_real->CreateCommandQueue(pDesc, riid, ppCommandQueue);
+    if (m_tier11 || FAILED(hr) || !ppCommandQueue || !*ppCommandQueue) return hr;
+    ID3D12CommandQueue* q = nullptr;
+    if (SUCCEEDED(static_cast<IUnknown*>(*ppCommandQueue)->QueryInterface(
+            __uuidof(ID3D12CommandQueue), (void**)&q)) && q) {
+        Dxr11InstallQueueHook(q);
+        q->Release();
+    }
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** ppCommandAllocator) { FWD(CreateCommandAllocator(type, riid, ppCommandAllocator)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateGraphicsPipelineState(pDesc, riid, ppPipelineState)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState)); }
+// Neither wrapped nor hooked, and both were tried and measured.
+//
+// Wrapping the list forces wrapping the queue, and a wrapped queue makes DXGI
+// access-violate on the first Present.
+//
+// Hooking the list vtable does not work either: a command list swaps to a
+// PER-OBJECT, heap-allocated vtable, so the shared image vtable present when
+// CreateCommandList returns is not the one in use when the app records. A hook
+// installed here self-tests cleanly and then never sees a single real call.
+// Measured with `tier11probe.exe -hooktest`; see docs/phase4-indirect-design.md.
+//
+// The queue vtable, by contrast, is an image address and is shared, which is
+// what the eventual design leans on.
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* pCommandAllocator, ID3D12PipelineState* pInitialState, REFIID riid, void** ppCommandList) { FWD(CreateCommandList(nodeMask, type, pCommandAllocator, pInitialState, riid, ppCommandList)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) { FWD(CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) { FWD(CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap)); }
