@@ -133,9 +133,10 @@ Version 1.
       resource array indexed [2], via a table      14450 hits   MATCH
       descriptor-table root signature, no array    14450 hits   MATCH
       independent shader, resource read in loop     6333 hits   MATCH
+      CommittedInstanceIndex + PrimitiveIndex      18496 hits   MATCH
 
   All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
-  Five render cases and ten analysis checks, run by
+  Six render cases and twelve analysis checks, run by
   `.\tools\run_rewriter_test.ps1`.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
@@ -203,18 +204,36 @@ Version 1.
   - `raytest --cs <file.hlsl>` compiles a given shader for the ground-truth
     side, so any independent shader can be its own oracle through WARP.
 
-  Next action, in order of how likely each is to break it.
-  1. **More independent shaders.** The first one found a real defect
-     immediately, which is the argument for writing another rather than
-     assuming it would pass. Most valuable: committed accessors outside the
-     whitelist, `CommittedInstanceIndex`, `CommittedPrimitiveIndex`,
-     `CommittedGeometryIndex`. Refused today and common in real code, so they
-     are the next thing a real engine hits.
+  **A second independent shader found a Tier 1.1 feature with NO lowering.**
+  `phase5/cases/rayquery_ids.hlsl` uses the committed index accessors.
+  `CommittedInstanceIndex` (207) and `CommittedPrimitiveIndex` (210) now work,
+  mapping to `InstanceIndex()` (142) and `PrimitiveIndex()` (161).
+  **`CommittedGeometryIndex` (209) does not and cannot**, see the
+  no-valid-lowering table below. All five of those opcodes share the one
+  `rayQuery_StateScalar.i32` function, which keeps vindicating dispatch on
+  operand 0.
+  - **The payload size is part of the state object contract.** Growing it from
+    16 to 28 bytes broke `CreateStateObject` with `E_INVALIDARG` until
+    `MaxPayloadSizeInBytes` was raised to match. Whatever generates the shaders
+    does not get to pick the payload freely; `PAYLOAD_BYTES` in `lower.py` and
+    the shader config have to move together.
+  - `raytest --multi` builds two instances of a two-triangle quad, so instance
+    varies left to right and primitive across the diagonal. Against the default
+    one-triangle scene every correct answer is 0 and a lowering returning a
+    constant would pass.
+
+  Next action, in order.
+  1. **Wire the rewriter into the proxy**, at `CreateStateObject` and the
+     compute pipeline path. Now the largest untested gap. It forces the tier
+     question: reporting Tier 1.1 entitles an app to emit RayQuery, so the flip
+     and a working rewriter have to land together, with anything refused
+     failing loudly rather than rendering wrong.
   2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
-  3. Wire the rewriter into the proxy at `CreateStateObject` and the compute
-     pipeline path. That forces the tier question: reporting Tier 1.1 entitles
-     an app to emit RayQuery, so the flip and a working rewriter have to land
-     together, with anything refused failing loudly.
+  3. More independent shaders. Both written so far found something the Phase 2
+     pair could not: the first a false refusal, the second a feature with no
+     lowering at all. Untried and plausible: non-default `RAY_FLAG`
+     combinations, `Abort()`, procedural primitives, and the committed
+     object-space accessors.
 
   What is NOT generic, written down so it is not rediscovered:
   - Resource arrays work, but only with a **constant, uniform** index. Dynamic
@@ -411,6 +430,14 @@ Detect these and fail loudly rather than producing wrong output:
 | Multiple concurrent RayQuery objects | `TraceRay` has one payload and one in-flight trace |
 | Loop body reading caller locals that do not fit the payload | The any-hit shader is a separate invocation; the payload is the only shared state |
 | Wave intrinsics around the query | Promotion to raygen changes lane occupancy |
+| **`CommittedGeometryIndex`** | MEASURED: `GeometryIndex()` in a DXR 1.0 hit shader is ITSELF Tier 1.1. It sets shader flag 0x2000000 and `CreateStateObject` returns `E_INVALIDARG` on the 1070, so there is nothing to lower onto |
+
+`CommittedGeometryIndex` was not in the original list and was found by testing.
+It is the first Tier 1.1 feature this approach cannot emulate at all, which is
+a fact about the project's scope rather than a limitation of the rewriter. A
+route exists in principle, encoding the geometry index in the shader table with
+one hit group record per geometry, but that means the shim rebuilding the
+application's SBT. Not attempted.
 
 The pixel-shader case is the most consequential, since it is legal in DXR 1.1
 and some engines use it.
