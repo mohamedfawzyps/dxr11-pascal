@@ -70,6 +70,10 @@ is useful for isolating whether a problem is the shim at all. The log lands in
 `%TEMP%\dxr11_proxy.log` and says what was intercepted, what was lowered and
 what was refused, with reasons.
 
+**[docs/usage.md](docs/usage.md) is the step by step guide**, including where
+the DLL has to go for Unreal, how to get the environment variable to reach a
+launcher, how to read the log, and what to try when something goes wrong.
+
 ## What it refuses, and why
 
 A shader the rewriter cannot lower is logged and forwarded unchanged, so the
