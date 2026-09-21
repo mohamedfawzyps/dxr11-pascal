@@ -35,7 +35,7 @@ if errorlevel 1 exit /b 1
 
 cl /nologo /EHsc /std:c++17 /O2 /W4 %INCS% /LD ^
    /Fo:"%~dp0obj\\" ^
-   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp ^
+   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp proxy\state_object_cache.cpp ^
    /Fe:d3d12.dll ^
    /link "%~dp0obj\d3d12_thunks.obj" /DEF:proxy\d3d12_proxy.def /INCREMENTAL:NO
 if errorlevel 1 exit /b 1

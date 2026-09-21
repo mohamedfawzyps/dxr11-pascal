@@ -9,23 +9,31 @@
 
 #include "d3d12_device.h"
 #include "proxy_log.h"
+#include "state_object_cache.h"
 
 #include <windows.h>
 #include <new>
+#include <string>
 
 // FWD(method, args...) - forward to the real device, returning its result.
 #define FWD(call) return m_real->call
 
 Dxr11Device::Dxr11Device(ID3D12Device5* real)
-    : m_real(real), m_real6(nullptr), m_real7(nullptr), m_refs(1) {
+    : m_real(real), m_tier11(false), m_real6(nullptr), m_real7(nullptr), m_refs(1) {
+    if (m_real) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
+        if (SUCCEEDED(m_real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
+            m_tier11 = (o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1);
+    }
     // Optional: a device that stops at Device5 is still wrappable, we just
     // decline the higher IIDs in QueryInterface.
     if (m_real) {
         m_real->QueryInterface(__uuidof(ID3D12Device6), (void**)&m_real6);
         m_real->QueryInterface(__uuidof(ID3D12Device7), (void**)&m_real7);
     }
-    ProxyLog("[dxr11-proxy] device wrapper created (real=%p, Device6=%s, Device7=%s)\n",
-             (void*)m_real, m_real6 ? "yes" : "no", m_real7 ? "yes" : "no");
+    ProxyLog("[dxr11-proxy] device wrapper created (real=%p, Device6=%s, Device7=%s, tier=%s)\n",
+             (void*)m_real, m_real6 ? "yes" : "no", m_real7 ? "yes" : "no",
+             m_tier11 ? "1.1" : "1.0");
 }
 
 Dxr11Device::~Dxr11Device() {
@@ -164,7 +172,56 @@ void STDMETHODCALLTYPE Dxr11Device::RemoveDevice() { m_real->RemoveDevice(); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::EnumerateMetaCommands(UINT* pNumMetaCommands, D3D12_META_COMMAND_DESC* pDescs) { FWD(EnumerateMetaCommands(pNumMetaCommands, pDescs)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::EnumerateMetaCommandParameters(REFGUID CommandId, D3D12_META_COMMAND_PARAMETER_STAGE Stage, UINT* pTotalStructureSizeInBytes, UINT* pParameterCount, D3D12_META_COMMAND_PARAMETER_DESC* pParameterDescs) { FWD(EnumerateMetaCommandParameters(CommandId, Stage, pTotalStructureSizeInBytes, pParameterCount, pParameterDescs)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateMetaCommand(REFGUID CommandId, UINT NodeMask, const void* pCreationParametersData, SIZE_T CreationParametersDataSizeInBytes, REFIID riid, void** ppMetaCommand) { FWD(CreateMetaCommand(CommandId, NodeMask, pCreationParametersData, CreationParametersDataSizeInBytes, riid, ppMetaCommand)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject) { FWD(CreateStateObject(pDesc, riid, ppStateObject)); }
+// CreateStateObject is the first half of the AddToStateObject emulation.
+//
+// On Tier 1.0 the driver refuses ALLOW_STATE_OBJECT_ADDITIONS outright
+// ("Invalid D3D12_STATE_OBJECT_FLAGS: 0x4"), so the app cannot even build the
+// object it intends to grow. We strip the flag, forward, and keep a deep copy of
+// what was asked for so AddToStateObject can rebuild from it later.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject) {
+    if (m_tier11 || !pDesc) FWD(CreateStateObject(pDesc, riid, ppStateObject));
+
+    // Only objects the app intends to grow need any of this.
+    bool wantsAdditions = false;
+    for (UINT i = 0; i < pDesc->NumSubobjects && !wantsAdditions; ++i) {
+        const auto& s = pDesc->pSubobjects[i];
+        if (s.Type == D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG && s.pDesc) {
+            const auto* c = static_cast<const D3D12_STATE_OBJECT_CONFIG*>(s.pDesc);
+            wantsAdditions = (c->Flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) != 0;
+        }
+    }
+    if (!wantsAdditions) FWD(CreateStateObject(pDesc, riid, ppStateObject));
+
+    auto* store = new (std::nothrow) StateObjectStore();
+    if (!store) return E_OUTOFMEMORY;
+    std::string why;
+    if (!store->Append(*pDesc, false, why)) {
+        // Refuse rather than build something subtly different from the request.
+        ProxyLog("[dxr11-proxy] CreateStateObject: cannot cache subobjects (%s); "
+                 "additions will not work for this object\n", why.c_str());
+        delete store;
+        FWD(CreateStateObject(pDesc, riid, ppStateObject));
+    }
+    store->StripAdditionsFlag();
+
+    D3D12_STATE_OBJECT_DESC stripped = store->Desc(pDesc->Type);
+    HRESULT hr = m_real->CreateStateObject(&stripped, riid, ppStateObject);
+    ProxyLog("[dxr11-proxy] CreateStateObject: stripped ALLOW_STATE_OBJECT_ADDITIONS, "
+             "%u subobjects cached, hr=0x%08lx\n",
+             (unsigned)store->Count(), (unsigned long)hr);
+    if (FAILED(hr) || !ppStateObject || !*ppStateObject) { delete store; return hr; }
+
+    // The cache entry now lives and dies with the state object itself.
+    ID3D12StateObject* so = nullptr;
+    if (SUCCEEDED(static_cast<IUnknown*>(*ppStateObject)->QueryInterface(
+            __uuidof(ID3D12StateObject), (void**)&so)) && so) {
+        StateObjectCacheAttach(so, store);   // takes ownership of `store`
+        so->Release();
+    } else {
+        delete store;
+    }
+    return hr;
+}
 void STDMETHODCALLTYPE Dxr11Device::GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) { m_real->GetRaytracingAccelerationStructurePrebuildInfo(pDesc, pInfo); }
 D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE Dxr11Device::CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE SerializedDataType, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* pIdentifierToCheck) { FWD(CheckDriverMatchingIdentifier(SerializedDataType, pIdentifierToCheck)); }
 
@@ -180,16 +237,62 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::SetBackgroundProcessingMode(D3D12_BACKGRO
 
 // --- ID3D12Device7 ----------------------------------------------------------
 
+// The second half of the emulation: rebuild the whole state object from the
+// cached subobjects plus the addition.
+//
+// Rebuilding, rather than genuinely growing, is the point. The driver has no
+// incremental path on Tier 1.0, but it will happily build a complete state
+// object that happens to contain everything the app has asked for so far. The
+// cost is compile time on every addition, which this project explicitly accepts.
 HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT_DESC* pAddition, ID3D12StateObject* pStateObjectToGrowFrom, REFIID riid, void** ppNewStateObject) {
-    if (!m_real7) return E_NOINTERFACE;
-    HRESULT hr = m_real7->AddToStateObject(pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
-    // Still a pure forward. Logged because this is the Phase 4 target: on Tier
-    // 1.0 the driver never gets this far, since CreateStateObject already
-    // refuses ALLOW_STATE_OBJECT_ADDITIONS. Seeing this line with a failure is
-    // the signal that an app needs the emulation.
-    ProxyLog("[dxr11-proxy] AddToStateObject additions=%u grow-from=%p hr=0x%08lx\n",
-             pAddition ? pAddition->NumSubobjects : 0u,
-             (void*)pStateObjectToGrowFrom, (unsigned long)hr);
+    if (m_tier11 && m_real7) {
+        HRESULT hr = m_real7->AddToStateObject(pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
+        ProxyLog("[dxr11-proxy] AddToStateObject forwarded (tier 1.1) hr=0x%08lx\n",
+                 (unsigned long)hr);
+        return hr;
+    }
+    if (!pAddition || !pStateObjectToGrowFrom || !ppNewStateObject) return E_INVALIDARG;
+
+    StateObjectStore* base = StateObjectCacheGet(pStateObjectToGrowFrom);
+    if (!base) {
+        ProxyLog("[dxr11-proxy] AddToStateObject: no cached subobjects for %p. The "
+                 "object was not created through this shim, or its creation did "
+                 "not request ALLOW_STATE_OBJECT_ADDITIONS.\n",
+                 (void*)pStateObjectToGrowFrom);
+        return E_INVALIDARG;
+    }
+
+    // Merge into a fresh store so the object being grown keeps its own copy and
+    // can still be grown again independently.
+    auto* merged = new (std::nothrow) StateObjectStore();
+    if (!merged) return E_OUTOFMEMORY;
+    std::string why;
+    D3D12_STATE_OBJECT_DESC baseDesc = base->Desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+    if (!merged->Append(baseDesc, false, why) ||
+        !merged->Append(*pAddition, /*dropDuplicateSingletons=*/true, why)) {
+        ProxyLog("[dxr11-proxy] AddToStateObject: merge failed (%s)\n", why.c_str());
+        delete merged;
+        return E_INVALIDARG;
+    }
+    merged->StripAdditionsFlag();
+
+    D3D12_STATE_OBJECT_DESC full = merged->Desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+    HRESULT hr = m_real->CreateStateObject(&full, riid, ppNewStateObject);
+    ProxyLog("[dxr11-proxy] AddToStateObject EMULATED: base %u + addition %u -> "
+             "%u subobjects, rebuilt hr=0x%08lx\n",
+             (unsigned)baseDesc.NumSubobjects, (unsigned)pAddition->NumSubobjects,
+             (unsigned)full.NumSubobjects, (unsigned long)hr);
+    if (FAILED(hr) || !*ppNewStateObject) { delete merged; return hr; }
+
+    // The grown object is itself growable, so it needs its own cache entry.
+    ID3D12StateObject* so = nullptr;
+    if (SUCCEEDED(static_cast<IUnknown*>(*ppNewStateObject)->QueryInterface(
+            __uuidof(ID3D12StateObject), (void**)&so)) && so) {
+        StateObjectCacheAttach(so, merged);
+        so->Release();
+    } else {
+        delete merged;
+    }
     return hr;
 }
 

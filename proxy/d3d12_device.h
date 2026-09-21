@@ -144,7 +144,13 @@ public:
     HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc, REFIID riid, void** ppSession) override;
 
 private:
+    // True when the real device already does Tier 1.1. Everything below then
+    // forwards untouched, so on capable hardware the shim stays transparent and
+    // only Tier 1.0 pays for the emulation.
+    bool IsTier11() const { return m_tier11; }
+
     ID3D12Device5* m_real;
+    bool           m_tier11;
     // Null when the underlying device does not offer these. QueryInterface
     // refuses the matching IID in that case, so the higher-level methods are
     // only ever reached when the corresponding pointer exists.

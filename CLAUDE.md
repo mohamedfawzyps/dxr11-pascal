@@ -12,13 +12,21 @@ Version 1.
 - Phase 4 probe: DONE, ground truth captured. See docs/phase4-probe.md.
   Headline: the Tier 1.1 ray flags ALREADY WORK on the GTX 1070, verified
   against WARP to the ray, so that feature needs no shim at all. Two features
-  remain. Next action: AddToStateObject, then indirect DispatchRays. Flip
-  CheckFeatureSupport to Tier 1.1 last.
+  remain. Flip CheckFeatureSupport to Tier 1.1 last.
 - Device7 wrapper extension: DONE. Dxr11Device now implements ID3D12Device7,
   so AddToStateObject and CreateProtectedResourceSession1 route through the
   shim. Verified by running the Phase 4 probe through the proxy: the
   AddToStateObject call lands in our wrapper on WARP, and no interface is
   passed through unwrapped any more. Regression clean on all three apps.
+- AddToStateObject emulation: WORKING on the GTX 1070. See
+  docs/phase4-addtostateobject.md. CreateStateObject strips
+  ALLOW_STATE_OBJECT_ADDITIONS and deep-copies the subobjects into a store
+  attached to the state object via SetPrivateDataInterface;
+  AddToStateObject merges that store with the addition and rebuilds a whole
+  new state object. On Tier 1.1 both forward untouched, so the shim stays
+  transparent where it is not needed. The Phase 4 probe on hardware now
+  matches the WARP ground truth exactly, 14450 + 2312 + 48774 = 65536.
+  Next action: indirect DispatchRays.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
