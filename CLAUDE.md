@@ -1,73 +1,211 @@
-# dxr11-pascal
+# dxr11-pascal: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
-Exploring whether DXR 1.1 (DirectX Raytracing) can be driven on NVIDIA Pascal
-(GTX 10-series) hardware, which lacks vendor DXR support. Work is staged in
-phases; each phase is a small, self-contained experiment before committing to a
-larger approach.
+Version 1.
 
-## Phase 1 - DXIL container signing (current)
+## What this is
 
-Question: the D3D12 runtime rejects shader containers whose 16-byte DXIL digest
-does not match. That digest is written by Microsoft's `dxil.dll` validator, not
-by us. Before building any custom shader path we need to know: can we take a
-DXIL container, modify it, and get `dxil.dll` to re-issue a valid digest?
+A user-mode D3D12 layer (proxy `d3d12.dll`) that makes GPUs reporting
+`D3D12_RAYTRACING_TIER_1_0` present as Tier 1.1, by translating the four Tier
+1.1 features into DXR 1.0 operations the driver already supports.
 
-Test: `src/signtest.cpp` (target: `header`, `bytecode`, or `both` (default);
-accepted as a bare word, `--header`/`--bytecode`/`--both`, or `--target=<t>`)
-1. Compile a trivial pixel shader with DXC (already produces a signed container).
-2. Tamper with one byte:
-   - `bytecode`: flip a byte inside the DXIL bytecode part.
-   - `header`: corrupt the header digest, leave the DXIL intact.
-   In both cases the digest is overwritten with a bogus value first, so any
-   "signed" result must come from the validator recomputing it.
-3. Load `dxil.dll`, create `IDxcValidator`, call `Validate(..., InPlaceEdit)`.
-4. Report whether the container gets re-signed. Running `both` shows the two
-   outcomes side by side.
+Target hardware: NVIDIA Pascal (GTX 10-series, dev machine has a GTX 1070) and
+Turing GTX 16-series. Both report Tier 1.0.
 
-Key facts that frame the result:
-- The DXIL "signature" is a hash (a tweaked MD5 over the container body), not a
-  keyed cryptographic signature. There is no secret. `IDxcValidator` recomputes
-  and writes it whenever validation succeeds - re-signing is its intended job.
-- Therefore the validator will re-sign ANY container whose DXIL still passes
-  validation, but will REFUSE to sign one whose DXIL no longer validates.
-- A blind byte-flip in the bytecode almost always corrupts the LLVM bitcode /
-  module, so the module fails validation and is NOT re-signed. Flipping a byte
-  in the header digest field (or making only edits that stay valid DXIL) is
-  re-signed cleanly. So "does it sign?" depends entirely on whether the edit
-  leaves valid DXIL behind.
+No application or engine modification. Performance is not a concern; 1 fps is
+an acceptable result. Correctness is what matters.
 
-Implication for the project: we cannot hand-patch arbitrary bytes into shader
-bytecode and expect a signature. Any custom shader must be emitted as valid
-DXIL (or produced through the compiler) and then signed by `dxil.dll`.
+## The premise this rests on
 
-### Result - CONFIRMED (run on Windows, DXC at C:\DW\DXC)
+NVIDIA's driver has supported DXR 1.0 on Pascal since driver 425.31 (April
+2019), running BVH traversal and ray/triangle intersection on the shader cores
+instead of RT cores. **The GPU already traces rays.** What Pascal lacks is the
+Tier 1.1 API surface, not the ray tracing capability.
 
-- HEADER trial: SIGNED. The validator recomputed the digest and it exactly
-  reproduced the original compiled digest (a30b87fc516764f74749523c033349d2),
-  proving the digest is a deterministic re-hash with no secret key.
-- BYTECODE trial: NOT SIGNED. Flipping one bytecode byte (offset 1982,
-  0x30 -> 0xcf) failed validation with 0x80aa0009 "Unrecognized subblock /
-  Malformed block / Validation failed."
+So the shim never implements ray tracing. It translates API shapes and lets
+the driver do all ray work. This matters for correctness: rays hit NVIDIA's
+own acceleration structure, traversed by NVIDIA's own code, so results match
+an RTX card by construction.
 
-Conclusion for Phase 2: re-signing modified DXIL via `dxil.dll` is viable, but
-only for containers whose DXIL still validates. The path forward is to produce
-*valid* DXIL and let `dxil.dll` sign it - not to patch bytes post hoc.
+**Do not build a custom BVH. Do not write software traversal.** Both were
+considered and rejected: they would be slower than the driver's path, would
+diverge from real DXR results, and would require parsing or replacing an
+acceleration structure the driver already builds correctly.
 
-## Build / run (Windows x64)
+## The four Tier 1.1 features
 
-Requires DXC SDK headers plus `dxcompiler.dll` and `dxil.dll` at runtime.
+| Feature | Approach | Shader work? |
+|---|---|---|
+| Indirect DispatchRays (`ExecuteIndirect` + `DISPATCH_RAYS`) | CPU readback of the argument buffer, then direct `DispatchRays` | No |
+| `AddToStateObject` (`ID3D12Device7`) | Rebuild the full state object from cached subobjects | No |
+| `RAY_FLAG_SKIP_TRIANGLES` / `SKIP_PROCEDURAL_PRIMITIVES` | Map onto existing masks and flags | No |
+| Inline ray tracing (`RayQuery` / `TraceRayInline`) | Lower to `TraceRay` + generated hit/miss shaders | **Yes** |
 
-    cmake -B build -DDXC_SDK_DIR=C:/path/to/dxc
-    cmake --build build --config Release
-    build\Release\signtest.exe                 # runs both trials
-    build\Release\signtest.exe --target=bytecode
-    # dxcompiler.dll + dxil.dll must be on PATH
+The first three are the cheap half and deliver a useful product on their own.
+The fourth is the real project.
 
-Exit codes: 0 = every trial matched expectation (header re-signed, bytecode
-rejected), 1 = setup/compile error, 2 = dxil.dll missing, 3 = a trial
-contradicted expectation.
+## The RayQuery to TraceRay mapping
 
-## Notes
+| RayQuery construct | DXR 1.0 equivalent |
+|---|---|
+| `RayQuery<FLAGS> q` | No object; FLAGS become the `TraceRay` RayFlags argument |
+| `q.TraceRayInline(AS, flags, mask, ray)` | `TraceRay(AS, FLAGS\|flags, mask, 0, 0, 0, ray, payload)` |
+| `while (q.Proceed())` loop body | Generated **any-hit shader** |
+| `q.CommitNonOpaqueTriangleHit()` | Any-hit returns normally (accept) |
+| not committing a candidate | Any-hit calls `IgnoreHit()` |
+| `q.CommitProceduralPrimitiveHit(t)` | Generated **intersection shader** calling `ReportHit(t, ...)` |
+| `q.Abort()` | `AcceptHitAndEndSearch()`, or a payload flag |
+| `q.CommittedStatus()` | Which terminal shader ran: closest-hit vs miss |
+| `Committed*` accessors | Payload fields, filled by the generated closest-hit shader from `RayTCurrent()`, `InstanceIndex()`, `PrimitiveIndex()`, `GeometryIndex()`, barycentric attributes, `HitKind()` |
 
-- This is a Linux dev checkout for editing; the signing path itself is
-  Windows-only (`dxil.dll`). Run the test on Windows for empirical results.
+The key correspondence: **the any-hit shader is `Proceed()`'s loop body.**
+Accept equals fall off the end, reject equals `IgnoreHit()`.
+
+`MaxTraceRecursionDepth` can be 1, since inline queries do not recurse.
+
+## Start with the easy patterns
+
+Do not attempt general RayQuery first. These three cover most real usage and
+are much simpler:
+
+1. **Opaque closest hit.** With `RAY_FLAG_FORCE_OPAQUE`, `Proceed()` never
+   yields a candidate and traversal is entirely fixed-function. Needs a
+   closest-hit and a miss shader, and **no any-hit shader at all**. This is
+   the first target.
+2. **Shadow / visibility.** `ACCEPT_FIRST_HIT_AND_END_SEARCH`, miss shader
+   only.
+3. **Alpha-tested closest hit.** Adds the generated any-hit shader.
+
+## Cases with no valid lowering
+
+Detect these and fail loudly rather than producing wrong output:
+
+| Pattern | Why |
+|---|---|
+| RayQuery in a pixel, vertex, mesh or amplification shader | `DispatchRays` only launches raygen; there is no promotion path |
+| RayQuery inside an existing DXR 1.0 shader | Any-hit and intersection shaders cannot call `TraceRay` |
+| RayQuery alongside `groupshared` or group barriers | Raygen shaders have no thread group |
+| Multiple concurrent RayQuery objects | `TraceRay` has one payload and one in-flight trace |
+| Loop body reading caller locals that do not fit the payload | The any-hit shader is a separate invocation; the payload is the only shared state |
+| Wave intrinsics around the query | Promotion to raygen changes lane occupancy |
+
+The pixel-shader case is the most consequential, since it is legal in DXR 1.1
+and some engines use it.
+
+## Build order
+
+Do not start with the proxy. The first two phases are experiments that decide
+whether the rest is worth building.
+
+### Phase 1: signing test (1 day) - GATE
+
+Compile a shader with stock DXC. Modify something harmless in the DXIL
+container. Load `dxil.dll`, get `IDxcValidator` via `DxcCreateInstance`
+(`CLSID_DxcValidator`), and try to validate and re-sign it. Graham Wihlidal
+documented this workflow with `DxcValidatorFlags_InPlaceEdit`.
+
+- **Signs:** the DXIL rewriting path is open. Proceed.
+- **Refuses:** switch to shader substitution (pre-compile replacements from
+  HLSL with stock DXC, swap by hash at `CreateStateObject`). Coverage
+  narrows to shaders you have source for.
+
+**Result: PASSED (2026-09-21).** `src/signtest.cpp` (build with `build.bat`)
+runs two trials through `dxil.dll`'s `IDxcValidator`:
+- Valid DXIL with a corrupted header digest re-signs cleanly, and the
+  recomputed digest exactly reproduces the original, so the digest is a
+  deterministic hash with no secret key.
+- A flipped DXIL bytecode byte is rejected ("Malformed block"), so the
+  validator signs only DXIL that still validates.
+
+The rewriting path is open: emit valid DXIL, let `dxil.dll` sign it. No
+substitution fallback needed. Detail in docs/phase1-signing.md.
+
+Note: `D3D12EnableExperimentalFeatures(D3D12ExperimentalShaderModels)` is NOT
+the answer here. It unlocks unfinalized shader models, not arbitrary unsigned
+DXIL, and Agility SDK 1.618/1.619 made it return `E_NOINTERFACE`. RayQuery is
+SM 6.5, already finalized, so nothing experimental is needed.
+
+### Phase 2: hand-lowering test (2-3 days) - GATE
+
+Minimal D3D12 app, no shim, no Unreal. One triangle scene, one TLAS, one BLAS.
+Write two versions of the same query by hand:
+
+- **A:** compute shader using `RayQuery`, run on **WARP** (which supports
+  Tier 1.1, select via `IDXGIFactory4::EnumWarpAdapter`). This is ground truth.
+- **B:** raygen shader using `TraceRay` with generated payload and hit
+  shaders, run on the **GTX 1070**.
+
+Diff the output buffers. Start with the opaque closest-hit pattern, then add
+alpha testing to exercise the any-hit path.
+
+- **Match:** the lowering is sound. Proceed.
+- **Diverge:** find out why by hand now, not inside a compiler later.
+
+Use a tolerance, not exact equality. DXR does not guarantee bit-identical
+results across implementations.
+
+### Phase 3: proxy skeleton (1 week)
+
+Proxy `d3d12.dll`. Wrap `ID3D12Device5` and friends, forward everything
+unchanged, verify a real DXR 1.0 app still runs through it. No translation yet.
+
+### Phase 4: the three non-shader features (1-2 weeks)
+
+Indirect DispatchRays, `AddToStateObject`, the new ray flags. Report Tier 1.1
+only once these work.
+
+**Warning:** reporting Tier 1.1 entitles the app to emit RayQuery. Until
+phase 5 works, either keep reporting 1.0, or detect RayQuery DXIL and fail
+clearly. A shim that claims 1.1 and then crashes is worse than one that
+claims 1.0.
+
+Main engineering cost here is command list splitting for the indirect case:
+preserving resource state and `ExecuteCommandLists` ordering across the break.
+
+### Phase 5: the DXIL rewriter (months)
+
+Automate phase 2's transform. DXIL is LLVM 3.7 bitcode. Parse, detect
+`dx.op.rayQuery_*` opcodes, generate the raygen/any-hit/closest-hit/miss set,
+synthesize the state object and shader table, re-sign.
+
+Reference implementations to read before writing anything:
+- **dxil-spirv** (HansKristian-Work): a DXIL parser with its own lightweight
+  LLVM bitcode reader, already handles ray tracing opcodes. Its front end is
+  the reusable half; it emits SPIR-V, not DXIL, so the back end is not.
+- **Maister's "My personal hell of translating DXIL to SPIR-V"**, parts 1-4.
+- **Mesa RADV** `radv_nir_lower_ray_queries.c`: the equivalent lowering at NIR
+  level, for the algorithm.
+- **Microsoft's archived D3D12 Raytracing Fallback Layer**: architecture and
+  its documented limitations. Note it never supported inline ray tracing.
+- **DXIL specs** for the `dx.op.rayQuery_*` opcode list (AllocateRayQuery is
+  178; verify current numbers against `DxilConstants.h` at your target DXIL
+  version, Microsoft appends opcodes over shader model revisions).
+
+## Testing
+
+WARP is the oracle throughout. It implements Tier 1.1 correctly in software,
+so any RayQuery shader can be run there for ground truth and diffed against
+the lowered version on the 1070. No RTX card needed.
+
+## Working method
+
+Read the source before designing. In the investigation that produced this
+brief, every architecture reasoned out in the abstract turned out to be wrong,
+and every correct finding came from reading actual files. Prefer a grep over a
+hypothesis.
+
+State clearly what is verified versus inferred. Flag uncertainty rather than
+guessing.
+
+## Preferences
+
+- No em dashes. Use commas or other punctuation.
+- Keep responses short and easy to follow.
+- Version deliverable files rather than overwriting; keep old versions in an
+  `archive/` folder.
+
+## Related
+
+There is a separate, smaller project targeting the same goal from inside
+Unreal Engine (NvRTX 5.7 Caustics), where Epic already wrote both dispatch
+paths and the fix is a handful of edits. That project is independent of this
+one and is the faster route if Unreal is the only target.
