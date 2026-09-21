@@ -7,15 +7,31 @@ Version 1.
 - Phase 1 signing test: PASSED. See below and docs/phase1-signing.md.
 - Phase 2 hand-lowering test: PASSED, bit-exact on both patterns. See
   docs/phase2-lowering.md.
-- Phase 3a forwarding-only proxy: PASSED, built and validated on both the
-  Phase 2 harness and the Microsoft DXR 1.0 sample. See docs/phase3-proxy.md.
-  Next action: Phase 3b, the ID3D12Device5 wrapper.
+- Phase 3a forwarding-only proxy: PASSED. Phase 3b ID3D12Device5 wrapper:
+  PASSED. See docs/phase3-proxy.md.
+  Next action: Phase 4, the three non-shader features.
 
-  One finding worth carrying forward: a proxy d3d12.dll must match the real
-  DLL's export ORDINALS, not just its names. The Windows SDK's d3d12.lib
-  imports D3D12CreateDevice by ordinal 101, so a name-only proxy dies at load
-  with STATUS_ORDINAL_NOT_FOUND (0xC0000138) before any of our code runs.
-  `proxy/d3d12_proxy.def` pins all eight implemented exports to real ordinals.
+  Two findings worth carrying forward, both about the proxy's export table:
+  - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
+    names. The Windows SDK's d3d12.lib imports D3D12CreateDevice by ordinal
+    101, so a name-only proxy dies at load with STATUS_ORDINAL_NOT_FOUND
+    (0xC0000138) before any of our code runs.
+  - The proxy MUST also export D3D12CoreCreateLayeredDevice,
+    D3D12CoreGetLayeredDeviceSize and D3D12CoreRegisterLayers, which
+    d3d12SDKLayers.dll imports from d3d12.dll by name. Without them the D3D12
+    debug layer silently does not run, reported as the misleading
+    "SDKLayers dll not found at D3D12SDKPath" (0x887E0003). Their signatures
+    are undocumented, so proxy/d3d12_thunks.asm forwards them as x64 tail
+    jumps, which need no signature. Keep the debug layer working: it is the
+    tool that catches our own mistakes in phases 4 and 5.
+
+  The device wrapper is `Dxr11Device` in proxy/d3d12_device.{h,cpp}: all 62
+  ID3D12Device5 methods forwarded unchanged. It wraps only the device, not
+  child objects, so ID3D12DeviceChild::GetDevice() still returns the real
+  device; Phase 4 has to handle that. QueryInterface for anything above
+  Device5 is passed through unwrapped AND logged, so watch the log for
+  ID3D12Device7 (AddToStateObject) before relying on Phase 4 interception.
+  DXR11_NO_WRAP=1 disables wrapping, restoring forward-only behaviour.
 
 Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\dxr11-pascal` - this repository.
@@ -210,13 +226,17 @@ Detail in docs/phase3-proxy.md. Validated on two DXR 1.0 apps on the GTX 1070:
   flip-model swapchain, see the caveat in docs/phase3-proxy.md.
 
 `build_sample.bat <SampleName> [debug]` builds either sample;
-`toolsun_proxy_test.ps1 -Exe ... [-Animated]` runs one with and without the
+`tools
+un_proxy_test.ps1 -Exe ... [-Animated]` runs one with and without the
 proxy and reports the diff. Both samples carry the same upstream
 uninitialised-`m_descriptorsAllocated` bug, patched at build time by
 `tools\patch_sample.ps1`.
 
-3b next: wrap the returned `ID3D12Device5`, forwarding every method unchanged,
-and re-verify. That wrapper is the seat for Phase 4 and 5.
+**Result: 3b PASSED (2026-09-21).** `Dxr11Device` wraps the device and forwards
+all 62 methods. Re-verified with the same three apps: raytest ALL MATCH,
+HelloWorld 0 of 14400 pixels differ, SimpleLighting unchanged fps. The D3D12
+debug layer runs clean through the wrapper, with the same single pre-existing
+warning as baseline and no errors.
 
 ### Phase 4: the three non-shader features (1-2 weeks)
 

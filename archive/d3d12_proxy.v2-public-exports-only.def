@@ -18,27 +18,13 @@
 ;                                         116 D3D12SerializeVersionedRootSignature
 ;                                         117 GetBehaviorValue
 ;
-; The publicly documented entry points are C forwarders in d3d12_proxy.cpp.
-;
-; The three D3D12Core* layering entry points are NOT optional, even though they
-; are undocumented: d3d12SDKLayers.dll imports them from "d3d12.dll" by name, so
-; without them the D3D12 debug layer cannot load and D3D12Core reports the
-; LoadLibrary failure as "D3D12 SDKLayers dll not found at D3D12SDKPath"
-; (0x887E0003). Measured on this machine, see docs/phase3-proxy.md.
-; Their signatures are not public, so they are forwarded by tail-jump thunks in
-; d3d12_thunks.asm, which need no signature.
-;
-; Still unexported, and so far never observed to be needed: the PIX entry points
-; (111-114), D3D12DeviceRemovedExtendedData (108), GetBehaviorValue (117),
-; SetAppCompatStringPointer (100) and the NONAME at 99. Adding one is a THUNK
-; line in the .asm, a name in g_thunkNames, and an ordinal here.
+; Only the publicly documented entry points are implemented here. The rest are
+; internal (layering, PIX, appcompat) with undocumented signatures; they are left
+; unexported for now and their absence is measured, not assumed.
 
 EXPORTS
 D3D12CreateDevice                             @101
 D3D12GetDebugInterface                        @102
-D3D12CoreCreateLayeredDevice                  @103
-D3D12CoreGetLayeredDeviceSize                 @104
-D3D12CoreRegisterLayers                       @105
 D3D12CreateRootSignatureDeserializer          @106
 D3D12CreateVersionedRootSignatureDeserializer @107
 D3D12EnableExperimentalFeatures               @109

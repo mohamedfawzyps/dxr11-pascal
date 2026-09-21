@@ -1,20 +1,46 @@
 @echo off
 setlocal
-rem Build the Phase 3a forwarding-only proxy d3d12.dll with MSVC.
-rem Run from an "x64 Native Tools Command Prompt for VS".
+rem Build the proxy d3d12.dll with MSVC.
 rem
 rem   build_proxy.bat
 rem
 rem Output: d3d12.dll. Copy it into the folder of a DXR 1.0 app's exe and run
 rem the app; Windows loads this proxy, which forwards to the real system
-rem d3d12.dll. Check %TEMP%\dxr11_proxy.log for the interception line.
+rem d3d12.dll and (since 3b) wraps the device. Check %TEMP%\dxr11_proxy.log.
+rem
+rem Headers: the Agility SDK ones if present, else the Windows SDK. The device
+rem wrapper's method signatures were transcribed from the Agility 1.619.5
+rem d3d12.h, so building against the same headers keeps them honest. The proxy
+rem itself does not depend on Agility at runtime; it only needs the interface
+rem declarations.
 
 call "%~dp0setup_msvc.bat" || exit /b 1
 
-cl /nologo /EHsc /std:c++17 /LD proxy\d3d12_proxy.cpp /Fe:d3d12.dll ^
-   /link /DEF:proxy\d3d12_proxy.def
+set "AGILITY=%AGILITY_SDK_DIR%"
+if "%AGILITY%"=="" set "AGILITY=C:\DW\microsoft.direct3d.d3d12.1.619.5"
+set "INCS="
+if exist "%AGILITY%\build\native\include\d3d12.h" (
+  set "INCS=/I "%AGILITY%\build\native\include""
+  echo [build_proxy] using Agility headers from "%AGILITY%"
+) else (
+  echo [build_proxy] Agility headers not found, using the Windows SDK
+)
+
+if not exist "%~dp0obj" mkdir "%~dp0obj"
+
+rem Tail-jump thunks for the undocumented D3D12Core* layering exports. These
+rem need no signature, which is the whole point; see proxy\d3d12_thunks.asm.
+ml64 /nologo /c /Fo"%~dp0obj\d3d12_thunks.obj" proxy\d3d12_thunks.asm
+if errorlevel 1 exit /b 1
+
+cl /nologo /EHsc /std:c++17 /O2 /W4 %INCS% /LD ^
+   /Fo:"%~dp0obj\\" ^
+   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp ^
+   /Fe:d3d12.dll ^
+   /link "%~dp0obj\d3d12_thunks.obj" /DEF:proxy\d3d12_proxy.def /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
 echo.
-echo Built d3d12.dll (forwarding proxy). Copy it next to a DXR 1.0 sample exe,
-echo run the sample, then check %%TEMP%%\dxr11_proxy.log.
+echo Built d3d12.dll. Copy it next to a DXR 1.0 sample exe, run the sample,
+echo then check %%TEMP%%\dxr11_proxy.log.
+echo Set DXR11_NO_WRAP=1 to forward only, without wrapping the device.

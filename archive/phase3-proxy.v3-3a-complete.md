@@ -16,9 +16,10 @@ load the real runtime by full System32 path, so forwarding never recurses.
   d3d12.dll, and logs D3D12CreateDevice to confirm the app runs through us.
   Fully transparent, no device wrapping. Source: `proxy/d3d12_proxy.cpp`,
   exports in `proxy/d3d12_proxy.def`. **PASSED, see Result below.**
-- 3b: wrap the returned `ID3D12Device5`, forwarding every method unchanged, and
-  re-verify. This is the seat for Phase 4/5 (tier spoof, CreateStateObject,
-  command-list interception). **PASSED, see Result: 3b below.**
+- 3b (next): wrap the returned `ID3D12Device5` (and the interfaces it hands out
+  that we will later intercept), forwarding every method unchanged, and
+  re-verify the sample. This is the seat for Phase 4/5 (tier spoof,
+  CreateStateObject, command-list interception).
 
 ## Exports must match the real DLL's ORDINALS, not just its names
 
@@ -165,114 +166,6 @@ a proper path, a hooked `Present` or a UAV readback, not window grabbing.
 None of this weakens the 3a result: the pixel-exact claim rests on HelloWorld,
 whose scene is static, and on raytest.exe, which compares buffer contents
 directly rather than pixels.
-
-## Result: 3b PASSED (2026-09-21)
-
-`proxy/d3d12_device.h` / `.cpp` define `Dxr11Device`, which implements
-`ID3D12Device5` and forwards all 62 methods unchanged. `D3D12CreateDevice` now
-wraps the real device and hands back the wrapper. `DXR11_NO_WRAP=1` turns
-wrapping off and restores exact 3a behaviour, which is useful for bisecting.
-
-Signatures were transcribed from the Agility 1.619.5 `d3d12.h` on this machine,
-not from memory, and the proxy now builds against those same headers. Building
-at `/W4` with every method marked `override` is itself a check: a wrong or
-missing signature leaves the class abstract and the build fails.
-
-Re-verified with the full 3a suite, all three still green:
-
-| | result |
-|---|---|
-| `raytest.exe` | ALL MATCH, both patterns still bit-exact, all 4 devices wrapped |
-| HelloWorld | **0 of 14400 pixels differ**, ~2231 vs ~2214 fps |
-| SimpleLighting | runs, ~1416 vs ~1415 fps |
-
-Refcounting is clean: every `device wrapper destroyed` line pairs with its
-creation on the runs that shut down normally.
-
-### What the wrapper deliberately does NOT do
-
-Only the device is wrapped. Child objects (queues, lists, resources, heaps) come
-back exactly as the runtime made them. Two consequences:
-
-1. `ID3D12DeviceChild::GetDevice()` on any child returns the **real** device, so
-   an app reaching the device that way bypasses us entirely. Harmless while we
-   only forward; Phase 4 has to deal with it.
-2. Nothing needs unwrapping on the way in, because the app never holds a wrapped
-   child to hand back to us.
-
-`QueryInterface` answers for `IUnknown`, `ID3D12Object` and `ID3D12Device`
-through `ID3D12Device5`. Anything else is passed to the real device **and
-logged**, so we find out what apps actually ask for instead of guessing. The
-samples produce exactly one such line:
-
-    [dxr11-proxy] device QI PASSED THROUGH UNWRAPPED: ID3D12InfoQueue
-
-which is correct: the debug layer wants the real InfoQueue. The line to watch
-for is `ID3D12Device7`, which carries `AddToStateObject`, a Phase 4 target. An
-app getting an unwrapped Device7 would bypass the shim, so the wrapper has to
-grow before that phase works.
-
-## The debug layer needs three undocumented exports
-
-This was the real find of 3b, and it is a **3a bug**, not a wrapper regression:
-`DXR11_NO_WRAP=1`, which is forward-only 3a behaviour, reproduces it.
-
-With the proxy in place the D3D12 debug layer silently did nothing. No adapter
-line, no state object dump, no messages at all, while the same binary without
-the proxy produced all of them. What surfaced the cause was:
-
-    D3D Error 887e0003: D3D12 SDKLayers dll not found at D3D12SDKPath.
-
-That message is misleading. The DLL is exactly where it should be. The real
-cause is that `d3d12SDKLayers.dll` imports three functions from `d3d12.dll`
-**by name**:
-
-    dumpbin /imports d3d12SDKLayers.dll
-      d3d12.dll
-        D3D12CoreGetLayeredDeviceSize
-        D3D12CoreRegisterLayers
-        D3D12CoreCreateLayeredDevice
-
-Our proxy is the module named `d3d12.dll` in the app directory, so those imports
-bind to us. We did not export them, the load failed, and D3D12Core reported the
-failure as a missing file.
-
-They are undocumented, so we cannot write C forwarders without guessing their
-signatures. `proxy/d3d12_thunks.asm` forwards them as x64 tail jumps instead,
-which need no signature at all: the arguments are already in the right registers
-and on the caller's stack, and the real function returns straight to our caller.
-Each thunk puts an index in `r10` and jumps to a common helper that resolves the
-target through `Dxr11ResolveThunk` and tail-jumps to it. The helper always
-spills and restores the argument registers, even once resolved, so that it has
-one ordinary prologue that x64 unwind info can describe.
-
-With that in place the debug layer is fully back, and it now validates the
-wrapper for us:
-
-    [dxr11-proxy] thunk D3D12CoreRegisterLayers -> 00007FF82676F190
-    [dxr11-proxy] thunk D3D12CoreGetLayeredDeviceSize -> 00007FF826761E90
-    [dxr11-proxy] thunk D3D12CoreCreateLayeredDevice -> 00007FF8267622E0
-    Direct3D Adapter (0): VID:10DE, PID:1B81 - NVIDIA GeForce GTX 1070
-    | D3D12 State Object ...: Raytracing Pipeline
-    D3D12 WARNING: ... CREATERESOURCE_STATE_IGNORED
-
-That is the identical message set the no-proxy baseline produces, including the
-same single pre-existing warning, and nothing about refcounts or interfaces.
-The debug build arms `SetBreakOnSeverity(ERROR)`, so any debug-layer error would
-have killed the process; it survived.
-
-**A misleading observation, recorded so it is not repeated.** Enumerating the
-process's loaded modules showed `d3d12SDKLayers.dll` present even while the
-debug layer was broken, which argued against this diagnosis and cost time.
-Do not use the module list to decide whether a DLL's imports resolved; a failed
-load can still appear there. The A/B that actually settled it was implementing
-the exports and watching the debug layer come back.
-
-Still unexported, and so far never observed to be needed: the PIX entry points
-(111-114), `D3D12DeviceRemovedExtendedData` (108), `GetBehaviorValue` (117),
-`SetAppCompatStringPointer` (100), and the NONAME at 99. Adding one is now three
-lines: a `THUNK` line in the `.asm`, a name in `g_thunkNames`, an ordinal in the
-`.def`.
 
 ## Building the MS sample without NuGet
 
