@@ -5,7 +5,7 @@ Version 1.
 ## Current position (2026-09-21)
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
-GTX 1070 and produces bit-exact output against WARP. Nine render cases, 0
+GTX 1070 and produces bit-exact output against WARP. Ten render cases, 0
 mismatches, plus two refusal gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
@@ -16,15 +16,17 @@ was missing. Nothing in this project implements ray tracing.
 four are permanently refused because DXR 1.0 offers nothing to lower them onto.
 
 **The shader table is now built from the application's own geometry layout.**
-Acceleration structure interception is complete and the instance data is USED:
-the hit group table is sized to the scene's largest
-`InstanceContributionToHitGroupIndex`, so an application that sets one works
-rather than being refused.
+Acceleration structure interception is complete and the instance data is USED.
+The hit group table is sized to the scene's largest
+`InstanceContributionToHitGroupIndex`, and each record carries the geometry
+TYPE that reaches that index, so a scene holding both triangles and procedural
+primitives works rather than being refused.
 
-**ONE case is left, and it is narrower than it looked.** A shader that commits
-PROCEDURAL hits, on a scene that also holds triangle geometry, is refused. The
-other direction of that mismatch turned out to be safe and now runs. See the
-entries below and docs/phase5-dxil-recon.md.
+**The structural work is DONE.** What is left is one shader-side gap, a query
+that commits BOTH kinds ITSELF, which needs the loop body lowered twice; and
+one thing no shim can fix, an application that routes both kinds to the SAME
+hit group record, since a record is one type or the other. See the entries
+below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
 
@@ -459,15 +461,14 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   shader has no accept or reject terminator: reporting IS accepting, and
   returning reports nothing. The closest-hit writes status 2, not 1.
 
-  **The obstacle is not in the lowering.** A query committing BOTH triangle and
-  procedural hits is REFUSED, and not out of laziness. A hit group is either
-  triangles or procedural, and which one a geometry uses is selected by
-  `InstanceContributionToHitGroupIndex`, which the APPLICATION set when it built
-  its acceleration structures; a BLAS also carries only one geometry type.
-  **Epic's shaders DO mix**, so this is the difference between procedural
-  working and procedural being useful. What is still missing is a table with a
-  record of each TYPE at the right index; see the AS entry below, which has the
-  measurements that say which half of this is actually a problem.
+  **The obstacle was never in the lowering.** A query committing BOTH triangle
+  and procedural hits is still refused, and not out of laziness: it needs the
+  loop body lowered TWICE from one module, into an any-hit and an intersection
+  shader, with two closest-hits since one writes committed status 1 and the
+  other 2. That is the last shader-side gap.
+  **A SCENE holding both kinds is no longer a problem**, which is a different
+  thing and was the bigger half. The table now carries a record of the right
+  TYPE at each index; see the typed-records entry below.
 
 - **Nonzero `InstanceContributionToHitGroupIndex`: FIXED.** This used to be a
   limitation that applied TODAY, to triangle-only scenes, and it is now handled
@@ -515,8 +516,8 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   - **What it reads matches the source exactly**: the probe scene comes back as
     2 instances, max contribution 1, reaching triangles and procedural, which is
     what `tier11probe.cpp` sets. Both Microsoft samples come back as 1 instance,
-    contribution 0, triangles only, which is the case the single-record table is
-    already right for.
+    contribution 0, triangles only, which is the simplest case the table has to
+    serve and the one a single record already covered.
   - **The point is the refusal, not the log.** A lowered RayQuery dispatch on a
     scene the table cannot serve now declines and says why, instead of drawing
     it wrong. `raytest --multi --contrib` makes that reachable: WARP finds 18496
@@ -565,24 +566,56 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     against WARP's 7396. The 8022 difference is exactly the triangle hits: for
     triangle geometry the hit group's intersection shader is not used, the
     closest-hit runs anyway, and it labels everything procedural.
-  - So the refusal is conditioned on **what the shader commits**, not on
-    whether the scene happens to be mixed.
-  - **The debug layer cannot settle this.** It is silent on BOTH cases,
-    including the one measured to be wrong, so it does not police hit group and
-    geometry type agreement and its silence carries no information. The safe
-    direction therefore rests on measurement against WARP on ONE driver, not on
-    the specification. Said plainly rather than quietly relied on.
+  - So the refusal was conditioned on **what the shader commits**, not on
+    whether the scene happens to be mixed. Both now work, see below.
+  - **The debug layer cannot settle the safe direction.** It is silent on BOTH
+    cases, including the one measured to be wrong, so it does not police hit
+    group and geometry type agreement and its silence carries no information.
+
+- Per-index typed records: **DONE, and this was the last structural piece.**
+  The table can now carry a record of a DIFFERENT TYPE at each index, so a
+  scene holding both geometry kinds is served rather than refused.
+  - **Two stub shaders, taken from DXC rather than guessed.**
+    `phase5/cases/reference/lib_null_ref.hlsl` asked what a hit group that must
+    never commit compiles to. `AnyHitNull` is
+    `call void @dx.op.ignoreHit(i32 155)` then `unreachable`, marked
+    `noreturn nounwind`; `IsectNull` is a bare `ret void`. Rejecting every
+    candidate is how a TRIANGLES group produces no hit, and reporting nothing
+    is how a PROCEDURAL one does.
+  - **Both measure SFI0 = 0x0**, so neither pulls in a Tier 1.1 feature flag.
+    That check is not optional here: `CommittedGeometryIndex` already proved an
+    intrinsic can look ordinary and be Tier 1.1.
+  - Both are emitted into EVERY lowered library, because which one a scene
+    needs is not knowable when the shader is lowered: the acceleration
+    structures do not exist yet. Two tiny functions is a cheap price for never
+    having to re-lower.
+  - **Three hit groups, and the table picks per slot.** The state object
+    carries the real hit group plus `HitGroupNullTri` and `HitGroupNullProc`. A
+    slot reached by the shader's own kind, by both, or by nothing keeps the
+    real record; a slot reached ONLY by the other kind gets the rejecting
+    record OF THAT KIND, so the geometry is traversed with a correctly typed
+    record and produces no hit.
+  - **Result:** a procedural-committing shader on a scene that also holds
+    triangles, the two kinds on different records, renders 7396 hits
+    **bit-exact against WARP**. That is the case that measured 15418 before.
+  - **The sensitivity check.** Replace the rejecting record with the real one
+    and change nothing else: 15418 hits again, 8022 mismatches, exactly the old
+    wrong answer. The typing carries the whole result.
+  - It also makes the SAFE direction well-defined instead of merely observed.
+    A triangle-only shader on a mixed scene used to rely on procedural geometry
+    meeting a triangles hit group and quietly producing nothing, which could
+    only be measured on one driver. Where the contributions are distinct, that
+    slot now holds a proper procedural record that reports nothing.
+  - **Still refused, and no shim can fix it:** both kinds collapsed onto ONE
+    record. That slot would need a procedural record for the procedural
+    geometry and a rejecting triangle record for the triangles, and a record is
+    one or the other. The application collapsed them.
 
   Next action, in order of value.
-  1. **Per-index records of the right TYPE.** The one case left is a shader
-     that commits procedural hits on a scene that also holds triangles. It
-     needs two hit groups rather than one, with a NULL record at the indices
-     the other kind reaches: an any-hit that always ignores, or an intersection
-     shader that reports nothing. That is rewriter work in both
-     implementations, plus keeping the per-index geometry kinds the tracker
-     currently aggregates away. Note it is only possible when the application
-     gave the two kinds DIFFERENT contributions; if it collapsed them onto one
-     index, no table can serve both and refusing is the only honest answer.
+  1. **A shader that commits BOTH kinds.** The only shader-side gap left. The
+     loop body has to be lowered twice, into an any-hit and an intersection
+     shader, with two closest-hits because one writes committed status 1 and
+     the other 2. Rewriter work in both implementations, not table work.
   2. **Dynamic descriptor indexing**, still refused.
   3. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
@@ -601,10 +634,10 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     `CreateStateObject` fails.
   - One entry point, one query.
   - Procedural primitives lower, via a generated intersection shader. A query
-    committing BOTH triangle and procedural hits does not. Nor does a
-    procedural-committing shader on a scene that also holds triangles, which is
-    DETECTED from the instance data and refused rather than drawn wrong. A
-    triangle-only shader on such a scene is fine and runs.
+    committing BOTH triangle and procedural hits does not, and that is the last
+    shader-side gap. A SCENE holding both kinds is fine either way now, unless
+    the application routed both to the same hit group record, which is
+    DETECTED from the instance data and refused rather than drawn wrong.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -1071,7 +1104,9 @@ anything.
   sized to the scene rather than to one record.
 - `--mixed` builds one triangle instance and one procedural instance under one
   top-level structure, the AABB being the same unit box `--proc` uses so the
-  existing test shaders work on it unchanged.
+  existing test shaders work on it unchanged. With `--contrib` the two kinds
+  land on different hit group records, which is the case the typed table
+  serves; without it they share record 0, which is the case nothing can serve.
 - `DXR11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
   drains the InfoQueue. Both halves are needed: the layer reports through
   `OutputDebugString`, so without the drain a console sees nothing and its

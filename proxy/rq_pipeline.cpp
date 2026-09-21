@@ -6,6 +6,8 @@
 #include "rewriter/rq_analyze.h"
 #include "rewriter/rq_lower.h"
 
+#include "as_tracker.h"
+
 #include <cstring>
 #include <new>
 #include <string>
@@ -119,10 +121,28 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     D3D12_GLOBAL_ROOT_SIGNATURE grs{};
     grs.pGlobalRootSignature = desc->pRootSignature;
 
-    D3D12_STATE_SUBOBJECT subs[5]{};
+    // Two more hit groups that never commit, one of each type. Which one a
+    // scene needs is not knowable here, so both exist and the table picks.
+    // A TRIANGLES group whose any-hit always ignores sees every triangle
+    // candidate and rejects it; a PROCEDURAL group whose intersection shader
+    // returns reports nothing. Neither carries a closest-hit, because neither
+    // can ever reach one.
+    D3D12_HIT_GROUP_DESC hgNullTri{};
+    hgNullTri.HitGroupExport = L"HitGroupNullTri";
+    hgNullTri.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+    hgNullTri.AnyHitShaderImport = L"AnyHitNull";
+
+    D3D12_HIT_GROUP_DESC hgNullProc{};
+    hgNullProc.HitGroupExport = L"HitGroupNullProc";
+    hgNullProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+    hgNullProc.IntersectionShaderImport = L"IsectNull";
+
+    D3D12_STATE_SUBOBJECT subs[7]{};
     UINT n = 0;
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
+    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri };
+    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc };
     if (grs.pGlobalRootSignature)
@@ -154,9 +174,12 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     const void* idRay = props->GetShaderIdentifier(L"RayGen");
     const void* idMiss = props->GetShaderIdentifier(L"Miss");
     const void* idHit = props->GetShaderIdentifier(L"HitGroup");
-    if (!idRay || !idMiss || !idHit) {
+    const void* idNullTri = props->GetShaderIdentifier(L"HitGroupNullTri");
+    const void* idNullProc = props->GetShaderIdentifier(L"HitGroupNullProc");
+    if (!idRay || !idMiss || !idHit || !idNullTri || !idNullProc) {
         props->Release(); so->Release();
-        *why = "the state object does not export RayGen, Miss and HitGroup";
+        *why = "the state object does not export RayGen, Miss, HitGroup and the "
+               "two rejecting hit groups";
         return nullptr;
     }
 
@@ -175,13 +198,15 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     std::memcpy(self->m_idRay, idRay, kIdSize);
     std::memcpy(self->m_idMiss, idMiss, kIdSize);
     std::memcpy(self->m_idHit, idHit, kIdSize);
+    std::memcpy(self->m_idNullTri, idNullTri, kIdSize);
+    std::memcpy(self->m_idNullProc, idNullProc, kIdSize);
     props->Release();
 
-    // One hit group record to begin with. The acceleration structures have
-    // usually not been built yet at pipeline creation, so how many the scene
-    // needs is not knowable here; the first dispatch grows the table if it is
-    // more than one.
-    if (!self->BuildTable(1, why)) {
+    // One record of the real hit group to begin with. The acceleration
+    // structures have usually not been built yet at pipeline creation, so what
+    // the scene needs is not knowable here; the first dispatch rebuilds the
+    // table once it is.
+    if (!self->BuildTable(std::vector<uint8_t>(), why)) {
         self->Release();
         return nullptr;
     }
@@ -195,8 +220,10 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     return self;
 }
 
-bool Dxr11RayQueryPso::BuildTable(UINT hitRecords, std::string* why) {
-    if (hitRecords < 1) hitRecords = 1;
+bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
+                                  std::string* why) {
+    const UINT hitRecords =
+        kinds.empty() ? 1u : static_cast<UINT>(kinds.size());
 
     // raygen, then miss, then the hit group records, each TABLE aligned to 64
     // and each RECORD to 32.
@@ -230,18 +257,32 @@ bool Dxr11RayQueryPso::BuildTable(UINT hitRecords, std::string* why) {
     std::memset(p, 0, static_cast<size_t>(size));
     std::memcpy(p + 0 * slot, m_idRay, kIdSize);
     std::memcpy(p + 1 * slot, m_idMiss, kIdSize);
-    // Every hit group record is the same identifier. The shim has ONE hit
-    // group; what the application's contributions decide is only WHICH SLOT a
-    // hit lands on, and every slot has to be a valid record for that hit to
-    // run. So the table is sized to the application's layout and filled with
-    // the shim's single answer.
-    for (UINT i = 0; i < hitRecords; ++i)
-        std::memcpy(p + 2 * slot + i * stride, m_idHit, kIdSize);
+
+    // One record per index, of the TYPE the geometry reaching that index needs.
+    // The application's contributions decide which slot a hit lands on; this
+    // decides what is in the slot.
+    const uint8_t mine = m_isProcedural ? astrack::kReachProcedural
+                                        : astrack::kReachTriangles;
+    const uint8_t other = m_isProcedural ? astrack::kReachTriangles
+                                         : astrack::kReachProcedural;
+    for (UINT i = 0; i < hitRecords; ++i) {
+        const uint8_t reach = i < kinds.size() ? kinds[i] : astrack::kReachNone;
+        const void* id = m_idHit;
+        // Reached ONLY by the kind this shader does not serve: give it a
+        // record of THAT kind which finds nothing, so the geometry is
+        // traversed correctly and simply produces no hit. A slot reached by
+        // our own kind, by both, or by nothing at all keeps the real record.
+        // Both is only possible for a triangle-only shader, since the
+        // procedural case is refused before it gets here.
+        if ((reach & other) && !(reach & mine))
+            id = m_isProcedural ? m_idNullTri : m_idNullProc;
+        std::memcpy(p + 2 * slot + i * stride, id, kIdSize);
+    }
     sbt->Unmap(0, nullptr);
 
     if (m_sbt) m_retired.push_back(m_sbt);   // may still be in flight
     m_sbt = sbt;
-    m_hitRecords = hitRecords;
+    m_kinds = kinds;
 
     const D3D12_GPU_VIRTUAL_ADDRESS base = sbt->GetGPUVirtualAddress();
     m_desc.RayGenerationShaderRecord.StartAddress = base + 0 * slot;
@@ -257,25 +298,36 @@ bool Dxr11RayQueryPso::BuildTable(UINT hitRecords, std::string* why) {
 
 void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                                       UINT gx, UINT gy, UINT gz,
-                                      UINT hitRecords) {
+                                      const std::vector<uint8_t>& recordKinds) {
     if (!cl) return;
 
-    // The scene may need more hit group records than the table has, which is
-    // the normal case the first time: the acceleration structures did not
-    // exist when the pipeline was created. Grow, never shrink, so a second
-    // smaller scene cannot invalidate a table a dispatch already used.
-    if (hitRecords > m_hitRecords) {
-        const UINT had = m_hitRecords;
+    // Rebuild when the scene's layout is not what the table was built for,
+    // which is the normal case the first time: the acceleration structures did
+    // not exist when the pipeline was created. A changed layout can mean more
+    // records OR the same number with different types in them.
+    if (!recordKinds.empty() && recordKinds != m_kinds) {
+        const size_t had = m_kinds.size();
         std::string why;
-        if (!BuildTable(hitRecords, &why)) {
+        if (!BuildTable(recordKinds, &why)) {
             ProxyLog("[dxr11-proxy] lowered RayQuery dispatch SKIPPED: the scene "
-                     "needs %u hit group records and the table could not grow "
-                     "(%s).\n", hitRecords, why.c_str());
+                     "needs %u hit group records and the table could not be "
+                     "rebuilt (%s).\n",
+                     static_cast<unsigned>(recordKinds.size()), why.c_str());
             return;
         }
-        ProxyLog("[dxr11-proxy] shader table grown from %u to %u hit group "
-                 "records, to match the scene's maximum "
-                 "InstanceContributionToHitGroupIndex.\n", had, m_hitRecords);
+        UINT rejecting = 0;
+        const uint8_t mine = m_isProcedural ? astrack::kReachProcedural
+                                            : astrack::kReachTriangles;
+        const uint8_t other = m_isProcedural ? astrack::kReachTriangles
+                                             : astrack::kReachProcedural;
+        for (uint8_t k : recordKinds)
+            if ((k & other) && !(k & mine)) ++rejecting;
+        ProxyLog("[dxr11-proxy] shader table rebuilt for the scene: %u -> %u hit "
+                 "group records, %u of them rejecting (%s geometry this shader "
+                 "does not serve).\n",
+                 static_cast<unsigned>(had),
+                 static_cast<unsigned>(recordKinds.size()), rejecting,
+                 m_isProcedural ? "triangle" : "procedural");
     }
 
     D3D12_DISPATCH_RAYS_DESC d = m_desc;

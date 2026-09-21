@@ -233,11 +233,10 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
                          "Nothing is drawn for it.\n", why.c_str());
             return;
         }
-        // How many hit group records the scene needs. Read from the instance
-        // descriptions, so it is 1 until a top-level structure has been seen,
-        // which is the right answer for a scene that has none.
-        m_rqPso->DispatchAsRays(m_real, x, y, z,
-                                astrack::GetSummary().maxContribution + 1);
+        // What geometry reaches each hit group record index, read from the
+        // instance descriptions. Empty until a top-level structure has been
+        // seen, which is the right answer for a scene that has none.
+        m_rqPso->DispatchAsRays(m_real, x, y, z, astrack::RecordKinds());
         return;
     }
     FWD(Dispatch(x, y, z));

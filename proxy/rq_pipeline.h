@@ -19,6 +19,7 @@
 
 #include <d3d12.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -52,13 +53,18 @@ public:
     // lowered raygen reads DispatchRaysIndex where the original read
     // SV_DispatchThreadID.
     //
-    // `hitRecords` is how many hit group records the scene needs, which is one
-    // more than the largest InstanceContributionToHitGroupIndex any instance
-    // carries. The caller supplies it because it comes from the acceleration
-    // structures, which this class knows nothing about. The table grows to fit
-    // if it has to; growing is what makes a nonzero contribution work at all.
+    // `recordKinds` says what geometry reaches each hit group record index,
+    // one entry per index, using astrack's Reach bits. Its SIZE is how many
+    // records the scene needs. The caller supplies it because it comes from
+    // the acceleration structures, which this class knows nothing about.
+    //
+    // Empty means nothing has been read yet, and one record will do.
+    //
+    // The table is rebuilt whenever this changes, not merely when it grows:
+    // a slot can go from holding the real hit group to holding a rejecting one
+    // without the count moving at all.
     void DispatchAsRays(ID3D12GraphicsCommandList4* cl, UINT gx, UINT gy, UINT gz,
-                        UINT hitRecords);
+                        const std::vector<uint8_t>& recordKinds);
 
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override;
@@ -81,12 +87,13 @@ private:
     Dxr11RayQueryPso() = default;
     ~Dxr11RayQueryPso();
 
-    // (Re)build the shader table with `hitRecords` hit group records. Every
-    // record holds the SAME identifier, because the shim has one hit group and
-    // wants it to run whichever slot the application's layout routes a hit to.
-    // Only the number of slots has to match the application; what is in them
-    // does not.
-    bool BuildTable(UINT hitRecords, std::string* why);
+    // (Re)build the shader table so that each record matches the geometry
+    // that reaches it. The shim has one REAL hit group, of one type, plus two
+    // that never commit, one of each type. A slot reached by the kind the real
+    // group serves gets the real group; a slot reached only by the other kind
+    // gets the rejecting group OF THAT KIND, so the geometry is traversed with
+    // a record of the correct type and simply produces no hit.
+    bool BuildTable(const std::vector<uint8_t>& kinds, std::string* why);
 
     ID3D12Device5* m_dev = nullptr;
     ID3D12StateObject* m_so = nullptr;
@@ -97,11 +104,15 @@ private:
     // held until the pipeline itself dies. Growth is monotonic and rare, so
     // this stays a handful of small buffers.
     std::vector<ID3D12Resource*> m_retired;
-    UINT m_hitRecords = 0;
     bool m_isProcedural = false;
-    // The three identifiers, kept so the table can be rebuilt without going
-    // back to the state object.
+    // The identifiers, kept so the table can be rebuilt without going back to
+    // the state object. m_idNullTri and m_idNullProc are the hit groups that
+    // never commit, one per geometry type.
     uint8_t m_idRay[32]{}, m_idMiss[32]{}, m_idHit[32]{};
+    uint8_t m_idNullTri[32]{}, m_idNullProc[32]{};
+    // What the current table was built for, so a rebuild happens when the
+    // scene's layout changes and not otherwise.
+    std::vector<uint8_t> m_kinds;
     D3D12_DISPATCH_RAYS_DESC m_desc{};
     UINT m_threads[3] = { 1, 1, 1 };
     LONG m_refs = 1;

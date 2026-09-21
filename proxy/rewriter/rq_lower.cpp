@@ -574,11 +574,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             add.push_back("declare i1 @dx.op.reportHit." +
                           std::string(kAttrs).substr(1) + "(i32, float, i32, " +
                           kAttrs + "*) #1");
-        } else if (q.hasLoop) {
-            add.push_back("");
-            add.push_back("; Function Attrs: noreturn nounwind");
-            add.push_back("declare void @dx.op.ignoreHit(i32) #3");
         }
+        // Unconditional now: the generated any-hit may or may not exist, but
+        // AnyHitNull always does and it is nothing but an IgnoreHit.
+        add.push_back("");
+        add.push_back("; Function Attrs: noreturn nounwind");
+        add.push_back("declare void @dx.op.ignoreHit(i32) #3");
         std::set<std::string> seenFn;
         for (const auto& g : globals) {
             const std::string f = HandleFn(g.elem);
@@ -594,7 +595,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             joined += add[i];
         }
         out = out.substr(0, anchor) + "\n" + joined + out.substr(anchor);
-        if (q.hasLoop && out.find("attributes #3") == std::string::npos)
+        if (out.find("attributes #3") == std::string::npos)
             out = Replace(out, "attributes #2 = { nounwind readonly }",
                           "attributes #2 = { nounwind readonly }\n"
                           "attributes #3 = { noreturn nounwind }");
@@ -947,6 +948,24 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                       "  store i32 0, i32* %ph, align 4\n"
                       "  ret void\n}");
 
+        // The two never-commit stubs. Shapes taken from DXC, see
+        // phase5/cases/reference/lib_null_ref.hlsl, which also confirms both
+        // are SFI0=0x0 and so carry no Tier 1.1 feature flag.
+        //
+        // Rejecting every candidate is how a TRIANGLES hit group produces no
+        // hit: traversal carries on past that geometry as if the shader had
+        // never seen it. #3 is noreturn nounwind, as DXC marks its own.
+        fns.push_back("define void @" + e.anyhitnull + "(" + std::string(kPayload) +
+                      "* noalias nocapture %p, " + kAttrs +
+                      "* nocapture readnone %attr) #3 {\n"
+                      "  call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()\n"
+                      "  unreachable\n}");
+
+        // And reporting nothing is how a PROCEDURAL hit group produces no hit:
+        // an intersection shader that returns has found nothing.
+        fns.push_back("define void @" + e.isectnull + "() #1 {\n"
+                      "  ret void\n}");
+
         static const std::regex kEnd(R"(\}\s*)");
         auto lines = llm::SplitLines(out);
         const int at = llm::FindLine(lines, kEnd);
@@ -1039,6 +1058,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         ann.push_back("!" + std::to_string(annHit));
         ann.push_back("void " + sigP + "* @" + e.miss);
         ann.push_back("!" + std::to_string(annMiss));
+        ann.push_back("void " + sigH + "* @" + e.anyhitnull);
+        ann.push_back("!" + std::to_string(annHit));
+        // An intersection shader is void(), so it annotates like the raygen.
+        ann.push_back("void ()* @" + e.isectnull);
+        ann.push_back("!" + std::to_string(annRaygen));
         std::string annJoined;
         for (size_t i = 0; i < ann.size(); ++i) {
             if (i) annJoined += ", ";
@@ -1075,6 +1099,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         else if (q.hasLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
         eps.push_back(entry(e.closesthit, sigH, 10, true, true));
         eps.push_back(entry(e.miss, sigP, 11, true, false));
+        eps.push_back(entry(e.anyhitnull, sigH, 9, true, true));
+        eps.push_back(entry(e.isectnull, "()", 8, false, false));
         eps.push_back(entry(e.raygen, "()", 7, false, false));
 
         std::string epJoined;

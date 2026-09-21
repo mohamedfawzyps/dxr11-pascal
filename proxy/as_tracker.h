@@ -63,6 +63,11 @@ BlasInfo Lookup(D3D12_GPU_VIRTUAL_ADDRESS address);
 
 // What a TOP-level structure turned out to contain, once its instance
 // descriptions were read. `valid` is false until then.
+// Which geometry reaches a hit group record index. A record is triangles or
+// procedural, never both, so an index reached by both kinds cannot be served
+// by any single record.
+enum Reach : uint8_t { kReachNone = 0, kReachTriangles = 1, kReachProcedural = 2 };
+
 struct TlasInfo {
     bool valid = false;
     UINT instanceCount = 0;
@@ -76,6 +81,10 @@ struct TlasInfo {
     // Instances whose bottom-level structure was never seen being built, so
     // its type is not known. Nonzero means the answer above is incomplete.
     UINT unknownBlas = 0;
+    // What reaches each record index, one entry per index up to
+    // maxContribution. This is what lets the table carry a record of the right
+    // TYPE at each slot rather than one record everywhere.
+    std::vector<uint8_t> reach;
 };
 
 // The instance descriptions of a top-level build, read from CPU-visible memory
@@ -132,6 +141,17 @@ TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);
 // memory the answer arrives a submission late, so the first dispatch of a run
 // may not be covered.
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
+
+// What reaches each hit group record index, aggregated over every top-level
+// structure read. The result's size is the number of records the table needs;
+// empty means nothing has been read and one record will do.
+//
+// Aggregated rather than per-structure for the same reason the refusal is:
+// which structure a dispatch traces against is not knowable at the dispatch
+// when it arrives through a descriptor table. Aggregating can only ever ask
+// for MORE records of MORE types than one scene needs, which costs a few
+// wasted slots and never a wrong one.
+std::vector<uint8_t> RecordKinds();
 
 // How many bottom-level structures have been seen, and of what kinds. For the
 // log and for tests, so the tracking can be shown to work before anything

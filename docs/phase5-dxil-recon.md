@@ -1598,27 +1598,92 @@ Two limits of that check, stated because they are real:
 - It can only see what has been **read**. On the GPU-only path the answer
   arrives a submission late, so the first dispatch of a run is not covered.
 
+### Per-index typed records: the last structural piece
+
+The refusal above is now much narrower, because the table can carry a record of
+a DIFFERENT TYPE at each index.
+
+**Two stub shaders, taken from DXC rather than guessed.**
+`phase5/cases/reference/lib_null_ref.hlsl` asked what a hit group that must
+never commit compiles to:
+
+    AnyHitNull   call void @dx.op.ignoreHit(i32 155)   then unreachable
+    IsectNull    ret void
+
+Rejecting every candidate is how a TRIANGLES hit group produces no hit:
+traversal carries on past that geometry as if the shader had never seen it.
+Reporting nothing is how a PROCEDURAL one does: an intersection shader that
+returns has found nothing. Both measure **SFI0 = 0x0**, so neither pulls in a
+Tier 1.1 feature flag, which is the check `CommittedGeometryIndex` taught this
+project to run before calling anything easy.
+
+Both are emitted into **every** lowered library, because which one a scene needs
+is not knowable when the shader is lowered: the acceleration structures do not
+exist yet. Two tiny functions is a cheap price for never having to re-lower.
+
+**Three hit groups, and the table picks per slot.** The state object now carries
+the real hit group plus `HitGroupNullTri` and `HitGroupNullProc`. For each
+record index, the tracker says which geometry kinds reach it, and the slot gets:
+
+- the real hit group, when its own kind reaches the slot, or nothing does;
+- the rejecting hit group OF THE OTHER KIND, when only the other kind reaches
+  it, so that geometry is traversed with a record of the correct type and
+  simply produces no hit.
+
+**The result.** A shader that commits procedural hits, on a scene that also
+holds triangle geometry, with the two kinds on different records:
+
+    WARP  65536 rays, 7396 hits
+    1070  65536 rays, 7396 hits        MATCH, 0 mismatches
+
+That is the case that measured 15418 against WARP's 7396 two commits ago, and
+was refused one commit ago.
+
+**The sensitivity check.** With the rejecting record replaced by the real one
+and nothing else changed, the same scene renders **15418 hits again, with 8022
+mismatches**: exactly the old wrong answer. So the typing is carrying the whole
+result and this case fails if it stops.
+
+It also makes the safe direction WELL-DEFINED rather than merely observed. A
+triangle-only shader on a mixed scene used to rely on procedural geometry
+meeting a triangles hit group and quietly producing nothing, which is behaviour
+this project could only measure on one driver. Where the contributions are
+distinct, that slot now holds a proper procedural record that reports nothing.
+
+### What is still refused, and why it cannot be fixed here
+
+**Both kinds collapsed onto ONE record.** If the application gave its triangle
+and procedural instances the same `InstanceContributionToHitGroupIndex`, that
+slot would need a procedural record for the procedural geometry and a rejecting
+triangle record for the triangles. A record is one or the other. The
+application collapsed them and nothing in the shim can undo it:
+
+    lowered RayQuery dispatch REFUSED: this shader commits procedural hits, and
+    the scene routes BOTH triangle and procedural geometry to the same hit group
+    record, which can only be one of the two. Nothing is drawn for it.
+
+**A shader that commits BOTH kinds ITSELF.** Still refused by the analysis, and
+unchanged by any of this. That needs the loop body lowered twice from one
+module, into an any-hit AND an intersection shader, with two closest-hits since
+one writes committed status 1 and the other 2. Separate work, in the rewriter
+rather than in the table.
+
 ### Regression
 
-11 checks in `.\tools\run_dispatch_test.ps1`: 9 render cases, all MATCH against
+12 checks in `.\tools\run_dispatch_test.ps1`: 10 render cases, all MATCH against
 WARP, plus two refusal gates, the tier flip staying off by default and the
-wrong-geometry case being declined. The rewriter suite is unchanged at 9 cases
-byte-identical between the Python and the C++ with all refusals behaving. The
-probe on hardware still gives 14450 + 2312 + 48774 = 65536 on both
-argument-buffer shapes, `D3D12RaytracingHelloWorld` is 0 of 14400 pixels
-different, and `D3D12RaytracingSimpleLighting` runs at baseline fps.
+collapsed layout being declined. The rewriter suite is 9 cases byte-identical
+between the Python and the C++ with all 13 analysis checks behaving, every one
+of them re-signed with the two new stubs present. The probe on hardware still
+gives 14450 + 2312 + 48774 = 65536 on both argument-buffer shapes,
+`D3D12RaytracingHelloWorld` is 0 of 14400 pixels different,
+`D3D12RaytracingSimpleLighting` runs at baseline fps, and the debug layer is
+silent through the new state objects.
 
 ## Next
 
-1. **Per-index records of the right TYPE.** The one remaining case is a shader
-   that commits procedural hits on a scene that also holds triangles. It needs
-   two hit groups rather than one, with a null record (an any-hit that always
-   ignores, or an intersection shader that reports nothing) at the indices the
-   other kind reaches. That is rewriter work in both implementations, plus
-   keeping the per-index geometry kinds that the tracker currently aggregates
-   away. Note it is only possible when the application gave the two kinds
-   DIFFERENT contributions; if it collapsed them onto one index, no table can
-   serve both and the refusal is the only honest answer.
+1. **A shader that commits both kinds**, which needs the loop body lowered
+   twice and two closest-hits. The only shader-side gap left.
 2. **Dynamic descriptor indexing**, still refused.
 3. **Only then consider making the tier flip the default**, once enough real
    software has run through it that the refusal list is trusted.

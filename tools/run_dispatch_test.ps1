@@ -59,7 +59,17 @@ $cases = @(
     # the debug layer is silent on this and on the case that IS wrong, so it
     # settles nothing.
     @{ name = 'mixedtri'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--mixed');
-       desc = 'triangle-only shader on a scene holding procedural geometry too' }
+       desc = 'triangle-only shader on a scene holding procedural geometry too' },
+    # The case the shim could not serve at all until per-index typed records.
+    # A shader that COMMITS procedural hits, on a scene that also holds
+    # triangles, with the two kinds on different records. Slot 0 gets a
+    # TRIANGLES hit group whose any-hit always ignores, so the triangle
+    # geometry is traversed with a record of the right type and produces
+    # nothing. Measured: with that rejecting record replaced by the real one,
+    # this scene gives 15418 hits against WARP's 7396, the 8022 difference
+    # being exactly the triangle hits. So this case fails if the typing stops.
+    @{ name = 'mixedproc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--mixed', '--contrib');
+       desc = 'procedural shader on a mixed scene, triangles on their own record' }
 )
 
 $failed = 0
@@ -105,13 +115,14 @@ if ($out -match 'needs Tier 1\.1') {
     $failed++
 }
 
-# The other direction of the same mismatch is NOT safe, and this proves the
-# refusal that covers it is reachable rather than dead code. A shader that
-# commits procedural hits, on a scene that also holds triangles, measured 15418
-# hits against WARP's 7396: the 8022 difference is exactly the triangle hits,
-# committed by a closest-hit that labels everything procedural.
+# What CANNOT be served, and this proves the refusal covering it is reachable
+# rather than dead code. When the application routes both geometry kinds to the
+# SAME hit group record, that slot would need a procedural record for the
+# procedural geometry and a rejecting triangle record for the triangles. A
+# record is one or the other, so there is no table that works and refusing is
+# the only honest answer.
 Write-Host ''
-Write-Host '=== a procedural shader on a scene with triangles is refused ==='
+Write-Host '=== both kinds collapsed onto one hit group record is refused ==='
 $log = Join-Path $env:TEMP 'dxr11_proxy.log'
 Remove-Item $log -ErrorAction SilentlyContinue
 $env:DXR11_TIER11 = '1'
@@ -119,10 +130,10 @@ $env:DXR11_TIER11 = '1'
     Out-Null
 $env:DXR11_TIER11 = ''
 Remove-Item dp_mix.bin -ErrorAction SilentlyContinue
-if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'commits procedural hits, and the scene also' -Quiet)) {
+if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'routes BOTH triangle and procedural geometry to the same' -Quiet)) {
     Write-Host '  refused, with the reason, as it must'
 } else {
-    Write-Host '  REFUSAL MISSING: the wrong-geometry case was allowed through'
+    Write-Host '  REFUSAL MISSING: the unservable layout was allowed through'
     $failed++
 }
 

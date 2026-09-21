@@ -42,14 +42,23 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     for (UINT i = 0; i < count; ++i) {
         if (d[i].InstanceContributionToHitGroupIndex > t.maxContribution)
             t.maxContribution = d[i].InstanceContributionToHitGroupIndex;
+    }
+    t.reach.assign(static_cast<size_t>(t.maxContribution) + 1, kReachNone);
+
+    for (UINT i = 0; i < count; ++i) {
+        const UINT slot = d[i].InstanceContributionToHitGroupIndex;
+        uint8_t bits = kReachNone;
         auto it = g_blas.find(d[i].AccelerationStructure);
         if (it == g_blas.end()) { ++t.unknownBlas; continue; }
         switch (it->second.kind) {
-            case Kind::kTriangles:  t.anyTriangles = true; break;
-            case Kind::kProcedural: t.anyProcedural = true; break;
-            case Kind::kMixed:      t.anyTriangles = t.anyProcedural = true; break;
+            case Kind::kTriangles:  bits = kReachTriangles; break;
+            case Kind::kProcedural: bits = kReachProcedural; break;
+            case Kind::kMixed:      bits = kReachTriangles | kReachProcedural; break;
             default:                ++t.unknownBlas; break;
         }
+        if (bits & kReachTriangles)  t.anyTriangles = true;
+        if (bits & kReachProcedural) t.anyProcedural = true;
+        t.reach[slot] |= bits;
     }
 
     const bool isNew = g_tlas.find(tlas) == g_tlas.end();
@@ -267,28 +276,50 @@ TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address) {
 }
 
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
-    // Nonzero contributions are no longer a refusal: the table is sized to the
-    // scene and every slot holds the shim's one hit group, so a hit resolves
-    // to a valid record whichever slot the application chose.
+    // Nonzero contributions are not a refusal: the table is sized to the scene
+    // and each slot carries a record of the right TYPE, so a hit resolves to a
+    // usable record whichever slot the application chose.
+    //
+    // A triangle-only shader is never refused. Procedural geometry reaches
+    // either a null procedural record or, where it shares a slot with
+    // triangles, the real triangle record; both produce no hit, which is the
+    // same answer the shader gives on Tier 1.1, where it never commits a
+    // procedural candidate either.
     if (!shaderCommitsProcedural) return false;
 
+    // For a shader that DOES commit procedural hits, one slot holding both
+    // kinds is the end of it: that slot would need a procedural record for the
+    // procedural geometry and a rejecting triangle record for the triangles,
+    // and a record is one or the other. The application collapsed them and
+    // nothing here can undo that.
     std::lock_guard<std::mutex> g(g_lock);
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
         if (!t.valid) continue;
-        // A procedural hit group reached by TRIANGLE geometry is the direction
-        // that goes wrong: the triangle hit runs the closest-hit, which labels
-        // it procedural. Measured as 8022 hits committed that should not have
-        // been. The other direction is safe, see the header.
-        if (t.anyTriangles) {
-            if (why)
-                *why = "this shader commits procedural hits, and the scene also "
-                       "holds triangle geometry, whose hits would run the "
-                       "procedural closest-hit and be committed wrongly";
-            return true;
+        for (size_t i = 0; i < t.reach.size(); ++i) {
+            if ((t.reach[i] & kReachTriangles) && (t.reach[i] & kReachProcedural)) {
+                if (why)
+                    *why = "this shader commits procedural hits, and the scene "
+                           "routes BOTH triangle and procedural geometry to the "
+                           "same hit group record, which can only be one of the "
+                           "two";
+                return true;
+            }
         }
     }
     return false;
+}
+
+std::vector<uint8_t> RecordKinds() {
+    std::lock_guard<std::mutex> g(g_lock);
+    std::vector<uint8_t> out;
+    for (const auto& kv : g_tlas) {
+        const TlasInfo& t = kv.second;
+        if (!t.valid) continue;
+        if (out.size() < t.reach.size()) out.resize(t.reach.size(), kReachNone);
+        for (size_t i = 0; i < t.reach.size(); ++i) out[i] |= t.reach[i];
+    }
+    return out;
 }
 
 Summary GetSummary() {

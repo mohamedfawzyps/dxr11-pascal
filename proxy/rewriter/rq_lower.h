@@ -31,6 +31,15 @@ struct Exports {
     std::string closesthit = "ClosestHit";
     std::string miss = "Miss";
     std::string intersection = "Isect";
+    // Hit groups that must never commit. A scene can route triangle and
+    // procedural geometry to DIFFERENT records, and the shim has a real hit
+    // group for only one of those kinds; the other index gets a record of the
+    // right TYPE that finds nothing. Emitted always, because which one a scene
+    // needs is not knowable when the shader is lowered: the acceleration
+    // structures do not exist yet. Two tiny functions is a cheap price for not
+    // having to re-lower later.
+    std::string anyhitnull = "AnyHitNull";
+    std::string isectnull = "IsectNull";
 };
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e = Exports());

@@ -143,7 +143,19 @@ def lower(module, q, exports=None):
     """Return the text of a lib_6_5 module implementing `q` with TraceRay."""
     exports = exports or {'raygen': 'RayGen', 'anyhit': 'AnyHit',
                           'closesthit': 'ClosestHit', 'miss': 'Miss',
-                          'intersection': 'Isect'}
+                          'intersection': 'Isect',
+                          # Hit groups that must never commit. A scene can
+                          # route triangle and procedural geometry to
+                          # DIFFERENT records, and the shim has a real hit
+                          # group for only one of those kinds; the other index
+                          # gets a record of the right TYPE that finds nothing.
+                          # Emitted always, because which one a scene needs is
+                          # not knowable when the shader is lowered: the
+                          # acceleration structures do not exist yet. Two tiny
+                          # functions is a cheap price for not having to
+                          # re-lower later.
+                          'anyhitnull': 'AnyHitNull',
+                          'isectnull': 'IsectNull'}
     text = module.text
     md = _metadata(text)
     table = _resource_table(text, md)
@@ -464,9 +476,10 @@ def _swap_declarations(text, q, globals_):
         new += ['', '; Function Attrs: nounwind',
                 'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #1'
                 % (ATTRS[1:], ATTRS)]
-    elif q.loop:
-        new += ['', '; Function Attrs: noreturn nounwind',
-                'declare void @dx.op.ignoreHit(i32) #3']
+    # Unconditional now: the generated any-hit may or may not exist, but
+    # AnyHitNull always does and it is nothing but an IgnoreHit.
+    new += ['', '; Function Attrs: noreturn nounwind',
+            'declare void @dx.op.ignoreHit(i32) #3']
     seen = set()
     for sym, gty, elem, _ in globals_.values():
         fnname, _ = _handle_fn(elem)
@@ -478,7 +491,7 @@ def _swap_declarations(text, q, globals_):
 
     anchor = text.index('\nattributes #0 =')
     text = text[:anchor] + '\n' + '\n'.join(new) + text[anchor:]
-    if q.loop and 'attributes #3' not in text:
+    if 'attributes #3' not in text:
         text = text.replace('attributes #2 = { nounwind readonly }',
                             'attributes #2 = { nounwind readonly }\n'
                             'attributes #3 = { noreturn nounwind }')
@@ -537,6 +550,24 @@ def _append_shaders(text, module, q, exports, table, globals_):
   store i32 0, i32* %ph, align 4
   ret void
 }}'''.format(ms=exports['miss'], pl=PAYLOAD))
+
+    # The two never-commit stubs. Shapes taken from DXC, see
+    # phase5/cases/reference/lib_null_ref.hlsl, which also confirms both are
+    # SFI0=0x0 and so carry no Tier 1.1 feature flag.
+    #
+    # Rejecting every candidate is how a TRIANGLES hit group produces no hit:
+    # traversal carries on past that geometry as if the shader had never seen
+    # it. #3 is noreturn nounwind, as DXC marks its own.
+    fns.append('''define void @{ah}({pl}* noalias nocapture %p, {at}* nocapture readnone %attr) #3 {{
+  call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()
+  unreachable
+}}'''.format(ah=exports['anyhitnull'], pl=PAYLOAD, at=ATTRS))
+
+    # And reporting nothing is how a PROCEDURAL hit group produces no hit: an
+    # intersection shader that returns has found nothing.
+    fns.append('''define void @{is}() #1 {{
+  ret void
+}}'''.format(**{'is': exports['isectnull']}))
 
     # Insert after the line that closes the entry function. Done on lines
     # rather than with a multiline regex: `\s*$` there also eats the following
@@ -810,6 +841,9 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
         ann += ['void %s* @%s' % (sig_h, exports['anyhit']), '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_h, exports['closesthit']), '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
+    ann += ['void %s* @%s' % (sig_h, exports['anyhitnull']), '!%d' % ann_hit]
+    # An intersection shader is void(), so it annotates like the raygen.
+    ann += ['void ()* @%s' % exports['isectnull'], '!%d' % ann_raygen]
     ann_id = node(', '.join(ann))
 
     # Entry points: a resource-only record, then one per export. Tags are
@@ -840,6 +874,8 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
         eps.append(entry(exports['anyhit'], sig_h, 9, True, True))
     eps.append(entry(exports['closesthit'], sig_h, 10, True, True))
     eps.append(entry(exports['miss'], sig_p, 11, True, False))
+    eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
+    eps.append(entry(exports['isectnull'], '()', 8, False, False))
     eps.append(entry(exports['raygen'], '()', 7, False, False))
 
     text = text.replace('!dx.entryPoints = !{!%d}' % old_entry,

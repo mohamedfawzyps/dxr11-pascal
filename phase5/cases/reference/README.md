@@ -19,3 +19,13 @@ DXC rather than from reasoning, and kept so the answer can be re-checked.
   RayTCurrent, ObjectRayOrigin, ObjectRayDirection and WorldToObject4x3 all
   give SFI0=0x0, so all are safe. GeometryIndex gives 0x100000 and
   InstanceContributionToHitGroupIndex does not exist in HLSL at all.
+
+- `lib_null_ref.hlsl` - what does a hit group that must NEVER commit compile
+  to, and does either half of it pull in a shader feature flag Tier 1.0
+  refuses? Compile with `-T lib_6_5`. Answers: an always-ignoring any-hit is
+  `call void @dx.op.ignoreHit(i32 155)` then `unreachable`, marked
+  `noreturn nounwind`; a no-op intersection shader is a bare `ret void`. Both
+  give SFI0=0x0, so neither costs anything on Pascal. That is the form
+  `lower.py` and `rq_lower.cpp` now emit as `AnyHitNull` and `IsectNull`, which
+  are what let the shader table carry a record of the right TYPE at an index
+  reached by geometry the lowered shader does not serve.
