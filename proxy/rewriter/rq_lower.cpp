@@ -604,6 +604,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     // --- generated shaders ---------------------------------------------------
     {
         std::vector<std::string> fns;
+        // ONE loop body, TWO shaders when the query commits both kinds. The
+        // substitution of CandidateType is what separates them: folded to
+        // CANDIDATE_PROCEDURAL_PRIMITIVE the triangle arm dies and this is an
+        // intersection shader, folded to CANDIDATE_NON_OPAQUE_TRIANGLE the
+        // procedural arm dies and it is an any-hit. Each keeps the other's
+        // dead arm as valid but unreachable IR.
         if (q.NeedsIntersection()) {
             // The Proceed loop body re-rooted as an INTERSECTION shader. Same
             // body as the any-hit case, with one substitution changed: an
@@ -625,6 +631,18 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     if (i.DxOp() == kCandidateType) subst[i.result] = "1";
                     else if (i.DxOp() == kCandidateProcNonOpaque)
                         subst[i.result] = "true";
+                    // Triangle barycentrics have NO source in an intersection
+                    // shader: there is no attributes parameter to read them
+                    // from. HitKind() is not available either. Both appear
+                    // only in the triangle arm, which CandidateType has just
+                    // folded away, so they are dead. Constants keep the IR
+                    // valid without pretending to a value. Substituted in this
+                    // pre-pass, so it does not depend on the order blocks
+                    // happen to be emitted in.
+                    else if (i.DxOp() == kCandidateBary)
+                        subst[i.result] = "0.000000e+00";
+                    else if (i.DxOp() == kCandidateFrontFace)
+                        subst[i.result] = "false";
                 }
             }
             std::vector<std::string> order{ q.loop.header };
@@ -664,7 +682,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 }
                 for (const auto& i : b->instrs) {
                     const int op = i.DxOp();
-                    if (op == kCandidateType || op == kCandidateProcNonOpaque) continue;
+                    if (op == kCandidateType || op == kCandidateProcNonOpaque ||
+                        op == kCandidateBary || op == kCandidateFrontFace) continue;
+                    // A TRIANGLE commit, in the arm CandidateType folded away.
+                    // Dead, and an intersection shader has nothing to lower it
+                    // onto, so it simply goes.
+                    if (op == kCommitNonOpaque) continue;
                     if (op == kCommitProcedural) {
                         const std::string tv = llm::OperandName(i.args[2]);
                         is.push_back("  %rq.rh" + std::to_string(i.index) +
@@ -713,7 +736,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 joinedIs += is[i];
             }
             fns.push_back(joinedIs);
-        } else if (q.hasLoop) {
+        }
+        // Not an else: a both-kinds query emits the intersection shader above
+        // AND the any-hit below, from the same loop body.
+        if (q.hasLoop && (q.NeedsBoth() || !q.NeedsIntersection())) {
             // AnyHit IS the Proceed loop body, re-rooted. Accept is falling off
             // the end; reject is IgnoreHit. The polarity is the reverse of the
             // RayQuery form, where committing is the special path.
@@ -727,6 +753,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (!b) continue;
                 for (const auto& i : b->instrs)
                     if (i.DxOp() == kCandidateType) subst[i.result] = "0";
+                    // Meaningless for a triangle candidate, and in the arm
+                    // CandidateType has just folded away. Dead, but it still
+                    // has to be a value.
+                    else if (i.DxOp() == kCandidateProcNonOpaque)
+                        subst[i.result] = "false";
             }
 
             // Abort() has no direct DXR 1.0 equivalent. An any-hit shader
@@ -802,7 +833,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 }
                 for (const auto& i : b->instrs) {
                     const int op = i.DxOp();
-                    if (op == kCandidateType || op == kCommitNonOpaque) continue;
+                    if (op == kCandidateType || op == kCommitNonOpaque ||
+                        op == kCandidateProcNonOpaque) continue;
+                    // A PROCEDURAL commit, in the arm CandidateType folded
+                    // away. Dead, and an any-hit shader cannot report a
+                    // procedural hit, so it simply goes.
+                    if (op == kCommitProcedural) continue;
                     if (op == kAbort) {
                         ah.push_back("  store i32 1, i32* %rq.pab, align 4");
                         continue;
@@ -875,10 +911,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             fns.push_back(joined);
         }
 
-        // ClosestHit
-        {
+        // ClosestHit. A both-kinds query needs TWO of these: a triangle hit
+        // reports COMMITTED_TRIANGLE_HIT and a procedural one
+        // COMMITTED_PROCEDURAL_PRIMITIVE_HIT, and one shader cannot say both,
+        // because it does not know which hit group resolved to it.
+        auto closestHit = [&](const std::string& name, const char* status) {
             std::vector<std::string> ch;
-            ch.push_back("define void @" + e.closesthit + "(" + kPayload +
+            ch.push_back("define void @" + name + "(" + kPayload +
                          "* noalias nocapture %p, " + kAttrs +
                          "* nocapture readonly %attr) #1 {");
             ch.push_back("  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()");
@@ -893,8 +932,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ch.push_back("  store <2 x float> %b, <2 x float>* %pb, align 4");
             ch.push_back(std::string("  %ph = getelementptr inbounds ") + kPayload + ", " +
                          kPayload + "* %p, i32 0, i32 2");
-            ch.push_back(std::string("  store i32 ") +
-                         (q.NeedsIntersection() ? "2" : "1") +
+            ch.push_back(std::string("  store i32 ") + status +
                          ", i32* %ph, align 4");
             for (const auto& s : kChSource) {
                 ch.push_back("  %id" + std::to_string(s.first) + " = " + s.second);
@@ -938,6 +976,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 joined += ch[i];
             }
             fns.push_back(joined);
+        };
+
+        if (q.NeedsBoth()) {
+            closestHit(e.closesthit, "1");
+            closestHit(e.closesthitproc, "2");
+        } else {
+            closestHit(e.closesthit, q.NeedsIntersection() ? "2" : "1");
         }
 
         // Miss
@@ -1046,7 +1091,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         std::vector<std::string> ann{ "i32 1", "void ()* @" + e.raygen,
                                       "!" + std::to_string(annRaygen) };
-        if (q.NeedsIntersection()) {
+        if (q.NeedsBoth()) {
+            // An intersection shader is void(), so it annotates like a raygen.
+            ann.push_back("void ()* @" + e.intersection);
+            ann.push_back("!" + std::to_string(annRaygen));
+            ann.push_back("void " + sigH + "* @" + e.anyhit);
+            ann.push_back("!" + std::to_string(annHit));
+        } else if (q.NeedsIntersection()) {
             // An intersection shader is void(), so it annotates like a raygen.
             ann.push_back("void ()* @" + e.intersection);
             ann.push_back("!" + std::to_string(annRaygen));
@@ -1056,6 +1107,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         }
         ann.push_back("void " + sigH + "* @" + e.closesthit);
         ann.push_back("!" + std::to_string(annHit));
+        if (q.NeedsBoth()) {
+            ann.push_back("void " + sigH + "* @" + e.closesthitproc);
+            ann.push_back("!" + std::to_string(annHit));
+        }
         ann.push_back("void " + sigP + "* @" + e.miss);
         ann.push_back("!" + std::to_string(annMiss));
         ann.push_back("void " + sigH + "* @" + e.anyhitnull);
@@ -1094,10 +1149,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         // Shader kind 8. An intersection shader carries neither a payload
         // size nor an attribute size, exactly as DXC emits it.
-        if (q.NeedsIntersection())
+        if (q.NeedsBoth()) {
+            eps.push_back(entry(e.intersection, "()", 8, false, false));
+            eps.push_back(entry(e.anyhit, sigH, 9, true, true));
+        } else if (q.NeedsIntersection())
             eps.push_back(entry(e.intersection, "()", 8, false, false));
         else if (q.hasLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
         eps.push_back(entry(e.closesthit, sigH, 10, true, true));
+        if (q.NeedsBoth())
+            eps.push_back(entry(e.closesthitproc, sigH, 10, true, true));
         eps.push_back(entry(e.miss, sigP, 11, true, false));
         eps.push_back(entry(e.anyhitnull, sigH, 9, true, true));
         eps.push_back(entry(e.isectnull, "()", 8, false, false));

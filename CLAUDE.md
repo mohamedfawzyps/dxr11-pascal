@@ -5,7 +5,7 @@ Version 1.
 ## Current position (2026-09-21)
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
-GTX 1070 and produces bit-exact output against WARP. Ten render cases, 0
+GTX 1070 and produces bit-exact output against WARP. Eleven render cases, 0
 mismatches, plus two refusal gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
@@ -22,11 +22,18 @@ The hit group table is sized to the scene's largest
 TYPE that reaches that index, so a scene holding both triangles and procedural
 primitives works rather than being refused.
 
-**The structural work is DONE.** What is left is one shader-side gap, a query
-that commits BOTH kinds ITSELF, which needs the loop body lowered twice; and
-one thing no shim can fix, an application that routes both kinds to the SAME
-hit group record, since a record is one type or the other. See the entries
-below and docs/phase5-dxil-recon.md.
+**EVERY RayQuery SHAPE THIS PROJECT SET OUT TO SUPPORT NOW WORKS**, including
+a query that commits BOTH triangle and procedural hits, which lowers to an
+any-hit AND an intersection shader from one Proceed loop.
+
+What is left is not shader translation and not table building:
+- **one thing no shim can fix**, an application that routes both geometry kinds
+  to the SAME hit group record, since a record is one type or the other;
+- **dynamic descriptor indexing**, the last refusal that is a limitation of
+  this rewriter rather than a fact about DXR 1.0;
+- and the four accessors DXR 1.0 offers nothing to lower onto.
+
+See the entries below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
 
@@ -163,11 +170,12 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
       Abort(), order-independent observable only               MATCH
       procedural primitives, generated intersection            MATCH
       the 11 accessors from the Unreal survey                  MATCH
+      commits BOTH kinds, two hit groups            9160 hits   MATCH
 
   All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
-  Nine render cases, each also checked byte-identical between the Python and
-  the C++, and thirteen analysis checks, run by
-  `.\tools\run_rewriter_test.ps1`.
+  Ten render cases, each also checked byte-identical between the Python and
+  the C++ on both the `.ll` path and the container path, and thirteen analysis
+  checks, run by `.\tools\run_rewriter_test.ps1`.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
                      dominators and natural loops
@@ -461,14 +469,11 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   shader has no accept or reject terminator: reporting IS accepting, and
   returning reports nothing. The closest-hit writes status 2, not 1.
 
-  **The obstacle was never in the lowering.** A query committing BOTH triangle
-  and procedural hits is still refused, and not out of laziness: it needs the
-  loop body lowered TWICE from one module, into an any-hit and an intersection
-  shader, with two closest-hits since one writes committed status 1 and the
-  other 2. That is the last shader-side gap.
-  **A SCENE holding both kinds is no longer a problem**, which is a different
-  thing and was the bigger half. The table now carries a record of the right
-  TYPE at each index; see the typed-records entry below.
+  **The obstacle was never in the lowering, and it is now gone.** A query
+  committing BOTH triangle and procedural hits lowers, see the both-kinds entry
+  below. A SCENE holding both kinds was the other half, and the typed table
+  handles that; the two were conflated for a long time and are different
+  problems.
 
 - **Nonzero `InstanceContributionToHitGroupIndex`: FIXED.** This used to be a
   limitation that applied TODAY, to triangle-only scenes, and it is now handled
@@ -611,13 +616,56 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     geometry and a rejecting triangle record for the triangles, and a record is
     one or the other. The application collapsed them.
 
+- A query that commits BOTH kinds: **DONE. The last shader-side gap.**
+  `phase5/cases/rayquery_both.hlsl`, one Proceed loop committing a triangle hit
+  in one arm and a procedural hit in the other. 9160 hits, bit-exact against
+  WARP on the 1070.
+  - **One loop body, two shaders**, and the substitution is what separates
+    them, exactly as it already did for the single-kind cases. Folding
+    `CandidateType()` to procedural kills the triangle arm and the body is an
+    intersection shader; folding it to triangle kills the procedural arm and
+    the same body is an any-hit. What is new is emitting BOTH from one module.
+  - **The dead arm still has to be VALID IR, and that was the actual work.**
+    Nothing folds the branch at the text level, so both arms are emitted and
+    one never runs. So each shader has to lower the other kind's opcodes: the
+    intersection shader drops `CommitNonOpaqueTriangleHit` and turns
+    `CandidateTriangleBarycentrics` and `CandidateTriangleFrontFace` into
+    constants, because it has no attributes parameter and no `HitKind()`; the
+    any-hit drops `CommitProceduralPrimitiveHit` and constant-folds
+    `CandidateProceduralPrimitiveNonOpaque`.
+  - Those constants are substituted in the same PRE-PASS as `CandidateType`,
+    not during emission, so the result does not depend on the order blocks
+    happen to be written out in.
+  - **Two closest-hits**, because a triangle hit reports committed status 1 and
+    a procedural one 2, and a closest-hit cannot say both: it does not know
+    which hit group resolved to it. Every other case keeps a single
+    `ClosestHit`, so no other output moves by a byte.
+  - **Two real hit groups** in the state object, and the typed table puts each
+    at the indices its geometry reaches.
+  - The test scene is built so the answer does NOT depend on traversal order:
+    the procedural commit reports the box front face at z = 0.5, always nearer
+    than the triangle at z = 0, so the procedural hit wins wherever both are
+    hit. RayQuery traversal order is implementation-defined and WARP is the
+    oracle, so a tie would have been untestable.
+
+- **A trap in the .ll production path, worth not rediscovering.** A `.ll` made
+  with `dxc -dumpbin | Out-File` is CRLF, and the C++ rewriter rejected it with
+  "TraceRayInline does not use the query handle", which is nowhere near the
+  truth: `SplitLines` kept the `\r`, the body-end test is a line equality
+  against `}`, so the parser never left the function body and the complaint
+  named something unrelated. **The Python tolerated it by accident**, because
+  its patterns end in `\s*$` and `\r` is whitespace. The suite builds its `.ll`
+  with `dxc -Fc`, which writes LF, so nothing covered this. The C++ now drops a
+  trailing `\r`.
+  - What located it: running the C++ on a **known-good** shader through the
+    same path. It failed there too, which put the fault in the path rather than
+    in the new code immediately. **When new code fails, run the OLD code
+    through the new path before believing the new code is wrong.**
+
   Next action, in order of value.
-  1. **A shader that commits BOTH kinds.** The only shader-side gap left. The
-     loop body has to be lowered twice, into an any-hit and an intersection
-     shader, with two closest-hits because one writes committed status 1 and
-     the other 2. Rewriter work in both implementations, not table work.
-  2. **Dynamic descriptor indexing**, still refused.
-  3. **Only then consider making the tier flip the default**, once enough real
+  1. **Dynamic descriptor indexing**, still refused. The last shape on the list
+     that is a limitation of this rewriter rather than a fact about DXR 1.0.
+  2. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
 
   Four accessors stay PERMANENTLY refused and must keep failing loudly:
@@ -633,11 +681,11 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     `PAYLOAD_BYTES` and `MaxPayloadSizeInBytes` move together or
     `CreateStateObject` fails.
   - One entry point, one query.
-  - Procedural primitives lower, via a generated intersection shader. A query
-    committing BOTH triangle and procedural hits does not, and that is the last
-    shader-side gap. A SCENE holding both kinds is fine either way now, unless
-    the application routed both to the same hit group record, which is
-    DETECTED from the instance data and refused rather than drawn wrong.
+  - Procedural primitives lower, via a generated intersection shader, and so
+    does a query committing BOTH kinds, via an any-hit and an intersection
+    shader from one loop body. A SCENE holding both kinds is fine too, unless
+    the application routed both to the SAME hit group record, which is DETECTED
+    from the instance data and refused rather than drawn wrong.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -1038,8 +1086,8 @@ clarity. The transform itself is a costed fork, see the position section.
 
 **Rewriter result (2026-09-21).** `phase5/rewriter/` automates the transform
 and reproduces both hand lowerings bit-exactly against WARP, 14450 and 8117 of
-65536 rays, 0 mismatches. It refuses nine distinct shapes it cannot lower, each
-provoked by a test. Opcodes are a whitelist; unknown ones stop the lowering
+65536 rays, 0 mismatches. It refuses eight distinct shapes it cannot lower,
+each provoked by a test. Opcodes are a whitelist; unknown ones stop the lowering
 rather than being guessed at.
 
 **Patterns 1 and 3 both work by hand (2026-09-21).** `phase5/hand/make_lib.py`
@@ -1107,6 +1155,9 @@ anything.
   existing test shaders work on it unchanged. With `--contrib` the two kinds
   land on different hit group records, which is the case the typed table
   serves; without it they share record 0, which is the case nothing can serve.
+- `--both` makes the harness build TWO hit groups and a two-record hit table,
+  for a library that commits both kinds. Only the `--lib` path needs it; the
+  proxy builds its own.
 - `DXR11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
   drains the InfoQueue. Both halves are needed: the layer reports through
   `OutputDebugString`, so without the drain a console sees nothing and its
@@ -1129,6 +1180,12 @@ this project a test passed for the wrong reason:
 
 The last one generalises: **an oracle that says nothing has to be shown capable
 of saying something**, on the same run, before its silence counts as a result.
+
+And one failure that was not a test at all, but the same shape of mistake. A
+CRLF `.ll` made the C++ rewriter refuse with a message about the query handle,
+which sent an hour after a phantom bug in a fresh port. **Run the OLD code
+through the NEW path before believing the new code is wrong.** It failed there
+too, which located the fault in the path immediately.
 
 A test that cannot fail has not been run. When a sensitivity check reports the
 same result as the real run, suspect the check first: diff what it actually

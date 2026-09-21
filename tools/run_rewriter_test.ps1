@@ -38,7 +38,16 @@ $cases = @(
        desc = 'the 11 accessors added after surveying Unreal' },
     @{ name = 'ids'; src = 'phase5\cases\rayquery_ids.ll'; pat = 'opaque'; flags = @('--multi');
        gt = @('--cs', 'phase5\cases\rayquery_ids.hlsl', '--multi');
-       desc = 'CommittedInstanceIndex and CommittedPrimitiveIndex, on a scene where both vary' }
+       desc = 'CommittedInstanceIndex and CommittedPrimitiveIndex, on a scene where both vary' },
+    # ONE loop body lowered TWICE, into an any-hit and an intersection shader,
+    # plus two closest-hits because the committed status differs. --both makes
+    # the harness build the two hit groups and a two-record hit table, and
+    # --mixed --contrib builds the scene that needs them: a triangle instance
+    # on record 0 and a procedural one on record 1.
+    @{ name = 'both'; src = 'phase5\cases\rayquery_both.ll'; pat = 'alpha';
+       flags = @('--mixed', '--contrib', '--both');
+       gt = @('--cs', 'phase5\cases\rayquery_both.hlsl', '--mixed', '--contrib');
+       desc = 'commits BOTH kinds: two hit groups from one Proceed loop' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

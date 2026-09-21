@@ -1650,40 +1650,118 @@ meeting a triangles hit group and quietly producing nothing, which is behaviour
 this project could only measure on one driver. Where the contributions are
 distinct, that slot now holds a proper procedural record that reports nothing.
 
+### A query that commits BOTH kinds: the last shader-side gap
+
+`phase5/cases/rayquery_both.hlsl` is one Proceed loop that commits a triangle
+hit in one arm and a procedural hit in the other. It now lowers, renders on the
+1070 and matches WARP bit-exactly.
+
+**One loop body, two shaders, and the substitution is what separates them.**
+Folding `CandidateType()` to `CANDIDATE_PROCEDURAL_PRIMITIVE` kills the
+triangle arm and the body becomes an intersection shader; folding it to
+`CANDIDATE_NON_OPAQUE_TRIANGLE` kills the procedural arm and the same body
+becomes an any-hit. That was already how the single-kind cases worked. What is
+new is emitting both from one module.
+
+**The dead arm still has to be valid IR**, and that is where the actual work
+was. Nothing folds the branch away at the text level, so both arms are emitted
+and one of them simply never runs. Each shader therefore has to lower opcodes
+belonging to the other kind:
+
+| In the intersection shader | Why |
+|---|---|
+| `CommitNonOpaqueTriangleHit` | dropped; nothing to lower it onto |
+| `CandidateTriangleBarycentrics` | constant; there is no attributes parameter to read |
+| `CandidateTriangleFrontFace` | constant; `HitKind()` is not available here |
+
+| In the any-hit shader | Why |
+|---|---|
+| `CommitProceduralPrimitiveHit` | dropped; an any-hit cannot report a procedural hit |
+| `CandidateProceduralPrimitiveNonOpaque` | constant; meaningless for a triangle candidate |
+
+The constants are substituted in the same pre-pass as `CandidateType`, not
+during emission, so the result does not depend on the order blocks happen to be
+written out in.
+
+**Two closest-hits**, because a triangle hit reports `COMMITTED_TRIANGLE_HIT`
+and a procedural one `COMMITTED_PROCEDURAL_PRIMITIVE_HIT`, and a closest-hit
+cannot say both: it does not know which hit group resolved to it. `ClosestHit`
+writes 1 and `ClosestHitProc` writes 2. Everything else keeps a single
+`ClosestHit`, so no other output moves by a byte.
+
+**Two real hit groups**, `HitGroup` (triangles, any-hit plus `ClosestHit`) and
+`HitGroupProc` (procedural, intersection plus `ClosestHitProc`), and the typed
+table puts each at the indices its geometry reaches.
+
+**The result**, on the mixed scene with the two kinds on different records:
+
+    WARP  65536 rays, 9160 hits
+    1070  65536 rays, 9160 hits        MATCH, 0 mismatches
+
+and bit-exact on `t` and the barycentrics, with the committed status matching
+ray by ray, since the harness compares the hit code exactly and this shader
+writes 1 for a triangle and 2 for a procedural hit.
+
+The scene is built so the answer does not depend on traversal order: the
+procedural commit reports the box's front face at z = 0.5, always nearer than
+the triangle at z = 0, so wherever both are hit the procedural one wins. That
+matters because RayQuery traversal order is implementation-defined and WARP is
+the oracle.
+
+### A trap in the .ll production path, worth not rediscovering
+
+Getting there cost an hour on a phantom bug in the port. A `.ll` produced with
+`dxc -dumpbin | Out-File` has CRLF line endings, and the C++ rewriter rejected
+it with
+
+    REFUSED: TraceRayInline at "..." does not use the query handle
+
+which is not remotely what was wrong. `SplitLines` kept the `\r`, so the
+body-end test, a line equality against `}`, never matched, the parser never
+left the function body, and the eventual complaint named something unrelated.
+The **Python tolerated it by accident**, because its patterns end in `\s*$` and
+`\r` is whitespace.
+
+Two things came out of it. The suite builds its `.ll` files with `dxc -Fc`,
+which writes LF, so nothing covered this. And the C++ now drops a trailing
+`\r`, so the two implementations agree on an input class neither test had.
+
+The diagnosis came from running the C++ on a **known-good** shader through the
+same path. It failed there too, which located the fault in the path rather than
+in the new code, immediately.
+
 ### What is still refused, and why it cannot be fixed here
 
 **Both kinds collapsed onto ONE record.** If the application gave its triangle
 and procedural instances the same `InstanceContributionToHitGroupIndex`, that
-slot would need a procedural record for the procedural geometry and a rejecting
-triangle record for the triangles. A record is one or the other. The
-application collapsed them and nothing in the shim can undo it:
+slot would need a procedural record for the procedural geometry and a triangle
+record for the triangles. A record is one or the other. This is now the only
+geometry case left, it applies to a both-kinds shader exactly as it did to a
+procedural one, and nothing in the shim can undo it:
 
     lowered RayQuery dispatch REFUSED: this shader commits procedural hits, and
     the scene routes BOTH triangle and procedural geometry to the same hit group
     record, which can only be one of the two. Nothing is drawn for it.
 
-**A shader that commits BOTH kinds ITSELF.** Still refused by the analysis, and
-unchanged by any of this. That needs the loop body lowered twice from one
-module, into an any-hit AND an intersection shader, with two closest-hits since
-one writes committed status 1 and the other 2. Separate work, in the rewriter
-rather than in the table.
-
 ### Regression
 
-12 checks in `.\tools\run_dispatch_test.ps1`: 10 render cases, all MATCH against
-WARP, plus two refusal gates, the tier flip staying off by default and the
-collapsed layout being declined. The rewriter suite is 9 cases byte-identical
-between the Python and the C++ with all 13 analysis checks behaving, every one
-of them re-signed with the two new stubs present. The probe on hardware still
-gives 14450 + 2312 + 48774 = 65536 on both argument-buffer shapes,
+13 checks in `.\tools\run_dispatch_test.ps1`: 11 render cases, all MATCH against
+WARP, plus two refusal gates. The rewriter suite is 10 cases byte-identical
+between the Python and the C++, on both the `.ll` path and the container path,
+with all 13 analysis checks behaving. The probe on hardware still gives
+14450 + 2312 + 48774 = 65536 on both argument-buffer shapes,
 `D3D12RaytracingHelloWorld` is 0 of 14400 pixels different,
 `D3D12RaytracingSimpleLighting` runs at baseline fps, and the debug layer is
 silent through the new state objects.
 
+One refusal test changed from a refusal to an ACCEPTANCE, since committing both
+kinds is now lowered. It checks the pattern NUMBER rather than merely that the
+shader was accepted: falling back to a neighbouring pattern would also be
+accepted, and would also be wrong.
+
 ## Next
 
-1. **A shader that commits both kinds**, which needs the loop body lowered
-   twice and two closest-hits. The only shader-side gap left.
-2. **Dynamic descriptor indexing**, still refused.
-3. **Only then consider making the tier flip the default**, once enough real
+1. **Dynamic descriptor indexing**, still refused. The last shape on the list
+   that is a rewriter limitation rather than a fact about DXR 1.0.
+2. **Only then consider making the tier flip the default**, once enough real
    software has run through it that the refusal list is trusted.

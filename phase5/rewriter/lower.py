@@ -144,6 +144,12 @@ def lower(module, q, exports=None):
     exports = exports or {'raygen': 'RayGen', 'anyhit': 'AnyHit',
                           'closesthit': 'ClosestHit', 'miss': 'Miss',
                           'intersection': 'Isect',
+                          # Only a both-kinds query uses this: a procedural
+                          # hit and a triangle hit report DIFFERENT committed
+                          # statuses, 2 and 1, and one closest-hit cannot say
+                          # both. Everything else keeps a single ClosestHit, so
+                          # no other output moves by a byte.
+                          'closesthitproc': 'ClosestHitProc',
                           # Hit groups that must never commit. A scene can
                           # route triangle and procedural geometry to
                           # DIFFERENT records, and the shim has a real hit
@@ -498,16 +504,16 @@ def _swap_declarations(text, q, globals_):
     return text
 
 
-def _append_shaders(text, module, q, exports, table, globals_):
-    # q is used below to decide whether the closest-hit fetches the matrix.
-    """Emit the generated shader set after the raygen."""
-    fns = []
-    if q.needs_intersection:
-        fns.append(_intersection(module, q, exports, table, globals_))
-    elif q.loop:
-        fns.append(_anyhit(module, q, exports, table, globals_))
+def _closesthit(name, status, q):
+    """The generated closest-hit, writing `status` as the committed kind.
+
+    A both-kinds query needs TWO of these. A triangle hit reports
+    COMMITTED_TRIANGLE_HIT and a procedural one
+    COMMITTED_PROCEDURAL_PRIMITIVE_HIT, and one shader cannot say both,
+    because it does not know which hit group resolved to it.
+    """
     ch = ['define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #1 {{'
-          .format(ch=exports['closesthit'], pl=PAYLOAD, at=ATTRS),
+          .format(ch=name, pl=PAYLOAD, at=ATTRS),
           '  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
           '  %ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
           '  %b = load <2 x float>, <2 x float>* %ap, align 4',
@@ -516,8 +522,7 @@ def _append_shaders(text, module, q, exports, table, globals_):
           '  %pb = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 1'.format(pl=PAYLOAD),
           '  store <2 x float> %b, <2 x float>* %pb, align 4',
           '  %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2'.format(pl=PAYLOAD),
-          '  store i32 %d, i32* %%ph, align 4'
-          % (2 if q.needs_intersection else 1)]
+          '  store i32 %d, i32* %%ph, align 4' % status]
     # The index fields. Emitted unconditionally: unused ones cost a dead call
     # the driver removes, and making them conditional is another place to get
     # the payload layout wrong.
@@ -544,7 +549,34 @@ def _append_shaders(text, module, q, exports, table, globals_):
                           '[12 x float]* %%pw, i32 0, i32 %d' % (s, s))
                 ch.append('  store float %%w%d, float* %%pw%d, align 4' % (s, s))
     ch += ['  ret void', '}']
-    fns.append('\n'.join(ch))
+    return '\n'.join(ch)
+
+
+def _append_shaders(text, module, q, exports, table, globals_):
+    # q is used below to decide whether the closest-hit fetches the matrix.
+    """Emit the generated shader set after the raygen."""
+    fns = []
+    if q.needs_both:
+        # ONE loop body, TWO shaders. The substitution of CandidateType is what
+        # separates them: folded to CANDIDATE_PROCEDURAL_PRIMITIVE the triangle
+        # arm dies and this is an intersection shader, folded to
+        # CANDIDATE_NON_OPAQUE_TRIANGLE the procedural arm dies and it is an
+        # any-hit. Each keeps the other's dead arm as valid but unreachable IR.
+        fns.append(_intersection(module, q, exports, table, globals_))
+        fns.append(_anyhit(module, q, exports, table, globals_))
+    elif q.needs_intersection:
+        fns.append(_intersection(module, q, exports, table, globals_))
+    elif q.loop:
+        fns.append(_anyhit(module, q, exports, table, globals_))
+
+    if q.needs_both:
+        # And two closest-hits, because the committed status differs and a
+        # closest-hit cannot tell which hit group resolved to it.
+        fns.append(_closesthit(exports['closesthit'], 1, q))
+        fns.append(_closesthit(exports['closesthitproc'], 2, q))
+    else:
+        fns.append(_closesthit(exports['closesthit'],
+                               2 if q.needs_intersection else 1, q))
     fns.append('''define void @{ms}({pl}* noalias nocapture %p) #1 {{
   %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2
   store i32 0, i32* %ph, align 4
@@ -611,6 +643,19 @@ def _intersection(module, q, exports, table, globals_):
                 # Only non-opaque procedural primitives ever reach a Proceed
                 # loop, so this is a tautology here, as CandidateType is.
                 subst[i.result] = 'true'
+            elif i.dxop == rq.CANDIDATE_BARY:
+                # Triangle barycentrics have NO source in an intersection
+                # shader: there is no attributes parameter to read them from.
+                # This only appears in the triangle arm, which CandidateType
+                # has just folded away, so it is dead. A constant keeps the IR
+                # valid without pretending to a value. Substituted in the same
+                # pre-pass as the others, so it does not depend on the order
+                # blocks happen to be emitted in.
+                subst[i.result] = '0.000000e+00'
+            elif i.dxop == rq.CANDIDATE_FRONT_FACE:
+                # Likewise: HitKind() is not available in an intersection
+                # shader, and this is in the dead triangle arm.
+                subst[i.result] = 'false'
 
     order = [header] + sorted(l for l in body if l not in (header, latch))
     out = ['define void @%s() #1 {' % exports['intersection'],
@@ -631,7 +676,13 @@ def _intersection(module, q, exports, table, globals_):
             out.append('')
             out.append('%s:' % label[1:])
         for i in blk.instrs:
-            if i.dxop in (rq.CANDIDATE_TYPE, rq.CANDIDATE_PROC_NON_OPAQUE):
+            if i.dxop in (rq.CANDIDATE_TYPE, rq.CANDIDATE_PROC_NON_OPAQUE,
+                          rq.CANDIDATE_BARY, rq.CANDIDATE_FRONT_FACE):
+                continue
+            if i.dxop == rq.COMMIT_NON_OPAQUE:
+                # A TRIANGLE commit, in the arm CandidateType folded away.
+                # Dead, and an intersection shader has nothing to lower it
+                # onto, so it simply goes.
                 continue
             if i.dxop == rq.COMMIT_PROCEDURAL:
                 t = rq_operand(i.args[2])
@@ -691,6 +742,11 @@ def _anyhit(module, q, exports, table, globals_):
                 # An any-hit shader runs only for non-opaque triangle
                 # candidates, so this test is a tautology here.
                 subst[i.result] = '0'
+            elif i.dxop == rq.CANDIDATE_PROC_NON_OPAQUE:
+                # Meaningless for a triangle candidate, and in the arm
+                # CandidateType has just folded away. Dead, but it still has to
+                # be a value.
+                subst[i.result] = 'false'
 
     # Abort() has no direct DXR 1.0 equivalent. An any-hit shader can only
     # IgnoreHit (reject and CONTINUE) or AcceptHitAndEndSearch (accept and
@@ -741,7 +797,13 @@ def _anyhit(module, q, exports, table, globals_):
             out.append('')
             out.append('%s:' % label[1:])
         for i in blk.instrs:
-            if i.dxop == rq.CANDIDATE_TYPE or i.dxop == rq.COMMIT_NON_OPAQUE:
+            if i.dxop in (rq.CANDIDATE_TYPE, rq.COMMIT_NON_OPAQUE,
+                          rq.CANDIDATE_PROC_NON_OPAQUE):
+                continue
+            if i.dxop == rq.COMMIT_PROCEDURAL:
+                # A PROCEDURAL commit, in the arm CandidateType folded away.
+                # Dead, and an any-hit shader cannot report a procedural hit,
+                # so it simply goes.
                 continue
             if i.dxop == rq.ABORT:
                 out.append('  store i32 1, i32* %rq.pab, align 4')
@@ -834,12 +896,19 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
     ann_miss = node('!%d, !%d' % (ret, par_payload))
 
     ann = ['i32 1', 'void ()* @%s' % exports['raygen'], '!%d' % ann_raygen]
-    if q.needs_intersection:
+    if q.needs_both:
+        # An intersection shader is void(), so it annotates like the raygen.
+        ann += ['void ()* @%s' % exports['intersection'], '!%d' % ann_raygen]
+        ann += ['void %s* @%s' % (sig_h, exports['anyhit']), '!%d' % ann_hit]
+    elif q.needs_intersection:
         # An intersection shader is void(), so it annotates like the raygen.
         ann += ['void ()* @%s' % exports['intersection'], '!%d' % ann_raygen]
     elif q.loop:
         ann += ['void %s* @%s' % (sig_h, exports['anyhit']), '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_h, exports['closesthit']), '!%d' % ann_hit]
+    if q.needs_both:
+        ann += ['void %s* @%s' % (sig_h, exports['closesthitproc']),
+                '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
     ann += ['void %s* @%s' % (sig_h, exports['anyhitnull']), '!%d' % ann_hit]
     # An intersection shader is void(), so it annotates like the raygen.
@@ -866,13 +935,18 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
         return node('void %s* @%s, !"%s", null, null, !%d'
                     % (sig, name, name, pid))
 
-    if q.needs_intersection:
+    if q.needs_both:
+        eps.append(entry(exports['intersection'], '()', 8, False, False))
+        eps.append(entry(exports['anyhit'], sig_h, 9, True, True))
+    elif q.needs_intersection:
         # Shader kind 8. An intersection shader carries neither a payload size
         # nor an attribute size, exactly as DXC emits it.
         eps.append(entry(exports['intersection'], '()', 8, False, False))
     elif q.loop:
         eps.append(entry(exports['anyhit'], sig_h, 9, True, True))
     eps.append(entry(exports['closesthit'], sig_h, 10, True, True))
+    if q.needs_both:
+        eps.append(entry(exports['closesthitproc'], sig_h, 10, True, True))
     eps.append(entry(exports['miss'], sig_p, 11, True, False))
     eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
     eps.append(entry(exports['isectnull'], '()', 8, False, False))

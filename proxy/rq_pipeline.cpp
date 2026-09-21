@@ -30,6 +30,7 @@ struct Xform {
     std::string why;
     bool hasAnyHit = false;
     bool hasIntersection = false;
+    bool needsBoth = false;
     int threads[3] = { 1, 1, 1 };
 };
 
@@ -47,6 +48,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     if (!l.ok) { *why = l.error; return false; }
     x->hasAnyHit = a.query.NeedsAnyHit();
     x->hasIntersection = a.query.NeedsIntersection();
+    x->needsBoth = a.query.NeedsBoth();
     *out = l.text;
     return true;
 }
@@ -94,20 +96,29 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     libDesc.DXILLibrary.pShaderBytecode = lib.data();
     libDesc.DXILLibrary.BytecodeLength = lib.size();
 
+    // A hit group is one TYPE, taking an intersection shader where the other
+    // takes an any-hit. A shader that commits both kinds therefore needs TWO,
+    // each with its own closest-hit, because one reports committed status 1
+    // and the other 2.
     D3D12_HIT_GROUP_DESC hg{};
     hg.HitGroupExport = L"HitGroup";
     hg.ClosestHitShaderImport = L"ClosestHit";
-    if (x.hasIntersection) {
-        // A procedural hit group is a different TYPE and takes an intersection
-        // shader where a triangle one takes an any-hit. The two are mutually
-        // exclusive, which is why the rewriter refuses a query that commits
-        // both kinds.
+    if (x.needsBoth) {
+        hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        hg.AnyHitShaderImport = L"AnyHit";
+    } else if (x.hasIntersection) {
         hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
         hg.IntersectionShaderImport = L"Isect";
     } else {
         hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
         if (x.hasAnyHit) hg.AnyHitShaderImport = L"AnyHit";
     }
+
+    D3D12_HIT_GROUP_DESC hgProc{};
+    hgProc.HitGroupExport = L"HitGroupProc";
+    hgProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+    hgProc.IntersectionShaderImport = L"Isect";
+    hgProc.ClosestHitShaderImport = L"ClosestHitProc";
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
     sc.MaxPayloadSizeInBytes = kPayloadBytes;
@@ -137,10 +148,12 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     hgNullProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
     hgNullProc.IntersectionShaderImport = L"IsectNull";
 
-    D3D12_STATE_SUBOBJECT subs[7]{};
+    D3D12_STATE_SUBOBJECT subs[8]{};
     UINT n = 0;
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
+    if (x.needsBoth)
+        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc };
@@ -176,7 +189,10 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     const void* idHit = props->GetShaderIdentifier(L"HitGroup");
     const void* idNullTri = props->GetShaderIdentifier(L"HitGroupNullTri");
     const void* idNullProc = props->GetShaderIdentifier(L"HitGroupNullProc");
-    if (!idRay || !idMiss || !idHit || !idNullTri || !idNullProc) {
+    const void* idHitProc =
+        x.needsBoth ? props->GetShaderIdentifier(L"HitGroupProc") : nullptr;
+    if (!idRay || !idMiss || !idHit || !idNullTri || !idNullProc ||
+        (x.needsBoth && !idHitProc)) {
         props->Release(); so->Release();
         *why = "the state object does not export RayGen, Miss, HitGroup and the "
                "two rejecting hit groups";
@@ -194,12 +210,15 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     self->m_rootSig = desc->pRootSignature;
     if (self->m_rootSig) self->m_rootSig->AddRef();
     for (int i = 0; i < 3; ++i) self->m_threads[i] = static_cast<UINT>(x.threads[i]);
-    self->m_isProcedural = x.hasIntersection;
+    // A both-kinds shader serves both; otherwise exactly one.
+    self->m_servesProc = x.hasIntersection;
+    self->m_servesTri = x.needsBoth || !x.hasIntersection;
     std::memcpy(self->m_idRay, idRay, kIdSize);
     std::memcpy(self->m_idMiss, idMiss, kIdSize);
     std::memcpy(self->m_idHit, idHit, kIdSize);
     std::memcpy(self->m_idNullTri, idNullTri, kIdSize);
     std::memcpy(self->m_idNullProc, idNullProc, kIdSize);
+    if (idHitProc) std::memcpy(self->m_idHitProc, idHitProc, kIdSize);
     props->Release();
 
     // One record of the real hit group to begin with. The acceleration
@@ -215,8 +234,9 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
              "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
              static_cast<size_t>(desc->CS.BytecodeLength), lib.size(),
              self->m_threads[0], self->m_threads[1], self->m_threads[2],
-             x.hasIntersection ? ", with a generated intersection shader"
-                               : (x.hasAnyHit ? ", with a generated any-hit shader" : ""));
+             x.needsBoth ? ", with a generated any-hit AND intersection shader"
+                 : x.hasIntersection ? ", with a generated intersection shader"
+                 : (x.hasAnyHit ? ", with a generated any-hit shader" : ""));
     return self;
 }
 
@@ -261,21 +281,27 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     // One record per index, of the TYPE the geometry reaching that index needs.
     // The application's contributions decide which slot a hit lands on; this
     // decides what is in the slot.
-    const uint8_t mine = m_isProcedural ? astrack::kReachProcedural
-                                        : astrack::kReachTriangles;
-    const uint8_t other = m_isProcedural ? astrack::kReachTriangles
-                                         : astrack::kReachProcedural;
     for (UINT i = 0; i < hitRecords; ++i) {
         const uint8_t reach = i < kinds.size() ? kinds[i] : astrack::kReachNone;
+        const bool tri = (reach & astrack::kReachTriangles) != 0;
+        const bool proc = (reach & astrack::kReachProcedural) != 0;
+
+        // Default to the shader's own hit group, which is right for a slot
+        // reached by the kind it serves, by both when it serves only one, or
+        // by nothing at all. A slot reached by BOTH when the shader serves
+        // both is unservable and was refused before this call.
         const void* id = m_idHit;
-        // Reached ONLY by the kind this shader does not serve: give it a
-        // record of THAT kind which finds nothing, so the geometry is
-        // traversed correctly and simply produces no hit. A slot reached by
-        // our own kind, by both, or by nothing at all keeps the real record.
-        // Both is only possible for a triangle-only shader, since the
-        // procedural case is refused before it gets here.
-        if ((reach & other) && !(reach & mine))
-            id = m_isProcedural ? m_idNullTri : m_idNullProc;
+        if (proc && !tri) {
+            // Procedural only: the real procedural group if there is one, and
+            // otherwise a procedural record that reports nothing, so the
+            // geometry is traversed with a record of the right TYPE.
+            id = m_servesProc ? (m_servesTri ? m_idHitProc : m_idHit)
+                              : m_idNullProc;
+        } else if (tri && !proc) {
+            // Triangles only. m_idHit is already the triangle group whenever
+            // the shader serves triangles at all.
+            id = m_servesTri ? m_idHit : m_idNullTri;
+        }
         std::memcpy(p + 2 * slot + i * stride, id, kIdSize);
     }
     sbt->Unmap(0, nullptr);
@@ -316,18 +342,19 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
             return;
         }
         UINT rejecting = 0;
-        const uint8_t mine = m_isProcedural ? astrack::kReachProcedural
-                                            : astrack::kReachTriangles;
-        const uint8_t other = m_isProcedural ? astrack::kReachTriangles
-                                             : astrack::kReachProcedural;
-        for (uint8_t k : recordKinds)
-            if ((k & other) && !(k & mine)) ++rejecting;
+        for (uint8_t k : recordKinds) {
+            const bool tri = (k & astrack::kReachTriangles) != 0;
+            const bool proc = (k & astrack::kReachProcedural) != 0;
+            if (proc && !tri && !m_servesProc) ++rejecting;
+            else if (tri && !proc && !m_servesTri) ++rejecting;
+        }
         ProxyLog("[dxr11-proxy] shader table rebuilt for the scene: %u -> %u hit "
-                 "group records, %u of them rejecting (%s geometry this shader "
-                 "does not serve).\n",
+                 "group records, %u of them rejecting geometry this shader does "
+                 "not serve (it commits %s).\n",
                  static_cast<unsigned>(had),
                  static_cast<unsigned>(recordKinds.size()), rejecting,
-                 m_isProcedural ? "triangle" : "procedural");
+                 (m_servesTri && m_servesProc) ? "both kinds"
+                     : m_servesProc ? "procedural hits" : "triangle hits");
     }
 
     D3D12_DISPATCH_RAYS_DESC d = m_desc;

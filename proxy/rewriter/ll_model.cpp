@@ -19,12 +19,25 @@ const std::regex kBlockLabel(R"(^([\w.$-]+):)");
 }  // namespace
 
 std::vector<std::string> SplitLines(const std::string& s) {
+    // A trailing carriage return is DROPPED. Without that, a CRLF .ll parses
+    // wrongly and SILENTLY: the body-end test is a line equality against "}",
+    // which "}\r" fails, so the parser never leaves the function body and the
+    // eventual complaint names something unrelated. The Python tolerates CRLF
+    // by accident, because its patterns end in `\s*$` and \r is whitespace,
+    // so the two implementations disagreed on an input neither test covered
+    // and the disagreement did not look like one.
     std::vector<std::string> out;
     std::string cur;
     for (char c : s) {
-        if (c == '\n') { out.push_back(cur); cur.clear(); }
-        else cur.push_back(c);
+        if (c == '\n') {
+            if (!cur.empty() && cur.back() == '\r') cur.pop_back();
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
     }
+    if (!cur.empty() && cur.back() == '\r') cur.pop_back();
     out.push_back(cur);
     return out;
 }

@@ -56,6 +56,26 @@ def expect_reject(name, text, must_mention):
         return True
 
 
+def expect_pattern(name, text, want):
+    """Accepted AND classified as `want`.
+
+    Plain acceptance is too weak for a case that used to be refused: falling
+    back to a NEIGHBOURING pattern would still be accepted and would still be
+    wrong.
+    """
+    try:
+        q = rayquery.analyze(Module(text))
+        got = q.pattern()[0]
+        if got != want:
+            print('  FAILED   %-34s pattern %d, expected %d' % (name, got, want))
+            return False
+        print('  ok       %-34s pattern %d' % (name, got))
+        return True
+    except rayquery.Unsupported as e:
+        print('  FAILED   %-34s unexpectedly refused: %s' % (name, e))
+        return False
+
+
 def main():
     if not os.path.isfile(OPAQUE):
         sys.exit('run build_phase5.bat first')
@@ -149,9 +169,12 @@ def main():
         ok.append(expect_reject('CommittedGeometryIndex', geom,
                                 'itself a Tier 1.1 feature'))
 
-    # Committing BOTH triangle and procedural hits needs a shader table with a
-    # record per geometry type, and a map from the application's instances to
-    # those records that only its acceleration structure builds carry.
+    # Committing BOTH kinds is no longer refused: the loop body lowers twice,
+    # into an any-hit and an intersection shader, with two closest-hits because
+    # the committed status differs. So this case flips from a refusal to an
+    # ACCEPTANCE, and it still earns its place, because mutating the procedural
+    # input is the cheapest way to build a both-kinds module and the result has
+    # to classify as pattern 5 rather than falling back to 4.
     PROC = os.path.join('phase5', 'cases', 'rayquery_proc.ll')
     if os.path.isfile(PROC):
         # ADD a triangle commit beside the procedural one; replacing it would
@@ -165,8 +188,7 @@ def main():
             m.group(0),
             m.group(0) + '\n  call void '
             '@dx.op.rayQuery_CommitNonOpaqueTriangleHit(i32 182, i32 %s)' % handle)
-        ok.append(expect_reject('triangle AND procedural commits', mixed,
-                                'either triangles or procedural'))
+        ok.append(expect_pattern('triangle AND procedural commits', mixed, 5))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

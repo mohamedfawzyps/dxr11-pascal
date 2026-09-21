@@ -42,11 +42,12 @@ public:
     // real pipeline state.
     static Dxr11RayQueryPso* From(ID3D12PipelineState* p);
 
-    // True when the lowered shader commits PROCEDURAL hits, so its hit group
-    // carries an intersection shader instead of an any-hit one. That decides
+    // True when the lowered shader commits PROCEDURAL hits. That decides
     // whether the scene's geometry can be served by it, which the caller asks
-    // the acceleration structure tracker about.
-    bool CommitsProcedural() const { return m_isProcedural; }
+    // the acceleration structure tracker about. A shader that commits BOTH
+    // kinds says true here as well: the slot it cannot serve is one holding
+    // both kinds at once, whichever else it handles.
+    bool CommitsProcedural() const { return m_servesProc; }
 
     // Issue the work the application asked for as Dispatch. The ray grid is
     // the thread group count times the shader's numthreads, because the
@@ -104,12 +105,18 @@ private:
     // held until the pipeline itself dies. Growth is monotonic and rare, so
     // this stays a handful of small buffers.
     std::vector<ID3D12Resource*> m_retired;
-    bool m_isProcedural = false;
+    // Which geometry kinds the lowered shader actually commits. Both can be
+    // true, and that is the case with two real hit groups.
+    bool m_servesTri = false;
+    bool m_servesProc = false;
     // The identifiers, kept so the table can be rebuilt without going back to
     // the state object. m_idNullTri and m_idNullProc are the hit groups that
     // never commit, one per geometry type.
     uint8_t m_idRay[32]{}, m_idMiss[32]{}, m_idHit[32]{};
     uint8_t m_idNullTri[32]{}, m_idNullProc[32]{};
+    // Only a both-kinds shader has a second REAL hit group: one of each type,
+    // with its own closest-hit, because the committed status differs.
+    uint8_t m_idHitProc[32]{};
     // What the current table was built for, so a rebuild happens when the
     // scene's layout changes and not otherwise.
     std::vector<uint8_t> m_kinds;

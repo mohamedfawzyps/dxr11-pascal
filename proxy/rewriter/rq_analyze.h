@@ -108,6 +108,12 @@ struct Query {
     bool NeedsAnyHit() const { return hasLoop && procCommits.empty(); }
     // A procedural commit means the loop body is an INTERSECTION shader.
     bool NeedsIntersection() const { return !procCommits.empty(); }
+    // Commits of BOTH kinds, so the loop body becomes TWO shaders. A hit group
+    // is either triangles or procedural, never both, so this needs two of
+    // them, and two closest-hits as well, because one writes committed status
+    // 1 and the other 2. Which record a geometry resolves to is the scene's
+    // business, handled by the typed shader table.
+    bool NeedsBoth() const { return !commits.empty() && !procCommits.empty(); }
 };
 
 struct AnalyzeResult {

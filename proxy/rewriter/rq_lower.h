@@ -31,6 +31,11 @@ struct Exports {
     std::string closesthit = "ClosestHit";
     std::string miss = "Miss";
     std::string intersection = "Isect";
+    // Only a both-kinds query uses this: a procedural hit and a triangle hit
+    // report DIFFERENT committed statuses, 2 and 1, and one closest-hit cannot
+    // say both. Everything else keeps a single ClosestHit, so no other output
+    // moves by a byte.
+    std::string closesthitproc = "ClosestHitProc";
     // Hit groups that must never commit. A scene can route triangle and
     // procedural geometry to DIFFERENT records, and the shim has a real hit
     // group for only one of those kinds; the other index gets a record of the

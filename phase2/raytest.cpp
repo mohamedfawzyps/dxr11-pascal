@@ -283,6 +283,10 @@ static bool g_contrib = false;
 static bool g_proc = false;
 // One triangle instance and one procedural instance under one TLAS.
 static bool g_mixed = false;
+// The lowered library commits BOTH kinds, so it exports two hit groups and the
+// hit table needs a record for each. Record 0 is triangles and record 1 is
+// procedural, which is what --mixed --contrib builds.
+static bool g_both = false;
 
 static bool g_table = false;
 static const UINT kTableSize = 4;
@@ -844,6 +848,26 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
 }
 
 // A shader table with one record: just a 32-byte identifier, table 64-aligned.
+// Records inside one table are aligned to 32, the table itself to 64.
+static const UINT kHitRecStride = D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT;
+
+// Two hit group records in one table, for a library that commits both kinds.
+static ComPtr<ID3D12Resource> MakeSBT2(ID3D12Device* dev, const void* a,
+                                       const void* b) {
+    const UINT idSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES; // 32
+    UINT64 size = (kHitRecStride * 2 + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1)
+                & ~(UINT64)(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1);
+    auto buf = CreateBuffer(dev, size, D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    uint8_t* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(buf->Map(0, &none, (void**)&p), "map SBT2");
+    std::memset(p, 0, (size_t)size);
+    std::memcpy(p, a, idSize);
+    std::memcpy(p + kHitRecStride, b, idSize);
+    buf->Unmap(0, nullptr);
+    return buf;
+}
+
 static ComPtr<ID3D12Resource> MakeSBT(ID3D12Device* dev, const void* ident) {
     const UINT idSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES; // 32
     UINT64 size = (idSize + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1)
@@ -918,7 +942,13 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     hg.HitGroupExport = L"HitGroup";
     hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
     hg.ClosestHitShaderImport = L"ClosestHit";
-    if (g_proc) {
+    if (g_both) {
+        // A library that commits both kinds exports an any-hit AND an
+        // intersection shader, and two closest-hits, because the committed
+        // status differs. So it needs two hit groups: this one for triangles
+        // and hgProc below for procedural primitives.
+        hg.AnyHitShaderImport = L"AnyHit";
+    } else if (g_proc) {
         // A procedural hit group takes an intersection shader instead of an
         // any-hit one, and is a different hit group TYPE.
         hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
@@ -927,6 +957,15 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
         hg.AnyHitShaderImport = L"AnyHit";
     }
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg });
+
+    D3D12_HIT_GROUP_DESC hgProc{};
+    if (g_both) {
+        hgProc.HitGroupExport = L"HitGroupProc";
+        hgProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+        hgProc.IntersectionShaderImport = L"Isect";
+        hgProc.ClosestHitShaderImport = L"ClosestHitProc";
+        subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc });
+    }
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
     // Must be at least the payload the rewriter emits, PAYLOAD_BYTES in
@@ -958,7 +997,13 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
 
     auto sbtRayGen = MakeSBT(g.device.Get(), props->GetShaderIdentifier(L"RayGen"));
     auto sbtMiss   = MakeSBT(g.device.Get(), props->GetShaderIdentifier(L"Miss"));
-    auto sbtHit    = MakeSBT(g.device.Get(), props->GetShaderIdentifier(L"HitGroup"));
+    // One record per InstanceContributionToHitGroupIndex the scene uses. With
+    // --both that is two: the triangle instance contributes 0 and the
+    // procedural one 1, which is what --mixed --contrib builds.
+    auto sbtHit = g_both
+        ? MakeSBT2(g.device.Get(), props->GetShaderIdentifier(L"HitGroup"),
+                   props->GetShaderIdentifier(L"HitGroupProc"))
+        : MakeSBT(g.device.Get(), props->GetShaderIdentifier(L"HitGroup"));
 
     D3D12_DISPATCH_RAYS_DESC dr{};
     const UINT idSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
@@ -968,8 +1013,8 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     dr.MissShaderTable.SizeInBytes = idSize;
     dr.MissShaderTable.StrideInBytes = idSize;
     dr.HitGroupTable.StartAddress = sbtHit->GetGPUVirtualAddress();
-    dr.HitGroupTable.SizeInBytes = idSize;
-    dr.HitGroupTable.StrideInBytes = idSize;
+    dr.HitGroupTable.SizeInBytes = g_both ? kHitRecStride * 2 : idSize;
+    dr.HitGroupTable.StrideInBytes = g_both ? kHitRecStride : idSize;
     dr.Width = kWidth; dr.Height = kHeight; dr.Depth = 1;
 
     g.list->SetPipelineState1(so.Get());
@@ -1205,6 +1250,10 @@ int main(int argc, char** argv) {
                 g_proc = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--both") == 0) {
+                g_both = true;
                 continue;
             }
             if (std::strcmp(argv[i], "--mixed") == 0) {

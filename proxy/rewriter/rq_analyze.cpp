@@ -279,23 +279,10 @@ AnalyzeResult Analyze(const llm::Module& m) {
 
     // Classify here rather than on demand, so a shape with no defined lowering
     // is refused by analysis itself.
-    if (q.NeedsIntersection()) {
-        // A hit group is EITHER triangles or procedural, never both, and which
-        // one a geometry uses is selected by
-        // InstanceContributionToHitGroupIndex, which the APPLICATION set when
-        // it built its acceleration structures. Supporting a shader that
-        // commits both would need the shim to track the geometry type of every
-        // BLAS. Refuse rather than build a shader table that is wrong.
-        if (!q.commits.empty()) {
-            r.error = "query commits BOTH triangle and procedural hits. A hit "
-                      "group is either triangles or procedural, and which one a "
-                      "geometry uses is selected by "
-                      "InstanceContributionToHitGroupIndex, which the application "
-                      "set when it built its acceleration structures. Supporting "
-                      "this needs the shim to track the geometry type of every "
-                      "BLAS, which it does not.";
-            return r;
-        }
+    if (q.NeedsBoth()) {
+        q.patternNum = 5;
+        q.patternDesc = "both triangle and procedural commits (two hit groups)";
+    } else if (q.NeedsIntersection()) {
         q.patternNum = 4;
         q.patternDesc = "procedural primitives (generated intersection shader)";
     } else if (q.NeedsAnyHit()) {

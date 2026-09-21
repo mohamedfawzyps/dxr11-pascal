@@ -69,7 +69,13 @@ $cases = @(
     # this scene gives 15418 hits against WARP's 7396, the 8022 difference
     # being exactly the triangle hits. So this case fails if the typing stops.
     @{ name = 'mixedproc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--mixed', '--contrib');
-       desc = 'procedural shader on a mixed scene, triangles on their own record' }
+       desc = 'procedural shader on a mixed scene, triangles on their own record' },
+    # The last shader-side gap: ONE Proceed loop that commits BOTH kinds. It
+    # lowers to an any-hit AND an intersection shader from the same body, plus
+    # two closest-hits, because a triangle hit reports committed status 1 and a
+    # procedural one 2. Two REAL hit groups, one per record.
+    @{ name = 'both'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_both.hlsl', '--mixed', '--contrib');
+       desc = 'a query committing BOTH triangle and procedural hits' }
 )
 
 $failed = 0

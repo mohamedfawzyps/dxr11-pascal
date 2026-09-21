@@ -201,26 +201,24 @@ class Query(object):
         """A procedural commit means the loop body is an INTERSECTION shader."""
         return bool(self.proc_commits)
 
+    @property
+    def needs_both(self):
+        """Commits of BOTH kinds, so the loop body becomes TWO shaders.
+
+        A hit group is either triangles or procedural, never both, so this
+        needs two of them, and two closest-hits as well, because one writes
+        committed status 1 and the other 2. The scene side of it is the shim's
+        problem: which record a geometry resolves to is chosen by
+        InstanceContributionToHitGroupIndex, which the APPLICATION set. That is
+        handled by the typed shader table, and is refused only when the
+        application routed both kinds to the SAME record.
+        """
+        return bool(self.commits) and bool(self.proc_commits)
+
     def pattern(self):
+        if self.needs_both:
+            return 5, 'both triangle and procedural commits (two hit groups)'
         if self.needs_intersection:
-            # A hit group is EITHER triangles or procedural, never both, and
-            # which one a geometry uses is chosen by
-            # InstanceContributionToHitGroupIndex, which the APPLICATION set
-            # when it built its acceleration structures. A shader that commits
-            # both kinds would need a shader table with a record per geometry
-            # type and a map from the app's instances to those records, which
-            # means intercepting every BuildRaytracingAccelerationStructure and
-            # tracking the geometry type of every BLAS. The shim does not do
-            # that, so refuse rather than build a table that is wrong.
-            if self.commits:
-                raise Unsupported(
-                    'query commits BOTH triangle and procedural hits. A hit '
-                    'group is either triangles or procedural, and which one a '
-                    'geometry uses is selected by '
-                    'InstanceContributionToHitGroupIndex, which the application '
-                    'set when it built its acceleration structures. Supporting '
-                    'this needs the shim to track the geometry type of every '
-                    'BLAS, which it does not.')
             return 4, 'procedural primitives (generated intersection shader)'
         if self.needs_anyhit:
             return 3, 'alpha-tested closest hit (generated any-hit shader)'
