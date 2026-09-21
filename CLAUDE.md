@@ -75,8 +75,45 @@ Version 1.
   sends every shader out to text and back before D3D12 sees it and still
   reports ALL MATCH, so a round-tripped `lib_6_3` builds a working state object
   on the 1070 and renders bit-exactly.
-  Next action: hand-edit `rayquery_opaque.ll` into a library and put it through
-  `dxilrt asm`, before writing any rewriter.
+- Phase 5 pattern 1: **WORKING on the GTX 1070, lowered by hand.**
+  `phase5/hand/make_lib.py` edits `rayquery_opaque.ll`, a `cs_6_5` compute
+  shader using `RayQuery<RAY_FLAG_FORCE_OPAQUE>`, into a `lib_6_5` DXR library
+  purely as text. Against WARP's native Tier 1.1 RayQuery as ground truth:
+  14450 of 65536 rays hit on both, 0 mismatches, max |dt| 0.000000. So a
+  RayQuery shader transformed as text runs correctly on Tier 1.0 hardware.
+  That is the Phase 5 premise demonstrated end to end, for one pattern.
+
+  The work was specified by the validator, not guessed. The first attempt
+  changed exactly one thing, `cs` to `lib`, and asked; it named both root
+  causes, and the recon had predicted both.
+
+  Facts worth carrying into the rewriter:
+  - Library resource handles come from `createHandleForLib` (160) applied to a
+    loaded global, NOT `createHandle` (57) applied to a binding index. So the
+    resources have to become real globals and `!dx.resources` has to point at
+    them instead of `undef`.
+  - **The CFG needs no changes at all**, phi nodes included. `CommittedStatus`
+    was already compared against `COMMITTED_TRIANGLE_HIT` (1), and the
+    generated `ClosestHit` writes `hit = 1` while `Miss` writes `0`, so loading
+    the payload's hit field is the identical test.
+  - **Exports need no MSVC mangling.** DXC emits `\01?RayGen@@YAXXZ`, but plain
+    `@RayGen` works and `RDAT` exposes it under exactly that name.
+  - LLVM numbers unnamed values sequentially, so added values must be NAMED.
+    The reverse also bites and the recon missed it: DELETING a numbered value
+    breaks the sequence. Removing the rayQuery values `%33` and `%34` made the
+    assembler refuse with "instruction expected to be numbered '%33'".
+    Replacement instructions have to take those exact numbers, or the function
+    has to be renumbered wholesale.
+
+  Next action: pattern 3 by hand, `rayquery_alpha.ll`. It has the rotated
+  `Proceed` loop, so it exercises the any-hit loop-body extraction that pattern
+  1 skipped entirely. That is the part with no precedent here. Automate only
+  after it works by hand.
+
+  Still unknown, worth settling before automating: whether a shader that binds
+  through descriptor tables rather than root descriptors, or declares more than
+  one query, still fits this shape. Everything proven so far is one shader with
+  three root-level bindings.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -432,6 +469,12 @@ code never moves between modules, so its resource bindings and handles cannot be
 got wrong in transit. Emitting a container from scratch is pointless when the
 input module already has the right resources, handles and types.
 
+**Pattern 1 result (2026-09-21).** `phase5/hand/make_lib.py` lowers
+`rayquery_opaque.ll` into a `lib_6_5` library as text, and it renders
+bit-exactly against WARP on the 1070: 14450 of 65536 rays, 0 mismatches. The
+method that worked was to change ONE thing, the shader model, and let the
+validator enumerate the rest. Do the same for pattern 3.
+
 Key facts for the transform, all read off real DXC 1.10 output:
 - `AllocateRayQuery` is 178, confirmed. But **dispatch on the opcode immediate,
   not the callee name**: 184 and 185 are the same LLVM function, as are 193 and
@@ -466,6 +509,19 @@ ends matter less now that the text level is available:
 WARP is the oracle throughout. It implements Tier 1.1 correctly in software,
 so any RayQuery shader can be run there for ground truth and diffed against
 the lowered version on the 1070. No RTX card needed.
+
+`raytest.exe` carries the Phase 5 hooks:
+- `--lib <file.dxil>` makes the TraceRay side load a pre-built library from
+  disk instead of compiling HLSL, so anything the rewriter produces can be held
+  against the same ground truth.
+- `--roundtrip` sends every shader out to `.ll` text and back before D3D12 sees
+  it. `--rtpoison` does the same but corrupts the lowered side on purpose, and
+  must DIVERGE.
+
+Check sensitivity before believing a pass. Twice in this project a test passed
+for the wrong reason: the `-gfxsplit` control re-bound a PSO the test had
+abandoned, and the first `--rtpoison` corrupted BOTH sides so they still agreed
+with each other. A test that cannot fail has not been run.
 
 ## Working method
 
