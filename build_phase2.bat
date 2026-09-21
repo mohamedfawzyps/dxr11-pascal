@@ -15,14 +15,11 @@ set "DXC=%DXC_SDK_DIR%"
 if "%DXC%"=="" set "DXC=C:\DW\DXC"
 set "AGILITY=%~1"
 if "%AGILITY%"=="" set "AGILITY=%AGILITY_SDK_DIR%"
-if "%AGILITY%"=="" (
-  echo Provide the Agility SDK path, e.g.:  build_phase2.bat C:\path\to\agility
-  echo (the folder that contains build\native\include\d3d12.h and build\native\bin\x64\D3D12Core.dll^)
-  echo Get it via NuGet: nuget install Microsoft.Direct3D.D3D12
-  exit /b 1
-)
+if "%AGILITY%"=="" set "AGILITY=C:\DW\microsoft.direct3d.d3d12.1.619.5"
 if not exist "%AGILITY%\build\native\include\d3d12.h" (
   echo d3d12.h not found under "%AGILITY%\build\native\include".
+  echo Pass the Agility SDK path, e.g.:  build_phase2.bat C:\path\to\agility
+  echo Get it via NuGet: nuget install Microsoft.Direct3D.D3D12
   exit /b 1
 )
 where cl >nul 2>nul || (

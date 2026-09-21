@@ -46,7 +46,7 @@ using Microsoft::WRL::ComPtr;
   #define DXRTEST_AGILITY_VERSION D3D12_SDK_VERSION
 #endif
 #ifndef DXRTEST_AGILITY_VERSION
-  #define DXRTEST_AGILITY_VERSION 614u   // override with -DDXRTEST_AGILITY_VERSION=NNN
+  #define DXRTEST_AGILITY_VERSION 619u   // matches SDK 1.619.x; override with -DDXRTEST_AGILITY_VERSION=NNN
 #endif
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = DXRTEST_AGILITY_VERSION; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
