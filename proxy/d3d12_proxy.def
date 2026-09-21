@@ -1,9 +1,33 @@
+; Ordinals must match the real system d3d12.dll exactly.
+; The Windows SDK's d3d12.lib imports D3D12CreateDevice BY ORDINAL (101), not by
+; name, so a proxy that exports the right names with linker-assigned ordinals
+; fails to load with STATUS_ORDINAL_NOT_FOUND (0xC0000138).
+;
+; Real table (Win11 26100, dumpbin /exports C:\Windows\System32\d3d12.dll):
+;    99 [NONAME]                          105 D3D12CoreRegisterLayers
+;   100 SetAppCompatStringPointer         106 D3D12CreateRootSignatureDeserializer
+;   101 D3D12CreateDevice                 107 D3D12CreateVersionedRootSignatureDeserializer
+;   102 D3D12GetDebugInterface            108 D3D12DeviceRemovedExtendedData
+;   103 D3D12CoreCreateLayeredDevice      109 D3D12EnableExperimentalFeatures
+;   104 D3D12CoreGetLayeredDeviceSize     110 D3D12GetInterface
+;                                         111 D3D12PIXEventsReplaceBlock
+;                                         112 D3D12PIXGetThreadInfo
+;                                         113 D3D12PIXNotifyWakeFromFenceSignal
+;                                         114 D3D12PIXReportCounter
+;                                         115 D3D12SerializeRootSignature
+;                                         116 D3D12SerializeVersionedRootSignature
+;                                         117 GetBehaviorValue
+;
+; Only the publicly documented entry points are implemented here. The rest are
+; internal (layering, PIX, appcompat) with undocumented signatures; they are left
+; unexported for now and their absence is measured, not assumed.
+
 EXPORTS
-D3D12CreateDevice
-D3D12GetDebugInterface
-D3D12SerializeRootSignature
-D3D12SerializeVersionedRootSignature
-D3D12CreateRootSignatureDeserializer
-D3D12CreateVersionedRootSignatureDeserializer
-D3D12EnableExperimentalFeatures
-D3D12GetInterface
+D3D12CreateDevice                             @101
+D3D12GetDebugInterface                        @102
+D3D12CreateRootSignatureDeserializer          @106
+D3D12CreateVersionedRootSignatureDeserializer @107
+D3D12EnableExperimentalFeatures               @109
+D3D12GetInterface                             @110
+D3D12SerializeRootSignature                   @115
+D3D12SerializeVersionedRootSignature          @116

@@ -12,42 +12,143 @@ load the real runtime by full System32 path, so forwarding never recurses.
 
 ## Staged plan
 
-- 3a (done): forwarding-only. Exports the d3d12 entry points, forwards each to
-  the real d3d12.dll, and logs D3D12CreateDevice to confirm the app runs through
-  us. Fully transparent, no device wrapping.  Source: `proxy/d3d12_proxy.cpp`,
-  exports in `proxy/d3d12_proxy.def`.
+- 3a: forwarding-only. Exports the d3d12 entry points, forwards each to the real
+  d3d12.dll, and logs D3D12CreateDevice to confirm the app runs through us.
+  Fully transparent, no device wrapping. Source: `proxy/d3d12_proxy.cpp`,
+  exports in `proxy/d3d12_proxy.def`. **PASSED, see Result below.**
 - 3b (next): wrap the returned `ID3D12Device5` (and the interfaces it hands out
   that we will later intercept), forwarding every method unchanged, and
   re-verify the sample. This is the seat for Phase 4/5 (tier spoof,
   CreateStateObject, command-list interception).
 
+## Exports must match the real DLL's ORDINALS, not just its names
+
+This was the one real finding of 3a, and it is not obvious.
+
+The Windows SDK's `d3d12.lib` imports **`D3D12CreateDevice` by ordinal 101**,
+not by name. `dumpbin /imports` on any app linked against it shows:
+
+    d3d12.dll
+                       Ordinal   101
+                     E D3D12SerializeRootSignature
+
+So a proxy that exports all the right *names* but lets the linker assign
+ordinals 1..N fails at load time with `STATUS_ORDINAL_NOT_FOUND`
+(`0xC0000138`), before any of our code runs. The first build did exactly that.
+
+The real table (Win11 26100, `dumpbin /exports C:\Windows\System32\d3d12.dll`),
+ordinal base 99:
+
+| Ord | Name | Ord | Name |
+|---|---|---|---|
+| 99 | *[NONAME]* | 109 | D3D12EnableExperimentalFeatures |
+| 100 | SetAppCompatStringPointer | 110 | D3D12GetInterface |
+| 101 | D3D12CreateDevice | 111 | D3D12PIXEventsReplaceBlock |
+| 102 | D3D12GetDebugInterface | 112 | D3D12PIXGetThreadInfo |
+| 103 | D3D12CoreCreateLayeredDevice | 113 | D3D12PIXNotifyWakeFromFenceSignal |
+| 104 | D3D12CoreGetLayeredDeviceSize | 114 | D3D12PIXReportCounter |
+| 105 | D3D12CoreRegisterLayers | 115 | D3D12SerializeRootSignature |
+| 106 | D3D12CreateRootSignatureDeserializer | 116 | D3D12SerializeVersionedRootSignature |
+| 107 | D3D12CreateVersionedRootSignatureDeserializer | 117 | GetBehaviorValue |
+| 108 | D3D12DeviceRemovedExtendedData | | |
+
+`proxy/d3d12_proxy.def` now pins each implemented export to its real ordinal.
+
+**Verified:** the 8 publicly documented entry points are enough for both test
+apps. **Not verified:** whether the internal ones (layering, PIX, appcompat,
+NONAME 99) are ever needed. They are left unexported deliberately, so that an
+app that wants one fails by name rather than silently misbehaving. Note they
+cannot be added as .def forwarders, because a forwarder names a module and
+`d3d12` would resolve back to this proxy in the app directory; they would need
+either asm tail-jump thunks or known signatures.
+
 ## Build (Windows x64)
 
     build_proxy.bat            -> d3d12.dll
+    build_sample.bat           -> sampletest\D3D12RaytracingHelloWorld.exe
+    build_sample.bat "" debug  -> sampletest\HelloWorldDbg.exe (D3D12 debug layer on)
 
-## Validate against a Microsoft DXR sample
+## Result: 3a PASSED (2026-09-21)
 
-1. Get microsoft/DirectX-Graphics-Samples and build a DXR 1.0 sample, e.g.
-   `Samples/Desktop/D3D12Raytracing/src/D3D12RaytracingSimpleLighting`
-   (or HelloWorld / ProceduralGeometry), x64.
-2. Copy our `d3d12.dll` into the sample's output folder, next to its `.exe`.
-3. Run the sample. It should render exactly as before.
-4. Check `%TEMP%\dxr11_proxy.log`: it should contain the "attached to process"
-   line and a `D3D12CreateDevice ... hr=0x00000000` line, proving the app went
-   through the proxy.
+Two independent DXR 1.0 apps, both on the GTX 1070, both through the proxy.
 
-To confirm the proxy is really the one being used, temporarily rename it and the
-sample should still run (using the system dll); restore it and the log should
-reappear.
+**1. `raytest.exe`, the Phase 2 harness.** Headless, builds a BLAS and TLAS,
+creates a state object and shader table, and runs `DispatchRays` on both WARP
+and the 1070. Through the proxy it still produces the Phase 2 result exactly:
 
-## Status
+    opaque: 65536 rays, 14450 hits, 0 mismatches, max |dt| 0.000000
+    alpha : 65536 rays,  8117 hits, 0 mismatches, max |dt| 0.000000
+    OVERALL: ALL MATCH
 
-- 3a written; not yet built/validated on the dev machine. Forwarders are thin
-  and the export set covers what the MS DXR samples import; if the sample fails
-  to load, the missing export name will name itself and we add it.
+The log caught all four device creations (WARP and hardware, twice):
+
+    [dxr11-proxy] attached to process
+    [dxr11-proxy] D3D12CreateDevice fl=0xc000 hr=0x00000000 device=00000268EECA6E90
+    ... x4
+
+**2. `D3D12RaytracingHelloWorld`, the Microsoft DXR 1.0 sample.** Windowed,
+swapchain, continuous frames, Agility SDK runtime. Ran 8 seconds with and
+without the proxy and the window was captured at t=5s in both runs:
+
+| | baseline | through proxy |
+|---|---|---|
+| fps | ~2140 | ~2140 |
+| Mrays/s | ~1970 | ~1970 |
+| frame | 1280x720, 14813 distinct colours | identical |
+| pixel diff | - | **0 differing pixels, max channel delta 0** |
+
+Proxy log from the sample run:
+
+    [dxr11-proxy] attached to process
+    [dxr11-proxy] D3D12CreateDevice fl=0xb000 hr=0x00000001 device=0000000000000000
+    [dxr11-proxy] D3D12CreateDevice fl=0xb000 hr=0x00000000 device=0000021FF78F41B0
+    [dxr11-proxy] D3D12CreateDevice fl=0xb000 hr=0x00000000 device=0000021FF7D02E10
+
+The first line is `hr = S_FALSE` with a null device: that is the documented
+capability-probe form of `D3D12CreateDevice` (null `ppDevice`), used by
+`DeviceResources` to test feature level support. Not an error.
+
+The proxy is transparent. Proceed to 3b.
+
+## Building the MS sample without NuGet
+
+`build_sample.bat` compiles the sample straight out of the
+DirectX-Graphics-Samples checkout with `cl.exe`, leaving that repo untouched.
+The upstream `.vcxproj` needs two NuGet packages and `nuget.exe` is not
+installed here; the sample has no PIX *code*, only the msbuild import, so PIX is
+skipped and the Agility SDK already at `C:\DW\microsoft.direct3d.d3d12.1.619.5`
+is used. The `FxCompile` step is reproduced by hand as
+`dxc -T lib_6_3 -Vn g_pRaytracing -Fh CompiledShaders\Raytracing.hlsl.h`.
+
+### Upstream bug in the sample, patched at build time
+
+`D3D12RaytracingHelloWorld::m_descriptorsAllocated`
+(`D3D12RaytracingHelloWorld.h:65`) is never initialised by the constructor. It
+is only zeroed in `ReleaseDeviceDependentResources()`, which does not run before
+the first `CreateDeviceDependentResources()`. So `AllocateDescriptor()` reads an
+uninitialised member on the first init and computes a garbage descriptor index:
+
+    D3D12 ERROR: ID3D12Device::CreateUnorderedAccessView: Specified CPU
+    descriptor handle ptr=0x000000058F3E5B82 does not refer to a location in a
+    descriptor heap. [ EXECUTION ERROR #646: INVALID_DESCRIPTOR_HANDLE ]
+
+followed by a ~5 second stall and an access violation (`0xC0000005`). The sample
+object is a local in `WinMain`, so whether this bites depends on stack contents;
+it reproduced every time with this toolchain, and it reproduces **without the
+proxy present**, so it is not ours. `build_sample.bat` adds
+`m_descriptorsAllocated(0)` to the constructor init list of a generated copy of
+the `.cpp`, and fails loudly if the anchor text moves.
+
+Worth remembering for later phases: a garbage descriptor handle on Pascal
+presents as a GPU hang plus an AV, not a clean error return. The D3D12 debug
+layer named it immediately. Build with `build_sample.bat "" debug` and capture
+`OutputDebugString` to get that output.
 
 ## Notes
 
 - We only proxy d3d12.dll. dxgi.dll is left to the system.
-- PIX exports are not forwarded; the MS samples do not import them. Add them if a
-  target app needs them.
+- The Agility SDK loads fine through the proxy: both test apps export
+  `D3D12SDKVersion` / `D3D12SDKPath` and pick up `.\D3D12\D3D12Core.dll`.
+  That matters, because the tier we will eventually spoof is reported by
+  D3D12Core, not by the System32 stub.
+- `sampletest\` is build output and is gitignored.

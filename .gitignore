@@ -12,3 +12,10 @@ d3d12.dll
 *.lib
 *.exp
 *.ilk
+
+# MS sample build output (build_sample.bat)
+sampletest/
+
+# DXC runtime copied next to the exes by the build scripts
+dxcompiler.dll
+dxil.dll

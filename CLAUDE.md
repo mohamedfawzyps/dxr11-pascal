@@ -7,10 +7,15 @@ Version 1.
 - Phase 1 signing test: PASSED. See below and docs/phase1-signing.md.
 - Phase 2 hand-lowering test: PASSED, bit-exact on both patterns. See
   docs/phase2-lowering.md.
-- Phase 3a forwarding-only proxy: written, NOT yet built or validated.
-  Next action: run `build_proxy.bat`, drop `d3d12.dll` beside a Microsoft DXR
-  1.0 sample exe, confirm it renders and that `%TEMP%\dxr11_proxy.log` shows
-  the D3D12CreateDevice line. Then Phase 3b, the ID3D12Device5 wrapper.
+- Phase 3a forwarding-only proxy: PASSED, built and validated on both the
+  Phase 2 harness and the Microsoft DXR 1.0 sample. See docs/phase3-proxy.md.
+  Next action: Phase 3b, the ID3D12Device5 wrapper.
+
+  One finding worth carrying forward: a proxy d3d12.dll must match the real
+  DLL's export ORDINALS, not just its names. The Windows SDK's d3d12.lib
+  imports D3D12CreateDevice by ordinal 101, so a name-only proxy dies at load
+  with STATUS_ORDINAL_NOT_FOUND (0xC0000138) before any of our code runs.
+  `proxy/d3d12_proxy.def` pins all eight implemented exports to real ordinals.
 
 Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\dxr11-pascal` - this repository.
@@ -19,7 +24,10 @@ Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\microsoft.direct3d.d3d12.1.619.5` - Agility SDK.
 - `C:\DW\DirectX-Graphics-Samples` - Microsoft samples, source of the DXR 1.0
   app used to validate the proxy.
-- Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`.
+- Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`,
+  `build_sample.bat`.
+  `build_sample.bat` builds the Microsoft DXR 1.0 sample used to validate the
+  proxy, with cl.exe and no NuGet restore, into `sampletest\`.
   Each calls `setup_msvc.bat`, which finds MSVC via vswhere and activates the
   x64 toolchain, so they work from any terminal. Running them from an
   "x64 Native Tools Command Prompt for VS" also still works, the helper
@@ -186,6 +194,17 @@ tolerance allowed. The lowering is sound for these patterns; proceed to Phase 3.
 
 Proxy `d3d12.dll`. Wrap `ID3D12Device5` and friends, forward everything
 unchanged, verify a real DXR 1.0 app still runs through it. No translation yet.
+
+**Result: 3a PASSED (2026-09-21).** Forwarding-only proxy, no device wrapping.
+Detail in docs/phase3-proxy.md. Validated on two DXR 1.0 apps on the GTX 1070:
+- `raytest.exe` (the Phase 2 harness) still reports ALL MATCH through the proxy,
+  and the log catches all four device creations.
+- `D3D12RaytracingHelloWorld` (Microsoft sample, windowed, swapchain, Agility
+  SDK) renders **pixel-identical** to the no-proxy baseline, 0 differing pixels,
+  same ~2140 fps.
+
+3b next: wrap the returned `ID3D12Device5`, forwarding every method unchanged,
+and re-verify. That wrapper is the seat for Phase 4 and 5.
 
 ### Phase 4: the three non-shader features (1-2 weeks)
 
