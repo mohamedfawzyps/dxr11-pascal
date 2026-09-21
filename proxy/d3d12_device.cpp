@@ -13,6 +13,7 @@
 #include "queue_hook.h"
 #include "d3d12_command_list.h"
 #include "command_signature.h"
+#include "dxil_scan.h"
 
 #include <windows.h>
 #include <new>
@@ -20,6 +21,72 @@
 
 // FWD(method, args...) - forward to the real device, returning its result.
 #define FWD(call) return m_real->call
+
+// --- RayQuery detection ----------------------------------------------------
+//
+// Groundwork for running the rewriter in the proxy, and useful on its own. The
+// brief requires that a RayQuery shader be detected and reported clearly
+// rather than handed to a driver that cannot run it.
+//
+// The proxy still reports Tier 1.0, so a well behaved application should never
+// emit RayQuery at all. Seeing this log therefore means one of two things: the
+// tier has been flipped and the rewriter is needed, or an application is
+// ignoring the reported tier. Both are worth knowing about.
+//
+// Detection does NOT change what is forwarded. On Tier 1.0 the driver rejects
+// these shaders on its own, and replacing its error with ours would hide
+// information without adding any. The log is the clarity; the behaviour is
+// unchanged until the rewriter can actually do something about it.
+static void NoteRayQuery(bool tier11, const char* where, const void* code, SIZE_T size) {
+    if (!code || !size || !Dxr11ContainerUsesRayQuery(code, size)) return;
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    ProxyLog("[dxr11-proxy] %s: shader USES RAYQUERY (SFI0 bit 20), %zu bytes.\n",
+             where, (size_t)size);
+    ProxyLog("[dxr11-proxy]   tier reported to the app is %s. The DXIL rewriter "
+             "is not wired in yet, so this is forwarded unchanged and the "
+             "driver will decide.\n", tier11 ? "1.1" : "1.0");
+}
+
+// A pipeline state stream is a packed sequence of subobjects, each a type enum
+// followed by its payload, with every entry aligned to a pointer. Walk it far
+// enough to find a compute shader; anything unrecognised ends the walk, since
+// the size of an unknown payload is unknowable.
+static void NoteRayQueryInStream(bool tier11, const D3D12_PIPELINE_STATE_STREAM_DESC* d) {
+    if (!d || !d->pPipelineStateSubobjectStream) return;
+    const BYTE* p = static_cast<const BYTE*>(d->pPipelineStateSubobjectStream);
+    SIZE_T left = d->SizeInBytes;
+    const SIZE_T align = sizeof(void*);
+    while (left >= sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+        memcpy(&type, p, sizeof(type));
+        const SIZE_T head = (sizeof(type) + align - 1) & ~(align - 1);
+        if (left < head) return;
+
+        SIZE_T payload = 0;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+            payload = sizeof(D3D12_SHADER_BYTECODE);
+            if (left < head + payload) return;
+            D3D12_SHADER_BYTECODE bc{};
+            memcpy(&bc, p + head, sizeof(bc));
+            NoteRayQuery(tier11, "CreatePipelineState", bc.pShaderBytecode,
+                         (SIZE_T)bc.BytecodeLength);
+        } else {
+            // Not a shader, and its size is not knowable from here.
+            return;
+        }
+        const SIZE_T step = (head + payload + align - 1) & ~(align - 1);
+        if (step > left) return;
+        p += step; left -= step;
+    }
+}
 
 Dxr11Device::Dxr11Device(ID3D12Device5* real)
     : m_real(real), m_tier11(false), m_real6(nullptr), m_real7(nullptr), m_refs(1) {
@@ -150,7 +217,14 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandQueue(const D3D12_COMMAND_QU
 }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** ppCommandAllocator) { FWD(CreateCommandAllocator(type, riid, ppCommandAllocator)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateGraphicsPipelineState(pDesc, riid, ppPipelineState)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) {
+    // The main path: RayQuery lives in compute shaders far more often than
+    // anywhere else, because that is where a DXR 1.1 engine puts it.
+    if (pDesc)
+        NoteRayQuery(m_tier11, "CreateComputePipelineState",
+                     pDesc->CS.pShaderBytecode, (SIZE_T)pDesc->CS.BytecodeLength);
+    FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState));
+}
 // Wrapped, not hooked. Hooking a command list does not work: it swaps to a
 // per-object heap vtable, so the shared image vtable present here is abandoned
 // before the app records anything, and a hook installed here never fires.
@@ -231,7 +305,10 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::SetResidencyPriority(UINT NumObjects, ID3
 
 // --- ID3D12Device2 ----------------------------------------------------------
 
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreatePipelineState(pDesc, riid, ppPipelineState)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) {
+    NoteRayQueryInStream(m_tier11, pDesc);
+    FWD(CreatePipelineState(pDesc, riid, ppPipelineState));
+}
 
 // --- ID3D12Device3 ----------------------------------------------------------
 
@@ -266,6 +343,19 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateMetaCommand(REFGUID CommandId, UINT
 // object it intends to grow. We strip the flag, forward, and keep a deep copy of
 // what was asked for so AddToStateObject can rebuild from it later.
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject) {
+    // RayQuery is legal inside a DXR 1.1 raygen or miss shader too, so the
+    // libraries here are worth checking even though compute is the common case.
+    if (pDesc && pDesc->pSubobjects) {
+        for (UINT i = 0; i < pDesc->NumSubobjects; ++i) {
+            const auto& so = pDesc->pSubobjects[i];
+            if (so.Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !so.pDesc)
+                continue;
+            auto* lib = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(so.pDesc);
+            NoteRayQuery(m_tier11, "CreateStateObject",
+                         lib->DXILLibrary.pShaderBytecode,
+                         (SIZE_T)lib->DXILLibrary.BytecodeLength);
+        }
+    }
     if (m_tier11 || !pDesc) FWD(CreateStateObject(pDesc, riid, ppStateObject));
 
     // Only objects the app intends to grow need any of this.

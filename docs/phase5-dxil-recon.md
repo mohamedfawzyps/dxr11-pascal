@@ -805,19 +805,104 @@ primitive land in each other's slots, after diffing to confirm the edit applied:
 differ is affected by a swap. That the number falls out at exactly half is
 independent evidence the scene varies both indices as intended.
 
+## Into the proxy: detection is in, the transform is a separate decision
+
+Wiring the rewriter into the proxy splits into two halves that turned out to be
+very different in size. The first is done; the second needs a decision that is
+not mine to make silently.
+
+### Detection, and why it costs almost nothing
+
+The brief requires that a RayQuery shader be detected and reported clearly
+rather than handed to a driver that cannot run it. That sounded like it needed
+a bitcode parser inside the proxy. It does not.
+
+MEASURED across every shader in `phase5`:
+
+    plain compute shader        SFI0 = 0x0
+    every RayQuery shader       SFI0 = 0x100000
+    DXC-built DXR 1.0 library   SFI0 = 0x0
+    the rewriter's own output   SFI0 = 0x0
+
+`SFI0` is the container's Shader Feature Info part, eight bytes, and bit 20 is
+the Tier 1.1 feature bit. So detection is a container walk and a mask, with no
+LLVM involved. `proxy/dxil_scan.{h,cpp}` is the whole of it.
+
+That the rewriter's OUTPUT reads 0x0 is worth noting on its own: the lowered
+library correctly stops claiming Tier 1.1, which is what lets the driver accept
+it.
+
+Hooked in three places, since RayQuery can arrive by any of them:
+
+- `CreateComputePipelineState`, the common case, because that is where a DXR
+  1.1 engine puts RayQuery;
+- `CreatePipelineState`, walking the subobject stream far enough to find a
+  shader, and stopping at anything whose payload size is not knowable;
+- `CreateStateObject`, checking each DXIL library, since RayQuery is legal in a
+  raygen or miss shader too.
+
+Detection does **not** change what is forwarded. On Tier 1.0 the driver rejects
+these shaders anyway, and replacing its error with ours would hide information
+without adding any. The log is the clarity.
+
+Verified: `raytest` through the proxy reports the RayQuery compute shader by
+its exact size, 4788 bytes. The DXR 1.0 probe and `D3D12RaytracingHelloWorld`
+stay **silent**, so DXR 1.0 libraries do not false-positive, and the sample is
+still pixel-identical at unchanged fps.
+
+### The transform is a much larger commitment, and it is a fork
+
+The rewriter is about 1100 lines of Python. The proxy is a C++ DLL loaded into
+an application's process. There is no version of "call the Python from the DLL"
+that is acceptable in a game's address space, so the transform cannot simply be
+wired in the way detection was.
+
+There is a second problem that is easy to miss. **The rewriter works on text,
+and the proxy receives bitcode.** So a C++ port does not only need the analysis
+and the lowering; it needs disassembly and assembly as well. Those exist, in
+`dxcompiler.dll` (`IDxcCompiler::Disassemble`, `IDxcAssembler`) and `dxil.dll`
+(signing, as Phase 1 established), which means **the shim would have to ship
+and load DXC at runtime.** For a compatibility shim that is probably acceptable,
+but it is a real deployment consequence and not an implementation detail.
+
+The realistic options:
+
+1. **Port the analysis and lowering to C++**, and load `dxcompiler.dll` plus
+   `dxil.dll` from the proxy for the text conversion and signing. Honest, but
+   comparable in size to all of Phase 5 so far, and adds two large runtime
+   dependencies.
+2. **Work on bitcode directly** in C++, avoiding the DXC dependency. Removes
+   the shipping problem and reinstates the one the recon measured away: writing
+   LLVM 3.7 bitcode. Strictly worse unless the DXC dependency is unacceptable.
+3. **Keep the Python rewriter as an offline tool** and have the proxy substitute
+   pre-lowered shaders by hash. This is the Phase 1 fallback, and its coverage
+   is limited to shaders someone has already lowered, which does not meet the
+   project's no-application-modification goal.
+
+Option 1 is the only one that meets the goal, and it should be started with
+open eyes about its size rather than drifted into.
+
+### What this does NOT unblock
+
+Reporting Tier 1.1 still cannot be turned on. Detection tells us when RayQuery
+arrives; it does nothing about it. The tier flip and a working in-proxy
+transform have to land together, exactly as the brief says, because a shim that
+claims 1.1 and then fails is worse than one that claims 1.0.
+
 ## Next
 
-Six render cases and twelve analysis checks, all passing. Two independent
-shaders have now been written and both found something the Phase 2 pair could
-not: the first a false refusal, the second a Tier 1.1 feature with no lowering
-at all.
+Detection is in the proxy and the regression is unchanged. The transform is a
+decision, not a next step: see the three options above. Option 1, porting the
+analysis and lowering to C++ with DXC loaded for text conversion and signing,
+is the only one that meets the project's goal, and it is a piece of work the
+size of Phase 5 so far.
 
-1. **Wire the rewriter into the proxy**, at `CreateStateObject` and the compute
-   pipeline path. This is now the largest untested gap, and it forces the tier
-   question: reporting Tier 1.1 entitles an app to emit RayQuery, so the flip
-   and a working rewriter have to land together, with anything refused failing
-   loudly rather than rendering wrong.
-2. **Dynamic descriptor indexing**, currently refused.
-3. More independent shaders, since the first two each found a real defect.
-   Untried and plausible: `RayQuery` with a non-default `RAY_FLAG` combination,
-   `Abort()`, procedural primitives, and committed object-space accessors.
+Smaller things that do not depend on that decision:
+
+1. **Dynamic descriptor indexing**, currently refused.
+2. More independent shaders. Both written so far found something the Phase 2
+   pair could not. Untried: non-default `RAY_FLAG` combinations, `Abort()`,
+   procedural primitives, committed object-space accessors.
+3. A check that the rewriter's output is rejected by nothing in the proxy path,
+   by feeding a lowered library through `CreateStateObject` on the proxy rather
+   than through the test harness directly.
