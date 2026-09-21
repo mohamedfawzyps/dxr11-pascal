@@ -11,9 +11,15 @@ patterns, 0 mismatches. Run `.\tools\run_dispatch_test.ps1`.
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
 was missing. Nothing in this project implements ray tracing.
 
-**Coverage is measured against a real engine: 20 of the 24 accessors Unreal
-uses.** It was 8. What remains is procedural primitives, plus four that are
-permanently refused.
+**ALL THE LOWERING IS DONE.** Unreal uses 25 distinct RayQuery accessors and
+**everything with a DXR 1.0 equivalent is now supported: 21 of 25.** The other
+four are permanently refused because DXR 1.0 offers nothing to lower them onto.
+
+**What remains is NOT shader translation.** The shim builds shader tables
+without knowing the application's geometry layout, which blocks mixed
+triangle-and-procedural queries AND, already today, any application that sets a
+nonzero `InstanceContributionToHitGroupIndex`. Both need acceleration structure
+interception. See the entries below.
 See the entries below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
@@ -340,7 +346,7 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   - **Unreal Engine 5.7** is the real RayQuery code available, nine files under
     `Engine/Shaders/Private`. They cannot be compiled standalone, so this is a
     SURVEY, not an execution test.
-  - **Epic uses 24 accessors; the rewriter supports 8.** Nothing of Epic's
+  - **Epic uses 25 accessors; the rewriter supports 8.** Nothing of Epic's
     would lower today. The biggest gaps, `CandidatePrimitiveIndex` and
     `CandidateInstanceIndex`, are used 11 times each, as often as
     `CommittedRayT`.
@@ -370,7 +376,7 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   after inlining, which the rewriter refuses, needs the compiled DXIL and so
   needs the engine.
 
-- The 11 accessors: **DONE, coverage 8 of 24 becomes 19 of 24.** Added to both
+- The 11 accessors: **DONE, coverage 8 of 25 becomes 19 of 25.** Added to both
   implementations, byte-identical, and render-verified on the 1070 by
   `phase5/cases/rayquery_acc.hlsl`.
   - The operand shape is IDENTICAL on both sides apart from the query handle,
@@ -402,7 +408,7 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     this project. **A test whose premise is a fact about the world needs
     re-checking when that fact changes.**
 
-- `Abort()` (181): **DONE, coverage 20 of 24.**
+- `Abort()` (181): **DONE, coverage 20 of 25.**
   - The brief offered `AcceptHitAndEndSearch()` or a payload flag. Only the
     flag works in general: **a DXR 1.0 any-hit shader has no "reject and
     stop".** Its two terminators are `IgnoreHit()`, which rejects and
@@ -430,11 +436,41 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   WARP can establish it. **This is the first thing in the project the oracle
   cannot settle.**
 
+- Procedural primitives: **DONE. 7396 hits, bit-exact, on the 1070.**
+  `CommitProceduralPrimitiveHit` is 183, `CandidateProceduralPrimitiveNonOpaque`
+  190; on the DXR 1.0 side `reportHit` is 158 and an intersection shader is
+  kind 8, carrying neither a payload nor an attribute size.
+
+  **The lowering is one body, two substitutions, two shaders.** The intersection
+  shader is the SAME Proceed loop body as the any-hit, with one substitution
+  changed: an any-hit folds `CandidateType()` to 0, the intersection folds it to
+  1, so the triangle branch dies and the procedural branch survives.
+  `CommitProceduralPrimitiveHit(t)` becomes `ReportHit(t, 0, attrs)`, and every
+  way out of the body becomes a plain `ret void`, because an intersection
+  shader has no accept or reject terminator: reporting IS accepting, and
+  returning reports nothing. The closest-hit writes status 2, not 1.
+
+  **The obstacle is not in the lowering.** A query committing BOTH triangle and
+  procedural hits is REFUSED, and not out of laziness. A hit group is either
+  triangles or procedural, and which one a geometry uses is selected by
+  `InstanceContributionToHitGroupIndex`, which the APPLICATION set when it built
+  its acceleration structures; a BLAS also carries only one geometry type. The
+  shim would have to intercept every `BuildRaytracingAccelerationStructure` and
+  track the geometry type of every BLAS. **Epic's shaders DO mix**, so this is
+  the difference between procedural working and procedural being useful.
+
+- **A limitation that applies TODAY, including to triangles.** The shim builds
+  ONE hit group record and dispatches with `RayContributionToHitGroupIndex`,
+  `MultiplierForGeometryContributionToShaderIndex` and `MissShaderIndex` all
+  zero, so every geometry resolves to record 0. That is correct only while
+  every instance has `InstanceContributionToHitGroupIndex = 0`. True of every
+  scene here; not guaranteed of a real one. Same fix as above.
+
   Next action, in order of value.
-  1. **Procedural primitives.** `CommitProceduralPrimitiveHit` needs a
-     generated INTERSECTION shader, which this project has never built. The
-     last piece of lowering, genuinely new work rather than another table
-     entry, and it takes coverage to 21, the practical maximum against Unreal.
+  1. **Acceleration structure interception.** Tracking the geometry type of
+     every BLAS and the contribution index of every instance unblocks BOTH the
+     mixed query and the nonzero contribution case. Largest remaining piece,
+     and it is dispatch machinery rather than shader translation.
   2. **Dynamic descriptor indexing**, still refused.
   3. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
@@ -933,6 +969,13 @@ hypothesis.
 
 State clearly what is verified versus inferred. Flag uncertainty rather than
 guessing.
+
+**Byte-identity has TWO blind spots, both found the hard way.** It proves the
+two implementations AGREE, not that either is right: they shared the phi
+blindness identically. And it compares OUTPUTS, so it cannot see a missing
+REFUSAL, which is how the C++ silently lost the Python's "loop body branches
+outside the loop" check and emitted identical bytes for everything tested while
+disagreeing about what to reject.
 
 **When porting, require identical OUTPUT, not passing tests.** Both
 implementations get checked against the same cases, so a shared

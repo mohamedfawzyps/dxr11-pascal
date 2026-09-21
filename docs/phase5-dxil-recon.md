@@ -1112,7 +1112,11 @@ need UE's preprocessor and a great deal of engine plumbing, so this is a SURVEY
 and not an execution test. It answers a narrower question honestly: what would
 a shipping engine need that this project has not thought of?
 
-### The answer: 8 of 24 accessors
+### The answer: 8 of 25 accessors
+
+(The survey first reported 24. Re-deriving the list by enumerating it gives 25,
+an off-by-one carried through several entries below before it was caught. The
+numbers here are the corrected ones.)
 
 Counting distinct RayQuery accessors across Epic's Lumen and RayTracing
 shaders, by frequency:
@@ -1176,7 +1180,7 @@ refuses, or merely separate functions, which is fine, cannot be determined by
 reading the source. It needs the compiled DXIL, and compiling it needs the
 engine.
 
-## The 11 accessors: coverage 8 of 24 becomes 19 of 24
+## The 11 accessors: coverage 8 of 25 becomes 19 of 25
 
 The survey said 11 of the 16 gaps were mechanically addable. They are added,
 in both implementations, and they work.
@@ -1249,11 +1253,11 @@ re-checking when that fact changes.
     12 of 12 refusals behaved
     five shaders end to end through the proxy on the 1070, all MATCH
 
-Coverage against Unreal's 24 accessors goes from 8 to 19. What remains is the
+Coverage against Unreal's 25 accessors goes from 8 to 19. What remains is the
 four permanently blocked (geometry index and instance contribution to hit group
 index) and `CommitProceduralPrimitiveHit` plus `Abort()`.
 
-## Abort(): 20 of 24, and a limit on what can be verified
+## Abort(): 20 of 25, and a limit on what can be verified
 
 `Abort()` is opcode 181. The brief offers two mappings, and only one of them is
 exact, which is the interesting part.
@@ -1315,7 +1319,7 @@ for someone to assume the green tick covers it.
 
 ### Where that leaves coverage
 
-Twenty of Unreal's 24 accessors. What remains is
+Twenty of Unreal's 25 accessors. What remains is
 `CommitProceduralPrimitiveHit`, needing the generated intersection shader, and
 the four that are permanently refused.
 
