@@ -34,6 +34,14 @@ if errorlevel 1 exit /b 1
 call :build traceray_alpha  lib_6_3
 if errorlevel 1 exit /b 1
 
+rem Hand-written cases that are not derived from the Phase 2 pair. These exist
+rem to find what the rewriter has accidentally assumed.
+for %%f in ("%~dp0phase5\cases\*.hlsl") do (
+    "%DXC%" -T cs_6_5 -E main -Fc "%~dp0phase5\cases\%%~nf.ll" ^
+            -Fo "%~dp0phase5\cases\%%~nf.dxil" "%%f" >nul 2>&1
+    if exist "%~dp0phase5\cases\%%~nf.ll" (echo   ok  case %%~nf) else (echo   -   case %%~nf is not a cs_6_5 shader, skipped)
+)
+
 echo.
 echo Disassembly in phase5\dxil\*.ll, containers in phase5\dxil\*.dxil
 echo Findings in docs\phase5-dxil-recon.md

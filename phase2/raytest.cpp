@@ -249,6 +249,16 @@ static bool g_poisonNow = false;   // set per trial: poison only the lowered sid
 // from disk instead of compiling HLSL, so a hand-lowered or rewriter-produced
 // library can be checked against the same WARP ground truth as everything else.
 static const char* g_libFile = nullptr;
+
+// Phase 5. With --table, the UAV is reached through a DESCRIPTOR TABLE holding
+// an array of 4 descriptors, and the shader writes through index 2. Only
+// descriptor 2 points at the real output buffer; 0, 1 and 3 point at a decoy.
+// So a lowering that dropped the array index would write to the decoy and the
+// output would come back untouched, which the diff reports as a divergence.
+// Without that asymmetry the test could not tell index 2 from index 0.
+static bool g_table = false;
+static const UINT kTableSize = 4;
+static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
     std::vector<uint8_t> v;
     FILE* f = std::fopen(path, "rb");
@@ -535,6 +545,39 @@ static void BindRoots(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs,
     cl->SetComputeRootUnorderedAccessView(2, out);
 }
 
+// Root signature for --table: b0 and t0 stay root descriptors, the UAV array
+// becomes a descriptor table of kTableSize entries starting at u0.
+static ComPtr<ID3D12RootSignature> MakeRootSigTable(ID3D12Device* dev) {
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.NumDescriptors = kTableSize;
+    range.BaseShaderRegister = 0;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &range;
+
+    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 3; rd.pParameters = params;
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
+        &blob, &err);
+    if (FAILED(hr)) {
+        if (err) std::fprintf(stderr, "root sig: %.*s\n", (int)err->GetBufferSize(),
+                              (const char*)err->GetBufferPointer());
+        Throw("D3D12SerializeRootSignature(table)", hr);
+    }
+    ComPtr<ID3D12RootSignature> rs;
+    HR(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+        IID_PPV_ARGS(&rs)), "CreateRootSignature(table)");
+    return rs;
+}
+
 // ---------------------------------------------------------------------------
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
@@ -572,7 +615,40 @@ static ComPtr<ID3D12Resource> MakeSBT(ID3D12Device* dev, const void* ident) {
 
 static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl, bool anyHit) {
-    auto rs = MakeRootSig(g.device.Get());
+    auto rs = g_table ? MakeRootSigTable(g.device.Get())
+                      : MakeRootSig(g.device.Get());
+
+    // The descriptor table and its decoy, built only for --table.
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Resource> decoy;
+    if (g_table) {
+        const UINT64 bytes = (UINT64)kWidth * kHeight * sizeof(Result);
+        decoy = CreateBuffer(g.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = kTableSize;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
+           "CreateDescriptorHeap");
+
+        const UINT stride = g.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto base = heap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < kTableSize; ++i) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            ud.Format = DXGI_FORMAT_UNKNOWN;
+            ud.Buffer.NumElements = kWidth * kHeight;
+            ud.Buffer.StructureByteStride = sizeof(Result);
+            D3D12_CPU_DESCRIPTOR_HANDLE h{ base.ptr + (SIZE_T)i * stride };
+            // Only the slot the shader indexes gets the real buffer.
+            g.device->CreateUnorderedAccessView(
+                i == kTableSlot ? out : decoy.Get(), nullptr, &ud, h);
+        }
+    }
 
     // --- state object subobjects ---
     std::vector<D3D12_STATE_SUBOBJECT> subs;
@@ -637,8 +713,18 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     dr.Width = kWidth; dr.Height = kHeight; dr.Depth = 1;
 
     g.list->SetPipelineState1(so.Get());
-    BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
-              s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress());
+    if (g_table) {
+        ID3D12DescriptorHeap* heaps[] = { heap.Get() };
+        g.list->SetDescriptorHeaps(1, heaps);
+        g.list->SetComputeRootSignature(rs.Get());
+        g.list->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress());
+        g.list->SetComputeRootShaderResourceView(1, s.tlas->GetGPUVirtualAddress());
+        g.list->SetComputeRootDescriptorTable(
+            2, heap->GetGPUDescriptorHandleForHeapStart());
+    } else {
+        BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
+                  s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress());
+    }
     g.list->DispatchRays(&dr);
     UavBarrier(g.list.Get(), out);
     g.flush();
@@ -811,6 +897,12 @@ int main(int argc, char** argv) {
         // Pull --roundtrip out of argv so the positional arguments below are
         // unaffected by it.
         for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--table") == 0) {
+                g_table = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
             if (std::strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
                 g_libFile = argv[i + 1];
                 for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];

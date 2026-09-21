@@ -564,17 +564,101 @@ Not generic, and it matters:
   all; the candidate opcode for them is not in the whitelist, so such a shader
   is refused rather than mislowered.
 
+## Descriptor tables: the thing flagged as most likely to break
+
+Both the brief and this document named descriptor tables as the most likely
+thing to break the rewriter on a real shader. Testing it showed that was the
+wrong thing to worry about, and found the right one.
+
+### A descriptor table alone changes nothing in the DXIL
+
+`phase5/cases/rayquery_tablers.hlsl` is the opaque shader with an explicit
+`[RootSignature]` using `DescriptorTable(CBV(b0)), DescriptorTable(SRV(t0)),
+DescriptorTable(UAV(u0))`. Diffed against the root-descriptor original:
+
+    IDENTICAL function body
+    !6, !9, !12 resource records identical
+
+The root signature lives in the container's `RTS0` part, not in the module. A
+non-library shader reaches resources through `createHandle(rangeId, index)`
+whatever the root signature says. So the rewriter is simply unaffected, and it
+lowers and renders bit-exactly.
+
+### The real hazard is resource ARRAYS, which tables enable
+
+`phase5/cases/rayquery_table.hlsl` declares `RWStructuredBuffer<Result>
+outBufs[4]` and writes through `outBufs[2]`. That does change the DXIL:
+
+    %49 = call ... @dx.op.createHandle(i32 57, i8 1, i32 0, i32 2, i1 false)
+    !9 = !{i32 0, [4 x %"class.RWStructuredBuffer<Result>"]* undef, ..., i32 4, ...}
+
+The index operand is 2 rather than the 0 every shader tested so far had, and
+the type is an array. **`_edit_resources` read the rangeId and ignored the
+index entirely**, which is exactly the kind of silent wrong-render this project
+is meant to avoid.
+
+It did not render wrong, but only by luck: the resource record's regex failed to
+match the array type and the lowering raised `LowerError`. Worse, the analysis
+had already accepted the shader, and the CLI let the exception escape as a
+Python traceback. A traceback is not "failing loudly" in any useful sense, so
+`dxrewrite` now catches `LowerError` and reports it as a refusal.
+
+### Supported rather than refused, because DXC showed the form
+
+Rather than guess, `phase5/cases/reference/lib_array_ref.hlsl` asks DXC what a
+LIBRARY does with a resource array:
+
+    @outBufs = external constant [4 x %"class.RWStructuredBuffer<Result>"], align 4
+    %2 = load %"class...", %"class..."* getelementptr inbounds (
+             [4 x %"class..."], [4 x %"class..."]* @outBufs, i32 0, i32 2), align 4
+    %3 = call %dx.types.Handle @"dx.op.createHandleForLib.class..."(i32 160, %"class..." %2)
+
+The global carries the ARRAY type, the element is reached through a constant
+`getelementptr`, and `createHandleForLib` takes the ELEMENT type. `lower.py`
+now emits exactly that. Dynamic indexing and non-uniform indexing are refused,
+since neither has been observed or tested.
+
+### Verified end to end, with the decoy that makes it mean something
+
+`raytest --table` binds the UAV through a real descriptor table of four
+descriptors. Only slot 2 points at the output buffer; slots 0, 1 and 3 point at
+a decoy. So a lowering that dropped the array index writes to the decoy and the
+output comes back untouched.
+
+    ground truth (WARP)                 14450 hits
+    array lowering, descriptor table    14450 hits    MATCH, 0 mismatches
+
+### The sensitivity check failed first, and it was the check that was wrong
+
+The first attempt at poisoning the index reported **MATCH**, which should have
+meant the test could not see a wrong descriptor at all. Diffing the two
+libraries showed they were identical apart from a trailing newline: the
+substitution looked for `@outBufs`, but the rewriter synthesises the global as
+`@rq_uav0`, because a compute module's resource records carry empty name
+strings and there is nothing else to name it after.
+
+So the poison had never applied and the earlier "bit-exact" result was, at that
+moment, worth less than it looked. Redone against the real symbol:
+
+    index dropped to 0    65536 rays, 0 hits
+    hit/miss mismatches: 14450    RESULT: DIVERGE
+
+A separate control points the same way: the ROOT-DESCRIPTOR library run with
+`--table` gives 0 hits, because it writes to u0, which is now the decoy. The
+table path is real, it isolates, and it notices.
+
 ## Next
 
-The rewriter works on what it has been shown, and refuses what it has not.
-The useful next steps, in order of how likely they are to break it:
+The rewriter now handles everything it has been shown, and refuses the rest.
+What remains, in order of how likely it is to break:
 
-1. **A shader binding through a descriptor table.** Named above as the most
-   likely failure, and nothing in this project has exercised it.
-2. **A second, independently written RayQuery shader**, ideally not derived
-   from the Phase 2 pair, to find what has been accidentally assumed.
+1. **A second, independently written RayQuery shader**, not derived from the
+   Phase 2 pair. Everything here still descends from two shaders written to
+   demonstrate one lowering, so the risk of an accidental shared assumption is
+   real. Descriptor tables were supposed to be the danger and turned out not to
+   be; something else will be.
+2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
 3. **Wire the rewriter into the proxy**, at `CreateStateObject` and the compute
-   pipeline path, so a real application's DXIL goes through it. That also
-   forces the question the brief flags: reporting Tier 1.1 entitles an app to
-   emit RayQuery, so the tier flip and a working rewriter have to land
+   pipeline path. That forces the tier question: reporting Tier 1.1 entitles an
+   app to emit RayQuery, so the flip and a working rewriter have to land
    together, with anything refused failing loudly rather than rendering wrong.

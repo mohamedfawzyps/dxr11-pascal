@@ -76,7 +76,13 @@ def cmd_lower(src, dst):
     except rayquery.Unsupported as e:
         sys.stderr.write('REFUSED: %s\n' % e)
         return 2
-    out = lower.lower(mod, q)
+    try:
+        out = lower.lower(mod, q)
+    except (rayquery.Unsupported, lower.LowerError) as e:
+        # A traceback is not "failing loudly" in any useful sense. Anything the
+        # lowering cannot do has to come out as a refusal the caller can read.
+        sys.stderr.write('REFUSED: %s\n' % e)
+        return 2
     io.open(dst, 'w', encoding='utf-8', newline='\n').write(out)
     print('lowered %s -> %s (pattern %d, %s)'
           % (src, dst, q.pattern_num, q.pattern_desc))

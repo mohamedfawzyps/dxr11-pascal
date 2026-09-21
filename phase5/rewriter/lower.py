@@ -34,12 +34,22 @@ def _metadata(text):
     return {int(m.group(1)): m.group(2) for m in _MD.finditer(text)}
 
 
+_ARRAY = re.compile(r'^\[(\d+) x (.+)\]$')
+
+
 def _resource_table(text, md):
-    """{resource class -> [(node id, llvm type, name)]} from !dx.resources.
+    """{resource class -> [Res]} from !dx.resources, where Res is
+    (node id, global type, element type, array length or None, name).
 
     A library's handles come from createHandleForLib applied to a loaded
     global, so every resource needs a real global and the record has to point
-    at it instead of `undef`."""
+    at it instead of `undef`.
+
+    A descriptor table does NOT by itself change any of this: measured, a
+    table-bound shader produces a byte-identical function body and identical
+    resource records, because the root signature lives outside the module.
+    What a table enables and what does change the DXIL is a resource ARRAY,
+    where the type is [N x T] and createHandle carries a real index."""
     m = re.search(r'!dx\.resources\s*=\s*!\{!(\d+)\}', text)
     if not m:
         raise LowerError('module has no !dx.resources')
@@ -52,11 +62,14 @@ def _resource_table(text, md):
         recs = []
         for nid in ids:
             fields = [f.strip() for f in md[nid].split(',')]
-            t = re.match(r'(%[\w.$-]+|%"[^"]+")\*\s+\S+', fields[1])
+            t = re.match(r'(\[[^\]]+\]|%[\w.$-]+|%"[^"]+")\*\s+\S+', fields[1])
             if not t:
                 raise LowerError('resource record !%d has an unexpected shape' % nid)
+            gty = t.group(1)
+            arr = _ARRAY.match(gty)
+            elem, count = (arr.group(2), int(arr.group(1))) if arr else (gty, None)
             name = re.match(r'!"([^"]*)"', fields[2])
-            recs.append((nid, t.group(1), name.group(1) if name else ''))
+            recs.append((nid, gty, elem, count, name.group(1) if name else ''))
         table[cls] = recs
     return table
 
@@ -100,13 +113,13 @@ def lower(module, q, exports=None):
 
 
 def _plan_globals(table):
-    """A global per resource: (class, node id) -> (global name, llvm type)."""
+    """(class, node id) -> (global name, global type, element type, name)."""
     g = {}
     for cls, recs in table.items():
-        for n, (nid, ty, name) in enumerate(recs):
+        for n, (nid, gty, elem, count, name) in enumerate(recs):
             sym = name if re.match(r'^[A-Za-z_]\w*$', name or '') \
                 else 'rq_%s%d' % (_CLASS_NAMES.get(cls, 'res'), n)
-            g[(cls, nid)] = (sym, ty, name or sym)
+            g[(cls, nid)] = (sym, gty, elem, name or sym)
     return g
 
 
@@ -122,14 +135,35 @@ def _edit_resources(module, q, edits, table, globals_):
             raise LowerError('createHandle names range %d of class %d, which '
                              '!dx.resources does not describe' % (rid, cls))
         nid = recs[rid][0]
-        sym, ty, _ = globals_[(cls, nid)]
-        fnname, _ = _handle_fn(ty)
-        raw = '%%rq.raw.%s' % sym
+        sym, gty, elem, _ = globals_[(cls, nid)]
+        fnname, _ = _handle_fn(elem)
+        raw = '%%rq.raw.%s' % instr.result[1:]
+
+        if gty == elem:
+            src = '{ty}* @{sym}'.format(ty=elem, sym=sym)
+        else:
+            # A resource array. DXC reaches the element through a constant
+            # getelementptr on the array global, and hands createHandleForLib
+            # the ELEMENT type. Matched against a DXC-built library.
+            idx = re.match(r'i32\s+(\d+)$', instr.args[3].strip())
+            if not idx:
+                raise rq.Unsupported(
+                    'resource array indexed by a non-constant (%s); dynamic '
+                    'descriptor indexing is not supported'
+                    % instr.args[3].strip())
+            nonuni = instr.args[4].strip()
+            if nonuni not in ('i1 false', 'i1 0'):
+                raise rq.Unsupported(
+                    'resource array indexed non-uniformly; not supported')
+            src = ('{elem}* getelementptr inbounds ({gty}, {gty}* @{sym}, '
+                   'i32 0, i32 {i})').format(elem=elem, gty=gty, sym=sym,
+                                             i=idx.group(1))
+
         edits[instr.index] = (
-            '  {raw} = load {ty}, {ty}* @{sym}, align 4\n'
-            '  {res} = call %dx.types.Handle @{fn}(i32 160, {ty} {raw})'
+            '  {raw} = load {elem}, {src}, align 4\n'
+            '  {res} = call %dx.types.Handle @{fn}(i32 160, {elem} {raw})'
             '  ; CreateHandleForLib(Resource)'
-        ).format(raw=raw, ty=ty, sym=sym, res=instr.result, fn=fnname)
+        ).format(raw=raw, elem=elem, src=src, res=instr.result, fn=fnname)
 
 
 def _edit_ray_index(q, edits):
@@ -286,11 +320,11 @@ def _add_types_and_globals(text, globals_):
     decls = ['%s = type { float, <2 x float>, i32 }' % PAYLOAD,
              '%s = type { <2 x float> }' % ATTRS, '']
     seen = set()
-    for sym, ty, _ in globals_.values():
+    for sym, gty, elem, _ in globals_.values():
         if sym in seen:
             continue
         seen.add(sym)
-        decls.append('@%s = external constant %s, align 4' % (sym, ty))
+        decls.append('@%s = external constant %s, align 4' % (sym, gty))
     anchor = re.search(r'^%dx\.types\.Handle = type .*$', text, re.M)
     if not anchor:
         raise LowerError('cannot find %dx.types.Handle to anchor declarations')
@@ -317,13 +351,13 @@ def _swap_declarations(text, q, globals_):
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.ignoreHit(i32) #3']
     seen = set()
-    for sym, ty, _ in globals_.values():
-        fnname, _ = _handle_fn(ty)
+    for sym, gty, elem, _ in globals_.values():
+        fnname, _ = _handle_fn(elem)
         if fnname in seen:
             continue
         seen.add(fnname)
         new += ['', '; Function Attrs: nounwind readonly',
-                'declare %%dx.types.Handle @%s(i32, %s) #2' % (fnname, ty)]
+                'declare %%dx.types.Handle @%s(i32, %s) #2' % (fnname, elem)]
 
     anchor = text.index('\nattributes #0 =')
     text = text[:anchor] + '\n' + '\n'.join(new) + text[anchor:]
@@ -428,7 +462,7 @@ def Block_successors(line):
 
 def _rewrite_metadata(text, md, table, globals_, q, exports):
     """Point the resource records at the globals and rebuild the entry points."""
-    for (cls, nid), (sym, ty, name) in globals_.items():
+    for (cls, nid), (sym, gty, elem, name) in globals_.items():
         fields = [f.strip() for f in md[nid].split(',')]
         fields[1] = re.sub(r'\*\s+\S+$', '* @%s' % sym, fields[1])
         fields[2] = '!"%s"' % name

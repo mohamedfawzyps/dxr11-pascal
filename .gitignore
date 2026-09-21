@@ -43,3 +43,7 @@ __pycache__/
 
 # Rewriter output (regenerate with tools/run_rewriter_test.ps1)
 phase5/out/
+
+# Generated from phase5/cases/*.hlsl by build_phase5.bat
+phase5/cases/*.ll
+phase5/cases/*.dxil
