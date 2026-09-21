@@ -19,3 +19,7 @@ sampletest/
 # DXC runtime copied next to the exes by the build scripts
 dxcompiler.dll
 dxil.dll
+
+# Phase 4 probe build output
+phase4out/
+obj/

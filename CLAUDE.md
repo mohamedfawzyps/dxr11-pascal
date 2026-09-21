@@ -9,7 +9,12 @@ Version 1.
   docs/phase2-lowering.md.
 - Phase 3a forwarding-only proxy: PASSED. Phase 3b ID3D12Device5 wrapper:
   PASSED. See docs/phase3-proxy.md.
-  Next action: Phase 4, the three non-shader features.
+- Phase 4 probe: DONE, ground truth captured. See docs/phase4-probe.md.
+  Headline: the Tier 1.1 ray flags ALREADY WORK on the GTX 1070, verified
+  against WARP to the ray, so that feature needs no shim at all. Two features
+  remain. Next action: extend Dxr11Device to ID3D12Device7 (a prerequisite,
+  Device7 is present on Tier 1.0 hardware), then AddToStateObject, then
+  indirect DispatchRays. Flip CheckFeatureSupport to Tier 1.1 last.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -41,7 +46,9 @@ Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\DirectX-Graphics-Samples` - Microsoft samples, source of the DXR 1.0
   app used to validate the proxy.
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`,
-  `build_sample.bat`.
+  `build_sample.bat`, `build_phase4.bat`.
+  `build_phase4.bat` builds the Tier 1.1 probe into `phase4out\`, a directory
+  with no proxy in it so the probe measures the real runtime.
   `build_sample.bat` builds a Microsoft DXR 1.0 sample used to validate the
   proxy, with cl.exe and no NuGet restore, into `sampletest\<SampleName>\`.
   Helpers live in `tools\`.
@@ -226,8 +233,7 @@ Detail in docs/phase3-proxy.md. Validated on two DXR 1.0 apps on the GTX 1070:
   flip-model swapchain, see the caveat in docs/phase3-proxy.md.
 
 `build_sample.bat <SampleName> [debug]` builds either sample;
-`tools
-un_proxy_test.ps1 -Exe ... [-Animated]` runs one with and without the
+`tools\run_proxy_test.ps1 -Exe ... [-Animated]` runs one with and without the
 proxy and reports the diff. Both samples carry the same upstream
 uninitialised-`m_descriptorsAllocated` bug, patched at build time by
 `tools\patch_sample.ps1`.
@@ -242,6 +248,20 @@ warning as baseline and no errors.
 
 Indirect DispatchRays, `AddToStateObject`, the new ray flags. Report Tier 1.1
 only once these work.
+
+**Probe result (2026-09-21), docs/phase4-probe.md.** `phase4/tier11probe.cpp`
+measures all three on WARP (Tier 1.1 ground truth) and on the 1070:
+- **Ray flags need no work.** `SKIP_TRIANGLES` and `SKIP_PROCEDURAL_PRIMITIVES`
+  behave identically on both adapters, on a scene with both triangle and
+  procedural geometry. The Tier 1.0 driver honours them.
+- **Indirect DispatchRays** stops at `CreateCommandSignature`. ByteStride is
+  104. A device method, so the wrapper already has the seat.
+- **AddToStateObject** stops earlier than expected, at `CreateStateObject`,
+  which rejects `ALLOW_STATE_OBJECT_ADDITIONS` (flags 0x4). Needs two
+  interception points, and an addition must repeat the shader config, the
+  pipeline config and the config flag; those are NOT inherited by new exports.
+- `ID3D12Device7` **is present on the 1070**, so `AddToStateObject` is callable
+  there and the wrapper must cover Device7 before any of this works.
 
 **Warning:** reporting Tier 1.1 entitles the app to emit RayQuery. Until
 phase 5 works, either keep reporting 1.0, or detect RayQuery DXIL and fail

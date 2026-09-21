@@ -73,8 +73,7 @@ Samples land in `sampletest\<SampleName>\`. Samples root comes from
 
 Then run either one through the proxy with:
 
-    tools
-un_proxy_test.ps1 -Exe sampletest\<Name>\<Name>.exe [-Animated]
+    tools\run_proxy_test.ps1 -Exe sampletest\<Name>\<Name>.exe [-Animated]
 
 which runs it twice, once clean and once with our d3d12.dll dropped beside it,
 and reports survival, fps, the proxy log, and (for a static scene) the closest
