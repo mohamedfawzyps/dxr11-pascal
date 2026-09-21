@@ -18,10 +18,11 @@ four are permanently refused because DXR 1.0 offers nothing to lower them onto.
 **What remains is NOT shader translation.** The shim builds shader tables
 without knowing the application's geometry layout, which blocks mixed
 triangle-and-procedural queries AND, already today, any application that sets a
-nonzero `InstanceContributionToHitGroupIndex`. Both need acceleration structure
-interception, whose cheap half is done and whose expensive half is the last
-structural piece. See the entries below.
-See the entries below and docs/phase5-dxil-recon.md.
+nonzero `InstanceContributionToHitGroupIndex`. **Acceleration structure
+interception is now complete, so the shim KNOWS which scenes those are** and
+refuses them loudly instead of drawing them wrong. Building a table that serves
+them is the last structural piece. See the entries below and
+docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
 
@@ -455,44 +456,84 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   procedural hits is REFUSED, and not out of laziness. A hit group is either
   triangles or procedural, and which one a geometry uses is selected by
   `InstanceContributionToHitGroupIndex`, which the APPLICATION set when it built
-  its acceleration structures; a BLAS also carries only one geometry type. The
-  shim would have to intercept every `BuildRaytracingAccelerationStructure` and
-  track the geometry type of every BLAS. **Epic's shaders DO mix**, so this is
-  the difference between procedural working and procedural being useful.
+  its acceleration structures; a BLAS also carries only one geometry type.
+  **Epic's shaders DO mix**, so this is the difference between procedural
+  working and procedural being useful. The interception that was needed to even
+  SEE this is now done, see the AS entry below; what is still missing is a table
+  with a record of each type at the right index.
 
 - **A limitation that applies TODAY, including to triangles.** The shim builds
   ONE hit group record and dispatches with `RayContributionToHitGroupIndex`,
   `MultiplierForGeometryContributionToShaderIndex` and `MissShaderIndex` all
   zero, so every geometry resolves to record 0. That is correct only while
   every instance has `InstanceContributionToHitGroupIndex = 0`. True of every
-  scene here; not guaranteed of a real one. Same fix as above.
+  scene here; not guaranteed of a real one. **It is no longer SILENT**: the
+  instance data is read and a dispatch on a scene where it does not hold is
+  refused with the reason. Making such a scene work is still open.
 
-- AS interception, cheap half: **DONE.** `proxy/as_tracker.{h,cpp}`, hooked at
+- AS interception: **DONE, both halves.** `proxy/as_tracker.{h,cpp}` and
+  `proxy/res_tracker.{h,cpp}`, hooked at
   `BuildRaytracingAccelerationStructure`. **The two halves cost wildly
-  different amounts, which is the finding.**
+  different amounts, which was the finding, and the expensive one turned out to
+  be blocked on an API fact rather than on engineering.**
   - **BLAS geometry types are FREE.** `D3D12_RAYTRACING_GEOMETRY_DESC` arrives
     as CPU MEMORY in the build call, so the type of every bottom-level
     structure is read and remembered with no copy and no sync.
     `ARRAY_OF_POINTERS` is handled as well as `ARRAY`; anything else is left
     unknown rather than guessed at. Verified on the Phase 4 probe, which builds
     one of each, and it distinguishes rather than always saying the same thing.
-  - **TLAS instance data is NOT free.** `InstanceDescs` is a GPU VIRTUAL
-    ADDRESS, so reading the contributions needs a copy and a sync per top-level
-    build, in engines that rebuild every frame. Not attempted, and nothing
-    guessed in its place.
-  - Instead a top-level build LOGS, once, exactly what is not known: the
-    contributions live in GPU memory, are not read, and the table still assumes
-    zero. **The limitation is now visible at runtime**, not only written down.
-    If this shim ever renders a real scene wrong, that line points at the cause.
+  - **TLAS instance data was blocked on a missing API, not on cost.**
+    `InstanceDescs` is a GPU VIRTUAL ADDRESS, `CopyBufferRegion` takes an
+    `ID3D12Resource` and an offset, and **D3D12 has no call that turns an
+    address back into a resource.** That was the whole obstacle.
+  - The way through: every resource an application creates goes through the
+    wrapped device, so `res_tracker` remembers the mapping itself, keyed by
+    start address. Two deliberate lifetime decisions. It **holds no reference**,
+    because an `AddRef` would change when the application's resources die, which
+    a transparent shim must not do, and would leak for every buffer ever
+    created; entries can go stale, which is safe because a lookup only happens
+    while the application is handing that buffer to a build. And an **entry is
+    replaced** when a new resource reports the same start address, which is how
+    address reuse after a free is handled.
+  - **Two read paths, and only one costs anything.** Upload-heap descriptions
+    are mapped and read at record time: no copy, no fence, no stall. That is
+    both Microsoft samples and every scene here. GPU-only descriptions get a
+    `CopyBufferRegion` recorded into the application's own list, between
+    `NON_PIXEL_SHADER_RESOURCE` and `COPY_SOURCE` barriers, and the queue hook
+    signals a fence and parses on a LATER submission. **Nothing ever waits**;
+    the earlier estimate of a sync per top-level build was pessimistic.
+  - Read **once per destination address**, so an engine rebuilding its TLAS
+    every frame pays only on the first. The cost of that choice: an application
+    that changes its contributions in place keeps the first answer.
+  - NOT read: `ARRAY_OF_POINTERS` instance descriptions, where each pointer is
+    itself a GPU address needing a second dependent copy. Logged, not guessed.
+  - `tier11probe -gpuinst` puts the descriptions in GPU-only memory on purpose,
+    so the expensive path is exercised rather than hypothetical. Both paths give
+    the same answer with the debug layer on and silent.
+  - **What it reads matches the source exactly**: the probe scene comes back as
+    2 instances, max contribution 1, reaching triangles and procedural, which is
+    what `tier11probe.cpp` sets. Both Microsoft samples come back as 1 instance,
+    contribution 0, triangles only, which is the case the single-record table is
+    already right for.
+  - **The point is the refusal, not the log.** A lowered RayQuery dispatch on a
+    scene the table cannot serve now declines and says why, instead of drawing
+    it wrong. `raytest --multi --contrib` makes that reachable: WARP finds 18496
+    hits and the shim gives none rather than inventing a number.
+  - Two limits of that check, both real. It is judged over EVERY top-level
+    structure read, not the one the shader is about to trace against, because a
+    TLAS arriving through a descriptor table is not identifiable at the
+    dispatch, so it can over-refuse; refusing is the safe direction. And it can
+    only see what has been READ, so on the GPU-only path the answer is a
+    submission late and the first dispatch of a run is not covered.
   - Note: lists are only wrapped on Tier 1.0, so nothing is tracked on WARP.
     Correct, since the shim does nothing there, but it means the tracking
     cannot be observed on the ground-truth path.
 
   Next action, in order of value.
-  1. **The TLAS half.** Copy the instance descriptions and read them back, the
-     same machinery as the Phase 4 indirect DispatchRays split. It unblocks
-     BOTH open problems at once and is the last structural piece of the shim.
-     The cost is a copy and a sync per top-level build.
+  1. **Use the instance data.** Size the shader table by the maximum
+     contribution and put a record of the right geometry type at each index.
+     That turns both refusals into working scenes and is the last structural
+     piece of the shim. Everything it needs is now measured.
   2. **Dynamic descriptor indexing**, still refused.
   3. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
@@ -505,11 +546,15 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   What is NOT generic, written down so it is not rediscovered:
   - Resource arrays work, but only with a **constant, uniform** index. Dynamic
     and non-uniform indexing are refused, as is `createHandleFromHeap`.
-  - The payload is fixed at `{float, <2 x float>, i32}`, carrying exactly the
-    three committed accessors the whitelist supports.
+  - The payload layout is FIXED, now 88 bytes, and carries exactly the
+    committed accessors the whitelist supports. It is a state object contract:
+    `PAYLOAD_BYTES` and `MaxPayloadSizeInBytes` move together or
+    `CreateStateObject` fails.
   - One entry point, one query.
-  - No procedural primitive or intersection shader path at all. Such a shader
-    is refused rather than mislowered.
+  - Procedural primitives lower, via a generated intersection shader. A query
+    committing BOTH triangle and procedural hits does not, and neither does a
+    scene whose instances carry nonzero contributions; both are now DETECTED
+    from the instance data and refused, rather than drawn wrong.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -549,7 +594,9 @@ Dev machine (Windows x64), everything under `C:\DW`:
   in to measure the shim instead. `tier11probe.exe [warp|hw]` runs the three
   feature probes, and takes `-debug` for the debug layer, `-gfxsplit` for
   graphics state across a split, `-batchsplit` for dispatch batching and its
-  control, `-time` and `-pipeline` for the split cost.
+  control, `-time` and `-pipeline` for the split cost, and `-gpuinst` to put
+  the TLAS instance descriptions in GPU-only memory so the shim has to copy
+  them out instead of mapping them.
   `build_rewriter.bat` builds the C++ rewriter and `phase5out\dxrw.exe`,
   copying DXC beside it. `dxrw lower` works on `.ll`, `dxrw rewrite` takes a
   container and returns a signed one, which is the path the proxy uses.
@@ -969,6 +1016,10 @@ anything.
 - `--roundtrip` sends every shader out to `.ll` text and back before D3D12 sees
   it. `--rtpoison` does the same but corrupts the lowered side on purpose, and
   must DIVERGE.
+- `--contrib`, with `--multi`, gives the two instances different
+  `InstanceContributionToHitGroupIndex` values, which is a scene the shim's
+  single-record table cannot serve. It exists so the refusal can be shown to be
+  reachable rather than dead code.
 
 Check sensitivity before believing a pass, and check the CHECK. Three times in
 this project a test passed for the wrong reason:
