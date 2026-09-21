@@ -26,8 +26,9 @@ Dev machine (Windows x64), everything under `C:\DW`:
   app used to validate the proxy.
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`,
   `build_sample.bat`.
-  `build_sample.bat` builds the Microsoft DXR 1.0 sample used to validate the
-  proxy, with cl.exe and no NuGet restore, into `sampletest\`.
+  `build_sample.bat` builds a Microsoft DXR 1.0 sample used to validate the
+  proxy, with cl.exe and no NuGet restore, into `sampletest\<SampleName>\`.
+  Helpers live in `tools\`.
   Each calls `setup_msvc.bat`, which finds MSVC via vswhere and activates the
   x64 toolchain, so they work from any terminal. Running them from an
   "x64 Native Tools Command Prompt for VS" also still works, the helper
@@ -202,6 +203,17 @@ Detail in docs/phase3-proxy.md. Validated on two DXR 1.0 apps on the GTX 1070:
 - `D3D12RaytracingHelloWorld` (Microsoft sample, windowed, swapchain, Agility
   SDK) renders **pixel-identical** to the no-proxy baseline, 0 differing pixels,
   same ~2140 fps.
+- `D3D12RaytracingSimpleLighting`, which exercises more device surface per frame
+  (3-descriptor heap, per-frame CB, index/vertex buffers with normals), runs
+  identically through the proxy at the same ~1380 fps. No pixel claim is made
+  for it: our window capture is not a reliable oracle for an animated
+  flip-model swapchain, see the caveat in docs/phase3-proxy.md.
+
+`build_sample.bat <SampleName> [debug]` builds either sample;
+`toolsun_proxy_test.ps1 -Exe ... [-Animated]` runs one with and without the
+proxy and reports the diff. Both samples carry the same upstream
+uninitialised-`m_descriptorsAllocated` bug, patched at build time by
+`tools\patch_sample.ps1`.
 
 3b next: wrap the returned `ID3D12Device5`, forwarding every method unchanged,
 and re-verify. That wrapper is the seat for Phase 4 and 5.

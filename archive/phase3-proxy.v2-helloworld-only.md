@@ -64,22 +64,9 @@ either asm tail-jump thunks or known signatures.
 
 ## Build (Windows x64)
 
-    build_proxy.bat                                       -> d3d12.dll
-    build_sample.bat                                      -> HelloWorld
-    build_sample.bat D3D12RaytracingSimpleLighting        -> SimpleLighting
-    build_sample.bat D3D12RaytracingSimpleLighting debug  -> debug layer on
-
-Samples land in `sampletest\<SampleName>\`. Samples root comes from
-`%DXSAMPLES_DIR%`, default `C:\DW\DirectX-Graphics-Samples`.
-
-Then run either one through the proxy with:
-
-    tools
-un_proxy_test.ps1 -Exe sampletest\<Name>\<Name>.exe [-Animated]
-
-which runs it twice, once clean and once with our d3d12.dll dropped beside it,
-and reports survival, fps, the proxy log, and (for a static scene) the closest
-matching frame pair.
+    build_proxy.bat            -> d3d12.dll
+    build_sample.bat           -> sampletest\D3D12RaytracingHelloWorld.exe
+    build_sample.bat "" debug  -> sampletest\HelloWorldDbg.exe (D3D12 debug layer on)
 
 ## Result: 3a PASSED (2026-09-21)
 
@@ -121,51 +108,7 @@ The first line is `hr = S_FALSE` with a null device: that is the documented
 capability-probe form of `D3D12CreateDevice` (null `ppDevice`), used by
 `DeviceResources` to test feature level support. Not an error.
 
-**3. `D3D12RaytracingSimpleLighting`, the second Microsoft sample.** Added
-because it exercises more device API surface per frame than HelloWorld: a
-3-descriptor heap rather than 1, a per-frame constant buffer, and index and
-vertex buffers with normals, plus a rotating camera and light. Through the
-proxy it runs identically:
-
-| | baseline | through proxy |
-|---|---|---|
-| survived 8s | yes | yes |
-| fps | ~1377 | ~1383 |
-| device creations logged | - | 3, same shape as HelloWorld |
-
-No frame comparison is claimed for this one, and the harness refuses to make
-one (`-Animated`). See the caveat below; it is a limitation of our capture, not
-a difference between the runs.
-
-The proxy is transparent on both. Proceed to 3b.
-
-### Caveat: our window capture is not an oracle for animated samples
-
-Worth writing down so it is not rediscovered later.
-
-**Measured:** on SimpleLighting, window grabs taken seconds apart *within a
-single run* come back byte-identical, even though the app reports ~1380 fps and
-its `OnUpdate` rotates the camera and light every frame. Across two runs, a
-constant 9609 of 14400 sampled pixels differ, and that number is the same at
-every timestep.
-
-**Not verified:** why. Two candidates, not distinguished. Either `BitBlt` on the
-window DC returns a stale frame for these flip-model swapchains, or the sample's
-per-frame re-rotation of `m_eye` settles into a fixed view. An earlier guess
-that accumulated float drift explained it was not supported by the measurement
-and has been dropped.
-
-Either way the capture path cannot be trusted to sample live frames here, so we
-do not draw conclusions from it for animated content. Two other capture
-approaches were tried and also fail on a flip-model swapchain: `PrintWindow`,
-and `BitBlt` while the window is occluded, both return near-blank images.
-Forcing the window topmost and foreground before each grab is what makes the
-static case work at all. If a later phase needs real frame comparison, it wants
-a proper path, a hooked `Present` or a UAV readback, not window grabbing.
-
-None of this weakens the 3a result: the pixel-exact claim rests on HelloWorld,
-whose scene is static, and on raytest.exe, which compares buffer contents
-directly rather than pixels.
+The proxy is transparent. Proceed to 3b.
 
 ## Building the MS sample without NuGet
 
@@ -177,7 +120,7 @@ skipped and the Agility SDK already at `C:\DW\microsoft.direct3d.d3d12.1.619.5`
 is used. The `FxCompile` step is reproduced by hand as
 `dxc -T lib_6_3 -Vn g_pRaytracing -Fh CompiledShaders\Raytracing.hlsl.h`.
 
-### Upstream bug in these samples, patched at build time
+### Upstream bug in the sample, patched at build time
 
 `D3D12RaytracingHelloWorld::m_descriptorsAllocated`
 (`D3D12RaytracingHelloWorld.h:65`) is never initialised by the constructor. It
@@ -192,18 +135,9 @@ uninitialised member on the first init and computes a garbage descriptor index:
 followed by a ~5 second stall and an access violation (`0xC0000005`). The sample
 object is a local in `WinMain`, so whether this bites depends on stack contents;
 it reproduced every time with this toolchain, and it reproduces **without the
-proxy present**, so it is not ours. `tools\patch_sample.ps1` adds
+proxy present**, so it is not ours. `build_sample.bat` adds
 `m_descriptorsAllocated(0)` to the constructor init list of a generated copy of
-the `.cpp`, and fails loudly if the anchor text moves. It also detects the case
-where upstream has since fixed it and copies through unchanged.
-
-**Both samples carry it**, so it is a shared-template bug rather than a quirk of
-one sample:
-
-| Sample | declared | zeroed only in Release... | read in AllocateDescriptor |
-|---|---|---|---|
-| HelloWorld | `.h:65` | `.cpp:568` | `.cpp:677` |
-| SimpleLighting | `.h:77` | `.cpp:736` | `.cpp:848` |
+the `.cpp`, and fails loudly if the anchor text moves.
 
 Worth remembering for later phases: a garbage descriptor handle on Pascal
 presents as a GPU hang plus an AV, not a clean error return. The D3D12 debug
