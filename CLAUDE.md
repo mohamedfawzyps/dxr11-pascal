@@ -146,6 +146,49 @@ the driver do all ray work. This matters for correctness: rays hit NVIDIA's
 own acceleration structure, traversed by NVIDIA's own code, so results match
 an RTX card by construction.
 
+### Vulkan draws the same line, which is the best evidence we have
+
+Checked on the dev machine, driver 582.66 (June 2026), GTX 1070, Vulkan 1.4,
+with `vulkaninfo`:
+
+    VK_KHR_acceleration_structure      revision 13
+    VK_KHR_ray_tracing_pipeline        revision 1
+    VK_KHR_ray_tracing_maintenance1    revision 1
+    VK_NV_ray_tracing                  revision 3
+    VK_KHR_ray_query                   ABSENT
+
+Pipeline ray tracing yes, ray query no. That is the same cut NVIDIA makes in
+D3D12, DXR 1.0 yes and Tier 1.1 no, arrived at through a completely unrelated
+API on the same silicon. Exposing `ray_tracing_pipeline` without `ray_query` is
+not a normal desktop combination, so it is a deliberate carve-out rather than a
+capability boundary.
+
+REPORTED, NOT VERIFIED: driver 460.89 (December 2020) is said to have exposed
+`VK_KHR_ray_query` on Pascal, and to be the only driver that did. If true, then
+NVIDIA had inline queries running on this hardware and later withdrew them,
+which is a strong form of the premise above. Confirming it needs a driver
+rollback, which would break this project's dev environment, so it stays
+unverified for now.
+
+### Vulkan is not a route, only evidence
+
+Reaching `VK_KHR_ray_query` from a D3D12 shim means translating D3D12 to
+Vulkan, which is vkd3d-proton, not a variant of this project. None of this
+repository would carry over, since the export ordinals, the device wrapper and
+the command list split are all D3D12 plumbing. Worse, acceleration structures
+cannot be shared between the two APIs, so every BLAS and TLAS would be built
+twice, which breaks the premise that rays hit NVIDIA's own AS traversed by
+NVIDIA's own code.
+
+Running an application under vkd3d-proton on driver 460.89 would in principle
+hand over DXR 1.1 including inline ray tracing for free. INFERRED, not tested:
+this probably eats itself, because a vkd3d-proton recent enough to implement
+DXR 1.1 wants Vulkan 1.3 and a long extension list, while a December 2020
+driver is Vulkan 1.2 era. The driver old enough to expose `ray_query` is likely
+too old for the translation layer that could use it. The same age problem hits
+Unreal from the other side: UE5 ships its own Agility SDK and expects far more
+of the D3D12 runtime than a 2020 driver provides.
+
 **Do not build a custom BVH. Do not write software traversal.** Both were
 considered and rejected: they would be slower than the driver's path, would
 diverge from real DXR results, and would require parsing or replacing an
