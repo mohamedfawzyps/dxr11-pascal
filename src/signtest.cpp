@@ -210,17 +210,23 @@ int main(int argc, char** argv) {
     bool doHeader = true, doBytecode = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto eq = a.find('=');
-        std::string val = (eq != std::string::npos) ? a.substr(eq + 1) : a;
         if (a == "-h" || a == "--help") {
-            std::printf("usage: signtest [--target=header|bytecode|both]\n");
+            std::printf("usage: signtest [target]\n"
+                        "  target: header | bytecode | both  (default both)\n"
+                        "  also accepts --header, --bytecode, --both, --target=<t>\n");
             return 0;
         }
+        // Normalize header / --header / --target=header all to "header".
+        std::string val = a;
+        auto eq = a.find('=');
+        if (eq != std::string::npos) val = a.substr(eq + 1);
+        else if (val.rfind("--", 0) == 0) val = val.substr(2);
+
         if (val == "header")        { doHeader = true;  doBytecode = false; }
         else if (val == "bytecode") { doHeader = false; doBytecode = true;  }
         else if (val == "both")     { doHeader = true;  doBytecode = true;  }
-        else if (a.rfind("--target", 0) == 0) {
-            std::printf("unknown target '%s' (want header|bytecode|both)\n", val.c_str());
+        else {
+            std::printf("unknown option '%s' (want header|bytecode|both; see --help)\n", a.c_str());
             return 1;
         }
     }

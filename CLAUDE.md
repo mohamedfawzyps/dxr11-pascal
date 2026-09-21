@@ -12,7 +12,8 @@ does not match. That digest is written by Microsoft's `dxil.dll` validator, not
 by us. Before building any custom shader path we need to know: can we take a
 DXIL container, modify it, and get `dxil.dll` to re-issue a valid digest?
 
-Test: `src/signtest.cpp` (run with `--target=header|bytecode|both`, default `both`)
+Test: `src/signtest.cpp` (target: `header`, `bytecode`, or `both` (default);
+accepted as a bare word, `--header`/`--bytecode`/`--both`, or `--target=<t>`)
 1. Compile a trivial pixel shader with DXC (already produces a signed container).
 2. Tamper with one byte:
    - `bytecode`: flip a byte inside the DXIL bytecode part.
@@ -38,6 +39,19 @@ Key facts that frame the result:
 Implication for the project: we cannot hand-patch arbitrary bytes into shader
 bytecode and expect a signature. Any custom shader must be emitted as valid
 DXIL (or produced through the compiler) and then signed by `dxil.dll`.
+
+### Result - CONFIRMED (run on Windows, DXC at C:\DW\DXC)
+
+- HEADER trial: SIGNED. The validator recomputed the digest and it exactly
+  reproduced the original compiled digest (a30b87fc516764f74749523c033349d2),
+  proving the digest is a deterministic re-hash with no secret key.
+- BYTECODE trial: NOT SIGNED. Flipping one bytecode byte (offset 1982,
+  0x30 -> 0xcf) failed validation with 0x80aa0009 "Unrecognized subblock /
+  Malformed block / Validation failed."
+
+Conclusion for Phase 2: re-signing modified DXIL via `dxil.dll` is viable, but
+only for containers whose DXIL still validates. The path forward is to produce
+*valid* DXIL and let `dxil.dll` sign it - not to patch bytes post hoc.
 
 ## Build / run (Windows x64)
 
