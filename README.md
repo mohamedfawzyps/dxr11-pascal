@@ -54,30 +54,39 @@ Verified on a GTX 1070, with WARP as the oracle for every result:
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
   pixel-identical to its no-proxy baseline
 
-The tier flip is **opt-in**, behind `DXR11_TIER11=1`. Without it the shim
-reports Tier 1.0 and forwards everything. Reporting 1.1 entitles an application
-to emit `RayQuery`, and a shim that claims 1.1 and then fails is worse than one
-that claims 1.0.
+Tier 1.1 is reported by default. A proxy DLL only sits beside an executable
+because somebody put it there, so the install is the opt-in, and asking for a
+second one through an environment variable mostly produced reports that the
+shim does nothing.
+
+Turning it off is one step either way: delete the DLL, or put `tier11 = 0` in a
+`dxr11.ini` beside it.
 
 ## Using it
 
 Build the proxy, then put the resulting `d3d12.dll` next to the target
-executable:
+executable. That is the whole installation:
 
 ```
 build_proxy.bat
 copy d3d12.dll <target directory>
-set DXR11_TIER11=1
 ```
 
-`DXR11_NO_WRAP=1` disables device wrapping and restores plain forwarding, which
-is useful for isolating whether a problem is the shim at all. The log lands in
-`%TEMP%\dxr11_proxy.log` and says what was intercepted, what was lowered and
-what was refused, with reasons.
+For a `RayQuery` shader to be rewritten, `dxcompiler.dll` and `dxil.dll` have
+to be in that directory too. They load lazily, so a plain DXR 1.0 application
+never needs them.
+
+Settings, if you want any, go in a `dxr11.ini` beside the DLL. See
+[dxr11.example.ini](dxr11.example.ini). A file is used rather than environment
+variables because a game started from Steam or the Epic launcher never sees a
+variable you set in a console.
+
+The log lands in `%TEMP%\dxr11_proxy.log` and says what was intercepted, what
+was lowered and what was refused, with reasons.
 
 **[docs/usage.md](docs/usage.md) is the step by step guide**, including where
-the DLL has to go for Unreal, how to get the environment variable to reach a
-launcher, how to read the log, and what to try when something goes wrong.
+the DLL has to go for Unreal, which files go beside it, how to read the log,
+and what to try when something goes wrong.
 
 ## What it refuses, and why
 
@@ -137,7 +146,7 @@ what it took to notice.
 The version is compiled into the DLL and logged on attach, so a log file
 identifies its own build:
 
-    [dxr11-proxy] attached to process, version 0.9.0
+    [dxr11-proxy] attached to process, version 0.10.0
 
 ## Documentation
 

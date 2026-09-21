@@ -40,6 +40,15 @@ void SetHostModule(HMODULE self);
 // Is DXC available? Loads on first call. `error` says why not, when false.
 bool Available(std::string* error);
 
+// Which DXC was actually loaded, for the log, e.g.
+// "dxcompiler 1.10.2605.37, dxil 1.10.2605.37".
+//
+// The first question about any signing or validation failure is which compiler
+// produced it, and a proxy DLL is copied next to an executable and then
+// forgotten. Returns "not loaded" before the first lowering, since DXC loads
+// lazily.
+const char* Versions();
+
 // A DXIL container to its .ll disassembly.
 bool Disassemble(const void* container, size_t size, std::string* text,
                  std::string* error);

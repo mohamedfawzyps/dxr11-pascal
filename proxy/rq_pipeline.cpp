@@ -230,6 +230,10 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
         return nullptr;
     }
 
+    static LONG onceVer = 0;
+    if (InterlockedCompareExchange(&onceVer, 1, 0) == 0)
+        ProxyLog("[dxr11-proxy] rewriter using %s\n", dxch::Versions());
+
     ProxyLog("[dxr11-proxy] RayQuery compute shader lowered and ready: "
              "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
              static_cast<size_t>(desc->CS.BytecodeLength), lib.size(),

@@ -120,22 +120,56 @@ foreach ($c in $cases) {
 }
 $env:DXR11_TIER11 = ''
 
-# The gate matters as much as the feature. Without the environment variable the
-# shim must still report Tier 1.0, so an application cannot be tempted into
-# emitting RayQuery before this path is trusted.
-Write-Host ''
-Write-Host '=== the tier flip stays OFF by default ==='
-# A non-zero exit is the EXPECTED outcome here, so stop 'Stop' aborting.
+# Tier 1.1 is ON by default now: a proxy DLL only sits beside an executable
+# because somebody put it there, and that is the opt-in. What has to be proven
+# instead is that the OFF switch still works, because it is the only way back
+# short of deleting the file, and because it is what a bug report will be asked
+# to try first.
+#
+# A non-zero exit is the EXPECTED outcome in the off cases, so stop 'Stop'
+# aborting.
 $ErrorActionPreference = 'Continue'
+
+Write-Host ''
+Write-Host '=== tier 1.1 is on by default ==='
+$env:DXR11_TIER11 = ''
 $out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1
-$ErrorActionPreference = 'Stop'
 Remove-Item dp_gate.bin -ErrorAction SilentlyContinue
 if ($out -match 'needs Tier 1\.1') {
-    Write-Host '  refused without DXR11_TIER11, as it must'
+    Write-Host '  DEFAULT BROKEN: RayQuery was refused with no configuration at all'
+    $failed++
 } else {
-    Write-Host '  GATE BROKEN: RayQuery was accepted without the opt-in'
+    Write-Host '  accepted with no configuration at all, as it must'
+}
+
+Write-Host ''
+Write-Host '=== DXR11_TIER11=0 turns it off ==='
+$env:DXR11_TIER11 = '0'
+$out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1
+$env:DXR11_TIER11 = ''
+Remove-Item dp_gate.bin -ErrorAction SilentlyContinue
+if ($out -match 'needs Tier 1\.1') {
+    Write-Host '  refused with DXR11_TIER11=0, as it must'
+} else {
+    Write-Host '  OFF SWITCH BROKEN: RayQuery was accepted with DXR11_TIER11=0'
     $failed++
 }
+
+# And through the file, which is the path a user without a terminal takes. The
+# env var is cleared above, so this proves the file alone is enough.
+Write-Host ''
+Write-Host '=== dxr11.ini turns it off too ==='
+'tier11 = 0' | Set-Content dxr11.ini -Encoding ascii
+$out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1
+Remove-Item dxr11.ini, dp_gate.bin -ErrorAction SilentlyContinue
+if ($out -match 'needs Tier 1\.1') {
+    Write-Host '  refused with tier11 = 0 in dxr11.ini, as it must'
+} else {
+    Write-Host '  INI IGNORED: RayQuery was accepted with tier11 = 0 in dxr11.ini'
+    $failed++
+}
+
+$ErrorActionPreference = 'Stop'
 
 # What CANNOT be served, and this proves the refusal covering it is reachable
 # rather than dead code. When the application routes both geometry kinds to the

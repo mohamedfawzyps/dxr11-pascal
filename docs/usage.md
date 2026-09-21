@@ -102,63 +102,55 @@ validation. Take both files from the same release.
 **Only one version has actually been tested.** If something fails at signing
 or validation, the version you used is the first thing to say in a bug report.
 
-## 4. Turn it on
+## 4. It is already on
 
-```
-set DXR11_TIER11=1
-```
+There is no fourth step. Tier 1.1 is reported by default, because putting the
+DLL there was the opt-in. Launch the application however you normally do, from
+Steam, from the Epic launcher, from Explorer. Nothing needs a terminal.
 
-Without this the shim reports Tier 1.0 and forwards everything unchanged,
-which is the safe default. With it, `CheckFeatureSupport` reports Tier 1.1 and
-RayQuery shaders are rewritten.
+### Turning it off, or changing anything
 
-**The variable has to be set in the environment that launches the .exe.** A
-`set` in one terminal does not reach a program started from Explorer or from
-the Epic Games Launcher. Three ways, in order of preference:
+Copy `dxr11.example.ini` into the same directory, rename it to `dxr11.ini` and
+edit it. A file beside the DLL is the only mechanism that works regardless of
+how the application is launched, since an environment variable set in a console
+never reaches a game started by a launcher.
 
-Launch from the same terminal:
-
-```
-set DXR11_TIER11=1
-"Engine\Binaries\Win64\UnrealEditor.exe"
+```ini
+tier11 = 0
 ```
 
-Or write a one-line launcher next to the .exe:
-
-```bat
-@echo off
-set DXR11_TIER11=1
-start "" "%~dp0UnrealEditor.exe" %*
-```
-
-Or set it for your whole user account, which survives reboots and reaches
-launchers. Remember you have set it:
+Environment variables of the same name still work and take priority over the
+file, which is what the test scripts use:
 
 ```
-setx DXR11_TIER11 1
+set DXR11_TIER11=0
 ```
 
 ### The whole switch list
 
 The shim reads exactly two environment variables. There are no others.
 
-| Variable | What it does |
-|---|---|
-| `DXR11_TIER11=1` | report Tier 1.1 and rewrite RayQuery shaders |
-| `DXR11_NO_WRAP=1` | hand the application the real device and translate nothing |
+| Setting | Default | What it does |
+|---|---|---|
+| `tier11` / `DXR11_TIER11` | **on** | report Tier 1.1 and rewrite RayQuery shaders |
+| `nowrap` / `DXR11_NO_WRAP` | off | hand the application the real device and translate nothing |
+
+Each can be set in `dxr11.ini` beside the DLL, or as an environment variable of
+the upper-case name. The environment wins, so a stray `.ini` can never change
+what the test scripts measure. Values are `1/true/on/yes` or `0/false/off/no`.
 
 `NO_WRAP` is not a companion to the first one, it overrides it. Everything the
 shim does lives on the device object it hands the application, including the
 Tier 1.1 answer, so refusing to hand over that object switches the whole layer
 off. With `NO_WRAP` set the application sees Tier 1.0 whatever else you set.
 
-That leaves four states, and only one of them is the one you want:
+That leaves these states:
 
-| DLL beside the .exe | `TIER11` | `NO_WRAP` | The application sees |
+| DLL beside the .exe | `tier11` | `nowrap` | The application sees |
 |---|---|---|---|
 | no | | | Tier 1.0 |
-| yes | unset | unset | Tier 1.0 |
-| yes | **1** | unset | **Tier 1.1, shaders rewritten** |
+| yes | default, or 1 | off | **Tier 1.1, shaders rewritten** |
+| yes | 0 | off | Tier 1.0 |
 | yes | anything | **1** | Tier 1.0, shim loaded but inert |
 
 ## 5. Read the log
@@ -173,7 +165,7 @@ type %TEMP%\dxr11_proxy.log
 A healthy start looks like this:
 
 ```
-[dxr11-proxy] attached to process, version 0.9.0
+[dxr11-proxy] attached to process, version 0.10.0
 [dxr11-proxy] device wrapping enabled
 [dxr11-proxy] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
 [dxr11-proxy] DXR11_TIER11=1: reporting Tier 1.1 to the application.
@@ -262,8 +254,8 @@ Three levels, increasing in thoroughness:
 
 | Goal | Do this |
 |---|---|
-| Report Tier 1.0 again, keep the shim loaded | unset `DXR11_TIER11` |
-| Forward everything, no wrapping | `set DXR11_NO_WRAP=1` |
+| Report Tier 1.0 again, keep the shim loaded | `tier11 = 0` in `dxr11.ini` |
+| Forward everything, translate nothing | `nowrap = 1` in `dxr11.ini` |
 | Remove the shim entirely | delete `d3d12.dll` from the .exe's directory |
 
 Deleting the DLL always restores the original behaviour exactly. The shim adds

@@ -28,6 +28,7 @@
 
 #include "proxy_log.h"
 #include "version.h"
+#include "config.h"
 #include "rewriter/dxc_host.h"
 #include "d3d12_device.h"
 
@@ -148,11 +149,14 @@ const char* ProxyIidName(const IID& iid) {
 
 static bool WrapEnabled() {
     static bool on = [] {
-        char v[8] = {};
-        DWORD n = GetEnvironmentVariableA("DXR11_NO_WRAP", v, sizeof(v));
-        bool disabled = (n > 0 && v[0] == '1');
-        ProxyLog("[dxr11-proxy] device wrapping %s\n", disabled ? "DISABLED (DXR11_NO_WRAP=1)" : "enabled");
-        return !disabled;
+        const cfg::Flag f = cfg::Get("DXR11_NO_WRAP", "nowrap", false);
+        if (f.value)
+            ProxyLog("[dxr11-proxy] device wrapping DISABLED (nowrap on, from %s). "
+                     "Nothing is translated, including the Tier 1.1 answer.\n",
+                     f.source);
+        else
+            ProxyLog("[dxr11-proxy] device wrapping enabled\n");
+        return !f.value;
     }();
     return on;
 }

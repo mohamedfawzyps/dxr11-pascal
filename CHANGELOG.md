@@ -17,6 +17,61 @@ build.
 
 ---
 
+## 0.10.0 (2026-09-22)
+
+Makes the thing usable without a terminal. No change to any translation, and
+the whole regression is unchanged.
+
+### Tier 1.1 is now ON by default
+
+The opt-in already happened. A proxy DLL only sits beside an executable
+because somebody deliberately put it there, and that is the consent. Requiring
+a second one, through an environment variable that a launcher never passes on,
+mostly produced reports that the shim does nothing.
+
+Turning it off is still one step: delete the DLL, or `tier11 = 0`.
+
+The gate this replaces was worth having during development, where the risk was
+a test run silently flipping. It is the wrong default for a release.
+
+### Settings live in a file now
+
+`dxr11.ini`, beside the DLL. A game started from Steam or the Epic launcher
+never sees an environment variable you set in a console, so a file is the only
+mechanism that works regardless of how something is launched. See
+`dxr11.example.ini`.
+
+Environment variables of the same name still work and **take priority**, so a
+stray `.ini` can never change what the test scripts measure.
+
+### The log says which DXC produced a shader
+
+    [dxr11-proxy] rewriter using dxcompiler 1.10.2605.37, dxil 1.10.2605.37
+
+The first question about any signing or validation failure is which compiler
+was involved, and the log could not answer it. Read from the file version
+resource rather than `IDxcVersionInfo`, which reports only major and minor,
+because a bug report needs the build number to name a release.
+
+### Verified
+
+The default flip is the part that could have broken something, so the case
+that matters is a DXR 1.0 application now being told Tier 1.1 with no
+configuration at all. `D3D12RaytracingHelloWorld` still renders 0 of 14400
+pixels different at unchanged fps, with the log confirming Tier 1.1 was
+reported.
+
+Everything else unchanged: 14 render cases, 12 rewriter cases byte-identical
+on both paths, 14 analysis and lowering checks, the probe at
+14450 + 2312 + 48774 = 65536.
+
+The gate tests were rewritten rather than deleted. They used to assert the
+flip could not happen by accident. They now assert the off switch works, by
+environment variable and by file, which is what a bug report will be asked to
+try first.
+
+---
+
 ## 0.9.0 (2026-09-21)
 
 First tagged release. A `RayQuery` compute shader, unmodified, runs on a GTX

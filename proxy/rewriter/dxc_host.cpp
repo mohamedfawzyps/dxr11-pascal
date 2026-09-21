@@ -2,7 +2,11 @@
 
 #include <dxcapi.h>
 
+#include <windows.h>
+
+#include <cstdio>
 #include <mutex>
+#include <vector>
 
 namespace dxch {
 namespace {
@@ -14,6 +18,7 @@ std::string g_why;
 
 HMODULE g_dxcompiler = nullptr;
 HMODULE g_dxil = nullptr;
+std::string g_versions = "not loaded";
 DxcCreateInstanceProc g_createDxc = nullptr;
 DxcCreateInstanceProc g_createDxil = nullptr;
 
@@ -51,6 +56,26 @@ HMODULE LoadBeside(const std::wstring& dir, const wchar_t* name) {
     return LoadLibraryW((dir + name).c_str());
 }
 
+// The file version resource, as "a.b.c.d". Taken from the file rather than
+// from IDxcVersionInfo, which reports only major and minor: a bug report needs
+// the build number to identify a release.
+std::string FileVersion(const std::wstring& path) {
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &ignored);
+    if (!size) return "unknown";
+    std::vector<unsigned char> buf(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, buf.data())) return "unknown";
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&fi), &len) || !fi)
+        return "unknown";
+    char out[64];
+    std::snprintf(out, sizeof(out), "%u.%u.%u.%u",
+                  HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                  HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return out;
+}
+
 void Init() {
     const std::wstring dir = HostDirectory();
     if (dir.empty()) { g_why = "cannot locate the shim's own directory"; return; }
@@ -74,6 +99,8 @@ void Init() {
         g_why = "DxcCreateInstance missing from dxcompiler.dll or dxil.dll";
         return;
     }
+    g_versions = "dxcompiler " + FileVersion(dir + L"dxcompiler.dll") +
+                 ", dxil " + FileVersion(dir + L"dxil.dll");
     g_ok = true;
 }
 
@@ -112,6 +139,8 @@ std::string ErrorTextOf(IDxcOperationResult* res) {
 void SetHostModule(HMODULE self) { g_self = self; }
 
 bool Available(std::string* error) { return Ready(error); }
+
+const char* Versions() { return g_versions.c_str(); }
 
 bool Disassemble(const void* container, size_t size, std::string* text,
                  std::string* error) {

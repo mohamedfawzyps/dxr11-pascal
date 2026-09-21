@@ -16,6 +16,7 @@
 #include "dxil_scan.h"
 #include "rq_pipeline.h"
 #include "res_tracker.h"
+#include "config.h"
 
 #include <windows.h>
 #include <new>
@@ -260,20 +261,24 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_CO
 }
 // The tier flip, OPT-IN. Reporting Tier 1.1 entitles an application to emit
 // RayQuery, and the brief is explicit that a shim which claims 1.1 and then
-// fails is worse than one that claims 1.0. So this stays off by default until
-// the dispatch path has been proven on more than the harness: set
-// DXR11_TIER11=1 to turn it on.
-static bool Tier11Requested() {
-    static const bool on = [] {
-        char buf[8]{};
-        return GetEnvironmentVariableA("DXR11_TIER11", buf, sizeof(buf)) && buf[0] == '1';
-    }();
-    return on;
+// fails is worse than one that claims 1.0.
+//
+// It is nonetheless ON by default, because the opt-in already happened: a
+// proxy DLL only exists beside an executable because somebody deliberately put
+// it there, and that is the consent. Asking for a second one, through an
+// environment variable a launcher never passes on, mostly produced reports
+// that the shim does nothing.
+//
+// Turning it off is still one step, and either of two: delete the DLL, or set
+// DXR11_TIER11=0. See proxy/config.h for where a value comes from.
+static cfg::Flag Tier11Requested() {
+    static const cfg::Flag f = cfg::Get("DXR11_TIER11", "tier11", true);
+    return f;
 }
 
 HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) {
     const HRESULT hr = m_real->CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize);
-    if (SUCCEEDED(hr) && Tier11Requested() && !m_tier11 &&
+    if (SUCCEEDED(hr) && Tier11Requested().value && !m_tier11 &&
         Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
         FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) {
         auto* o5 = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pFeatureSupportData);
@@ -281,10 +286,11 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature
             o5->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
-                ProxyLog("[dxr11-proxy] DXR11_TIER11=1: reporting Tier 1.1 to the "
-                         "application. RayQuery shaders will be rewritten; anything "
-                         "the rewriter refuses is logged and forwarded, and the "
-                         "driver then rejects it.\n");
+                ProxyLog("[dxr11-proxy] reporting Tier 1.1 to the application "
+                         "(tier11 on, from %s). RayQuery shaders will be "
+                         "rewritten; anything the rewriter refuses is logged and "
+                         "forwarded, and the driver then rejects it.\n",
+                         Tier11Requested().source);
         }
     }
     return hr;
