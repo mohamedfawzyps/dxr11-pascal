@@ -11,11 +11,10 @@ patterns, 0 mismatches. Run `.\tools\run_dispatch_test.ps1`.
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
 was missing. Nothing in this project implements ray tracing.
 
-**But the COVERAGE is narrow, and that is now measured.** Surveyed against
-Unreal Engine 5.7, the only real RayQuery code available: Epic uses 24 distinct
-RayQuery accessors and the rewriter supports **eight**, so not one of Epic's
-RayQuery shaders would lower today. The structure is finished; the coverage is
-not. See the survey entry below, and docs/phase5-dxil-recon.md.
+**Coverage is measured against a real engine: 19 of the 24 accessors Unreal
+uses.** It was 8; the 11 mechanically addable ones are done. What remains is
+`Abort()` and procedural primitives, plus four that are permanently refused.
+See the entries below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
 
@@ -371,17 +370,52 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   after inlining, which the rewriter refuses, needs the compiled DXIL and so
   needs the engine.
 
+- The 11 accessors: **DONE, coverage 8 of 24 becomes 19 of 24.** Added to both
+  implementations, byte-identical, and render-verified on the 1070 by
+  `phase5/cases/rayquery_acc.hlsl`.
+  - The operand shape is IDENTICAL on both sides apart from the query handle,
+    which simply goes away: `StateMatrix(op, handle, i32 row, i8 col)` becomes
+    `worldToObject(152, i32 row, i8 col)`. That is why eleven accessors cost
+    one small table rather than eleven special cases.
+  - Two need real conversion. `*TriangleFrontFace` returns `i1` in RayQuery
+    while `HitKind()` is an integer, so `icmp eq i32 hk, 254`. The
+    world-to-object matrix is twelve floats and travels in the payload as
+    `[12 x float]` indexed `row * 4 + col`.
+  - **The payload is now 84 bytes**, almost all matrix. The LAYOUT is fixed
+    even when the matrix is unread, because variable offsets across two
+    implementations is a good way to get one subtly wrong; the per-invocation
+    COST is what is conditional, so the closest-hit fetches the matrix only
+    when the shader reads it. `MaxPayloadSizeInBytes` must move with
+    `PAYLOAD_BYTES` in BOTH `lower.py`/`rq_lower.cpp` AND `rq_pipeline.cpp`
+    and the harness.
+
+  **Two bugs this work exposed, both worth not repeating.**
+  - **The loop isolation check was blind to phi nodes.** It exists to catch
+    values escaping the loop, and **a phi is exactly how a value escapes**, so
+    it was blind to its own purpose. `Uses()` read call arguments only, and a
+    phi is not a call. Both implementations had it identically, which is a
+    reminder that byte-identity proves AGREEMENT, not correctness.
+  - **A refusal test decayed rather than failed.** `test_reject.py` used opcode
+    191 as its "unverified" example; the Unreal survey turned 191 into
+    `CandidateTriangleFrontFace`, so the case became a verified one and the
+    check started accepting what it was written to refuse. Second instance in
+    this project. **A test whose premise is a fact about the world needs
+    re-checking when that fact changes.**
+
   Next action, in order of value.
-  1. **The 11 mechanically addable accessors.** The biggest step toward real
-     content and the least risky: the mapping is one table, each target is
-     already measured available, and the failure mode is a refusal.
-  2. **`Abort()`**, four uses in Epic's shaders, mapping to
-     `AcceptHitAndEndSearch()`.
-  3. **Procedural primitives**, needing the generated intersection shader. The
-     largest remaining piece of lowering and genuinely new work.
-  4. **Dynamic descriptor indexing**, still refused.
-  5. **Only then consider making the tier flip the default**, once enough real
+  1. **`Abort()`**, four uses in Epic's shaders, mapping to
+     `AcceptHitAndEndSearch()`. Small, takes coverage to 20.
+  2. **Procedural primitives**, needing the generated intersection shader.
+     Genuinely new work rather than another table entry, and takes coverage to
+     21, the practical maximum.
+  3. **Dynamic descriptor indexing**, still refused.
+  4. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
+
+  Four accessors stay PERMANENTLY refused and must keep failing loudly:
+  Candidate and `CommittedGeometryIndex`, which are Tier 1.1 on the DXR 1.0
+  side too, and `*InstanceContributionToHitGroupIndex`, which HLSL does not
+  expose to a hit shader at all.
 
   What is NOT generic, written down so it is not rediscovered:
   - Resource arrays work, but only with a **constant, uniform** index. Dynamic
