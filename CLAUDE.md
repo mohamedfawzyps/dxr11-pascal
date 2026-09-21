@@ -20,7 +20,10 @@ Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\DirectX-Graphics-Samples` - Microsoft samples, source of the DXR 1.0
   app used to validate the proxy.
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`.
-  Run them from an "x64 Native Tools Command Prompt for VS".
+  Each calls `setup_msvc.bat`, which finds MSVC via vswhere and activates the
+  x64 toolchain, so they work from any terminal. Running them from an
+  "x64 Native Tools Command Prompt for VS" also still works, the helper
+  detects cl.exe and does nothing.
 
 Optional read-only reference: a local clone of the Unreal Engine 5.7 NvRTX
 Caustics branch. Useful from Phase 4 on, to see how a shipping engine queries

@@ -15,10 +15,7 @@ if not exist "%DXC%\inc\dxcapi.h" (
   echo (the folder that contains inc\dxcapi.h and bin\x64\dxcompiler.dll^)
   exit /b 1
 )
-where cl >nul 2>nul || (
-  echo cl.exe not found - open "x64 Native Tools Command Prompt for VS" first.
-  exit /b 1
-)
+call "%~dp0setup_msvc.bat" || exit /b 1
 
 cl /nologo /EHsc /std:c++17 /I "%DXC%\inc" src\signtest.cpp /Fe:signtest.exe /link /INCREMENTAL:NO
 if errorlevel 1 exit /b 1

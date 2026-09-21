@@ -22,10 +22,7 @@ if not exist "%AGILITY%\build\native\include\d3d12.h" (
   echo Get it via NuGet: nuget install Microsoft.Direct3D.D3D12
   exit /b 1
 )
-where cl >nul 2>nul || (
-  echo cl.exe not found - open "x64 Native Tools Command Prompt for VS" first.
-  exit /b 1
-)
+call "%~dp0setup_msvc.bat" || exit /b 1
 
 cl /nologo /EHsc /std:c++17 /I "%AGILITY%\build\native\include" /I "%DXC%\inc" ^
    phase2\raytest.cpp /Fe:raytest.exe /link d3d12.lib dxgi.lib /INCREMENTAL:NO
