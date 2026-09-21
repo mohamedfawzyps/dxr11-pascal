@@ -919,6 +919,90 @@ raytest ALL MATCH, probe on hardware MATCH on both argument-buffer shapes and
 AddToStateObject still fine, HelloWorld 0 of 14400 pixels differ at 2140 against
 2137 fps, SimpleLighting 1386 against 1387 fps.
 
+## Batching: one sync for a run of dispatches
+
+The first working split paid two synchronisations per indirect dispatch. One is
+unavoidable: the argument buffer is written by the GPU, so the CPU has to wait
+before it can read the dimensions. The second was pure bookkeeping, a wait after
+each dispatch just to know the temporary command list was safe to reuse.
+
+Both are gone now.
+
+**The bookkeeping wait.** Dispatch lists come from a pool, `Dxr11DispatchList`,
+each entry carrying the fence value it was last submitted with. An entry is
+reusable when `GetCompletedValue()` has passed that value. So the shim signals
+the fence after submitting and carries straight on, instead of waiting; if no
+entry has retired by the next dispatch it just makes another.
+
+**The per-dispatch wait.** A split used to close the segment immediately. It now
+only queues the dispatch, and the segment stays open until the application
+records something that has to be ordered after it. So a run of adjacent
+dispatches lands in a single segment and shares a single sync.
+
+What counts as "has to be ordered after it" is a list of 32 work-recording
+methods (draws, dispatches, copies, barriers, clears, queries, acceleration
+structure builds, render passes, `ExecuteBundle`, a forwarded `ExecuteIndirect`)
+plus `Close()`. State-setting calls deliberately do **not** end the segment:
+they change nothing on the timeline, and each queued dispatch carries its own
+binding snapshot, so a rebinding between two dispatches is already handled.
+
+That last point is the risky one, so the test proves it rather than assuming it.
+
+### Tested
+
+`tier11probe.exe hw -batchsplit` runs two adjacent GPU-argument indirect
+dispatches with **only a rebinding between them**, writing to two *different*
+output buffers:
+
+    dispatch A -> buffer 1   : 14450 tri + 2312 proc
+    dispatch B -> buffer 2   : 14450 tri + 2312 proc
+    log: split: one sync for 2 dispatches
+
+Two different buffers is what makes this worth running. If the shim shared one
+binding snapshot across the queued dispatches, both would write to buffer 2 and
+buffer 1 would come back untouched. If a dispatch were dropped by the deferral,
+one buffer would be empty. Both failure modes are visible, and neither happened.
+
+WARP, which has Tier 1.1 natively and so never enters the split path, produces
+identical counts.
+
+### The control
+
+The same probe then repeats the pair with a UAV barrier between them. A barrier
+is ordered work, so it must end the segment:
+
+    both dispatches -> buffer 1: 14450 tri + 2312 proc
+    log: split: one sync for 1 dispatch
+         split: one sync for 1 dispatch
+
+Without this, "one sync for 2 dispatches" would not mean anything: a shim that
+never closed a segment at all would print the same line and be badly broken. The
+log line is deliberately printed for every segment, not just batched ones, so
+the two cases are distinguishable.
+
+### What it is worth
+
+Eight dispatches of the same grid, batched against forced apart, median of five,
+four runs:
+
+    1 segment,  1 sync        5.15   5.24   5.65   5.36  ms
+    8 segments, 8 syncs       6.50   7.29   6.67   7.18  ms
+    saved                     1.35   2.05   1.02   1.82  ms  (15-28%)
+
+Always faster, by roughly 0.15-0.3 ms per avoided sync.
+
+That is well below the 0.8-1.0 ms per split measured earlier, and the difference
+is not noise, it is measuring something else. The earlier figure came from the
+pipelined frame loop, where a mid-frame sync collapses CPU/GPU overlap and the
+frame cost becomes CPU+GPU instead of max(CPU,GPU). This probe wraps everything
+in one blocking flush, so there is no overlap to lose and only the sync's own
+latency is recovered. In a real pipelined renderer the saving should be nearer
+the larger number.
+
+One confound, stated rather than controlled for: the barrier variant also
+serialises on the GPU. These segments already execute in sequence on a single
+queue, so that should be close to free, but it is not provably zero.
+
 ### Still not tracked
 
 Stream output targets, predication, sample positions and shading rate. Each is a

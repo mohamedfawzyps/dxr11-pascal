@@ -120,10 +120,22 @@ struct Dxr11PendingDispatch {
     Dxr11Bindings bindings;
 };
 
+// A closed segment, followed by the dispatches that could not be recorded until
+// its contents had run. Several dispatches share one segment, and therefore one
+// sync, whenever the application issued them with no GPU work in between.
 struct Dxr11Segment {
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;  // closed
-    bool                 hasPending = false;
-    Dxr11PendingDispatch pending;
+    std::vector<Dxr11PendingDispatch> pendings;
+};
+
+// A dispatch-only list and its allocator, reusable once the GPU has passed the
+// fence value recorded when it was submitted. Pooling is what lets the submit
+// path signal without blocking: the old code waited after every dispatch purely
+// to know the list was safe to reuse, which doubled the number of stalls.
+struct Dxr11DispatchList {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>     alloc;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
+    UINT64 fenceValue = 0;
 };
 
 // Private interface used only so the queue hook can tell one of our wrappers
@@ -267,7 +279,16 @@ private:
     // a readback buffer, closes the segment, opens a fresh one and replays the
     // bindings into it. Returns false if it could not, and the caller then
     // refuses the dispatch rather than issuing a wrong one.
-    bool BeginSplit(ID3D12Resource* args, UINT64 argOffset);
+    // Records the readback copy for an indirect dispatch and queues it, WITHOUT
+    // closing the segment. The close is deferred so that a run of dispatches
+    // with no work between them lands in one segment behind one sync.
+    bool QueueSplit(ID3D12Resource* args, UINT64 argOffset);
+    // Closes the segment if any dispatches are queued, and opens a continuation
+    // with the bindings replayed. Called before recording anything that must be
+    // ordered after those dispatches.
+    void FlushQueuedSplit();
+    // True when a dispatch is queued and the caller is about to record work.
+    void WorkBarrier() { if (!m_openPendings.empty()) FlushQueuedSplit(); }
     ID3D12Device5* RealDevice();
 
     ID3D12GraphicsCommandList4* m_real;
@@ -281,7 +302,8 @@ private:
     // dispatch, which is every recording in every app tested so far.
     std::vector<Dxr11Segment>                          m_segments;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator>     m_allocator;   // the app's, from Reset
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>     m_splitAlloc;  // ours, for dispatch lists
+    std::vector<Dxr11PendingDispatch>                  m_openPendings; // queued, not yet closed
+    std::vector<Dxr11DispatchList>                     m_dispatchPool;
     Microsoft::WRL::ComPtr<ID3D12Fence>                m_fence;
     UINT64                                             m_fenceValue = 0;
     Microsoft::WRL::ComPtr<ID3D12Device5>              m_device;

@@ -189,12 +189,17 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::SetName(LPCWSTR n) { return FWD(SetN
 HRESULT STDMETHODCALLTYPE Dxr11CommandList::GetDevice(REFIID riid, void** ppv) { return FWD(GetDevice(riid, ppv)); }
 D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE Dxr11CommandList::GetType() { return FWD(GetType()); }
 
-HRESULT STDMETHODCALLTYPE Dxr11CommandList::Close() { return FWD(Close()); }
+HRESULT STDMETHODCALLTYPE Dxr11CommandList::Close() {
+    // A dispatch queued right at the end still needs its own segment.
+    FlushQueuedSplit();
+    return FWD(Close());
+}
 // Reset starts a fresh recording, so any segments from the previous one are
 // stale. It also clears all binding state, which is exactly why a split has to
 // replay it.
 HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) {
     m_segments.clear();
+    m_openPendings.clear();
     m_bindings.ReleaseAll();
     m_gfx.ReleaseAll();
     m_gfx = Dxr11GfxState{};
@@ -203,15 +208,15 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     m_allocator = a;
     return FWD(Reset(a, p));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) { FWD(ClearState(p)); }
-void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { FWD(DrawInstanced(a, b, c, d)); }
-void STDMETHODCALLTYPE Dxr11CommandList::DrawIndexedInstanced(UINT a, UINT b, UINT c, INT d, UINT e) { FWD(DrawIndexedInstanced(a, b, c, d, e)); }
-void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) { FWD(Dispatch(x, y, z)); }
-void STDMETHODCALLTYPE Dxr11CommandList::CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 n) { FWD(CopyBufferRegion(d, dof, s, sof, n)); }
-void STDMETHODCALLTYPE Dxr11CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* b) { FWD(CopyTextureRegion(d, x, y, z, s, b)); }
-void STDMETHODCALLTYPE Dxr11CommandList::CopyResource(ID3D12Resource* d, ID3D12Resource* s) { FWD(CopyResource(d, s)); }
-void STDMETHODCALLTYPE Dxr11CommandList::CopyTiles(ID3D12Resource* r, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) { FWD(CopyTiles(r, c, sz, b, off, f)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT f) { FWD(ResolveSubresource(d, ds, s, ss, f)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) { WorkBarrier(); FWD(ClearState(p)); }
+void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
+void STDMETHODCALLTYPE Dxr11CommandList::DrawIndexedInstanced(UINT a, UINT b, UINT c, INT d, UINT e) { WorkBarrier(); FWD(DrawIndexedInstanced(a, b, c, d, e)); }
+void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) { WorkBarrier(); FWD(Dispatch(x, y, z)); }
+void STDMETHODCALLTYPE Dxr11CommandList::CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 n) { WorkBarrier(); FWD(CopyBufferRegion(d, dof, s, sof, n)); }
+void STDMETHODCALLTYPE Dxr11CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* b) { WorkBarrier(); FWD(CopyTextureRegion(d, x, y, z, s, b)); }
+void STDMETHODCALLTYPE Dxr11CommandList::CopyResource(ID3D12Resource* d, ID3D12Resource* s) { WorkBarrier(); FWD(CopyResource(d, s)); }
+void STDMETHODCALLTYPE Dxr11CommandList::CopyTiles(ID3D12Resource* r, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) { WorkBarrier(); FWD(CopyTiles(r, c, sz, b, off, f)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT f) { WorkBarrier(); FWD(ResolveSubresource(d, ds, s, ss, f)); }
 void STDMETHODCALLTYPE Dxr11CommandList::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) {
     m_gfx.hasTopology = true; m_gfx.topology = t;
     FWD(IASetPrimitiveTopology(t));
@@ -237,12 +242,13 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState(ID3D12PipelineState* p
     m_gfx.pso = p; if (p) p->AddRef();
     FWD(SetPipelineState(p));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) { FWD(ResourceBarrier(n, b)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) { WorkBarrier(); FWD(ResourceBarrier(n, b)); }
 
 // A bundle is created through CreateCommandList too, so it arrives wrapped.
 // Unwrap before the runtime sees it. Same problem the queue hook solves, in
 // miniature.
 void STDMETHODCALLTYPE Dxr11CommandList::ExecuteBundle(ID3D12GraphicsCommandList* pCommandList) {
+    WorkBarrier();
     ID3D12CommandList* real = Dxr11CommandList::Unwrap(pCommandList);
     FWD(ExecuteBundle(real ? static_cast<ID3D12GraphicsCommandList*>(real) : pCommandList));
 }
@@ -366,15 +372,15 @@ void STDMETHODCALLTYPE Dxr11CommandList::OMSetRenderTargets(UINT n, const D3D12_
     if (ds) m_gfx.dsvHandle = *ds;
     FWD(OMSetRenderTargets(n, rt, single, ds));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE v, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT n, const D3D12_RECT* r) { FWD(ClearDepthStencilView(v, f, d, s, n, r)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE v, const FLOAT c[4], UINT n, const D3D12_RECT* r) { FWD(ClearRenderTargetView(v, c, n, r)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const UINT v[4], UINT n, const D3D12_RECT* r) { FWD(ClearUnorderedAccessViewUint(g, c, res, v, n, r)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const FLOAT v[4], UINT n, const D3D12_RECT* r) { FWD(ClearUnorderedAccessViewFloat(g, c, res, v, n, r)); }
-void STDMETHODCALLTYPE Dxr11CommandList::DiscardResource(ID3D12Resource* r, const D3D12_DISCARD_REGION* d) { FWD(DiscardResource(r, d)); }
-void STDMETHODCALLTYPE Dxr11CommandList::BeginQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { FWD(BeginQuery(h, t, i)); }
-void STDMETHODCALLTYPE Dxr11CommandList::EndQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { FWD(EndQuery(h, t, i)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ResolveQueryData(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT s, UINT n, ID3D12Resource* d, UINT64 o) { FWD(ResolveQueryData(h, t, s, n, d, o)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetPredication(ID3D12Resource* b, UINT64 o, D3D12_PREDICATION_OP op) { FWD(SetPredication(b, o, op)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE v, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT n, const D3D12_RECT* r) { WorkBarrier(); FWD(ClearDepthStencilView(v, f, d, s, n, r)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE v, const FLOAT c[4], UINT n, const D3D12_RECT* r) { WorkBarrier(); FWD(ClearRenderTargetView(v, c, n, r)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const UINT v[4], UINT n, const D3D12_RECT* r) { WorkBarrier(); FWD(ClearUnorderedAccessViewUint(g, c, res, v, n, r)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const FLOAT v[4], UINT n, const D3D12_RECT* r) { WorkBarrier(); FWD(ClearUnorderedAccessViewFloat(g, c, res, v, n, r)); }
+void STDMETHODCALLTYPE Dxr11CommandList::DiscardResource(ID3D12Resource* r, const D3D12_DISCARD_REGION* d) { WorkBarrier(); FWD(DiscardResource(r, d)); }
+void STDMETHODCALLTYPE Dxr11CommandList::BeginQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { WorkBarrier(); FWD(BeginQuery(h, t, i)); }
+void STDMETHODCALLTYPE Dxr11CommandList::EndQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { WorkBarrier(); FWD(EndQuery(h, t, i)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ResolveQueryData(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT s, UINT n, ID3D12Resource* d, UINT64 o) { WorkBarrier(); FWD(ResolveQueryData(h, t, s, n, d, o)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetPredication(ID3D12Resource* b, UINT64 o, D3D12_PREDICATION_OP op) { WorkBarrier(); FWD(SetPredication(b, o, op)); }
 void STDMETHODCALLTYPE Dxr11CommandList::SetMarker(UINT m, const void* d, UINT s) { FWD(SetMarker(m, d, s)); }
 void STDMETHODCALLTYPE Dxr11CommandList::BeginEvent(UINT m, const void* d, UINT s) { FWD(BeginEvent(m, d, s)); }
 void STDMETHODCALLTYPE Dxr11CommandList::EndEvent() { FWD(EndEvent()); }
@@ -395,6 +401,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::EndEvent() { FWD(EndEvent()); }
 void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature* sig, UINT maxCount, ID3D12Resource* args, UINT64 argOffset, ID3D12Resource* countBuf, UINT64 countOffset) {
     Dxr11CommandSignature* ours = Dxr11CommandSignature::From(sig);
     if (!ours) {
+        WorkBarrier();
         FWD(ExecuteIndirect(sig, maxCount, args, argOffset, countBuf, countOffset));
         return;
     }
@@ -424,7 +431,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
                      "GPU-written argument buffer is not supported, dispatch SKIPPED\n", maxCount);
             return;
         }
-        if (!BeginSplit(args, argOffset)) {
+        if (!QueueSplit(args, argOffset)) {
             ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): split failed, "
                      "dispatch SKIPPED\n");
         }
@@ -457,34 +464,34 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
     }
 }
 
-void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { FWD(AtomicCopyBufferUINT(d, dof, s, sof, n, dep, ranges)); }
-void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT64(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { FWD(AtomicCopyBufferUINT64(d, dof, s, sof, n, dep, ranges)); }
+void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { WorkBarrier(); FWD(AtomicCopyBufferUINT(d, dof, s, sof, n, dep, ranges)); }
+void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT64(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { WorkBarrier(); FWD(AtomicCopyBufferUINT64(d, dof, s, sof, n, dep, ranges)); }
 void STDMETHODCALLTYPE Dxr11CommandList::OMSetDepthBounds(FLOAT a, FLOAT b) {
     m_gfx.hasDepthBounds = true; m_gfx.depthMin = a; m_gfx.depthMax = b;
     FWD(OMSetDepthBounds(a, b));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::SetSamplePositions(UINT a, UINT b, D3D12_SAMPLE_POSITION* p) { FWD(SetSamplePositions(a, b, p)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ResolveSubresourceRegion(ID3D12Resource* d, UINT ds, UINT x, UINT y, ID3D12Resource* s, UINT ss, D3D12_RECT* r, DXGI_FORMAT f, D3D12_RESOLVE_MODE m) { FWD(ResolveSubresourceRegion(d, ds, x, y, s, ss, r, f, m)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ResolveSubresourceRegion(ID3D12Resource* d, UINT ds, UINT x, UINT y, ID3D12Resource* s, UINT ss, D3D12_RECT* r, DXGI_FORMAT f, D3D12_RESOLVE_MODE m) { WorkBarrier(); FWD(ResolveSubresourceRegion(d, ds, x, y, s, ss, r, f, m)); }
 void STDMETHODCALLTYPE Dxr11CommandList::SetViewInstanceMask(UINT m) {
     m_gfx.hasViewInstanceMask = true; m_gfx.viewInstanceMask = m;
     FWD(SetViewInstanceMask(m));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::WriteBufferImmediate(UINT c, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* p, const D3D12_WRITEBUFFERIMMEDIATE_MODE* m) { FWD(WriteBufferImmediate(c, p, m)); }
+void STDMETHODCALLTYPE Dxr11CommandList::WriteBufferImmediate(UINT c, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* p, const D3D12_WRITEBUFFERIMMEDIATE_MODE* m) { WorkBarrier(); FWD(WriteBufferImmediate(c, p, m)); }
 void STDMETHODCALLTYPE Dxr11CommandList::SetProtectedResourceSession(ID3D12ProtectedResourceSession* s) { FWD(SetProtectedResourceSession(s)); }
-void STDMETHODCALLTYPE Dxr11CommandList::BeginRenderPass(UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rt, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds, D3D12_RENDER_PASS_FLAGS f) { FWD(BeginRenderPass(n, rt, ds, f)); }
-void STDMETHODCALLTYPE Dxr11CommandList::EndRenderPass() { FWD(EndRenderPass()); }
-void STDMETHODCALLTYPE Dxr11CommandList::InitializeMetaCommand(ID3D12MetaCommand* m, const void* d, SIZE_T s) { FWD(InitializeMetaCommand(m, d, s)); }
-void STDMETHODCALLTYPE Dxr11CommandList::ExecuteMetaCommand(ID3D12MetaCommand* m, const void* d, SIZE_T s) { FWD(ExecuteMetaCommand(m, d, s)); }
-void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) { FWD(BuildRaytracingAccelerationStructure(d, n, p)); }
-void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
-void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { FWD(CopyRaytracingAccelerationStructure(d, s, m)); }
+void STDMETHODCALLTYPE Dxr11CommandList::BeginRenderPass(UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rt, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds, D3D12_RENDER_PASS_FLAGS f) { WorkBarrier(); FWD(BeginRenderPass(n, rt, ds, f)); }
+void STDMETHODCALLTYPE Dxr11CommandList::EndRenderPass() { WorkBarrier(); FWD(EndRenderPass()); }
+void STDMETHODCALLTYPE Dxr11CommandList::InitializeMetaCommand(ID3D12MetaCommand* m, const void* d, SIZE_T s) { WorkBarrier(); FWD(InitializeMetaCommand(m, d, s)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ExecuteMetaCommand(ID3D12MetaCommand* m, const void* d, SIZE_T s) { WorkBarrier(); FWD(ExecuteMetaCommand(m, d, s)); }
+void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) { WorkBarrier(); FWD(BuildRaytracingAccelerationStructure(d, n, p)); }
+void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
+void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { WorkBarrier(); FWD(CopyRaytracingAccelerationStructure(d, s, m)); }
 void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s) {
     if (m_bindings.stateObject) m_bindings.stateObject->Release();
     m_bindings.stateObject = s;
     if (s) s->AddRef();
     FWD(SetPipelineState1(s));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) { FWD(DispatchRays(d)); }
+void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) { WorkBarrier(); FWD(DispatchRays(d)); }
 
 // --- ID3D12GraphicsCommandList5 / 6 -----------------------------------------
 // Only reachable when QueryInterface handed the interface out, which it does
@@ -497,7 +504,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::RSSetShadingRate(D3D12_SHADING_RATE r, 
 void STDMETHODCALLTYPE Dxr11CommandList::RSSetShadingRateImage(ID3D12Resource* img) {
     if (m_real5) m_real5->RSSetShadingRateImage(img);
 }
-void STDMETHODCALLTYPE Dxr11CommandList::DispatchMesh(UINT x, UINT y, UINT z) {
+void STDMETHODCALLTYPE Dxr11CommandList::DispatchMesh(UINT x, UINT y, UINT z) { WorkBarrier();
     if (m_real6) m_real6->DispatchMesh(x, y, z);
 }
 
@@ -511,7 +518,7 @@ ID3D12Device5* Dxr11CommandList::RealDevice() {
     return m_device.Get();
 }
 
-bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
+bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     ID3D12Device5* dev = RealDevice();
     if (!dev || !m_allocator) {
         ProxyLog("[dxr11-proxy] split: no device or allocator (was Reset called?)\n");
@@ -533,13 +540,10 @@ bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
         return false;
     }
 
-    // Last thing in this segment: copy the arguments out.
-    //
     // The barriers are NOT optional. D3D12 requires the argument buffer to be in
-    // INDIRECT_ARGUMENT state at an ExecuteIndirect, and whatever wrote it, a
-    // copy or a compute shader, needs an execution dependency before this read.
-    // Without them the copy returns stale contents, which showed up as
-    // dimensions of 0x0x0 and a silently skipped dispatch.
+    // INDIRECT_ARGUMENT state at an ExecuteIndirect, and whatever wrote it needs
+    // an execution dependency before this read. Without them the copy returns
+    // stale contents, which showed up as dimensions of 0x0x0.
     D3D12_RESOURCE_BARRIER toCopy{};
     toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     toCopy.Transition.pResource = args;
@@ -554,17 +558,31 @@ bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
     back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     back.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     m_real->ResourceBarrier(1, &back);
+
+    // Queue it, but do NOT close the segment yet. If the next thing the
+    // application records is another indirect ray dispatch, both land in this
+    // same segment and share a single sync.
+    Dxr11PendingDispatch pend;
+    pend.readback = readback;
+    pend.bindings = m_bindings;
+    pend.bindings.Retain();
+    m_openPendings.push_back(pend);
+    return true;
+}
+
+void Dxr11CommandList::FlushQueuedSplit() {
+    if (m_openPendings.empty()) return;
+    ID3D12Device5* dev = RealDevice();
+    if (!dev || !m_allocator) return;
+
     if (FAILED(m_real->Close())) {
         ProxyLog("[dxr11-proxy] split: Close failed on the segment\n");
-        return false;
+        return;
     }
 
     Dxr11Segment seg;
-    seg.list = m_real;                 // keeps its reference
-    seg.hasPending = true;
-    seg.pending.readback = readback;
-    seg.pending.bindings = m_bindings;  // copy, then take our own references
-    seg.pending.bindings.Retain();
+    seg.list = m_real;                    // keeps its reference
+    seg.pendings.swap(m_openPendings);
     m_segments.push_back(seg);
 
     // Open the continuation on the SAME allocator. Legal because the previous
@@ -573,11 +591,9 @@ bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
     if (FAILED(dev->CreateCommandList(0, m_real->GetType(), m_allocator.Get(), nullptr,
                                       IID_PPV_ARGS(&next)))) {
         ProxyLog("[dxr11-proxy] split: could not open the continuation segment\n");
-        m_segments.pop_back();
-        return false;
+        return;
     }
 
-    // Swap the continuation in. The old list is owned by the segment now.
     if (m_real6) { m_real6->Release(); m_real6 = nullptr; }
     if (m_real5) { m_real5->Release(); m_real5 = nullptr; }
     m_real = next.Detach();
@@ -590,7 +606,6 @@ bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
     // because the app carries on recording draws into it.
     m_bindings.Replay(m_real);
     m_gfx.Replay(m_real);
-    return true;
 }
 
 bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submit) {
@@ -603,12 +618,6 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             return false;
         }
     }
-    if (!m_splitAlloc) {
-        if (FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&m_splitAlloc)))) {
-            ProxyLog("[dxr11-proxy] split submit: could not create an allocator\n");
-            return false;
-        }
-    }
 
     HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!evt) return false;
@@ -617,10 +626,11 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
         Dxr11Segment& seg = m_segments[i];
         ID3D12CommandList* one[] = { seg.list.Get() };
         submit(queue, 1, one);
-        if (!seg.hasPending) continue;
+        if (seg.pendings.empty()) continue;
 
-        // The bubble the measurements priced: the CPU cannot go on until the
-        // GPU has produced the dispatch dimensions.
+        // ONE sync for the whole run of dispatches queued against this segment.
+        // Their arguments were all produced by work inside it, so a single wait
+        // makes every one of them readable.
         ++m_fenceValue;
         queue->Signal(m_fence.Get(), m_fenceValue);
         if (m_fence->GetCompletedValue() < m_fenceValue) {
@@ -628,44 +638,71 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             WaitForSingleObject(evt, INFINITE);
         }
 
-        D3D12_DISPATCH_RAYS_DESC desc{};
-        void* p = nullptr;
-        D3D12_RANGE readAll{ 0, sizeof(desc) };
-        if (SUCCEEDED(seg.pending.readback->Map(0, &readAll, &p)) && p) {
-            std::memcpy(&desc, p, sizeof(desc));
-            D3D12_RANGE noWrite{ 0, 0 };
-            seg.pending.readback->Unmap(0, &noWrite);
-        }
-
-        if (desc.Width && desc.Height && desc.Depth) {
-            // Now the dimensions are known, the dispatch can finally be recorded.
-            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> dl;
-            if (SUCCEEDED(m_splitAlloc->Reset()) &&
-                SUCCEEDED(dev->CreateCommandList(0, m_real->GetType(), m_splitAlloc.Get(),
-                                                 nullptr, IID_PPV_ARGS(&dl)))) {
-                seg.pending.bindings.Replay(dl.Get());
-                dl->DispatchRays(&desc);
-                if (SUCCEEDED(dl->Close())) {
-                    ID3D12CommandList* d[] = { dl.Get() };
-                    submit(queue, 1, d);
-                    static LONG once = 0;
-                    if (InterlockedCompareExchange(&once, 1, 0) == 0)
-                        ProxyLog("[dxr11-proxy] split dispatch issued: %ux%ux%u, dimensions "
-                                 "read back from the GPU\n", desc.Width, desc.Height, desc.Depth);
-                }
+        for (Dxr11PendingDispatch& pend : seg.pendings) {
+            D3D12_DISPATCH_RAYS_DESC desc{};
+            void* p = nullptr;
+            D3D12_RANGE readAll{ 0, sizeof(desc) };
+            if (SUCCEEDED(pend.readback->Map(0, &readAll, &p)) && p) {
+                std::memcpy(&desc, p, sizeof(desc));
+                D3D12_RANGE noWrite{ 0, 0 };
+                pend.readback->Unmap(0, &noWrite);
             }
-            // The dispatch list must outlive its execution, so keep the CPU here
-            // until the GPU is done with it. Same bubble, already paid for.
+            if (!desc.Width || !desc.Height || !desc.Depth) {
+                ProxyLog("[dxr11-proxy] split: dimensions read back as %ux%ux%u, "
+                         "dispatch skipped\n", desc.Width, desc.Height, desc.Depth);
+                continue;
+            }
+
+            // Take a dispatch list the GPU has finished with, or make a new one.
+            // Nothing blocks here: the pool is checked against the fence value
+            // recorded when each list was last submitted.
+            Dxr11DispatchList* slot = nullptr;
+            const UINT64 done = m_fence->GetCompletedValue();
+            for (Dxr11DispatchList& d : m_dispatchPool)
+                if (d.fenceValue <= done) { slot = &d; break; }
+            if (!slot) {
+                Dxr11DispatchList fresh;
+                if (FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&fresh.alloc)))) {
+                    ProxyLog("[dxr11-proxy] split submit: allocator creation failed\n");
+                    continue;
+                }
+                m_dispatchPool.push_back(fresh);
+                slot = &m_dispatchPool.back();
+            }
+
+            slot->list.Reset();
+            if (FAILED(slot->alloc->Reset()) ||
+                FAILED(dev->CreateCommandList(0, m_real->GetType(), slot->alloc.Get(),
+                                              nullptr, IID_PPV_ARGS(&slot->list)))) {
+                ProxyLog("[dxr11-proxy] split submit: dispatch list creation failed\n");
+                continue;
+            }
+
+            pend.bindings.Replay(slot->list.Get());
+            slot->list->DispatchRays(&desc);
+            if (FAILED(slot->list->Close())) continue;
+
+            ID3D12CommandList* d[] = { slot->list.Get() };
+            submit(queue, 1, d);
+
+            // Signal WITHOUT waiting. This is only lifetime bookkeeping, so the
+            // CPU carries on and the pool reclaims the list later.
             ++m_fenceValue;
             queue->Signal(m_fence.Get(), m_fenceValue);
-            if (m_fence->GetCompletedValue() < m_fenceValue) {
-                m_fence->SetEventOnCompletion(m_fenceValue, evt);
-                WaitForSingleObject(evt, INFINITE);
-            }
-        } else {
-            ProxyLog("[dxr11-proxy] split: dimensions read back as %ux%ux%u, dispatch skipped\n",
-                     desc.Width, desc.Height, desc.Depth);
+            slot->fenceValue = m_fenceValue;
+
+            static LONG once = 0;
+            if (InterlockedCompareExchange(&once, 1, 0) == 0)
+                ProxyLog("[dxr11-proxy] split dispatch issued: %ux%ux%u, dimensions "
+                         "read back from the GPU\n", desc.Width, desc.Height, desc.Depth);
         }
+        // One line per segment, whatever its size, so a test can tell "two
+        // dispatches behind one sync" apart from "one dispatch, twice". Bounded,
+        // because a real application splits on every frame.
+        static LONG segLogs = 0;
+        if (InterlockedIncrement(&segLogs) <= 8)
+            ProxyLog("[dxr11-proxy] split: one sync for %zu dispatch%s\n",
+                     seg.pendings.size(), seg.pendings.size() == 1 ? "" : "es");
     }
 
     // Finally the tail, the part recorded after the last split.

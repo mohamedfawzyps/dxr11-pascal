@@ -42,6 +42,7 @@
 #include <vector>
 #include <stdexcept>
 #include <functional>
+#include <algorithm>
 
 using Microsoft::WRL::ComPtr;
 
@@ -84,6 +85,7 @@ static bool g_dxgiQueue = false;
 static bool g_hookTest = false;
 static bool g_queueVTable = false;
 static bool g_gfxSplit = false;
+static bool g_batchSplit = false;
 static int g_filler = 4;
 static int g_frames = 60;
 static uint32_t g_rayCount = 1u << 20;   // 1M rays, enough that Pascal does real work
@@ -1401,6 +1403,168 @@ static void ProbePipeline(Ctx& c, uint32_t rayCount, int fillerPasses, int frame
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Two indirect ray dispatches back to back, with no GPU work between them.
+//
+// The shim defers closing a segment until the application records work that has
+// to be ordered after a queued dispatch. So a run of dispatches like this should
+// land in ONE segment and share ONE sync, instead of paying a stall each.
+//
+// The two dispatches write to DIFFERENT output buffers, with only a rebinding
+// between them. That makes the test prove two things at once: that both
+// dispatches actually ran, and that each carries its own binding snapshot rather
+// than sharing the last one set.
+// ---------------------------------------------------------------------------
+static void ProbeBatchSplit(Ctx& c) {
+    std::printf("\n-- two adjacent indirect dispatches: one sync? --\n");
+
+    std::string err;
+    auto lib = c.dxc.tryCompile(kLibHLSL, L"lib_6_3", {}, err);
+    if (!lib) { std::printf("   [!] library: %s\n", err.c_str()); return; }
+    ComPtr<ID3D12StateObject> so;
+    if (FAILED(MakeStateObject(c, lib.Get(), false, so))) {
+        std::printf("   [!] state object failed\n"); return;
+    }
+    ComPtr<ID3D12StateObjectProperties> props;
+    HR(so.As(&props), "props");
+    auto sbtRay  = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"RayGen"));
+    auto sbtMiss = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"Miss"));
+    const void* hitIds[2] = { props->GetShaderIdentifier(L"HitGroup"),
+                              props->GetShaderIdentifier(L"HitGroupProc") };
+    auto sbtHit = MakeSBT(c.g.device.Get(), hitIds, 2);
+    auto dr = MakeDispatchDesc(sbtRay.Get(), sbtMiss.Get(), sbtHit.Get(), 2);
+
+    D3D12_INDIRECT_ARGUMENT_DESC arg{}; arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    D3D12_COMMAND_SIGNATURE_DESC csd{};
+    csd.ByteStride = sizeof(D3D12_DISPATCH_RAYS_DESC);
+    csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
+    ComPtr<ID3D12CommandSignature> cs;
+    if (FAILED(c.g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&cs)))) {
+        std::printf("   [!] DISPATCH_RAYS signature unavailable\n"); return;
+    }
+
+    auto upArgs = CreateBuffer(c.g.device.Get(), sizeof(dr), D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_STATE_GENERIC_READ);
+    { void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+      HR(upArgs->Map(0, &none, &p), "map args"); std::memcpy(p, &dr, sizeof(dr));
+      upArgs->Unmap(0, nullptr); }
+    auto argsA = CreateBuffer(c.g.device.Get(), sizeof(dr), D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_STATE_COMMON);
+    auto argsB = CreateBuffer(c.g.device.Get(), sizeof(dr), D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_STATE_COMMON);
+
+    // A second output, so the two dispatches are distinguishable.
+    auto out2 = CreateBuffer(c.g.device.Get(), c.outSize, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto rb2 = CreateBuffer(c.g.device.Get(), c.outSize, D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+
+    c.clear_out();
+    auto& cl = c.g.list;
+    // Both argument buffers are produced here, BEFORE either dispatch, which is
+    // what makes a single sync sufficient for both.
+    cl->CopyBufferRegion(argsA.Get(), 0, upArgs.Get(), 0, sizeof(dr));
+    cl->CopyBufferRegion(argsB.Get(), 0, upArgs.Get(), 0, sizeof(dr));
+    Transition(cl.Get(), argsA.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    Transition(cl.Get(), argsB.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+
+    cl->SetPipelineState1(so.Get());
+    BindRoots(cl.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+              c.scene.tlas->GetGPUVirtualAddress(), c.out->GetGPUVirtualAddress());
+    cl->ExecuteIndirect(cs.Get(), 1, argsA.Get(), 0, nullptr, 0);
+
+    // Only a rebinding between them: no GPU work, so the segment should stay
+    // open and both dispatches should share one sync.
+    BindRoots(cl.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+              c.scene.tlas->GetGPUVirtualAddress(), out2->GetGPUVirtualAddress());
+    cl->ExecuteIndirect(cs.Get(), 1, argsB.Get(), 0, nullptr, 0);
+
+    c.g.flush();
+
+    uint32_t triA = 0, procA = 0, ignore = 0, unwrittenA = 0;
+    c.readback_counts(triA, procA, ignore, unwrittenA, 0);
+
+    Transition(cl.Get(), out2.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cl->CopyResource(rb2.Get(), out2.Get());
+    c.g.flush();
+    std::vector<Result> v(kWidth * kHeight);
+    void* rp = nullptr; D3D12_RANGE full{ 0, (SIZE_T)c.outSize };
+    HR(rb2->Map(0, &full, &rp), "map rb2");
+    std::memcpy(v.data(), rp, c.outSize);
+    D3D12_RANGE noWrite{ 0, 0 }; rb2->Unmap(0, &noWrite);
+    uint32_t triB = 0, procB = 0;
+    for (auto& r : v) { if (r.hit == 1) ++triB; if (r.hit == 2) ++procB; }
+
+    std::printf("   dispatch A -> buffer 1   : %u tri + %u proc\n", triA, procA);
+    std::printf("   dispatch B -> buffer 2   : %u tri + %u proc\n", triB, procB);
+    const bool ok = (triA == 14450 && procA == 2312 && triB == 14450 && procB == 2312);
+    std::printf("   RESULT                   : %s\n", ok
+        ? "both dispatches ran, each with its own bindings"
+        : "DIVERGE, a dispatch was lost or bindings were shared");
+    std::printf("   (the log should read \"one sync for 2 dispatches\")\n");
+
+    // Negative control. The same two dispatches, but with a UAV barrier
+    // recorded between them. A barrier is ordered work, so it has to end the
+    // segment: if this pass ALSO reports one sync, the batching is ignoring
+    // ordering and the pass above proved nothing.
+    std::printf("\n   -- control: a UAV barrier between them --\n");
+    c.clear_out();
+    cl->SetPipelineState1(so.Get());
+    BindRoots(cl.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+              c.scene.tlas->GetGPUVirtualAddress(), c.out->GetGPUVirtualAddress());
+    cl->ExecuteIndirect(cs.Get(), 1, argsA.Get(), 0, nullptr, 0);
+    UavBarrier(cl.Get(), c.out.Get());          // ordered work: forces the break
+    BindRoots(cl.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+              c.scene.tlas->GetGPUVirtualAddress(), c.out->GetGPUVirtualAddress());
+    cl->ExecuteIndirect(cs.Get(), 1, argsB.Get(), 0, nullptr, 0);
+    c.g.flush();
+
+    uint32_t triC = 0, procC = 0, ignore2 = 0, unwrittenC = 0;
+    c.readback_counts(triC, procC, ignore2, unwrittenC, 0);
+    std::printf("   both dispatches -> buffer 1: %u tri + %u proc\n", triC, procC);
+    std::printf("   RESULT                   : %s\n",
+        (triC == 14450 && procC == 2312) ? "correct across the forced break"
+                                         : "DIVERGE");
+    std::printf("   (the log should now read \"one sync for 1 dispatch\", twice)\n");
+
+    // What the batching is actually worth. Identical ray work either way, eight
+    // dispatches of the same grid; the only difference is whether the shim can
+    // keep them in one segment. One confound worth naming: the barrier variant
+    // also serialises on the GPU. These segments already run in sequence on a
+    // single queue, so that part should be close to free, but it is not zero.
+    const int kRuns = 5, kDisp = 8;
+    double t[2][kRuns];
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int r = 0; r < kRuns; ++r) {
+            c.g.flush();
+            const double t0 = NowMs();
+            cl->SetPipelineState1(so.Get());
+            for (int i = 0; i < kDisp; ++i) {
+                BindRoots(cl.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+                          c.scene.tlas->GetGPUVirtualAddress(),
+                          c.out->GetGPUVirtualAddress());
+                cl->ExecuteIndirect(cs.Get(), 1, argsA.Get(), 0, nullptr, 0);
+                if (pass == 1 && i + 1 < kDisp) UavBarrier(cl.Get(), c.out.Get());
+            }
+            c.g.flush();
+            t[pass][r] = NowMs() - t0;
+        }
+        std::sort(t[pass], t[pass] + kRuns);
+    }
+    std::printf("\n   -- what one sync is worth, %d dispatches --\n", kDisp);
+    std::printf("   1 segment,  1 sync       : %6.2f ms   (median of %d)\n",
+                t[0][kRuns / 2], kRuns);
+    std::printf("   %d segments, %d syncs      : %6.2f ms\n",
+                kDisp, kDisp, t[1][kRuns / 2]);
+    std::printf("   saved                    : %6.2f ms   (%.0f%%)\n",
+                t[1][kRuns / 2] - t[0][kRuns / 2],
+                100.0 * (t[1][kRuns / 2] - t[0][kRuns / 2]) / t[1][kRuns / 2]);
+}
+
 // ---------------------------------------------------------------------------
 // Does graphics state survive a command list split?
 //
@@ -2007,6 +2171,10 @@ static void RunAdapter(Adapter which) {
     auto addLib = c.dxc.tryCompile(kAddLibHLSL, L"lib_6_3", {}, err);
     if (!addLib) { std::printf("\n[!] addition library failed to compile: %s\n", err.c_str()); return; }
 
+    if (g_batchSplit) {
+        ProbeBatchSplit(c);                             c.drain("batchsplit");
+        return;
+    }
     if (g_gfxSplit) {
         ProbeGfxSplit(c);                               c.drain("gfxsplit");
         return;
@@ -2051,6 +2219,7 @@ int main(int argc, char** argv) {
             else if (std::strcmp(argv[i], "-hooktest") == 0) g_hookTest = true;
             else if (std::strcmp(argv[i], "-queuevtable") == 0) g_queueVTable = true;
             else if (std::strcmp(argv[i], "-gfxsplit") == 0) g_gfxSplit = true;
+            else if (std::strcmp(argv[i], "-batchsplit") == 0) g_batchSplit = true;
             else if (std::strcmp(argv[i], "-filler") == 0 && i + 1 < argc) g_filler = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-frames") == 0 && i + 1 < argc) g_frames = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-rays") == 0 && i + 1 < argc) g_rayCount = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
