@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Prove the analysis refuses what it should refuse.
+
+The brief is explicit: detect the cases with no valid lowering and fail loudly
+rather than produce wrong output. An analysis that never says no is worth as
+little as one that never finds anything, so each refusal is provoked here by
+mutating a known-good input.
+
+    python phase5/rewriter/test_reject.py
+"""
+
+import io
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, '..', 'hand'))
+
+from dxil import Module
+from llnorm import normalize
+import rayquery
+
+OPAQUE = os.path.join('phase5', 'dxil', 'rayquery_opaque.ll')
+ALPHA = os.path.join('phase5', 'dxil', 'rayquery_alpha.ll')
+
+
+def load(path):
+    return normalize(io.open(path, encoding='utf-8').read())
+
+
+def expect_ok(name, text):
+    try:
+        q = rayquery.analyze(Module(text))
+        print('  ok       %-34s pattern %d' % (name, q.pattern()[0]))
+        return True
+    except rayquery.Unsupported as e:
+        print('  FAILED   %-34s unexpectedly refused: %s' % (name, e))
+        return False
+
+
+def expect_reject(name, text, must_mention):
+    try:
+        rayquery.analyze(Module(text))
+        print('  FAILED   %-34s was ACCEPTED, should have been refused' % name)
+        return False
+    except rayquery.Unsupported as e:
+        if must_mention.lower() not in str(e).lower():
+            print('  FAILED   %-34s refused for the wrong reason: %s'
+                  % (name, e))
+            return False
+        print('  refused  %-34s %s' % (name, str(e).split('.')[0][:52]))
+        return True
+
+
+def main():
+    if not os.path.isfile(OPAQUE):
+        sys.exit('run build_phase5.bat first')
+    opaque, alpha = load(OPAQUE), load(ALPHA)
+    ok = []
+
+    print('\n-- the two known-good inputs must still pass --')
+    ok.append(expect_ok('rayquery_opaque', opaque))
+    ok.append(expect_ok('rayquery_alpha', alpha))
+
+    print('\n-- cases the brief says have no valid lowering --')
+
+    # RayQuery in a pixel shader: DispatchRays only launches raygen.
+    ok.append(expect_reject(
+        'pixel shader', opaque.replace('!{!"cs", i32 6, i32 5}',
+                                       '!{!"ps", i32 6, i32 5}'),
+        'DispatchRays only launches raygen'))
+
+    # Two concurrent queries: TraceRay has one payload, one in-flight trace.
+    two = opaque.replace(
+        '  %v33 = call i32 @dx.op.allocateRayQuery(i32 178, i32 1)',
+        '  %v33 = call i32 @dx.op.allocateRayQuery(i32 178, i32 1)\n'
+        '  %vq2 = call i32 @dx.op.allocateRayQuery(i32 178, i32 1)')
+    ok.append(expect_reject('two concurrent queries', two, 'one payload'))
+
+    # groupshared: a raygen shader has no thread group.
+    gs = opaque.replace(
+        '@dx.op.createHandle(i32 57, i8 1',
+        '@dx.op.createHandle(i32 57, i8 1', 1)
+    gs = gs.replace('%CB = type {', '@shared = addrspace(3) global [4 x i32] undef\n%CB = type {')
+    ok.append(expect_reject('groupshared memory', gs, 'no thread group'))
+
+    # Wave intrinsics change lane occupancy when promoted to raygen.
+    wave = opaque.replace(
+        '  %v34 = call i1 @dx.op.rayQuery_Proceed.i1(i32 180, i32 %v33)',
+        '  %vw = call i32 @dx.op.waveActiveOp.i32(i32 119, i32 %v4, i8 0, i8 0)\n'
+        '  %v34 = call i1 @dx.op.rayQuery_Proceed.i1(i32 180, i32 %v33)')
+    ok.append(expect_reject('wave intrinsics', wave, 'lane occupancy'))
+
+    print('\n-- shapes this project has not verified --')
+
+    # An opcode we have never seen. Refuse rather than guess: 184 and 185 share
+    # one LLVM function, so a near miss here renders the wrong thing silently.
+    unknown = opaque.replace(
+        '  %v35 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 184, i32 %v33)',
+        '  %v35 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 191, i32 %v33)')
+    ok.append(expect_reject('unverified rayQuery opcode', unknown,
+                            'refusing rather than guessing'))
+
+    # Committed state read inside the loop: the any-hit shader is a separate
+    # invocation and cannot see it.
+    inloop = alpha.replace(
+        '  %v37 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 185, i32 %v33)',
+        '  %vct = call float @dx.op.rayQuery_StateScalar.f32(i32 200, i32 %v33)\n'
+        '  %v37 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 185, i32 %v33)')
+    ok.append(expect_reject('committed state read in loop', inloop,
+                            'separate invocation'))
+
+    # No loop and not FORCE_OPAQUE: traversal would yield candidates the
+    # shader never inspects, so there is nothing to lower to.
+    noflag = opaque.replace('@dx.op.allocateRayQuery(i32 178, i32 1)',
+                            '@dx.op.allocateRayQuery(i32 178, i32 0)')
+    noflag = noflag.replace('i32 %v33, %dx.types.Handle %v2, i32 1, i32 255',
+                            'i32 %v33, %dx.types.Handle %v2, i32 0, i32 255')
+    ok.append(expect_reject('no loop, not FORCE_OPAQUE', noflag,
+                            'no lowering is defined'))
+
+    print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
+    return 0 if all(ok) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

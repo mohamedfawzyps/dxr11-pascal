@@ -40,3 +40,6 @@ phase5/hand/*.dxil
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Rewriter output (regenerate with tools/run_rewriter_test.ps1)
+phase5/out/

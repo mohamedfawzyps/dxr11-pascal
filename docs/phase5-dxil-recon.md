@@ -464,22 +464,117 @@ the opaque hit count with nothing left over, which is independent confirmation
 that the alpha test is being evaluated per candidate and that the any-hit shader
 governs the outcome. Neither number was arranged; they fell out.
 
+## The rewriter: automated, and it matches the hand lowerings
+
+`phase5/rewriter/` finds the sites structurally instead of matching instruction
+text, and reproduces both hand lowerings with no input-specific knowledge.
+
+    python phase5/rewriter/dxrewrite.py analyze <in.ll>
+    python phase5/rewriter/dxrewrite.py lower   <in.ll> <out.ll>
+    .\tools\run_rewriter_test.ps1        end to end, against WARP
+
+| file | what it is |
+|---|---|
+| `dxil.py` | a deliberately small .ll model: blocks, instructions, dx.op decoding, and real dominator and natural-loop analysis |
+| `rayquery.py` | finds and classifies the query, and refuses what has no lowering |
+| `lower.py` | the transform, driven entirely by the analysis |
+| `dxrewrite.py` | CLI |
+| `test_reject.py` | proves the refusals fire |
+
+### The three structural handles the recon promised
+
+All three held up, which is the main result here.
+
+**Follow the handle.** `allocateRayQuery` returns a plain `i32`, so every
+operation belonging to a query is one def-use hop away. No alias analysis, and
+counting distinct allocations is all that multi-query detection needs.
+
+**Dispatch on the opcode immediate.** Never the callee name. `dx.op.rayQuery_
+StateScalar.i32` is both CommittedStatus (184) and CandidateType (185), so a
+name-based match would silently confuse the final hit with the candidate under
+consideration.
+
+**Find the loop with dominators.** `Function.natural_loops` finds back edges
+where the header dominates the latch. On `rayquery_alpha.ll` it reports header
+`bb36`, latch `bb44`, body `bb36, bb39, bb46`, which is exactly what the recon
+worked out by hand. There is no textual pattern that finds this, because the
+guard is peeled into the preheader and the source's single `while` condition
+does not exist as one thing in the IR.
+
+### Results
+
+    pattern 1, opaque closest hit               14450 hits   MATCH
+    pattern 3, alpha-tested, generated any-hit   8117 hits   MATCH
+
+Both bit-exact against WARP, 0 mismatches, max |dt| and max |dbary| both
+0.000000. Byte for byte the same outcome as the hand lowerings, produced
+without any of their hardcoded instruction text.
+
+Pattern 2 also lowers and renders correctly, from an input built by setting
+`ACCEPT_FIRST_HIT_AND_END_SEARCH` on the opaque shader: it classifies as
+pattern 2, assembles, signs, and matches. **Caveat, stated rather than glossed:
+this scene has a single layer of triangles, so accept-first-hit is
+indistinguishable from closest-hit in it.** That result shows the path works,
+not that first-hit semantics are preserved where they would differ.
+
+### The refusals, and why they are tested
+
+The brief says to detect the cases with no valid lowering and fail loudly
+rather than produce wrong output. An analysis that never says no is worth as
+little as one that never finds anything, so `test_reject.py` provokes each
+refusal by mutating a known-good input. All nine behave:
+
+| provoked | refused because |
+|---|---|
+| RayQuery in a pixel shader | DispatchRays only launches raygen |
+| two concurrent queries | TraceRay has one payload and one in-flight trace |
+| groupshared memory | a raygen shader has no thread group |
+| wave intrinsics | promotion to raygen changes lane occupancy |
+| an unverified rayQuery opcode | refusing rather than guessing |
+| committed state read inside the loop | the any-hit shader is a separate invocation |
+| no Proceed loop and not FORCE_OPAQUE | no lowering is defined |
+
+Opcodes are a **whitelist**. Only the nine this project has actually observed
+in DXC output are accepted; anything else stops the lowering. Given that 184
+and 185 share one LLVM function, a near miss here would render the wrong thing
+silently, which is far worse than a refusal.
+
+Writing that test found a real defect. The "no loop and not FORCE_OPAQUE" case
+was accepted, because the check lived in `Query.pattern()` and `analyze()` never
+called it, so a caller that did not ask for the pattern got a Query back for a
+shader that cannot be lowered at all. Classification now happens during
+analysis. The fix was to the code, not the test.
+
+### What is generic and what is not
+
+Generic: query discovery in any function, any number of resources of any type
+read out of `!dx.resources`, `createHandle` to `createHandleForLib` for
+arbitrary resource types including quoted template ones, arbitrary loop body
+blocks, and metadata ids allocated above whatever the module already uses.
+
+Not generic, and it matters:
+
+- **The payload is fixed** at `{float, <2 x float>, i32}`, which carries
+  exactly the three committed accessors the whitelist supports. Any other
+  accessor is refused rather than silently dropped.
+- **Root-level bindings only.** Descriptor tables, and `createHandleFromHeap`,
+  are untested. This is the most likely thing to break on a real shader.
+- **One entry point, one query.**
+- Procedural primitives and the intersection shader path do not exist here at
+  all; the candidate opcode for them is not in the whitelist, so such a shader
+  is refused rather than mislowered.
+
 ## Next
 
-Both patterns the brief names as the early targets now work by hand, so the
-remaining questions are about generality rather than feasibility.
+The rewriter works on what it has been shown, and refuses what it has not.
+The useful next steps, in order of how likely they are to break it:
 
-1. **Automate.** The edits in both scripts are keyed to exact instruction text,
-   which is fine for a fixed input and useless for a real one. A rewriter has
-   to find the same sites structurally: follow the query handle, match opcodes
-   on operand 0, and recognise the rotated loop. The recon says the IR supports
-   all three. `llnorm` runs first, `dxilrt asm` is the feedback loop, and
-   `raytest --lib` is the correctness check.
-2. **Pattern 2, shadow rays.** `ACCEPT_FIRST_HIT_AND_END_SEARCH`, miss shader
-   only. Not yet attempted, and expected to be the easiest of the three.
-
-Still untested, and all of it matters before this meets a real shader:
-descriptor tables rather than root descriptors, more than one query in a
-shader, procedural primitives and the intersection shader path, and any of the
-no-valid-lowering cases in the brief's table. Everything proven so far is one
-compute shader with three root-level bindings and a single query.
+1. **A shader binding through a descriptor table.** Named above as the most
+   likely failure, and nothing in this project has exercised it.
+2. **A second, independently written RayQuery shader**, ideally not derived
+   from the Phase 2 pair, to find what has been accidentally assumed.
+3. **Wire the rewriter into the proxy**, at `CreateStateObject` and the compute
+   pipeline path, so a real application's DXIL goes through it. That also
+   forces the question the brief flags: reporting Tier 1.1 entitles an app to
+   emit RayQuery, so the tier flip and a working rewriter have to land
+   together, with anything refused failing loudly rather than rendering wrong.
