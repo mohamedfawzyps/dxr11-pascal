@@ -27,6 +27,9 @@ $cases = @(
     @{ name = 'indep'; src = 'phase5\cases\rayquery_indep.ll'; pat = 'alpha'; flags = @();
        gt = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
        desc = 'independently written: resource READ INSIDE the Proceed loop' },
+    @{ name = 'proc'; src = 'phase5\cases\rayquery_proc.ll'; pat = 'alpha'; flags = @('--proc');
+       gt = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--proc');
+       desc = 'procedural primitives, generated INTERSECTION shader' },
     @{ name = 'abort'; src = 'phase5\cases\rayquery_abort.ll'; pat = 'alpha'; flags = @('--multi');
        gt = @('--cs', 'phase5\cases\rayquery_abort.hlsl', '--multi');
        desc = 'Abort(), observing only the order-INDEPENDENT hit flag' },

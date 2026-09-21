@@ -272,6 +272,12 @@ static const UINT kMaskCount = 8;
 // answer is 0, so a lowering that returned a constant 0 would pass.
 static bool g_multi = false;
 
+// --proc builds a scene of PROCEDURAL geometry, one AABB, and switches the hit
+// group to D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE with the generated
+// intersection shader. A BLAS carries one geometry type, so procedural and
+// triangle geometry can never share one.
+static bool g_proc = false;
+
 static bool g_table = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
@@ -481,6 +487,53 @@ static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
 // screen: left half is instance 0 and right half instance 1, and within each
 // quad the diagonal splits primitive 0 from primitive 1. So both indices vary
 // per pixel and a constant answer cannot pass.
+// One AABB at the origin, enclosing the box the shader intersects itself.
+// The AABB only has to BOUND the primitive; the actual intersection is the
+// shader's job, which is the whole point of procedural geometry.
+static Scene BuildSceneProc(Gpu& g, bool opaque) {
+    Scene s;
+    const D3D12_RAYTRACING_AABB aabb = { -0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f };
+    s.vb = CreateBuffer(g.device.Get(), sizeof(aabb), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(s.vb->Map(0, &none, &p), "map aabb"); std::memcpy(p, &aabb, sizeof(aabb));
+    s.vb->Unmap(0, nullptr);
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geo{};
+    geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+    // Non-opaque, so traversal yields the candidate to the shader rather than
+    // accepting it outright.
+    geo.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+    geo.AABBs.AABBCount = 1;
+    geo.AABBs.AABBs.StartAddress = s.vb->GetGPUVirtualAddress();
+    geo.AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
+    bi.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    bi.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    bi.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    bi.NumDescs = 1; bi.pGeometryDescs = &geo;
+    s.blas = BuildAS(g, bi);
+
+    D3D12_RAYTRACING_INSTANCE_DESC inst{};
+    inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
+    inst.InstanceMask = 0xFF;
+    inst.AccelerationStructure = s.blas->GetGPUVirtualAddress();
+    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, &inst, sizeof(inst));
+    instBuf->Unmap(0, nullptr);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    s.tlas = BuildAS(g, ti);
+    return s;
+}
+
 static Scene BuildSceneMulti(Gpu& g, bool opaque) {
     Scene s;
     const float qx = 0.4f, qy = 0.8f;
@@ -773,7 +826,14 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     hg.HitGroupExport = L"HitGroup";
     hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
     hg.ClosestHitShaderImport = L"ClosestHit";
-    if (anyHit) hg.AnyHitShaderImport = L"AnyHit";
+    if (g_proc) {
+        // A procedural hit group takes an intersection shader instead of an
+        // any-hit one, and is a different hit group TYPE.
+        hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+        hg.IntersectionShaderImport = L"Isect";
+    } else if (anyHit) {
+        hg.AnyHitShaderImport = L"AnyHit";
+    }
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg });
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
@@ -912,7 +972,8 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
 
     Gpu g; g.init(device.Get());
     Dxc dxc; dxc.init();
-    Scene scene = g_multi ? BuildSceneMulti(g, pattern == Pattern::Opaque)
+    Scene scene = g_proc  ? BuildSceneProc(g, pattern == Pattern::Opaque)
+                : g_multi ? BuildSceneMulti(g, pattern == Pattern::Opaque)
                           : BuildScene(g, pattern == Pattern::Opaque);
 
     // Constant buffer.
@@ -1008,6 +1069,12 @@ int main(int argc, char** argv) {
         // Pull --roundtrip out of argv so the positional arguments below are
         // unaffected by it.
         for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--proc") == 0) {
+                g_proc = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
             if (std::strcmp(argv[i], "--multi") == 0) {
                 g_multi = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];

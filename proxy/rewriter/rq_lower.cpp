@@ -122,6 +122,16 @@ std::string HandleFn(const std::string& llvmType) {
     return "dx.op.createHandleForLib." + bare;
 }
 
+// Every block this line branches to.
+std::vector<std::string> Block_successors(const std::string& line) {
+    static const std::regex re(R"(label\s+(%[\w.$-]+))");
+    std::vector<std::string> out;
+    for (auto it = std::sregex_iterator(line.begin(), line.end(), re);
+         it != std::sregex_iterator(); ++it)
+        out.push_back((*it)[1].str());
+    return out;
+}
+
 std::string Replace(std::string s, const std::string& from, const std::string& to) {
     size_t p = s.find(from);
     if (p != std::string::npos) s.replace(p, from.size(), to);
@@ -558,7 +568,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 "declare float @dx.op.objectRayOrigin.f32(i32, i8) #0");
         addDecl(usedOps.count(kCandidateObjectRayDirection) != 0,
                 "declare float @dx.op.objectRayDirection.f32(i32, i8) #0");
-        if (q.hasLoop) {
+        if (q.NeedsIntersection()) {
+            add.push_back("");
+            add.push_back("; Function Attrs: nounwind");
+            add.push_back("declare i1 @dx.op.reportHit." +
+                          std::string(kAttrs).substr(1) + "(i32, float, i32, " +
+                          kAttrs + "*) #1");
+        } else if (q.hasLoop) {
             add.push_back("");
             add.push_back("; Function Attrs: noreturn nounwind");
             add.push_back("declare void @dx.op.ignoreHit(i32) #3");
@@ -587,7 +603,116 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     // --- generated shaders ---------------------------------------------------
     {
         std::vector<std::string> fns;
-        if (q.hasLoop) {
+        if (q.NeedsIntersection()) {
+            // The Proceed loop body re-rooted as an INTERSECTION shader. Same
+            // body as the any-hit case, with one substitution changed: an
+            // any-hit folds CandidateType to CANDIDATE_NON_OPAQUE_TRIANGLE (0)
+            // and this folds it to CANDIDATE_PROCEDURAL_PRIMITIVE (1), so the
+            // triangle branch dies and the procedural branch survives. One
+            // body, two substitutions, two shaders.
+            //
+            // CommitProceduralPrimitiveHit becomes ReportHit. An intersection
+            // shader has no accept or reject terminator: reporting IS
+            // accepting and returning reports nothing, so every way out of the
+            // loop body is a plain ret void.
+            std::map<std::string, std::string> subst;
+            for (const auto& lbl : q.loop.body) {
+                if (lbl == q.loop.latch) continue;
+                const llm::Block* b = fn.FindBlock(lbl);
+                if (!b) continue;
+                for (const auto& i : b->instrs) {
+                    if (i.DxOp() == kCandidateType) subst[i.result] = "1";
+                    else if (i.DxOp() == kCandidateProcNonOpaque)
+                        subst[i.result] = "true";
+                }
+            }
+            std::vector<std::string> order{ q.loop.header };
+            {
+                std::vector<std::string> rest;
+                for (const auto& l : q.loop.body)
+                    if (l != q.loop.header && l != q.loop.latch) rest.push_back(l);
+                std::sort(rest.begin(), rest.end());
+                for (const auto& l : rest) order.push_back(l);
+            }
+            std::vector<std::string> is;
+            is.push_back("define void @" + e.intersection + "() #1 {");
+            is.push_back(std::string("  %rq.at = alloca ") + kAttrs + ", align 8");
+
+            std::set<std::string> usedNames;
+            for (const auto& lbl : q.loop.body) {
+                if (lbl == q.loop.latch) continue;
+                const llm::Block* b = fn.FindBlock(lbl);
+                if (!b) continue;
+                for (const auto& i : b->instrs)
+                    for (const auto& u : i.Uses()) usedNames.insert(u);
+            }
+            for (const auto& b : fn.blocks)
+                for (const auto& i : b.instrs)
+                    if (i.DxOp() == kCreateHandle && usedNames.count(i.result)) {
+                        const std::string txt = handleText(i);
+                        if (!handleErr.empty()) { r.error = handleErr; return r; }
+                        is.push_back(txt);
+                    }
+
+            for (const auto& lbl : order) {
+                const llm::Block* b = fn.FindBlock(lbl);
+                if (!b) continue;
+                if (lbl != q.loop.header) {
+                    is.push_back("");
+                    is.push_back(lbl.substr(1) + ":");
+                }
+                for (const auto& i : b->instrs) {
+                    const int op = i.DxOp();
+                    if (op == kCandidateType || op == kCandidateProcNonOpaque) continue;
+                    if (op == kCommitProcedural) {
+                        const std::string tv = llm::OperandName(i.args[2]);
+                        is.push_back("  %rq.rh" + std::to_string(i.index) +
+                                     " = call i1 @dx.op.reportHit." +
+                                     std::string(kAttrs).substr(1) +
+                                     "(i32 158, float " + tv + ", i32 0, " + kAttrs +
+                                     "* nonnull %rq.at)"
+                                     "  ; ReportHit(THit,HitKind,Attributes)");
+                        continue;
+                    }
+                    // Nothing to do for Abort: returning has reported nothing,
+                    // and there is no later invocation to gate.
+                    if (op == kAbort) continue;
+                    if (const CandMap* cmap = FindCand(op)) {
+                        std::string cargs = "i32 " + std::to_string(cmap->dxop);
+                        for (int k = 0; k < cmap->extra; ++k)
+                            cargs += ", " + Trim(i.args[2 + k]);
+                        is.push_back("  " + i.result + " = call " + cmap->ty + " @" +
+                                     cmap->callee + "(" + cargs + ")");
+                        continue;
+                    }
+                    std::string line = i.line;
+                    for (const auto& kv : subst)
+                        line = std::regex_replace(
+                            line, std::regex("\\" + kv.first + "\\b"), kv.second);
+                    line = std::regex_replace(
+                        line, std::regex("label\\s+\\" + q.loop.latch + "\\b"),
+                        "label %rq.done");
+                    for (const auto& s2 : Block_successors(line))
+                        if (!q.loop.body.count(s2) && s2 != "%rq.done") {
+                            r.error = "Proceed loop body branches to " + s2 +
+                                      ", outside the loop; no lowering is defined "
+                                      "for that";
+                            return r;
+                        }
+                    is.push_back(line);
+                }
+            }
+            is.push_back("");
+            is.push_back("rq.done:");
+            is.push_back("  ret void");
+            is.push_back("}");
+            std::string joinedIs;
+            for (size_t i = 0; i < is.size(); ++i) {
+                if (i) joinedIs += "\n";
+                joinedIs += is[i];
+            }
+            fns.push_back(joinedIs);
+        } else if (q.hasLoop) {
             // AnyHit IS the Proceed loop body, re-rooted. Accept is falling off
             // the end; reject is IgnoreHit. The polarity is the reverse of the
             // RayQuery form, where committing is the special path.
@@ -722,6 +847,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         line, std::regex("label\\s+" + std::string("\\") + q.loop.latch +
                                          "\\b"),
                         "label " + target);
+                    for (const auto& s2 : Block_successors(line))
+                        if (!q.loop.body.count(s2) && s2 != "%rq.accept" &&
+                            s2 != "%rq.reject") {
+                            r.error = "Proceed loop body branches to " + s2 +
+                                      ", outside the loop; no lowering is defined "
+                                      "for that";
+                            return r;
+                        }
                     ah.push_back(line);
                 }
             }
@@ -759,7 +892,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ch.push_back("  store <2 x float> %b, <2 x float>* %pb, align 4");
             ch.push_back(std::string("  %ph = getelementptr inbounds ") + kPayload + ", " +
                          kPayload + "* %p, i32 0, i32 2");
-            ch.push_back("  store i32 1, i32* %ph, align 4");
+            ch.push_back(std::string("  store i32 ") +
+                         (q.NeedsIntersection() ? "2" : "1") +
+                         ", i32* %ph, align 4");
             for (const auto& s : kChSource) {
                 ch.push_back("  %id" + std::to_string(s.first) + " = " + s.second);
                 ch.push_back("  %pi" + std::to_string(s.first) +
@@ -892,7 +1027,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         std::vector<std::string> ann{ "i32 1", "void ()* @" + e.raygen,
                                       "!" + std::to_string(annRaygen) };
-        if (q.hasLoop) {
+        if (q.NeedsIntersection()) {
+            // An intersection shader is void(), so it annotates like a raygen.
+            ann.push_back("void ()* @" + e.intersection);
+            ann.push_back("!" + std::to_string(annRaygen));
+        } else if (q.hasLoop) {
             ann.push_back("void " + sigH + "* @" + e.anyhit);
             ann.push_back("!" + std::to_string(annHit));
         }
@@ -929,7 +1068,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         "\", null, null, !" + std::to_string(pid));
         };
 
-        if (q.hasLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
+        // Shader kind 8. An intersection shader carries neither a payload
+        // size nor an attribute size, exactly as DXC emits it.
+        if (q.NeedsIntersection())
+            eps.push_back(entry(e.intersection, "()", 8, false, false));
+        else if (q.hasLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
         eps.push_back(entry(e.closesthit, sigH, 10, true, true));
         eps.push_back(entry(e.miss, sigP, 11, true, false));
         eps.push_back(entry(e.raygen, "()", 7, false, false));

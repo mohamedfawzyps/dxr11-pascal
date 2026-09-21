@@ -30,6 +30,7 @@ struct Exports {
     std::string anyhit = "AnyHit";
     std::string closesthit = "ClosestHit";
     std::string miss = "Miss";
+    std::string intersection = "Isect";
 };
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e = Exports());

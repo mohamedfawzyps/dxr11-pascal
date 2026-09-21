@@ -142,7 +142,8 @@ def _handle_fn(llvm_type):
 def lower(module, q, exports=None):
     """Return the text of a lib_6_5 module implementing `q` with TraceRay."""
     exports = exports or {'raygen': 'RayGen', 'anyhit': 'AnyHit',
-                          'closesthit': 'ClosestHit', 'miss': 'Miss'}
+                          'closesthit': 'ClosestHit', 'miss': 'Miss',
+                          'intersection': 'Isect'}
     text = module.text
     md = _metadata(text)
     table = _resource_table(text, md)
@@ -459,7 +460,11 @@ def _swap_declarations(text, q, globals_):
     for ops, decl in conditional:
         if used_ops & ops:
             new += ['', '; Function Attrs: nounwind readnone', decl]
-    if q.loop:
+    if q.needs_intersection:
+        new += ['', '; Function Attrs: nounwind',
+                'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #1'
+                % (ATTRS[1:], ATTRS)]
+    elif q.loop:
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.ignoreHit(i32) #3']
     seen = set()
@@ -484,7 +489,9 @@ def _append_shaders(text, module, q, exports, table, globals_):
     # q is used below to decide whether the closest-hit fetches the matrix.
     """Emit the generated shader set after the raygen."""
     fns = []
-    if q.loop:
+    if q.needs_intersection:
+        fns.append(_intersection(module, q, exports, table, globals_))
+    elif q.loop:
         fns.append(_anyhit(module, q, exports, table, globals_))
     ch = ['define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #1 {{'
           .format(ch=exports['closesthit'], pl=PAYLOAD, at=ATTRS),
@@ -496,7 +503,8 @@ def _append_shaders(text, module, q, exports, table, globals_):
           '  %pb = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 1'.format(pl=PAYLOAD),
           '  store <2 x float> %b, <2 x float>* %pb, align 4',
           '  %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2'.format(pl=PAYLOAD),
-          '  store i32 1, i32* %ph, align 4']
+          '  store i32 %d, i32* %%ph, align 4'
+          % (2 if q.needs_intersection else 1)]
     # The index fields. Emitted unconditionally: unused ones cost a dead call
     # the driver removes, and making them conditional is another place to get
     # the payload layout wrong.
@@ -542,6 +550,96 @@ def _append_shaders(text, module, q, exports, table, globals_):
     block = ('\n' + '\n\n'.join(fns)).split('\n')
     lines[at + 1:at + 1] = block
     return '\n'.join(lines)
+
+
+def _intersection(module, q, exports, table, globals_):
+    """The Proceed loop body, re-rooted as an INTERSECTION shader.
+
+    The same body as the any-hit case, with one substitution changed: where
+    an any-hit folds `CandidateType()` to CANDIDATE_NON_OPAQUE_TRIANGLE (0),
+    this folds it to CANDIDATE_PROCEDURAL_PRIMITIVE (1). The triangle branch
+    then becomes dead and the procedural branch survives, and the transplant
+    is otherwise identical. One body, two substitutions, two shaders.
+
+    `CommitProceduralPrimitiveHit(t)` becomes `ReportHit(t, 0, attrs)`. An
+    intersection shader has no accept or reject terminator: reporting IS
+    accepting, and simply returning reports nothing, so every path out of the
+    loop body becomes a plain `ret void`.
+    """
+    fn = q.fn
+    header, latch, body = q.loop
+
+    subst = {}
+    for label in body:
+        if label == latch:
+            continue
+        for i in fn.block(label).instrs:
+            if i.dxop == rq.CANDIDATE_TYPE:
+                subst[i.result] = '1'          # CANDIDATE_PROCEDURAL_PRIMITIVE
+            elif i.dxop == rq.CANDIDATE_PROC_NON_OPAQUE:
+                # Only non-opaque procedural primitives ever reach a Proceed
+                # loop, so this is a tautology here, as CandidateType is.
+                subst[i.result] = 'true'
+
+    order = [header] + sorted(l for l in body if l not in (header, latch))
+    out = ['define void @%s() #1 {' % exports['intersection'],
+           '  %%rq.at = alloca %s, align 8' % ATTRS]
+
+    used = set()
+    for label in body:
+        if label != latch:
+            for i in fn.block(label).instrs:
+                used.update(i.uses())
+    for _, i in fn.instrs():
+        if i.dxop == 57 and i.result in used:
+            out.append(_handle_text(i, table, globals_))
+
+    for label in order:
+        blk = fn.block(label)
+        if label != header:
+            out.append('')
+            out.append('%s:' % label[1:])
+        for i in blk.instrs:
+            if i.dxop in (rq.CANDIDATE_TYPE, rq.CANDIDATE_PROC_NON_OPAQUE):
+                continue
+            if i.dxop == rq.COMMIT_PROCEDURAL:
+                t = rq_operand(i.args[2])
+                out.append('  %%rq.rh%s = call i1 @dx.op.reportHit.%s'
+                           '(i32 158, float %s, i32 0, %s* nonnull %%rq.at)'
+                           '  ; ReportHit(THit,HitKind,Attributes)'
+                           % (i.index, ATTRS[1:], t, ATTRS))
+                continue
+            if i.dxop == rq.ABORT:
+                # Nothing to set: an intersection shader that returns has
+                # reported nothing, and there is no later invocation to gate.
+                continue
+            if i.dxop in CANDIDATE_MAP:
+                ty, callee, op, extra = CANDIDATE_MAP[i.dxop]
+                args = ['i32 %d' % op] + [a.strip() for a in i.args[2:2 + extra]]
+                out.append('  %s = call %s @%s(%s)'
+                           % (i.result, ty, callee, ', '.join(args)))
+                continue
+            line = i.line
+            for old, new in subst.items():
+                line = re.sub(re.escape(old) + r'\b', new, line)
+            # Every way out of the loop body is just a return here.
+            line = re.sub(r'label\s+' + re.escape(latch) + r'\b', 'label %rq.done', line)
+            for s2 in Block_successors(line):
+                if s2 not in body and s2 != '%rq.done':
+                    raise rq.Unsupported(
+                        'Proceed loop body branches to %s, outside the loop; '
+                        'no lowering is defined for that' % s2)
+            out.append(line)
+
+    out += ['', 'rq.done:', '  ret void', '}']
+    return '\n'.join(out)
+
+
+def rq_operand(arg):
+    """The value part of an operand, e.g. 'float %v12' -> '%v12'."""
+    from dxil import operand_name
+    n = operand_name(arg)
+    return n if n else arg.strip().split()[-1]
 
 
 def _anyhit(module, q, exports, table, globals_):
@@ -705,7 +803,10 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
     ann_miss = node('!%d, !%d' % (ret, par_payload))
 
     ann = ['i32 1', 'void ()* @%s' % exports['raygen'], '!%d' % ann_raygen]
-    if q.loop:
+    if q.needs_intersection:
+        # An intersection shader is void(), so it annotates like the raygen.
+        ann += ['void ()* @%s' % exports['intersection'], '!%d' % ann_raygen]
+    elif q.loop:
         ann += ['void %s* @%s' % (sig_h, exports['anyhit']), '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_h, exports['closesthit']), '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
@@ -731,7 +832,11 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
         return node('void %s* @%s, !"%s", null, null, !%d'
                     % (sig, name, name, pid))
 
-    if q.loop:
+    if q.needs_intersection:
+        # Shader kind 8. An intersection shader carries neither a payload size
+        # nor an attribute size, exactly as DXC emits it.
+        eps.append(entry(exports['intersection'], '()', 8, False, False))
+    elif q.loop:
         eps.append(entry(exports['anyhit'], sig_h, 9, True, True))
     eps.append(entry(exports['closesthit'], sig_h, 10, True, True))
     eps.append(entry(exports['miss'], sig_p, 11, True, False))

@@ -28,6 +28,8 @@ TRACE_INLINE = 179
 PROCEED = 180
 ABORT = 181
 COMMIT_NON_OPAQUE = 182
+COMMIT_PROCEDURAL = 183
+CANDIDATE_PROC_NON_OPAQUE = 190
 COMMITTED_STATUS = 184
 CANDIDATE_TYPE = 185
 CANDIDATE_BARY = 193
@@ -65,6 +67,8 @@ KNOWN = {
     PROCEED: 'Proceed',
     ABORT: 'Abort',
     COMMIT_NON_OPAQUE: 'CommitNonOpaqueTriangleHit',
+    COMMIT_PROCEDURAL: 'CommitProceduralPrimitiveHit',
+    CANDIDATE_PROC_NON_OPAQUE: 'CandidateProceduralPrimitiveNonOpaque',
     COMMITTED_STATUS: 'CommittedStatus',
     CANDIDATE_TYPE: 'CandidateType',
     CANDIDATE_BARY: 'CandidateTriangleBarycentrics',
@@ -88,7 +92,8 @@ KNOWN = {
 
 # Read in the any-hit shader, where they need no payload at all: the candidate
 # under test IS what a DXR 1.0 hit-shader intrinsic reports.
-CANDIDATE_OPS = (CANDIDATE_TYPE, CANDIDATE_BARY, CANDIDATE_WORLD_TO_OBJECT,
+CANDIDATE_OPS = (CANDIDATE_PROC_NON_OPAQUE,
+                 CANDIDATE_TYPE, CANDIDATE_BARY, CANDIDATE_WORLD_TO_OBJECT,
                  CANDIDATE_FRONT_FACE, CANDIDATE_RAY_T, CANDIDATE_INSTANCE_INDEX,
                  CANDIDATE_INSTANCE_ID, CANDIDATE_PRIMITIVE_INDEX,
                  CANDIDATE_OBJECT_RAY_ORIGIN, CANDIDATE_OBJECT_RAY_DIRECTION)
@@ -157,6 +162,7 @@ class Query(object):
         self.proceeds = []          # [(block, instr)]
         self.commits = []
         self.aborts = []
+        self.proc_commits = []
         self.candidate_ops = []
         self.committed_ops = []
         self.loop = None            # (header, latch, body) or None
@@ -190,7 +196,32 @@ class Query(object):
         which is exactly what an any-hit shader does."""
         return self.loop is not None
 
+    @property
+    def needs_intersection(self):
+        """A procedural commit means the loop body is an INTERSECTION shader."""
+        return bool(self.proc_commits)
+
     def pattern(self):
+        if self.needs_intersection:
+            # A hit group is EITHER triangles or procedural, never both, and
+            # which one a geometry uses is chosen by
+            # InstanceContributionToHitGroupIndex, which the APPLICATION set
+            # when it built its acceleration structures. A shader that commits
+            # both kinds would need a shader table with a record per geometry
+            # type and a map from the app's instances to those records, which
+            # means intercepting every BuildRaytracingAccelerationStructure and
+            # tracking the geometry type of every BLAS. The shim does not do
+            # that, so refuse rather than build a table that is wrong.
+            if self.commits:
+                raise Unsupported(
+                    'query commits BOTH triangle and procedural hits. A hit '
+                    'group is either triangles or procedural, and which one a '
+                    'geometry uses is selected by '
+                    'InstanceContributionToHitGroupIndex, which the application '
+                    'set when it built its acceleration structures. Supporting '
+                    'this needs the shim to track the geometry type of every '
+                    'BLAS, which it does not.')
+            return 4, 'procedural primitives (generated intersection shader)'
         if self.needs_anyhit:
             return 3, 'alpha-tested closest hit (generated any-hit shader)'
         if self.ray_flags & 0x004:
@@ -271,6 +302,8 @@ def _collect(fn, q):
             q.commits.append((block, instr))
         elif op == ABORT:
             q.aborts.append((block, instr))
+        elif op == COMMIT_PROCEDURAL:
+            q.proc_commits.append((block, instr))
         elif op in CANDIDATE_OPS:
             q.candidate_ops.append((block, instr))
         elif op in COMMITTED_OPS:

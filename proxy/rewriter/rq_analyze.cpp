@@ -14,6 +14,8 @@ const std::map<int, const char*>& KnownTable() {
         { kProceed, "Proceed" },
         { kAbort, "Abort" },
         { kCommitNonOpaque, "CommitNonOpaqueTriangleHit" },
+        { kCommitProcedural, "CommitProceduralPrimitiveHit" },
+        { kCandidateProcNonOpaque, "CandidateProceduralPrimitiveNonOpaque" },
         { kCommittedStatus, "CommittedStatus" },
         { kCandidateType, "CandidateType" },
         { kCandidateBary, "CandidateTriangleBarycentrics" },
@@ -81,6 +83,7 @@ bool IsCommittedOp(int op) {
 
 bool IsCandidateOp(int op) {
     return op == kCandidateType || op == kCandidateBary ||
+           op == kCandidateProcNonOpaque ||
            op == kCandidateWorldToObject || op == kCandidateFrontFace ||
            op == kCandidateRayT || op == kCandidateInstanceIndex ||
            op == kCandidateInstanceID || op == kCandidatePrimitiveIndex ||
@@ -173,6 +176,8 @@ std::string Collect(const llm::Function& fn, Query& q) {
                 q.commits.emplace_back(&b, &i);
             } else if (op == kAbort) {
                 q.aborts.emplace_back(&b, &i);
+            } else if (op == kCommitProcedural) {
+                q.procCommits.emplace_back(&b, &i);
             } else if (IsCandidateOp(op)) {
                 q.candidateOps.emplace_back(&b, &i);
             } else if (IsCommittedOp(op)) {
@@ -274,7 +279,26 @@ AnalyzeResult Analyze(const llm::Module& m) {
 
     // Classify here rather than on demand, so a shape with no defined lowering
     // is refused by analysis itself.
-    if (q.NeedsAnyHit()) {
+    if (q.NeedsIntersection()) {
+        // A hit group is EITHER triangles or procedural, never both, and which
+        // one a geometry uses is selected by
+        // InstanceContributionToHitGroupIndex, which the APPLICATION set when
+        // it built its acceleration structures. Supporting a shader that
+        // commits both would need the shim to track the geometry type of every
+        // BLAS. Refuse rather than build a shader table that is wrong.
+        if (!q.commits.empty()) {
+            r.error = "query commits BOTH triangle and procedural hits. A hit "
+                      "group is either triangles or procedural, and which one a "
+                      "geometry uses is selected by "
+                      "InstanceContributionToHitGroupIndex, which the application "
+                      "set when it built its acceleration structures. Supporting "
+                      "this needs the shim to track the geometry type of every "
+                      "BLAS, which it does not.";
+            return r;
+        }
+        q.patternNum = 4;
+        q.patternDesc = "procedural primitives (generated intersection shader)";
+    } else if (q.NeedsAnyHit()) {
         q.patternNum = 3;
         q.patternDesc = "alpha-tested closest hit (generated any-hit shader)";
     } else if (q.RayFlags() & 0x004) {

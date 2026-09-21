@@ -1323,12 +1323,93 @@ the four that are permanently refused.
     six shaders end to end through the proxy on the 1070, all MATCH
     12 of 12 refusals behaved
 
+## Procedural primitives: the last lowering, and a real obstacle beside it
+
+    procedural-only RayQuery on the GTX 1070   7396 hits   MATCH, 0 mismatches
+
+`CommitProceduralPrimitiveHit` is 183, `CandidateProceduralPrimitiveNonOpaque`
+is 190. On the DXR 1.0 side `reportHit` is 158, overloaded on the attribute
+struct, and an intersection shader is shader kind 8 carrying neither a payload
+size nor an attribute size.
+
+### One body, two substitutions, two shaders
+
+The lowering turned out to be the prettiest part of the project. The
+intersection shader is **the same loop body as the any-hit**, with one
+substitution changed:
+
+    any-hit        CandidateType() folds to 0   CANDIDATE_NON_OPAQUE_TRIANGLE
+    intersection   CandidateType() folds to 1   CANDIDATE_PROCEDURAL_PRIMITIVE
+
+The triangle branch then dies and the procedural branch survives, or the other
+way round. `CommitProceduralPrimitiveHit(t)` becomes `ReportHit(t, 0, attrs)`,
+and every way out of the loop body becomes a plain `ret void`, because an
+intersection shader has no accept or reject terminator: reporting IS accepting,
+and returning reports nothing.
+
+The generated shader is the slab test transplanted verbatim, with
+`CandidateType` folded to a constant-true `icmp eq i32 1, 1` and the object-space
+ray accessors becoming ordinary DXR 1.0 intrinsics. The closest-hit also writes
+status 2, `COMMITTED_PROCEDURAL_PRIMITIVE_HIT`, rather than 1.
+
+### The obstacle, which is not in the lowering
+
+**A query that commits BOTH triangle and procedural hits is refused**, and this
+is not laziness. A hit group is either triangles or procedural, never both, and
+which one a geometry uses is chosen by `InstanceContributionToHitGroupIndex`,
+which the APPLICATION set when it built its acceleration structures. A BLAS
+also carries only one geometry type, so the two always live in different
+instances.
+
+To build a correct shader table for a mixed scene the shim would need to know,
+for every instance, which BLAS it points at and what geometry type that BLAS
+holds. That information exists only in the
+`BuildRaytracingAccelerationStructure` calls, so supporting it means
+intercepting every one of them and tracking the geometry type of every BLAS.
+The shim does not do that, so it refuses with a message saying exactly this.
+
+Epic's shaders do mix, so this is the difference between procedural working and
+procedural being useful. It is the largest single piece of work left.
+
+**A related limitation that applies TODAY, including to triangles.** The shim
+builds one hit group record and dispatches with
+`RayContributionToHitGroupIndex`, `MultiplierForGeometryContributionToShaderIndex`
+and `MissShaderIndex` all zero, so every geometry resolves to record 0. That is
+correct only while every instance has `InstanceContributionToHitGroupIndex = 0`.
+An application that set it for its own DXR 1.0 use would index past the single
+record. Not yet handled, and it needs the same AS interception.
+
+### Sensitivity
+
+Reporting a constant `t` of 1.5 instead of the computed 2.0:
+
+    7396 value mismatches, max |dt| 0.500000    RESULT: DIVERGE
+
+And the mixed case refuses, as its own test case.
+
+### A divergence byte-identity could not see
+
+Porting this exposed something worth recording. The C++ any-hit generation had
+silently lost the Python's "loop body branches outside the loop" refusal during
+the original port. **Byte-identity never noticed, because it compares OUTPUTS
+and a missing refusal produces no output to differ.** The two implementations
+emitted the same bytes for everything tested while disagreeing about what to
+reject.
+
+That is the second limit found in this project's strongest oracle, after "it
+proves agreement, not correctness". It also proves agreement only where both
+produce something.
+
 ## Next
 
-1. **Procedural primitives.** `CommitProceduralPrimitiveHit` needs a generated
-   INTERSECTION shader, which this project has never built. It is the last
-   piece of lowering, genuinely new work rather than another table entry, and
-   takes coverage to 21, the practical maximum against Unreal.
+All the lowering Phase 5 set out to do is done. What remains is not lowering.
+
+1. **Acceleration structure interception.** Tracking the geometry type of every
+   BLAS and the contribution index of every instance is what unblocks BOTH
+   mixed triangle-and-procedural queries AND the nonzero
+   `InstanceContributionToHitGroupIndex` case that already limits triangles. It
+   is the largest remaining piece of work and it is dispatch machinery, not
+   shader translation.
 2. **Dynamic descriptor indexing**, still refused.
 3. **Only then consider making the tier flip the default**, once enough real
    software has run through it that the refusal list is trusted.

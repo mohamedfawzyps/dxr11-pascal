@@ -37,6 +37,8 @@ $cases = @(
        desc = 'built-in alpha-tested RayQuery, generated any-hit' },
     @{ name = 'indep';   pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
        desc = 'independent shader, resource read in the Proceed loop, numthreads(16,16,1)' },
+    @{ name = 'proc';    pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--proc');
+       desc = 'procedural primitives, generated intersection shader' },
     @{ name = 'abort';   pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_abort.hlsl', '--multi');
        desc = 'Abort(), order-independent observable only' },
     @{ name = 'acc';     pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi');

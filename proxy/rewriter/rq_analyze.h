@@ -31,6 +31,8 @@ enum Opcode {
     kProceed = 180,
     kAbort = 181,
     kCommitNonOpaque = 182,
+    kCommitProcedural = 183,
+    kCandidateProcNonOpaque = 190,
     kCommittedStatus = 184,
     kCandidateType = 185,
     kCandidateBary = 193,
@@ -89,6 +91,7 @@ struct Query {
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> proceeds;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> commits;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> aborts;
+    std::vector<std::pair<const llm::Block*, const llm::Instr*>> procCommits;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> candidateOps;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> committedOps;
     bool hasLoop = false;
@@ -102,7 +105,9 @@ struct Query {
     std::string AsHandle() const;
     // mask, origin x/y/z, tmin, direction x/y/z, tmax, as operand text.
     std::vector<std::string> RayArgs() const;
-    bool NeedsAnyHit() const { return hasLoop; }
+    bool NeedsAnyHit() const { return hasLoop && procCommits.empty(); }
+    // A procedural commit means the loop body is an INTERSECTION shader.
+    bool NeedsIntersection() const { return !procCommits.empty(); }
 };
 
 struct AnalyzeResult {

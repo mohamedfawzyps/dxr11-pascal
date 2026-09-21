@@ -26,6 +26,7 @@ UINT AlignUp(UINT v, UINT a) { return (v + a - 1) & ~(a - 1); }
 struct Xform {
     std::string why;
     bool hasAnyHit = false;
+    bool hasIntersection = false;
     int threads[3] = { 1, 1, 1 };
 };
 
@@ -42,6 +43,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     auto l = rq::Lower(m, a.query);
     if (!l.ok) { *why = l.error; return false; }
     x->hasAnyHit = a.query.NeedsAnyHit();
+    x->hasIntersection = a.query.NeedsIntersection();
     *out = l.text;
     return true;
 }
@@ -90,9 +92,18 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
 
     D3D12_HIT_GROUP_DESC hg{};
     hg.HitGroupExport = L"HitGroup";
-    hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
     hg.ClosestHitShaderImport = L"ClosestHit";
-    if (x.hasAnyHit) hg.AnyHitShaderImport = L"AnyHit";
+    if (x.hasIntersection) {
+        // A procedural hit group is a different TYPE and takes an intersection
+        // shader where a triangle one takes an any-hit. The two are mutually
+        // exclusive, which is why the rewriter refuses a query that commits
+        // both kinds.
+        hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+        hg.IntersectionShaderImport = L"Isect";
+    } else {
+        hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        if (x.hasAnyHit) hg.AnyHitShaderImport = L"AnyHit";
+    }
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
     sc.MaxPayloadSizeInBytes = kPayloadBytes;
@@ -210,7 +221,8 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
              "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
              static_cast<size_t>(desc->CS.BytecodeLength), lib.size(),
              self->m_threads[0], self->m_threads[1], self->m_threads[2],
-             x.hasAnyHit ? ", with a generated any-hit shader" : "");
+             x.hasIntersection ? ", with a generated intersection shader"
+                               : (x.hasAnyHit ? ", with a generated any-hit shader" : ""));
     return self;
 }
 

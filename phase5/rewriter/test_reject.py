@@ -11,6 +11,7 @@ mutating a known-good input.
 
 import io
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -147,6 +148,25 @@ def main():
             '@dx.op.rayQuery_StateScalar.i32(i32 209')
         ok.append(expect_reject('CommittedGeometryIndex', geom,
                                 'itself a Tier 1.1 feature'))
+
+    # Committing BOTH triangle and procedural hits needs a shader table with a
+    # record per geometry type, and a map from the application's instances to
+    # those records that only its acceleration structure builds carry.
+    PROC = os.path.join('phase5', 'cases', 'rayquery_proc.ll')
+    if os.path.isfile(PROC):
+        # ADD a triangle commit beside the procedural one; replacing it would
+        # leave a shader that commits only one kind, which is exactly what the
+        # first version of this check did and why it passed nothing.
+        mixed = load(PROC)
+        m = re.search(r'^.*rayQuery_CommitProceduralPrimitiveHit.*$', mixed, re.M)
+        assert m, 'the procedural case no longer has a procedural commit'
+        handle = re.search(r'i32 183, i32 (%v\d+)', m.group(0)).group(1)
+        mixed = mixed.replace(
+            m.group(0),
+            m.group(0) + '\n  call void '
+            '@dx.op.rayQuery_CommitNonOpaqueTriangleHit(i32 182, i32 %s)' % handle)
+        ok.append(expect_reject('triangle AND procedural commits', mixed,
+                                'either triangles or procedural'))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1
