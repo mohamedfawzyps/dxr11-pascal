@@ -75,7 +75,7 @@ Version 1.
   sends every shader out to text and back before D3D12 sees it and still
   reports ALL MATCH, so a round-tripped `lib_6_3` builds a working state object
   on the 1070 and renders bit-exactly.
-- Phase 5 pattern 1: **WORKING on the GTX 1070, lowered by hand.**
+- Phase 5 patterns 1 and 3: **BOTH WORKING on the GTX 1070, lowered by hand.**
   `phase5/hand/make_lib.py` edits `rayquery_opaque.ll`, a `cs_6_5` compute
   shader using `RayQuery<RAY_FLAG_FORCE_OPAQUE>`, into a `lib_6_5` DXR library
   purely as text. Against WARP's native Tier 1.1 RayQuery as ground truth:
@@ -98,22 +98,45 @@ Version 1.
     the payload's hit field is the identical test.
   - **Exports need no MSVC mangling.** DXC emits `\01?RayGen@@YAXXZ`, but plain
     `@RayGen` works and `RDAT` exposes it under exactly that name.
-  - LLVM numbers unnamed values sequentially, so added values must be NAMED.
-    The reverse also bites and the recon missed it: DELETING a numbered value
-    breaks the sequence. Removing the rayQuery values `%33` and `%34` made the
-    assembler refuse with "instruction expected to be numbered '%33'".
-    Replacement instructions have to take those exact numbers, or the function
-    has to be renumbered wholesale.
+  - LLVM numbers unnamed values and blocks POSITIONALLY. Added values must be
+    named, and deleting a numbered value breaks the sequence outright: the
+    assembler refuses with "instruction expected to be numbered '%33'". Do not
+    work around this per site. Run `phase5/hand/llnorm.py` first, which renames
+    `%33` to `%v33` and block 44 to `bb44` throughout, after which nothing is
+    positional and blocks can be added or deleted freely. Verified safe on its
+    own: normalising and reassembling an untouched module still validates and
+    signs. **The rewriter should start with this pass.**
 
-  Next action: pattern 3 by hand, `rayquery_alpha.ll`. It has the rotated
-  `Proceed` loop, so it exercises the any-hit loop-body extraction that pattern
-  1 skipped entirely. That is the part with no precedent here. Automate only
-  after it works by hand.
+  Pattern 3, `phase5/hand/make_lib_alpha.py`, is the one the project rests on,
+  since it has the rotated `Proceed` loop that pattern 1 lacks entirely.
+  8117 of 65536 rays hit on both WARP and the lowered version, 0 mismatches.
+  The lowering deletes SIX basic blocks from the raygen (preheader, header,
+  candidate block, latch, commit block, exit) and replaces them with a payload
+  init and one `traceRay`. The any-hit body is the loop body re-rooted onto the
+  `attr` parameter, with the arithmetic completely unchanged.
+  - **The polarity inverts.** Committing is the special path in RayQuery;
+    `IgnoreHit` is the special path in any-hit. Accept is the fall-through in
+    one and the explicit case in the other. Easiest thing here to get backwards.
+  - **The `CandidateType()` test is dropped**, because it is a tautology inside
+    an any-hit shader. A `CANDIDATE_PROCEDURAL_PRIMITIVE` arm would have to
+    become an intersection shader instead. Not exercised, not tested.
+  - `IgnoreHit` is `noreturn nounwind` and a compute module has no attribute
+    group for it, so one has to be appended.
 
-  Still unknown, worth settling before automating: whether a shader that binds
-  through descriptor tables rather than root descriptors, or declares more than
-  one query, still fits this shape. Everything proven so far is one shader with
-  three root-level bindings.
+  Next action: automate. Both scripts key off exact instruction text, which is
+  fine for a fixed input and useless for a real one. The rewriter has to find
+  the same sites structurally: follow the query handle, match opcodes on
+  operand 0, recognise the rotated loop. `llnorm` first, `dxilrt asm` as the
+  feedback loop, `raytest --lib` as the correctness check. Pattern 2, shadow
+  rays with `ACCEPT_FIRST_HIT_AND_END_SEARCH` and a miss shader only, is not
+  yet attempted and should be the easiest of the three.
+
+  Still untested, and all of it matters before this meets a real shader:
+  descriptor tables rather than root descriptors, more than one query per
+  shader, procedural primitives and the intersection path, and every
+  no-valid-lowering case in the "Cases with no valid lowering" table below.
+  Everything proven so far is one compute shader with three root-level
+  bindings and a single query.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -469,11 +492,14 @@ code never moves between modules, so its resource bindings and handles cannot be
 got wrong in transit. Emitting a container from scratch is pointless when the
 input module already has the right resources, handles and types.
 
-**Pattern 1 result (2026-09-21).** `phase5/hand/make_lib.py` lowers
-`rayquery_opaque.ll` into a `lib_6_5` library as text, and it renders
-bit-exactly against WARP on the 1070: 14450 of 65536 rays, 0 mismatches. The
-method that worked was to change ONE thing, the shader model, and let the
-validator enumerate the rest. Do the same for pattern 3.
+**Patterns 1 and 3 both work by hand (2026-09-21).** `phase5/hand/make_lib.py`
+and `make_lib_alpha.py` lower `rayquery_opaque.ll` and `rayquery_alpha.ll` into
+`lib_6_5` libraries as text. Both render bit-exactly against WARP on the 1070,
+14450 and 8117 of 65536 rays, 0 mismatches either way. Pattern 3 is the real
+one: its `Proceed` loop becomes a generated any-hit shader.
+
+The method that worked, and worth repeating: change ONE thing, the shader
+model, and let the validator enumerate the rest of the job.
 
 Key facts for the transform, all read off real DXC 1.10 output:
 - `AllocateRayQuery` is 178, confirmed. But **dispatch on the opcode immediate,
