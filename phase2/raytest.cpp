@@ -256,6 +256,17 @@ static const char* g_libFile = nullptr;
 // So a lowering that dropped the array index would write to the decoy and the
 // output would come back untouched, which the diff reports as a divergence.
 // Without that asymmetry the test could not tell index 2 from index 0.
+// --cs <file.hlsl> compiles that file for the RayQuery (ground truth) side
+// instead of a built-in shader, so an independently written shader can be its
+// own oracle: WARP runs the original, the 1070 runs what the rewriter made of
+// it, and the two are diffed as usual.
+static const char* g_csFile = nullptr;
+
+// t1 is always in the root signature, bound to a small alpha mask. Shaders
+// that do not declare it simply leave the root parameter unused, which is
+// legal, so this costs the existing cases nothing.
+static const UINT kMaskCount = 8;
+
 static bool g_table = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
@@ -513,14 +524,16 @@ static Scene BuildScene(Gpu& g, bool opaque) {
 
 // --- root signature shared by both methods: b0 CBV, t0 SRV(TLAS), u0 UAV(out)
 static ComPtr<ID3D12RootSignature> MakeRootSig(ID3D12Device* dev) {
-    D3D12_ROOT_PARAMETER params[3]{};
+    D3D12_ROOT_PARAMETER params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[1].Descriptor.ShaderRegister = 0;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].Descriptor.ShaderRegister = 0;
-    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 3; rd.pParameters = params;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 4; rd.pParameters = params;
     ComPtr<ID3DBlob> blob, err;
     HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
         &blob, &err);
@@ -536,13 +549,26 @@ static ComPtr<ID3D12RootSignature> MakeRootSig(ID3D12Device* dev) {
 }
 
 // Bind b0/t0/u0 for a compute or DXR dispatch.
+// Alternating 0 and 1, so a shader indexing it with a barycentric gets a
+// stripe pattern. Only --cs shaders use it.
+static ComPtr<ID3D12Resource> MakeAlphaMask(ID3D12Device* dev) {
+    auto buf = CreateBuffer(dev, sizeof(float) * kMaskCount,
+        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    float* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(buf->Map(0, &none, (void**)&p), "map alpha mask");
+    for (UINT i = 0; i < kMaskCount; ++i) p[i] = (i & 1) ? 1.0f : 0.0f;
+    buf->Unmap(0, nullptr);
+    return buf;
+}
+
 static void BindRoots(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs,
         D3D12_GPU_VIRTUAL_ADDRESS cb, D3D12_GPU_VIRTUAL_ADDRESS tlas,
-        D3D12_GPU_VIRTUAL_ADDRESS out) {
+        D3D12_GPU_VIRTUAL_ADDRESS out, D3D12_GPU_VIRTUAL_ADDRESS mask = 0) {
     cl->SetComputeRootSignature(rs);
     cl->SetComputeRootConstantBufferView(0, cb);
     cl->SetComputeRootShaderResourceView(1, tlas);
     cl->SetComputeRootUnorderedAccessView(2, out);
+    if (mask) cl->SetComputeRootShaderResourceView(3, mask);
 }
 
 // Root signature for --table: b0 and t0 stay root descriptors, the UAV array
@@ -554,7 +580,7 @@ static ComPtr<ID3D12RootSignature> MakeRootSigTable(ID3D12Device* dev) {
     range.BaseShaderRegister = 0;
     range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[3]{};
+    D3D12_ROOT_PARAMETER params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -562,8 +588,10 @@ static ComPtr<ID3D12RootSignature> MakeRootSigTable(ID3D12Device* dev) {
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[2].DescriptorTable.NumDescriptorRanges = 1;
     params[2].DescriptorTable.pDescriptorRanges = &range;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor.ShaderRegister = 1;
 
-    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 3; rd.pParameters = params;
+    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 4; rd.pParameters = params;
     ComPtr<ID3DBlob> blob, err;
     HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
         &blob, &err);
@@ -582,6 +610,13 @@ static ComPtr<ID3D12RootSignature> MakeRootSigTable(ID3D12Device* dev) {
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
     auto rs = MakeRootSig(g.device.Get());
+    std::string fromFile;
+    if (g_csFile) {
+        auto bytes = ReadAll(g_csFile);
+        fromFile.assign((const char*)bytes.data(), bytes.size());
+        hlsl = fromFile.c_str();
+        std::printf("        compute shader from %s\n", g_csFile);
+    }
     ComPtr<IDxcBlob> cs = dxc.compile(hlsl, L"main", L"cs_6_5");
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = rs.Get();
@@ -591,9 +626,14 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)),
        "CreateComputePipelineState");
 
+    auto mask = MakeAlphaMask(g.device.Get());
     g.list->SetPipelineState(pso.Get());
     BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
-              s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress());
+              s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
+              mask->GetGPUVirtualAddress());
+    // Group count sized for the smallest thread group any of these shaders
+    // uses. A 16x16 shader then gets more groups than it needs, which is safe
+    // because every one of them bounds checks; too FEW groups would not be.
     g.list->Dispatch((kWidth + 7) / 8, (kHeight + 7) / 8, 1);
     UavBarrier(g.list.Get(), out);
     g.flush();
@@ -619,6 +659,7 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
                       : MakeRootSig(g.device.Get());
 
     // The descriptor table and its decoy, built only for --table.
+    auto mask = MakeAlphaMask(g.device.Get());
     ComPtr<ID3D12DescriptorHeap> heap;
     ComPtr<ID3D12Resource> decoy;
     if (g_table) {
@@ -721,9 +762,11 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
         g.list->SetComputeRootShaderResourceView(1, s.tlas->GetGPUVirtualAddress());
         g.list->SetComputeRootDescriptorTable(
             2, heap->GetGPUDescriptorHandleForHeapStart());
+        g.list->SetComputeRootShaderResourceView(3, mask->GetGPUVirtualAddress());
     } else {
         BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
-                  s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress());
+                  s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
+                  mask->GetGPUVirtualAddress());
     }
     g.list->DispatchRays(&dr);
     UavBarrier(g.list.Get(), out);
@@ -897,6 +940,12 @@ int main(int argc, char** argv) {
         // Pull --roundtrip out of argv so the positional arguments below are
         // unaffected by it.
         for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--cs") == 0 && i + 1 < argc) {
+                g_csFile = argv[i + 1];
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
+                continue;
+            }
             if (std::strcmp(argv[i], "--table") == 0) {
                 g_table = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];

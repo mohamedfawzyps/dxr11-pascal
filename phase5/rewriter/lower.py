@@ -107,7 +107,7 @@ def lower(module, q, exports=None):
     out = render(module, edits)
     out = _add_types_and_globals(out, globals_)
     out = _swap_declarations(out, q, globals_)
-    out = _append_shaders(out, module, q, exports)
+    out = _append_shaders(out, module, q, exports, table, globals_)
     out = _rewrite_metadata(out, md, table, globals_, q, exports)
     return out
 
@@ -123,47 +123,56 @@ def _plan_globals(table):
     return g
 
 
+def _handle_text(instr, table, globals_):
+    """The load + createHandleForLib that replaces one createHandle.
+
+    Shared, because the any-hit shader has to recreate any resource handle the
+    Proceed loop body used. A handle is not caller state: it names a resource,
+    and every shader in the library can reach it."""
+    cls = int(re.match(r'i8\s+(\d+)', instr.args[1].strip()).group(1))
+    rid = int(re.match(r'i32\s+(\d+)', instr.args[2].strip()).group(1))
+    recs = table.get(cls, [])
+    if rid >= len(recs):
+        raise LowerError('createHandle names range %d of class %d, which '
+                         '!dx.resources does not describe' % (rid, cls))
+    nid = recs[rid][0]
+    sym, gty, elem, _ = globals_[(cls, nid)]
+    fnname, _ = _handle_fn(elem)
+    raw = '%%rq.raw.%s' % instr.result[1:]
+
+    if gty == elem:
+        src = '{ty}* @{sym}'.format(ty=elem, sym=sym)
+    else:
+        # A resource array. DXC reaches the element through a constant
+        # getelementptr on the array global, and hands createHandleForLib
+        # the ELEMENT type. Matched against a DXC-built library.
+        idx = re.match(r'i32\s+(\d+)$', instr.args[3].strip())
+        if not idx:
+            raise rq.Unsupported(
+                'resource array indexed by a non-constant (%s); dynamic '
+                'descriptor indexing is not supported'
+                % instr.args[3].strip())
+        nonuni = instr.args[4].strip()
+        if nonuni not in ('i1 false', 'i1 0'):
+            raise rq.Unsupported(
+                'resource array indexed non-uniformly; not supported')
+        src = ('{elem}* getelementptr inbounds ({gty}, {gty}* @{sym}, '
+               'i32 0, i32 {i})').format(elem=elem, gty=gty, sym=sym,
+                                         i=idx.group(1))
+
+    return (
+        '  {raw} = load {elem}, {src}, align 4\n'
+        '  {res} = call %dx.types.Handle @{fn}(i32 160, {elem} {raw})'
+        '  ; CreateHandleForLib(Resource)'
+    ).format(raw=raw, elem=elem, src=src, res=instr.result, fn=fnname)
+
+
 def _edit_resources(module, q, edits, table, globals_):
     """createHandle(57, class, rangeId, ...) -> load + createHandleForLib."""
     for block, instr in q.fn.instrs():
         if instr.dxop != 57:
             continue
-        cls = int(re.match(r'i8\s+(\d+)', instr.args[1].strip()).group(1))
-        rid = int(re.match(r'i32\s+(\d+)', instr.args[2].strip()).group(1))
-        recs = table.get(cls, [])
-        if rid >= len(recs):
-            raise LowerError('createHandle names range %d of class %d, which '
-                             '!dx.resources does not describe' % (rid, cls))
-        nid = recs[rid][0]
-        sym, gty, elem, _ = globals_[(cls, nid)]
-        fnname, _ = _handle_fn(elem)
-        raw = '%%rq.raw.%s' % instr.result[1:]
-
-        if gty == elem:
-            src = '{ty}* @{sym}'.format(ty=elem, sym=sym)
-        else:
-            # A resource array. DXC reaches the element through a constant
-            # getelementptr on the array global, and hands createHandleForLib
-            # the ELEMENT type. Matched against a DXC-built library.
-            idx = re.match(r'i32\s+(\d+)$', instr.args[3].strip())
-            if not idx:
-                raise rq.Unsupported(
-                    'resource array indexed by a non-constant (%s); dynamic '
-                    'descriptor indexing is not supported'
-                    % instr.args[3].strip())
-            nonuni = instr.args[4].strip()
-            if nonuni not in ('i1 false', 'i1 0'):
-                raise rq.Unsupported(
-                    'resource array indexed non-uniformly; not supported')
-            src = ('{elem}* getelementptr inbounds ({gty}, {gty}* @{sym}, '
-                   'i32 0, i32 {i})').format(elem=elem, gty=gty, sym=sym,
-                                             i=idx.group(1))
-
-        edits[instr.index] = (
-            '  {raw} = load {elem}, {src}, align 4\n'
-            '  {res} = call %dx.types.Handle @{fn}(i32 160, {elem} {raw})'
-            '  ; CreateHandleForLib(Resource)'
-        ).format(raw=raw, elem=elem, src=src, res=instr.result, fn=fnname)
+        edits[instr.index] = _handle_text(instr, table, globals_)
 
 
 def _edit_ray_index(q, edits):
@@ -281,7 +290,15 @@ def _check_loop_isolated(fn, q, header, latch, body):
             if i.result:
                 defined.add(i.result)
             used.update(i.uses())
-    outside = {u for u in used if u not in defined and u != q.handle}
+
+    # A resource handle read inside the loop is NOT caller state. It names a
+    # resource, and the any-hit shader can create its own handle for the same
+    # one, so those are recreated rather than refused. Real alpha testing reads
+    # a texture or buffer in the loop body, so refusing this would have blocked
+    # the most common shape there is.
+    handles = {i.result for _, i in fn.instrs() if i.dxop == 57 and i.result}
+    outside = {u for u in used
+               if u not in defined and u != q.handle and u not in handles}
     if outside:
         raise rq.Unsupported(
             'Proceed loop body reads values defined outside it (%s); the '
@@ -368,11 +385,11 @@ def _swap_declarations(text, q, globals_):
     return text
 
 
-def _append_shaders(text, module, q, exports):
+def _append_shaders(text, module, q, exports, table, globals_):
     """Emit the generated shader set after the raygen."""
     fns = []
     if q.loop:
-        fns.append(_anyhit(module, q, exports))
+        fns.append(_anyhit(module, q, exports, table, globals_))
     fns.append('''define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #1 {{
   %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()
   %ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0
@@ -397,7 +414,7 @@ def _append_shaders(text, module, q, exports):
     return text[:marker.end()] + '\n\n' + '\n\n'.join(fns) + text[marker.end():]
 
 
-def _anyhit(module, q, exports):
+def _anyhit(module, q, exports, table, globals_):
     """The Proceed loop body, re-rooted as an any-hit shader.
 
     Accept is falling off the end; reject is IgnoreHit. Note the polarity is
@@ -421,6 +438,17 @@ def _anyhit(module, q, exports):
            % (exports['anyhit'], PAYLOAD, ATTRS),
            '  %rq.ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
            '  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4']
+
+    # Recreate every resource handle the body uses, under the SAME SSA name it
+    # had in the raygen, so the transplanted instructions need no rewriting.
+    used = set()
+    for label in body:
+        if label != latch:
+            for i in fn.block(label).instrs:
+                used.update(i.uses())
+    for _, i in fn.instrs():
+        if i.dxop == 57 and i.result in used:
+            out.append(_handle_text(i, table, globals_))
 
     for label in order:
         blk = fn.block(label)

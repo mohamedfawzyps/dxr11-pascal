@@ -23,7 +23,10 @@ $cases = @(
     @{ name = 'table';  src = 'phase5\cases\rayquery_table.ll'; pat = 'opaque'; flags = @('--table');
        desc = 'resource array indexed at [2], bound through a descriptor table' },
     @{ name = 'tablers'; src = 'phase5\cases\rayquery_tablers.ll'; pat = 'opaque'; flags = @();
-       desc = 'descriptor-table root signature, no array; DXIL body is identical' }
+       desc = 'descriptor-table root signature, no array; DXIL body is identical' },
+    @{ name = 'indep'; src = 'phase5\cases\rayquery_indep.ll'; pat = 'alpha'; flags = @();
+       gt = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
+       desc = 'independently written: resource READ INSIDE the Proceed loop' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {
@@ -59,7 +62,8 @@ foreach ($c in $cases) {
     Write-Host '  assembled, validated and signed'
 
     # WARP RayQuery is the oracle; the 1070 runs what the rewriter produced.
-    & .\raytest.exe warp rayquery $c.pat "rw_${n}_a.bin" | Out-Null
+    $gt = if ($c.ContainsKey('gt')) { $c.gt } else { @() }
+    & .\raytest.exe warp rayquery $c.pat "rw_${n}_a.bin" @($gt) | Out-Null
     & .\raytest.exe hw traceray $c.pat "rw_${n}_b.bin" --lib "phase5\out\$n.dxil" @($c.flags) | Out-Null
     $diff = & .\raytest.exe diff "rw_${n}_a.bin" "rw_${n}_b.bin" 2>&1
     $diff | Where-Object { $_ -match 'rays|mismatches|max|RESULT' } |

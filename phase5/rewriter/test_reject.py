@@ -23,6 +23,7 @@ import rayquery
 
 OPAQUE = os.path.join('phase5', 'dxil', 'rayquery_opaque.ll')
 ALPHA = os.path.join('phase5', 'dxil', 'rayquery_alpha.ll')
+INDEP = os.path.join('phase5', 'cases', 'rayquery_indep.ll')
 
 
 def load(path):
@@ -59,9 +60,15 @@ def main():
     opaque, alpha = load(OPAQUE), load(ALPHA)
     ok = []
 
-    print('\n-- the two known-good inputs must still pass --')
+    print('\n-- known-good inputs must still pass --')
     ok.append(expect_ok('rayquery_opaque', opaque))
     ok.append(expect_ok('rayquery_alpha', alpha))
+    # The independently written shader reads a RESOURCE inside the Proceed
+    # loop, which the isolation check used to refuse. A resource handle is not
+    # caller state, so this must be accepted; refusing it would block the most
+    # common real alpha test there is.
+    if os.path.isfile(INDEP):
+        ok.append(expect_ok('rayquery_indep (resource in loop)', load(INDEP)))
 
     print('\n-- cases the brief says have no valid lowering --')
 

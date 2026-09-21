@@ -647,17 +647,85 @@ A separate control points the same way: the ROOT-DESCRIPTOR library run with
 `--table` gives 0 hits, because it writes to u0, which is now the decoy. The
 table path is real, it isolates, and it notices.
 
+## An independently written shader, and the assumption it found
+
+Everything up to here descended from the two Phase 2 shaders, which were
+written to demonstrate one lowering. `phase5/cases/rayquery_indep.hlsl` is
+deliberately not: different thread group (16x16), different control flow, the
+query behind a helper function, `continue` inside the loop, the committed
+accessors read in a different order, and, most importantly, **a resource read
+inside the Proceed loop**, which is what a real alpha test does.
+
+It keeps only the harness contract, a `Result` written to u0, so the diff still
+works. WARP running the same shader is its own ground truth, so its alpha rule
+does not have to match Phase 2's.
+
+### It found a false refusal, and a consequential one
+
+    REFUSED: Proceed loop body reads values defined outside it (%v2); the
+    any-hit shader is a separate invocation and the payload is the only shared
+    state
+
+`%v2` is the `alphaMask` SRV handle, created in the entry block and used in the
+loop. The isolation check was right in principle and wrong here: **a resource
+handle is not caller state.** It names a resource, and every shader in the
+library can reach the same one. The any-hit shader just creates its own.
+
+This mattered. Refusing it would have blocked the most common real alpha test
+there is, the one that samples a texture or buffer per candidate, which is the
+whole reason alpha testing exists. The Phase 2 pair could never have exposed it,
+because its alpha rule is pure arithmetic on the barycentrics.
+
+The fix: `_check_loop_isolated` exempts `createHandle` results, and `_anyhit`
+recreates each handle the body uses, **under the same SSA name it had in the
+raygen**, so the transplanted instructions need no rewriting at all. Values
+that are genuinely caller locals are still refused.
+
+The generated any-hit reads exactly as it should:
+
+    %rq.raw.v2 = load %"class.StructuredBuffer<float>", ...* @rq_srv1, align 4
+    %v2 = call %dx.types.Handle @"dx.op.createHandleForLib..."(i32 160, ... %rq.raw.v2)
+    %v41 = icmp eq i32 0, 0                      <- CandidateType tautology, folds
+    ...
+    %v49 = call ... @dx.op.rawBufferLoad.f32(i32 139, %dx.types.Handle %v2, ...)
+    %v51 = fcmp fast ogt float %v50, 5.000000e-01
+    br i1 %v51, label %bb52, label %rq.reject
+
+### Result
+
+    WARP RayQuery (its own ground truth)   65536 rays, 6333 hits
+    automated lowering on the GTX 1070     65536 rays, 6333 hits
+    0 mismatches, max |dt| and max |dbary| 0.000000
+
+6333 is neither 14450 nor 8117, so the mask buffer is demonstrably being read
+and is changing the outcome.
+
+### Sensitivity, checked the way the last mistake taught
+
+`raytest --cs <file.hlsl>` compiles a given shader for the ground-truth side, so
+an independent shader can be its own oracle.
+
+Inverting the mask comparison in the generated any-hit, `ogt` to `olt`, after
+diffing to confirm the substitution actually applied this time:
+
+    inverted   65536 rays, 8117 hits
+    hit/miss mismatches: 14450    RESULT: DIVERGE
+
+And 6333 + 8117 = 14450, the opaque hit count, so the accepted and rejected
+sets partition it exactly. As before, neither number was arranged.
+
 ## Next
 
-The rewriter now handles everything it has been shown, and refuses the rest.
-What remains, in order of how likely it is to break:
+The regression is now five shaders and ten analysis checks, all passing. The
+independent shader did its job and found a real false refusal on the first try,
+which is the best argument for doing it again rather than assuming the next one
+would pass.
 
-1. **A second, independently written RayQuery shader**, not derived from the
-   Phase 2 pair. Everything here still descends from two shaders written to
-   demonstrate one lowering, so the risk of an accidental shared assumption is
-   real. Descriptor tables were supposed to be the danger and turned out not to
-   be; something else will be.
-2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
+1. **More independent shaders**, especially ones using committed accessors
+   outside the whitelist (`CommittedInstanceIndex`, `CommittedPrimitiveIndex`,
+   `CommittedGeometryIndex`). Those are refused today and are common in real
+   code, so they are the next thing a real engine would hit.
+2. **Dynamic descriptor indexing**, currently refused.
 3. **Wire the rewriter into the proxy**, at `CreateStateObject` and the compute
    pipeline path. That forces the tier question: reporting Tier 1.1 entitles an
    app to emit RayQuery, so the flip and a working rewriter have to land
