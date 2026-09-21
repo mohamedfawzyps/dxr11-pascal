@@ -19,7 +19,8 @@ four are permanently refused because DXR 1.0 offers nothing to lower them onto.
 without knowing the application's geometry layout, which blocks mixed
 triangle-and-procedural queries AND, already today, any application that sets a
 nonzero `InstanceContributionToHitGroupIndex`. Both need acceleration structure
-interception. See the entries below.
+interception, whose cheap half is done and whose expensive half is the last
+structural piece. See the entries below.
 See the entries below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
@@ -466,11 +467,32 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   every instance has `InstanceContributionToHitGroupIndex = 0`. True of every
   scene here; not guaranteed of a real one. Same fix as above.
 
+- AS interception, cheap half: **DONE.** `proxy/as_tracker.{h,cpp}`, hooked at
+  `BuildRaytracingAccelerationStructure`. **The two halves cost wildly
+  different amounts, which is the finding.**
+  - **BLAS geometry types are FREE.** `D3D12_RAYTRACING_GEOMETRY_DESC` arrives
+    as CPU MEMORY in the build call, so the type of every bottom-level
+    structure is read and remembered with no copy and no sync.
+    `ARRAY_OF_POINTERS` is handled as well as `ARRAY`; anything else is left
+    unknown rather than guessed at. Verified on the Phase 4 probe, which builds
+    one of each, and it distinguishes rather than always saying the same thing.
+  - **TLAS instance data is NOT free.** `InstanceDescs` is a GPU VIRTUAL
+    ADDRESS, so reading the contributions needs a copy and a sync per top-level
+    build, in engines that rebuild every frame. Not attempted, and nothing
+    guessed in its place.
+  - Instead a top-level build LOGS, once, exactly what is not known: the
+    contributions live in GPU memory, are not read, and the table still assumes
+    zero. **The limitation is now visible at runtime**, not only written down.
+    If this shim ever renders a real scene wrong, that line points at the cause.
+  - Note: lists are only wrapped on Tier 1.0, so nothing is tracked on WARP.
+    Correct, since the shim does nothing there, but it means the tracking
+    cannot be observed on the ground-truth path.
+
   Next action, in order of value.
-  1. **Acceleration structure interception.** Tracking the geometry type of
-     every BLAS and the contribution index of every instance unblocks BOTH the
-     mixed query and the nonzero contribution case. Largest remaining piece,
-     and it is dispatch machinery rather than shader translation.
+  1. **The TLAS half.** Copy the instance descriptions and read them back, the
+     same machinery as the Phase 4 indirect DispatchRays split. It unblocks
+     BOTH open problems at once and is the last structural piece of the shim.
+     The cost is a copy and a sync per top-level build.
   2. **Dynamic descriptor indexing**, still refused.
   3. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
