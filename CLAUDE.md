@@ -268,22 +268,49 @@ Version 1.
     is not the string it looks like. Use `R"RX( ... )RX"` when the pattern
     contains a quote.
 
-  Next action, in order. The tier flip is still blocked, by two unwritten
-  pieces rather than by the transform.
-  1. **The DXC host in C++.** The rewriter works on text, the proxy receives
-     bitcode. Container to text and back needs `IDxcCompiler::Disassemble`,
-     `IDxcAssembler` and `dxil.dll` for signing, loaded from the proxy. Small
-     next to the port, and it makes the rewriter callable on what the proxy
-     actually gets. This is the DXC runtime dependency the fork accepted.
-  2. **The dispatch path.** Lowering a compute shader to a library is half the
-     job. The application then calls `Dispatch`, which has to become
-     `DispatchRays` against a state object and shader table the shim builds and
-     owns. The larger of the two, and nothing is written.
-  3. Only then the tier flip, with anything refused failing loudly.
+- The DXC host: **DONE.** `proxy/rewriter/dxc_host.{h,cpp}` closes the gap
+  between what the rewriter works on, `.ll` TEXT, and what D3D12 hands over, a
+  DXIL CONTAINER. Disassembly and assembly from `dxcompiler.dll`, signing from
+  `dxil.dll`, the Phase 1 mechanism unchanged. `dxrw rewrite <in.dxil>
+  <out.dxil>` is the whole path in one call and is what the proxy will do
+  internally; all five RayQuery shaders go container in, signed container out,
+  and render bit-exactly on the 1070. The container path is its own line in the
+  regression, separate from the `.ll` path, because it is the one that will
+  actually run in an application.
 
-  Independent of all that: dynamic descriptor indexing is still refused, and
-  more independent shaders are still the cheapest way to find what has been
-  assumed. Untried: non-default `RAY_FLAG` combinations, `Abort()`, procedural
+  Three things a DLL in someone else's process has to get right, all handled
+  and worth not undoing:
+  - **Load DXC by FULL PATH, never by name.** An application may already have
+    its own `dxcompiler.dll` loaded, and `LoadLibraryW(L"dxcompiler.dll")`
+    returns THEIRS, of whatever version. `SetHostModule` is called from
+    `DllMain` so the host can find the copies beside the shim. Proven: with the
+    beside-exe copy hidden and a different one present in the working
+    directory, it refuses rather than loading the wrong one.
+  - **Never throw.** Every failure is a returned error; a missing DLL is a
+    message, not a fault in the host process.
+  - **Load lazily and once.** HelloWorld runs through the proxy with the whole
+    rewriter linked in and loads no DXC at all, still pixel-identical.
+
+  **ONE piece now stands between this and the tier flip, and it is the largest
+  thing left in Phase 5.**
+
+  **The dispatch path.** Lowering a compute shader to a library is half the
+  job. The application then calls `Dispatch`, and that has to become
+  `DispatchRays`. Concretely: `CreateComputePipelineState` on a RayQuery shader
+  must produce a state object and shader table the shim builds and OWNS,
+  `SetPipelineState` must recognise it, `Dispatch` must map the thread group
+  grid onto a ray grid, and the root signature and bindings have to be carried
+  across. None of it exists. Until it does a rewritten shader has nowhere to
+  run, which is why detection still only logs.
+
+  Next action, in order.
+  1. **The dispatch path**, above.
+  2. **Then the tier flip**, with anything the rewriter refuses failing loudly
+     rather than rendering wrong.
+
+  Independent of both: dynamic descriptor indexing is still refused, and more
+  independent shaders are still the cheapest way to find what has been assumed.
+  Untried: non-default `RAY_FLAG` combinations, `Abort()`, procedural
   primitives, committed object-space accessors.
 
   What is NOT generic, written down so it is not rediscovered:
@@ -334,6 +361,9 @@ Dev machine (Windows x64), everything under `C:\DW`:
   feature probes, and takes `-debug` for the debug layer, `-gfxsplit` for
   graphics state across a split, `-batchsplit` for dispatch batching and its
   control, `-time` and `-pipeline` for the split cost.
+  `build_rewriter.bat` builds the C++ rewriter and `phase5out\dxrw.exe`,
+  copying DXC beside it. `dxrw lower` works on `.ll`, `dxrw rewrite` takes a
+  container and returns a signed one, which is the path the proxy uses.
   `build_phase5.bat` extracts the Phase 2 shaders and disassembles them into
   `phase5\dxil\`; `build_phase5_tool.bat` builds `phase5out\dxilrt.exe`, which
   round-trips a container through text and assembles and signs arbitrary `.ll`.
@@ -661,6 +691,12 @@ and rewrite `!dx.entryPoints` with `!dx.typeAnnotations`. The application's own
 code never moves between modules, so its resource bindings and handles cannot be
 got wrong in transit. Emitting a container from scratch is pointless when the
 input module already has the right resources, handles and types.
+
+**DXC host (2026-09-21).** `proxy/rewriter/dxc_host.{h,cpp}` converts a
+container to text and back and signs the result, loading DXC by full path from
+beside the shim. The rewriter and its host are linked into the proxy. The
+dispatch path is the one structural piece still missing, see the position
+section.
 
 **Proxy detection (2026-09-21).** `proxy/dxil_scan.{h,cpp}` detects RayQuery
 from SFI0 bit 20, no bitcode parsing needed, hooked at the two pipeline
