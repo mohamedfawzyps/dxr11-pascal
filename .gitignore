@@ -23,3 +23,12 @@ dxil.dll
 # Phase 4 probe build output
 phase4out/
 obj/
+
+# Phase 5 recon material, regenerate with build_phase5.bat
+phase5/shaders/
+phase5/dxil/
+phase5out/
+
+# dxilrt round-trip diff output
+rt_before.ll
+rt_after.ll

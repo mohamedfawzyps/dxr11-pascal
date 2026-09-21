@@ -236,10 +236,22 @@ void ClosestHit(inout Payload p, BuiltInTriangleIntersectionAttributes attr) {
 void Miss(inout Payload p) { p.hit = 0; }
 )HLSL";
 
+// Phase 5 measurement, off by default. With --roundtrip, every shader this
+// harness compiles is disassembled to text, reassembled, and re-signed before
+// it ever reaches D3D12. The existing WARP against GTX 1070 comparison then
+// answers the only question that matters about text rewriting: does a shader
+// that has been through .ll and back still produce the same pixels?
+static bool g_roundTrip = false;
+static bool g_rtPoison  = false;   // deliberate corruption, to prove the check bites
+static bool g_poisonNow = false;   // set per trial: poison only the lowered side
+
 // --- DXC runtime compile ---------------------------------------------------
 struct Dxc {
     ComPtr<IDxcCompiler3> compiler;
     ComPtr<IDxcUtils> utils;
+    ComPtr<IDxcAssembler> assembler;
+    ComPtr<IDxcValidator> validator;   // from dxil.dll, as in Phase 1
+    ComPtr<IDxcCompiler> disassembler; // Disassemble() lives on IDxcCompiler
     void init() {
         HMODULE m = LoadLibraryW(L"dxcompiler.dll");
         if (!m) Throw("LoadLibrary(dxcompiler.dll)", HRESULT_FROM_WIN32(GetLastError()));
@@ -247,6 +259,66 @@ struct Dxc {
         if (!create) Throw("GetProcAddress(DxcCreateInstance)", E_FAIL);
         HR(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler)), "create IDxcCompiler3");
         HR(create(CLSID_DxcUtils, IID_PPV_ARGS(&utils)), "create IDxcUtils");
+        if (!g_roundTrip) return;
+        HR(create(CLSID_DxcAssembler, IID_PPV_ARGS(&assembler)), "create IDxcAssembler");
+        HR(create(CLSID_DxcCompiler, IID_PPV_ARGS(&disassembler)), "create IDxcCompiler");
+        HMODULE d = LoadLibraryW(L"dxil.dll");
+        if (!d) Throw("LoadLibrary(dxil.dll)", HRESULT_FROM_WIN32(GetLastError()));
+        auto dcreate = (DxcCreateInstanceProc)GetProcAddress(d, "DxcCreateInstance");
+        if (!dcreate) Throw("GetProcAddress(dxil DxcCreateInstance)", E_FAIL);
+        HR(dcreate(CLSID_DxcValidator, IID_PPV_ARGS(&validator)), "create IDxcValidator");
+    }
+
+    // container -> .ll text -> container -> validated and re-signed container.
+    ComPtr<IDxcBlob> roundTrip(IDxcBlob* in) {
+        ComPtr<IDxcBlobEncoding> text;
+        HR(disassembler->Disassemble(in, &text), "Disassemble");
+
+        // Sensitivity check for the round trip itself. --rtpoison makes ONE
+        // edit to the disassembly, flipping the ray direction from -Z to +Z so
+        // every ray points away from the scene. If a poisoned run still reports
+        // MATCH, then this harness is not actually sensitive to what the IR
+        // says and a clean --roundtrip result would prove nothing. It is also
+        // the project's first real DXIL text rewrite, however small.
+        std::string ll(static_cast<const char*>(text->GetBufferPointer()),
+                       text->GetBufferSize());
+        if (g_rtPoison && g_poisonNow) {
+            const std::string from = "float -1.000000e+00";
+            const std::string to   = "float 1.000000e+00";
+            size_t n = 0, at = 0;
+            while ((at = ll.find(from, at)) != std::string::npos) {
+                ll.replace(at, from.size(), to);
+                at += to.size(); ++n;
+            }
+            std::printf("        [--rtpoison] flipped ray direction in %zu place(s)\n", n);
+        }
+
+        ComPtr<IDxcBlobEncoding> src;
+        HR(utils->CreateBlob(ll.data(), (UINT32)ll.size(),
+                             DXC_CP_ACP, &src), "CreateBlob(ll)");
+        ComPtr<IDxcOperationResult> ares;
+        HR(assembler->AssembleToContainer(src.Get(), &ares), "AssembleToContainer");
+        HRESULT st = E_FAIL; ares->GetStatus(&st);
+        if (FAILED(st)) Throw("reassembly", st);
+        ComPtr<IDxcBlob> rebuilt;
+        HR(ares->GetResult(&rebuilt), "assembler result");
+
+        // InPlaceEdit signs the blob we hand it, the Phase 1 mechanism.
+        ComPtr<IDxcOperationResult> vres;
+        HR(validator->Validate(rebuilt.Get(), DxcValidatorFlags_InPlaceEdit, &vres),
+           "Validate");
+        vres->GetStatus(&st);
+        if (FAILED(st)) {
+            ComPtr<IDxcBlobEncoding> err;
+            vres->GetErrorBuffer(&err);
+            std::fprintf(stderr, "round-trip validation failed:\n%.*s\n",
+                         err ? (int)err->GetBufferSize() : 0,
+                         err ? (const char*)err->GetBufferPointer() : "");
+            Throw("round-trip validation", st);
+        }
+        std::printf("        round-tripped through .ll: %zu -> %zu bytes\n",
+                    (size_t)in->GetBufferSize(), (size_t)rebuilt->GetBufferSize());
+        return rebuilt;
     }
     // Compile HLSL to a signed DXIL blob. entry may be empty for a lib target.
     ComPtr<IDxcBlob> compile(const char* src, const wchar_t* entry,
@@ -267,6 +339,7 @@ struct Dxc {
         }
         ComPtr<IDxcBlob> obj;
         HR(res->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&obj), nullptr), "get DXIL object");
+        if (g_roundTrip) return roundTrip(obj.Get());
         return obj;
     }
 };
@@ -579,6 +652,11 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
     const char* pn = (pattern == Pattern::Opaque) ? "opaque" : "alpha";
     std::printf("[trial] %s %s on %s -> %s\n", pn, mn, an, outPath);
 
+    // Poison only the LOWERED side. Corrupting both would leave them agreeing
+    // with each other, so the diff would still report MATCH and would prove
+    // nothing about whether it can see an IR change at all.
+    g_poisonNow = (method == Method::TraceRay);
+
     ComPtr<IDXGIFactory6> factory;
     UINT flags = 0;
 #ifdef _DEBUG
@@ -704,6 +782,20 @@ static int Diff(const char* pa, const char* pb) {
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     try {
+        // Pull --roundtrip out of argv so the positional arguments below are
+        // unaffected by it.
+        for (int i = 1; i < argc; ++i) {
+            const bool poison = std::strcmp(argv[i], "--rtpoison") == 0;
+            if (!poison && std::strcmp(argv[i], "--roundtrip") != 0) continue;
+            g_roundTrip = true;
+            if (poison) g_rtPoison = true;
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            --argc; --i;
+        }
+        if (g_roundTrip)
+            std::printf("[--roundtrip] every shader goes through .ll and back "
+                        "before D3D12 sees it\n");
+
         if (argc >= 4 && std::strcmp(argv[1], "diff") == 0)
             return Diff(argv[2], argv[3]);
 
