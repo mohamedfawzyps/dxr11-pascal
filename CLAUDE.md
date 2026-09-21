@@ -11,9 +11,9 @@ patterns, 0 mismatches. Run `.\tools\run_dispatch_test.ps1`.
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
 was missing. Nothing in this project implements ray tracing.
 
-**Coverage is measured against a real engine: 19 of the 24 accessors Unreal
-uses.** It was 8; the 11 mechanically addable ones are done. What remains is
-`Abort()` and procedural primitives, plus four that are permanently refused.
+**Coverage is measured against a real engine: 20 of the 24 accessors Unreal
+uses.** It was 8. What remains is procedural primitives, plus four that are
+permanently refused.
 See the entries below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
@@ -381,7 +381,7 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     while `HitKind()` is an integer, so `icmp eq i32 hk, 254`. The
     world-to-object matrix is twelve floats and travels in the payload as
     `[12 x float]` indexed `row * 4 + col`.
-  - **The payload is now 84 bytes**, almost all matrix. The LAYOUT is fixed
+  - **The payload is now 88 bytes**, almost all matrix, plus the abort flag. The LAYOUT is fixed
     even when the matrix is unread, because variable offsets across two
     implementations is a good way to get one subtly wrong; the per-invocation
     COST is what is conditional, so the closest-hit fetches the matrix only
@@ -402,14 +402,41 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     this project. **A test whose premise is a fact about the world needs
     re-checking when that fact changes.**
 
+- `Abort()` (181): **DONE, coverage 20 of 24.**
+  - The brief offered `AcceptHitAndEndSearch()` or a payload flag. Only the
+    flag works in general: **a DXR 1.0 any-hit shader has no "reject and
+    stop".** Its two terminators are `IgnoreHit()`, which rejects and
+    CONTINUES, and `AcceptHitAndEndSearch()`, which accepts and stops. A bare
+    `Abort()` needs the missing third.
+  - So `Abort` stores a payload flag and the any-hit prologue ignores its
+    candidate at once when it is set. Commit-then-abort still accepts, since
+    the control flow still falls through; a bare abort still rejects. Either
+    way nothing further commits, which is what stopping traversal means for the
+    RESULT. Traversal carries on, so this is slower than ideal;
+    `AcceptHitAndEndSearch` would be exact for the commit case but only after
+    proving the commit dominates the abort in the same iteration.
+  - `Abort()` outside the Proceed loop is refused: the any-hit shader is the
+    only place traversal can be stopped from.
+
+  **MOST OF Abort CANNOT BE VERIFIED AGAINST WARP, and the passing test does
+  not mean it is.** Abort stops at whichever candidate traversal reaches first,
+  and that order is implementation-defined, so the committed t, the
+  barycentrics and which instance was hit are all legitimately allowed to
+  differ between WARP and NVIDIA. A test of those would be meaningless. The
+  test therefore observes only WHETHER there was a hit, which is
+  order-independent for commit-then-abort: 10377 hits both sides. Pre-setting
+  the flag gives 0 hits and DIVERGE, so the flag, its initialisation and the
+  prologue check ARE exercised. The TIMING is not, and nothing compared against
+  WARP can establish it. **This is the first thing in the project the oracle
+  cannot settle.**
+
   Next action, in order of value.
-  1. **`Abort()`**, four uses in Epic's shaders, mapping to
-     `AcceptHitAndEndSearch()`. Small, takes coverage to 20.
-  2. **Procedural primitives**, needing the generated intersection shader.
-     Genuinely new work rather than another table entry, and takes coverage to
-     21, the practical maximum.
-  3. **Dynamic descriptor indexing**, still refused.
-  4. **Only then consider making the tier flip the default**, once enough real
+  1. **Procedural primitives.** `CommitProceduralPrimitiveHit` needs a
+     generated INTERSECTION shader, which this project has never built. The
+     last piece of lowering, genuinely new work rather than another table
+     entry, and it takes coverage to 21, the practical maximum against Unreal.
+  2. **Dynamic descriptor indexing**, still refused.
+  3. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
 
   Four accessors stay PERMANENTLY refused and must keep failing loudly:
