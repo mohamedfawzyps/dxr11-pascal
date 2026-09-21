@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <new>
+#include <string>
 
 const GUID IID_Dxr11RayQueryPso =
     { 0x7e3b1c42, 0x9a54, 0x4d18, { 0x8f, 0x60, 0x2c, 0x71, 0xb0, 0xa4, 0xe9, 0xd3 } };
@@ -51,6 +52,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
 }  // namespace
 
 Dxr11RayQueryPso::~Dxr11RayQueryPso() {
+    for (ID3D12Resource* r : m_retired) r->Release();
     if (m_sbt) m_sbt->Release();
     if (m_so) m_so->Release();
     if (m_rootSig) m_rootSig->Release();
@@ -149,73 +151,40 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     }
 
     // --- shader table -------------------------------------------------------
-    // One record each, raygen then miss then hit group, each table aligned.
-    const UINT stride = AlignUp(kIdSize, kRecAlign);
-    const UINT slot = AlignUp(stride, kTableAlign);
-    const UINT64 size = static_cast<UINT64>(slot) * 3;
-
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = size; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    ID3D12Resource* sbt = nullptr;
-    hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                      IID_PPV_ARGS(&sbt));
-    if (FAILED(hr)) {
-        props->Release(); so->Release();
-        *why = "cannot create the shader table buffer";
-        return nullptr;
-    }
-
-    uint8_t* p = nullptr;
-    D3D12_RANGE none{ 0, 0 };
-    if (FAILED(sbt->Map(0, &none, reinterpret_cast<void**>(&p)))) {
-        sbt->Release(); props->Release(); so->Release();
-        *why = "cannot map the shader table";
-        return nullptr;
-    }
-    std::memset(p, 0, static_cast<size_t>(size));
     const void* idRay = props->GetShaderIdentifier(L"RayGen");
     const void* idMiss = props->GetShaderIdentifier(L"Miss");
     const void* idHit = props->GetShaderIdentifier(L"HitGroup");
     if (!idRay || !idMiss || !idHit) {
-        sbt->Unmap(0, nullptr); sbt->Release(); props->Release(); so->Release();
+        props->Release(); so->Release();
         *why = "the state object does not export RayGen, Miss and HitGroup";
         return nullptr;
     }
-    std::memcpy(p + 0 * slot, idRay, kIdSize);
-    std::memcpy(p + 1 * slot, idMiss, kIdSize);
-    std::memcpy(p + 2 * slot, idHit, kIdSize);
-    sbt->Unmap(0, nullptr);
-    props->Release();
 
     auto* self = new (std::nothrow) Dxr11RayQueryPso();
     if (!self) {
-        sbt->Release(); so->Release();
+        props->Release(); so->Release();
         *why = "out of memory";
         return nullptr;
     }
     self->m_dev = dev;
     self->m_so = so;
-    self->m_sbt = sbt;
     self->m_rootSig = desc->pRootSignature;
     if (self->m_rootSig) self->m_rootSig->AddRef();
     for (int i = 0; i < 3; ++i) self->m_threads[i] = static_cast<UINT>(x.threads[i]);
+    self->m_isProcedural = x.hasIntersection;
+    std::memcpy(self->m_idRay, idRay, kIdSize);
+    std::memcpy(self->m_idMiss, idMiss, kIdSize);
+    std::memcpy(self->m_idHit, idHit, kIdSize);
+    props->Release();
 
-    const D3D12_GPU_VIRTUAL_ADDRESS base = sbt->GetGPUVirtualAddress();
-    self->m_desc.RayGenerationShaderRecord.StartAddress = base + 0 * slot;
-    self->m_desc.RayGenerationShaderRecord.SizeInBytes = kIdSize;
-    self->m_desc.MissShaderTable.StartAddress = base + 1 * slot;
-    self->m_desc.MissShaderTable.SizeInBytes = kIdSize;
-    self->m_desc.MissShaderTable.StrideInBytes = stride;
-    self->m_desc.HitGroupTable.StartAddress = base + 2 * slot;
-    self->m_desc.HitGroupTable.SizeInBytes = kIdSize;
-    self->m_desc.HitGroupTable.StrideInBytes = stride;
+    // One hit group record to begin with. The acceleration structures have
+    // usually not been built yet at pipeline creation, so how many the scene
+    // needs is not knowable here; the first dispatch grows the table if it is
+    // more than one.
+    if (!self->BuildTable(1, why)) {
+        self->Release();
+        return nullptr;
+    }
 
     ProxyLog("[dxr11-proxy] RayQuery compute shader lowered and ready: "
              "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
@@ -226,9 +195,89 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     return self;
 }
 
+bool Dxr11RayQueryPso::BuildTable(UINT hitRecords, std::string* why) {
+    if (hitRecords < 1) hitRecords = 1;
+
+    // raygen, then miss, then the hit group records, each TABLE aligned to 64
+    // and each RECORD to 32.
+    const UINT stride = AlignUp(kIdSize, kRecAlign);
+    const UINT slot = AlignUp(stride, kTableAlign);
+    const UINT hitBytes = AlignUp(stride * hitRecords, kTableAlign);
+    const UINT64 size = static_cast<UINT64>(slot) * 2 + hitBytes;
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* sbt = nullptr;
+    if (FAILED(m_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&sbt)))) {
+        if (why) *why = "cannot create the shader table buffer";
+        return false;
+    }
+
+    uint8_t* p = nullptr;
+    D3D12_RANGE none{ 0, 0 };
+    if (FAILED(sbt->Map(0, &none, reinterpret_cast<void**>(&p)))) {
+        sbt->Release();
+        if (why) *why = "cannot map the shader table";
+        return false;
+    }
+    std::memset(p, 0, static_cast<size_t>(size));
+    std::memcpy(p + 0 * slot, m_idRay, kIdSize);
+    std::memcpy(p + 1 * slot, m_idMiss, kIdSize);
+    // Every hit group record is the same identifier. The shim has ONE hit
+    // group; what the application's contributions decide is only WHICH SLOT a
+    // hit lands on, and every slot has to be a valid record for that hit to
+    // run. So the table is sized to the application's layout and filled with
+    // the shim's single answer.
+    for (UINT i = 0; i < hitRecords; ++i)
+        std::memcpy(p + 2 * slot + i * stride, m_idHit, kIdSize);
+    sbt->Unmap(0, nullptr);
+
+    if (m_sbt) m_retired.push_back(m_sbt);   // may still be in flight
+    m_sbt = sbt;
+    m_hitRecords = hitRecords;
+
+    const D3D12_GPU_VIRTUAL_ADDRESS base = sbt->GetGPUVirtualAddress();
+    m_desc.RayGenerationShaderRecord.StartAddress = base + 0 * slot;
+    m_desc.RayGenerationShaderRecord.SizeInBytes = kIdSize;
+    m_desc.MissShaderTable.StartAddress = base + 1 * slot;
+    m_desc.MissShaderTable.SizeInBytes = kIdSize;
+    m_desc.MissShaderTable.StrideInBytes = stride;
+    m_desc.HitGroupTable.StartAddress = base + 2 * slot;
+    m_desc.HitGroupTable.SizeInBytes = stride * hitRecords;
+    m_desc.HitGroupTable.StrideInBytes = stride;
+    return true;
+}
+
 void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
-                                      UINT gx, UINT gy, UINT gz) {
+                                      UINT gx, UINT gy, UINT gz,
+                                      UINT hitRecords) {
     if (!cl) return;
+
+    // The scene may need more hit group records than the table has, which is
+    // the normal case the first time: the acceleration structures did not
+    // exist when the pipeline was created. Grow, never shrink, so a second
+    // smaller scene cannot invalidate a table a dispatch already used.
+    if (hitRecords > m_hitRecords) {
+        const UINT had = m_hitRecords;
+        std::string why;
+        if (!BuildTable(hitRecords, &why)) {
+            ProxyLog("[dxr11-proxy] lowered RayQuery dispatch SKIPPED: the scene "
+                     "needs %u hit group records and the table could not grow "
+                     "(%s).\n", hitRecords, why.c_str());
+            return;
+        }
+        ProxyLog("[dxr11-proxy] shader table grown from %u to %u hit group "
+                 "records, to match the scene's maximum "
+                 "InstanceContributionToHitGroupIndex.\n", had, m_hitRecords);
+    }
+
     D3D12_DISPATCH_RAYS_DESC d = m_desc;
     // Dispatch counts thread GROUPS; DispatchRays counts RAYS. The lowered
     // raygen reads DispatchRaysIndex where the original read

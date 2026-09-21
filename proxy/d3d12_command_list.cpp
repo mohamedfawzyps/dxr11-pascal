@@ -226,14 +226,18 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         // image: a silently wrong result is the one failure mode this project
         // will not ship.
         std::string why;
-        if (astrack::TableWouldBeWrong(&why)) {
+        if (astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why)) {
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
                 ProxyLog("[dxr11-proxy] lowered RayQuery dispatch REFUSED: %s. "
                          "Nothing is drawn for it.\n", why.c_str());
             return;
         }
-        m_rqPso->DispatchAsRays(m_real, x, y, z);
+        // How many hit group records the scene needs. Read from the instance
+        // descriptions, so it is 1 until a top-level structure has been seen,
+        // which is the right answer for a scene that has none.
+        m_rqPso->DispatchAsRays(m_real, x, y, z,
+                                astrack::GetSummary().maxContribution + 1);
         return;
     }
     FWD(Dispatch(x, y, z));

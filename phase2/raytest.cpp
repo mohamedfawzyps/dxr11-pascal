@@ -281,6 +281,8 @@ static bool g_contrib = false;
 // intersection shader. A BLAS carries one geometry type, so procedural and
 // triangle geometry can never share one.
 static bool g_proc = false;
+// One triangle instance and one procedural instance under one TLAS.
+static bool g_mixed = false;
 
 static bool g_table = false;
 static const UINT kTableSize = 4;
@@ -465,6 +467,10 @@ struct Scene {
     ComPtr<ID3D12Resource> vb;      // triangle vertices
     ComPtr<ID3D12Resource> blas;    // bottom-level AS
     ComPtr<ID3D12Resource> tlas;    // top-level AS
+    // Only the mixed scene uses these: a BLAS carries ONE geometry type, so
+    // triangles and procedural primitives need one structure each.
+    ComPtr<ID3D12Resource> vb2;
+    ComPtr<ID3D12Resource> blas2;
 };
 
 static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
@@ -534,6 +540,87 @@ static Scene BuildSceneProc(Gpu& g, bool opaque) {
     ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    s.tlas = BuildAS(g, ti);
+    return s;
+}
+
+// A triangle instance and a procedural instance under ONE top-level
+// structure, which is the shape the shim could not previously build a table
+// for. The AABB sits to the left of the triangle and inside the ray grid, so
+// both geometries are actually traversed and the two contributions can be told
+// apart in the output.
+static Scene BuildSceneMixed(Gpu& g, bool opaque) {
+    Scene s;
+    const float verts[9] = {
+        0.0f,  1.0f, 0.0f,
+        1.0f, -1.0f, 0.0f,
+       -1.0f, -1.0f, 0.0f,
+    };
+    s.vb = CreateBuffer(g.device.Get(), sizeof(verts), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(s.vb->Map(0, &none, &p), "map vb"); std::memcpy(p, verts, sizeof(verts));
+    s.vb->Unmap(0, nullptr);
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geo{};
+    geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geo.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+    geo.Triangles.VertexBuffer.StartAddress = s.vb->GetGPUVirtualAddress();
+    geo.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+    geo.Triangles.VertexCount = 3;
+    geo.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    geo.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
+    bi.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    bi.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    bi.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    bi.NumDescs = 1; bi.pGeometryDescs = &geo;
+    s.blas = BuildAS(g, bi);
+
+    // The SAME unit box the procedural-only scene uses, so the existing
+    // procedural test shader works on this scene unchanged. It overlaps the
+    // triangle in screen space, which is the point: both geometries are
+    // traversed for the same rays, and which one commits is decided by the
+    // shader rather than by the scene.
+    const D3D12_RAYTRACING_AABB aabb = { -0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f };
+    s.vb2 = CreateBuffer(g.device.Get(), sizeof(aabb), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(s.vb2->Map(0, &none, &p), "map aabb"); std::memcpy(p, &aabb, sizeof(aabb));
+    s.vb2->Unmap(0, nullptr);
+
+    D3D12_RAYTRACING_GEOMETRY_DESC box{};
+    box.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+    box.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+    box.AABBs.AABBCount = 1;
+    box.AABBs.AABBs.StartAddress = s.vb2->GetGPUVirtualAddress();
+    box.AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+    bi.pGeometryDescs = &box;
+    s.blas2 = BuildAS(g, bi);
+
+    D3D12_RAYTRACING_INSTANCE_DESC inst[2]{};
+    for (int i = 0; i < 2; ++i) {
+        inst[i].Transform[0][0] = inst[i].Transform[1][1] = inst[i].Transform[2][2] = 1.0f;
+        inst[i].InstanceMask = 0xFF;
+        // With --contrib the two geometries land on DIFFERENT hit group
+        // records, which is what a real engine does when it needs one shader
+        // per kind. Without it they share record 0.
+        if (g_contrib) inst[i].InstanceContributionToHitGroupIndex = (UINT)i;
+    }
+    inst[0].AccelerationStructure = s.blas->GetGPUVirtualAddress();
+    inst[1].AccelerationStructure = s.blas2->GetGPUVirtualAddress();
+
+    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, inst, sizeof(inst));
+    instBuf->Unmap(0, nullptr);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = 2; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
     return s;
 }
@@ -946,16 +1033,54 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
 
     ComPtr<IDXGIFactory6> factory;
     UINT flags = 0;
+    // The debug layer is the only thing that can say whether a shader table we
+    // built is VALID as opposed to merely producing the number we wanted, so it
+    // has to be reachable from a release build too.
+    bool wantDebug = false;
 #ifdef _DEBUG
-    { ComPtr<ID3D12Debug> dbg; if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer(); }
-    flags = DXGI_CREATE_FACTORY_DEBUG;
+    wantDebug = true;
 #endif
+    { char buf[8]; size_t n = 0;
+      if (getenv_s(&n, buf, sizeof(buf), "DXR11_DEBUGLAYER") == 0 && n > 1 && buf[0] == '1')
+          wantDebug = true; }
+    if (wantDebug) {
+        ComPtr<ID3D12Debug> dbg;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+        flags = DXGI_CREATE_FACTORY_DEBUG;
+    }
     HR(CreateDXGIFactory2(flags, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
     auto adapt = PickAdapter(factory.Get(), adapter);
 
     ComPtr<ID3D12Device5> device;
     HR(D3D12CreateDevice(adapt.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)),
        "D3D12CreateDevice");
+
+    // The debug layer reports through OutputDebugString, which a console never
+    // sees, so its silence in a terminal means nothing at all. Take the
+    // messages from the InfoQueue and print them, the way the Phase 4 probe
+    // does, or this switch is decoration.
+    ComPtr<ID3D12InfoQueue> infoQueue;
+    if (wantDebug) {
+        if (SUCCEEDED(device.As(&infoQueue)))
+            std::printf("        debug layer: on\n");
+        else
+            std::printf("        debug layer: requested, ID3D12InfoQueue unavailable\n");
+    }
+    auto drainDebug = [&infoQueue](const char* where) {
+        if (!infoQueue) return;
+        const UINT64 n = infoQueue->GetNumStoredMessages();
+        for (UINT64 i = 0; i < n; ++i) {
+            SIZE_T len = 0;
+            if (FAILED(infoQueue->GetMessage(i, nullptr, &len)) || !len) continue;
+            std::vector<char> raw(len);
+            auto* m = reinterpret_cast<D3D12_MESSAGE*>(raw.data());
+            if (FAILED(infoQueue->GetMessage(i, m, &len))) continue;
+            if (m->Severity > D3D12_MESSAGE_SEVERITY_WARNING) continue;
+            std::printf("        [debug-layer/%s] %.*s\n", where,
+                        (int)m->DescriptionByteLength, m->pDescription);
+        }
+        infoQueue->ClearStoredMessages();
+    };
 
     // Feature gates.
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
@@ -977,7 +1102,8 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
 
     Gpu g; g.init(device.Get());
     Dxc dxc; dxc.init();
-    Scene scene = g_proc  ? BuildSceneProc(g, pattern == Pattern::Opaque)
+    Scene scene = g_mixed ? BuildSceneMixed(g, pattern == Pattern::Opaque)
+                : g_proc  ? BuildSceneProc(g, pattern == Pattern::Opaque)
                 : g_multi ? BuildSceneMulti(g, pattern == Pattern::Opaque)
                           : BuildScene(g, pattern == Pattern::Opaque);
 
@@ -1018,6 +1144,7 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
     D3D12_RANGE nowrite{ 0, 0 }; readback->Unmap(0, &nowrite);
 
     uint32_t hits = 0; for (auto& r : results) hits += r.hit ? 1 : 0;
+    drainDebug("trial");
     std::printf("        %u rays, %u hits\n", kWidth * kHeight, hits);
     WriteFile(outPath, results);
 }
@@ -1078,6 +1205,10 @@ int main(int argc, char** argv) {
                 g_proc = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--mixed") == 0) {
+                g_mixed = true;
                 continue;
             }
             if (std::strcmp(argv[i], "--contrib") == 0) {

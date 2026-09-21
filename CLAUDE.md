@@ -5,8 +5,8 @@ Version 1.
 ## Current position (2026-09-21)
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
-GTX 1070 and produces bit-exact output against WARP. Four shaders, two
-patterns, 0 mismatches. Run `.\tools\run_dispatch_test.ps1`.
+GTX 1070 and produces bit-exact output against WARP. Nine render cases, 0
+mismatches, plus two refusal gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
 was missing. Nothing in this project implements ray tracing.
@@ -15,14 +15,16 @@ was missing. Nothing in this project implements ray tracing.
 **everything with a DXR 1.0 equivalent is now supported: 21 of 25.** The other
 four are permanently refused because DXR 1.0 offers nothing to lower them onto.
 
-**What remains is NOT shader translation.** The shim builds shader tables
-without knowing the application's geometry layout, which blocks mixed
-triangle-and-procedural queries AND, already today, any application that sets a
-nonzero `InstanceContributionToHitGroupIndex`. **Acceleration structure
-interception is now complete, so the shim KNOWS which scenes those are** and
-refuses them loudly instead of drawing them wrong. Building a table that serves
-them is the last structural piece. See the entries below and
-docs/phase5-dxil-recon.md.
+**The shader table is now built from the application's own geometry layout.**
+Acceleration structure interception is complete and the instance data is USED:
+the hit group table is sized to the scene's largest
+`InstanceContributionToHitGroupIndex`, so an application that sets one works
+rather than being refused.
+
+**ONE case is left, and it is narrower than it looked.** A shader that commits
+PROCEDURAL hits, on a scene that also holds triangle geometry, is refused. The
+other direction of that mismatch turned out to be safe and now runs. See the
+entries below and docs/phase5-dxil-recon.md.
 
 The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
 
@@ -156,9 +158,13 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
       descriptor-table root signature, no array    14450 hits   MATCH
       independent shader, resource read in loop     6333 hits   MATCH
       CommittedInstanceIndex + PrimitiveIndex      18496 hits   MATCH
+      Abort(), order-independent observable only               MATCH
+      procedural primitives, generated intersection            MATCH
+      the 11 accessors from the Unreal survey                  MATCH
 
   All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
-  Six render cases and twelve analysis checks, run by
+  Nine render cases, each also checked byte-identical between the Python and
+  the C++, and thirteen analysis checks, run by
   `.\tools\run_rewriter_test.ps1`.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
@@ -175,7 +181,8 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   loop detection reports exactly the header, latch and body the recon worked
   out by hand. No textual pattern finds that loop.
 
-  **Opcodes are a whitelist** of the nine actually observed in DXC output.
+  **Opcodes are a whitelist** of the ones actually observed in DXC output,
+  nine at first and 26 now that the Unreal accessors are covered.
   Anything else stops the lowering. Given two of them share one LLVM function,
   a near miss would render the wrong thing silently.
 
@@ -458,18 +465,13 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   `InstanceContributionToHitGroupIndex`, which the APPLICATION set when it built
   its acceleration structures; a BLAS also carries only one geometry type.
   **Epic's shaders DO mix**, so this is the difference between procedural
-  working and procedural being useful. The interception that was needed to even
-  SEE this is now done, see the AS entry below; what is still missing is a table
-  with a record of each type at the right index.
+  working and procedural being useful. What is still missing is a table with a
+  record of each TYPE at the right index; see the AS entry below, which has the
+  measurements that say which half of this is actually a problem.
 
-- **A limitation that applies TODAY, including to triangles.** The shim builds
-  ONE hit group record and dispatches with `RayContributionToHitGroupIndex`,
-  `MultiplierForGeometryContributionToShaderIndex` and `MissShaderIndex` all
-  zero, so every geometry resolves to record 0. That is correct only while
-  every instance has `InstanceContributionToHitGroupIndex = 0`. True of every
-  scene here; not guaranteed of a real one. **It is no longer SILENT**: the
-  instance data is read and a dispatch on a scene where it does not hold is
-  refused with the reason. Making such a scene work is still open.
+- **Nonzero `InstanceContributionToHitGroupIndex`: FIXED.** This used to be a
+  limitation that applied TODAY, to triangle-only scenes, and it is now handled
+  rather than refused. See the shader table entry below.
 
 - AS interception: **DONE, both halves.** `proxy/as_tracker.{h,cpp}` and
   `proxy/res_tracker.{h,cpp}`, hooked at
@@ -529,11 +531,58 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     Correct, since the shim does nothing there, but it means the tracking
     cannot be observed on the ground-truth path.
 
+- The shader table, built from that data: **DONE.** `proxy/rq_pipeline.cpp`.
+  The shim passes zero for `RayContributionToHitGroupIndex` and the geometry
+  multiplier, so the record index IS the application's contribution. The table
+  now holds **max contribution + 1** records instead of one.
+  - **Every record holds the SAME identifier.** The shim has ONE hit group and
+    wants it to run for every hit; what the contributions decide is only WHICH
+    SLOT a hit lands on, and each slot has to be a valid record for that hit to
+    run at all. So the table is sized to the application's layout and filled
+    with the shim's single answer.
+  - **It grows at DISPATCH, not at pipeline creation.** The acceleration
+    structures usually do not exist when the application creates its compute
+    pipeline, so how many records the scene needs is not knowable there. It
+    starts at one and grows on the first dispatch that needs more. Growth is
+    monotonic and replaced buffers are held until the pipeline dies, because a
+    dispatch recorded against an old one may still be in flight.
+  - Verified with `raytest --multi --contrib`, contributions 0 and 1: **18496
+    hits, bit-exact against WARP**, on the scene that was refused before this.
+  - **The sensitivity check is the part worth keeping.** With the growth
+    disabled the same scene renders 9248 hits, exactly half, with 9248
+    hit/miss mismatches: every hit on the instance contributing 1 disappears,
+    silently and with no error from anywhere.
+
+- **The mixed case is NOT symmetric, and that was the surprise.**
+  `raytest --mixed` builds one triangle instance and one procedural instance
+  under one top-level structure. Both directions were measured on it.
+  - **Triangle-only shader, procedural geometry present: SAFE.** 14450 hits,
+    bit-exact against WARP. The shim's hit group is triangles-only so the
+    procedural geometry reports nothing, which is the same answer the shader
+    gives on Tier 1.1, where it never commits a procedural candidate either.
+    The scene being mixed is irrelevant to it. **This used to be refused.**
+  - **Procedural shader, triangle geometry reachable: WRONG.** 15418 hits
+    against WARP's 7396. The 8022 difference is exactly the triangle hits: for
+    triangle geometry the hit group's intersection shader is not used, the
+    closest-hit runs anyway, and it labels everything procedural.
+  - So the refusal is conditioned on **what the shader commits**, not on
+    whether the scene happens to be mixed.
+  - **The debug layer cannot settle this.** It is silent on BOTH cases,
+    including the one measured to be wrong, so it does not police hit group and
+    geometry type agreement and its silence carries no information. The safe
+    direction therefore rests on measurement against WARP on ONE driver, not on
+    the specification. Said plainly rather than quietly relied on.
+
   Next action, in order of value.
-  1. **Use the instance data.** Size the shader table by the maximum
-     contribution and put a record of the right geometry type at each index.
-     That turns both refusals into working scenes and is the last structural
-     piece of the shim. Everything it needs is now measured.
+  1. **Per-index records of the right TYPE.** The one case left is a shader
+     that commits procedural hits on a scene that also holds triangles. It
+     needs two hit groups rather than one, with a NULL record at the indices
+     the other kind reaches: an any-hit that always ignores, or an intersection
+     shader that reports nothing. That is rewriter work in both
+     implementations, plus keeping the per-index geometry kinds the tracker
+     currently aggregates away. Note it is only possible when the application
+     gave the two kinds DIFFERENT contributions; if it collapsed them onto one
+     index, no table can serve both and refusing is the only honest answer.
   2. **Dynamic descriptor indexing**, still refused.
   3. **Only then consider making the tier flip the default**, once enough real
      software has run through it that the refusal list is trusted.
@@ -552,9 +601,10 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     `CreateStateObject` fails.
   - One entry point, one query.
   - Procedural primitives lower, via a generated intersection shader. A query
-    committing BOTH triangle and procedural hits does not, and neither does a
-    scene whose instances carry nonzero contributions; both are now DETECTED
-    from the instance data and refused, rather than drawn wrong.
+    committing BOTH triangle and procedural hits does not. Nor does a
+    procedural-committing shader on a scene that also holds triangles, which is
+    DETECTED from the instance data and refused rather than drawn wrong. A
+    triangle-only shader on such a scene is fine and runs.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -1016,18 +1066,34 @@ anything.
 - `--roundtrip` sends every shader out to `.ll` text and back before D3D12 sees
   it. `--rtpoison` does the same but corrupts the lowered side on purpose, and
   must DIVERGE.
-- `--contrib`, with `--multi`, gives the two instances different
-  `InstanceContributionToHitGroupIndex` values, which is a scene the shim's
-  single-record table cannot serve. It exists so the refusal can be shown to be
-  reachable rather than dead code.
+- `--contrib`, with `--multi` or `--mixed`, gives the two instances different
+  `InstanceContributionToHitGroupIndex` values, so the shader table has to be
+  sized to the scene rather than to one record.
+- `--mixed` builds one triangle instance and one procedural instance under one
+  top-level structure, the AABB being the same unit box `--proc` uses so the
+  existing test shaders work on it unchanged.
+- `DXR11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
+  drains the InfoQueue. Both halves are needed: the layer reports through
+  `OutputDebugString`, so without the drain a console sees nothing and its
+  silence proves nothing.
 
-Check sensitivity before believing a pass, and check the CHECK. Three times in
+Check sensitivity before believing a pass, and check the CHECK. Four times in
 this project a test passed for the wrong reason:
 - the `-gfxsplit` control re-bound a PSO the test had abandoned;
 - the first `--rtpoison` corrupted BOTH sides, so they still agreed;
 - the descriptor-array poison substituted on `@outBufs` when the rewriter
   synthesises `@rq_uav0`, so it never applied and the "failure" case was
-  byte-identical to the passing one.
+  byte-identical to the passing one;
+- **the debug layer's silence was read as evidence when it was not even
+  running.** `raytest` enabled the layer only in a `_DEBUG` build, and the
+  layer reports through `OutputDebugString`, which a console never sees. The
+  fix was `DXR11_DEBUGLAYER=1` plus an `ID3D12InfoQueue` drain, as the Phase 4
+  probe already does. The control that exposed it: run the layer against a case
+  ALREADY KNOWN to be wrong. It stayed silent there too, so the silence meant
+  nothing either way.
+
+The last one generalises: **an oracle that says nothing has to be shown capable
+of saying something**, on the same run, before its silence counts as a result.
 
 A test that cannot fail has not been run. When a sensitivity check reports the
 same result as the real run, suspect the check first: diff what it actually

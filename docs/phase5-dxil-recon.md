@@ -1511,20 +1511,83 @@ assumed.
 The Microsoft samples read as 1 instance, max contribution 0, triangles only,
 which is the case the shim's single-record table is already right for.
 
+### Using it: the table is sized to the scene
+
+A record in the hit group table is selected by
+
+    index = RayContributionToHitGroupIndex
+          + MultiplierForGeometryContributionToShaderIndex * GeometryIndex
+          + InstanceContributionToHitGroupIndex
+
+and the shim passes zero for the first two, so the index IS the application's
+contribution. The table now holds `max contribution + 1` records instead of one.
+
+Every record holds the SAME identifier. The shim has ONE hit group and wants it
+to run for every hit; what the contributions decide is only WHICH SLOT a hit
+lands on, and each slot has to be a valid record for that hit to run at all. So
+the table is sized to the application's layout and filled with the shim's single
+answer.
+
+**The table grows at dispatch, not at pipeline creation**, because the
+acceleration structures usually do not exist yet when the application creates
+its compute pipeline, so how many records the scene needs is not knowable there.
+It starts at one and grows on the first dispatch that needs more. Growth is
+monotonic and the replaced buffers are held until the pipeline dies, since a
+dispatch recorded against an old one may still be in flight and nothing here
+knows when it lands.
+
+Verified with `raytest --multi --contrib`, which gives the two instances
+contributions 0 and 1: **18496 hits, bit-exact against WARP**, on the scene the
+shim refused one commit earlier.
+
+**The sensitivity check is the part worth recording.** With the growth disabled
+and the table left at one record, the same scene renders 9248 hits, exactly half,
+with 9248 hit/miss mismatches: every hit belonging to the instance contributing 1
+disappears, silently and with no error from anywhere. So the growth is doing real
+work and the earlier refusal was right.
+
+### The mixed case is NOT symmetric, which was the surprise
+
+`raytest --mixed` builds one triangle instance and one procedural instance under
+one top-level structure, the AABB being the same unit box the procedural-only
+scene uses so the existing test shaders work on it unchanged. Both directions of
+the mismatch were measured on it, and they do not behave alike.
+
+**Triangle-only shader, procedural geometry present: SAFE.** 14450 hits,
+bit-exact against WARP. The shim's hit group is triangles-only, so the
+procedural geometry reports nothing, which is the same answer the shader gives
+on Tier 1.1, where it never commits a procedural candidate either. The scene
+being mixed is irrelevant to it.
+
+**Procedural shader, triangle geometry reachable: WRONG.** 15418 hits against
+WARP's 7396. The 8022 difference is exactly the triangle hits: for triangle
+geometry the hit group's intersection shader is not used, the closest-hit runs
+anyway, and it labels everything procedural, so those hits get committed when
+they should not be.
+
+So the refusal is now conditioned on **what the shader commits**, not on whether
+the scene happens to be mixed, and the safe direction runs.
+
+**The debug layer cannot settle this, which was worth finding out.** It is
+silent on BOTH cases, including the one measured to be wrong, so it does not
+police hit group and geometry type agreement and its silence carries no
+information either way. Finding that out needed a fix of its own: `raytest`
+enabled the debug layer only in a `_DEBUG` build, and the layer reports through
+`OutputDebugString`, which a console never sees. It now takes `DXR11_DEBUGLAYER=1`
+and drains the `ID3D12InfoQueue`, the way the Phase 4 probe does. The first
+"silence" observed here was worth nothing at all.
+
+The safe direction therefore rests on measurement against WARP on one driver,
+not on the specification. Stated plainly rather than quietly relied on.
+
 ### The refusal this bought
 
-The point of knowing is not to log it. A lowered RayQuery dispatch builds ONE
-hit group record of ONE geometry type, and until now it would have run anyway
-on a scene where that is wrong, producing a quietly incorrect image. It now
-refuses:
+A lowered RayQuery dispatch that cannot be served correctly now declines and
+says why, instead of drawing a quietly wrong image:
 
-    lowered RayQuery dispatch REFUSED: the scene uses nonzero
-    InstanceContributionToHitGroupIndex, so a single hit group record would not
-    be the one the ray resolves to. Nothing is drawn for it.
-
-Shown to be real rather than unreachable with `raytest --multi --contrib`,
-which gives the two instances different contributions: WARP finds 18496 hits,
-and the shim declines to answer instead of inventing a number.
+    lowered RayQuery dispatch REFUSED: this shader commits procedural hits, and
+    the scene also holds triangle geometry, whose hits would run the procedural
+    closest-hit and be committed wrongly. Nothing is drawn for it.
 
 Two limits of that check, stated because they are real:
 
@@ -1537,17 +1600,25 @@ Two limits of that check, stated because they are real:
 
 ### Regression
 
-Unchanged by all of this: 7 of 7 end-to-end dispatch cases MATCH against WARP,
-the probe on hardware still gives 14450 + 2312 + 48774 = 65536 on both
+11 checks in `.\tools\run_dispatch_test.ps1`: 9 render cases, all MATCH against
+WARP, plus two refusal gates, the tier flip staying off by default and the
+wrong-geometry case being declined. The rewriter suite is unchanged at 9 cases
+byte-identical between the Python and the C++ with all refusals behaving. The
+probe on hardware still gives 14450 + 2312 + 48774 = 65536 on both
 argument-buffer shapes, `D3D12RaytracingHelloWorld` is 0 of 14400 pixels
-different, `D3D12RaytracingSimpleLighting` runs at baseline fps, and the debug
-layer is silent through the new barriers and copies.
+different, and `D3D12RaytracingSimpleLighting` runs at baseline fps.
 
 ## Next
 
-1. **Use the instance data.** Size the shader table by the maximum contribution
-   and place a record of the right type at each index. That turns both refusals
-   into working scenes, and it is the last structural piece of the shim.
+1. **Per-index records of the right TYPE.** The one remaining case is a shader
+   that commits procedural hits on a scene that also holds triangles. It needs
+   two hit groups rather than one, with a null record (an any-hit that always
+   ignores, or an intersection shader that reports nothing) at the indices the
+   other kind reaches. That is rewriter work in both implementations, plus
+   keeping the per-index geometry kinds that the tracker currently aggregates
+   away. Note it is only possible when the application gave the two kinds
+   DIFFERENT contributions; if it collapsed them onto one index, no table can
+   serve both and the refusal is the only honest answer.
 2. **Dynamic descriptor indexing**, still refused.
 3. **Only then consider making the tier flip the default**, once enough real
    software has run through it that the refusal list is trusted.

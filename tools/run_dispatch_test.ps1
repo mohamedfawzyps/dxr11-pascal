@@ -44,7 +44,22 @@ $cases = @(
     @{ name = 'acc';     pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi');
        desc = 'the 11 accessors from the Unreal survey, end to end' },
     @{ name = 'ids';     pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_ids.hlsl', '--multi');
-       desc = 'CommittedInstanceIndex and CommittedPrimitiveIndex' }
+       desc = 'CommittedInstanceIndex and CommittedPrimitiveIndex' },
+    # The instances carry DIFFERENT hit group contributions, so the shader
+    # table has to be sized to the scene rather than to one record. Measured:
+    # with a single record this scene loses exactly the hits belonging to the
+    # instance contributing 1, 9248 of 18496, silently. So this case fails if
+    # the table stops growing.
+    @{ name = 'contrib'; pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi', '--contrib');
+       desc = 'nonzero InstanceContributionToHitGroupIndex, table sized to the scene' },
+    # A triangle-only shader on a scene that ALSO holds procedural geometry.
+    # The shim's hit group is triangles-only and the procedural geometry simply
+    # reports nothing, which is the same answer Tier 1.1 gives, since the
+    # shader never commits a procedural candidate either. Measured, not assumed:
+    # the debug layer is silent on this and on the case that IS wrong, so it
+    # settles nothing.
+    @{ name = 'mixedtri'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--mixed');
+       desc = 'triangle-only shader on a scene holding procedural geometry too' }
 )
 
 $failed = 0
@@ -87,6 +102,27 @@ if ($out -match 'needs Tier 1\.1') {
     Write-Host '  refused without DXR11_TIER11, as it must'
 } else {
     Write-Host '  GATE BROKEN: RayQuery was accepted without the opt-in'
+    $failed++
+}
+
+# The other direction of the same mismatch is NOT safe, and this proves the
+# refusal that covers it is reachable rather than dead code. A shader that
+# commits procedural hits, on a scene that also holds triangles, measured 15418
+# hits against WARP's 7396: the 8022 difference is exactly the triangle hits,
+# committed by a closest-hit that labels everything procedural.
+Write-Host ''
+Write-Host '=== a procedural shader on a scene with triangles is refused ==='
+$log = Join-Path $env:TEMP 'dxr11_proxy.log'
+Remove-Item $log -ErrorAction SilentlyContinue
+$env:DXR11_TIER11 = '1'
+& .\raytest.exe hw rayquery alpha dp_mix.bin --cs phase5\cases\rayquery_proc.hlsl --mixed |
+    Out-Null
+$env:DXR11_TIER11 = ''
+Remove-Item dp_mix.bin -ErrorAction SilentlyContinue
+if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'commits procedural hits, and the scene also' -Quiet)) {
+    Write-Host '  refused, with the reason, as it must'
+} else {
+    Write-Host '  REFUSAL MISSING: the wrong-geometry case was allowed through'
     $failed++
 }
 

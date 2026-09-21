@@ -97,37 +97,41 @@ void AfterSubmit(ID3D12CommandQueue* queue);
 // What is known about the top-level structure at this address.
 TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);
 
-// Would the shim's shader table be wrong for the scene as read so far? A
-// lowered RayQuery dispatch builds ONE hit group record of ONE geometry type,
-// which is only right when every instance contributes 0 and they all reach the
-// same kind of geometry. Fills `why` and returns true when it does not hold.
+// Would the shim's shader table be wrong for the scene as read so far?
+//
+// The shim builds ONE hit group, and the two directions of mismatch between it
+// and the scene's geometry are NOT symmetric. Both were measured on a scene
+// holding one triangle instance and one procedural instance:
+//
+//   triangle-only shader, procedural geometry present
+//       the procedural geometry reports no hit, which is the same answer the
+//       shader gives on Tier 1.1, where it never commits a procedural
+//       candidate either. 14450 hits, bit-exact against WARP. SAFE.
+//
+//   procedural shader, triangle geometry reachable
+//       triangle hits run the closest-hit anyway, and it labels them
+//       procedural, so they are committed when they should not be. 15418
+//       against WARP's 7396, the 8022 difference being exactly the triangle
+//       hits. WRONG, and silently.
+//
+// So `shaderCommitsProcedural` decides the question, not whether the scene
+// happens to be mixed. Fills `why` and returns true when the dispatch must
+// not run.
+//
+// NOT settled by the debug layer. It is silent on BOTH cases, including the
+// one measured to be wrong, so it does not police hit group and geometry type
+// agreement and its silence says nothing. The safe direction above rests on
+// measurement against WARP on one driver, not on the specification.
 //
 // Judged over EVERY top-level structure read, not the one the shader is about
 // to trace against, because which structure that is is not knowable here when
 // it arrives through a descriptor table. So this can refuse a dispatch that
-// would in fact have been fine. Refusing is the safe direction: the
-// alternative is a silently wrong image.
+// would in fact have been fine. Refusing is the safe direction.
 //
 // It can also only see what has been READ. When the descriptions live in GPU
 // memory the answer arrives a submission late, so the first dispatch of a run
 // may not be covered.
-bool TableWouldBeWrong(std::string* why);
-
-// Would the shim's shader table be wrong for the scene as read so far? A
-// lowered RayQuery dispatch builds ONE hit group record of ONE geometry type,
-// which is only right when every instance contributes 0 and they all reach the
-// same kind of geometry. Fills `why` and returns true when it does not hold.
-//
-// Judged over EVERY top-level structure read, not the one the shader is about
-// to trace against, because which structure that is is not knowable here when
-// it arrives through a descriptor table. So this can refuse a dispatch that
-// would in fact have been fine. Refusing is the safe direction: the
-// alternative is a silently wrong image.
-//
-// It can also only see what has been READ. When the descriptions live in GPU
-// memory the answer arrives a submission late, so the first dispatch of a run
-// may not be covered.
-bool TableWouldBeWrong(std::string* why);
+bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
 
 // How many bottom-level structures have been seen, and of what kinds. For the
 // log and for tests, so the tracking can be shown to work before anything

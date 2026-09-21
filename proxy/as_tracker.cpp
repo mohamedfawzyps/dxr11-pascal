@@ -77,16 +77,18 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     if (t.maxContribution != 0 && !warnedContribution) {
         warnedContribution = true;
         ProxyLog("[dxr11-proxy] NOTE: this scene uses nonzero hit group "
-                 "contributions (max %u). A lowered RayQuery dispatch builds "
-                 "ONE hit group record and would resolve to the wrong one.\n",
-                 t.maxContribution);
+                 "contributions (max %u), so a lowered RayQuery dispatch needs "
+                 "%u hit group records rather than one.\n",
+                 t.maxContribution, t.maxContribution + 1);
     }
     static bool warnedMixed = false;
     if (t.anyTriangles && t.anyProcedural && !warnedMixed) {
         warnedMixed = true;
         ProxyLog("[dxr11-proxy] NOTE: this scene reaches BOTH triangle and "
                  "procedural geometry from one top-level structure. A lowered "
-                 "RayQuery dispatch builds records of one type only.\n");
+                 "RayQuery dispatch builds records of one type only, which is "
+                 "safe for a triangle-only shader and not for one that commits "
+                 "procedural hits.\n");
     }
 }
 
@@ -264,23 +266,25 @@ TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address) {
     return it == g_tlas.end() ? TlasInfo() : it->second;
 }
 
-bool TableWouldBeWrong(std::string* why) {
+bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
+    // Nonzero contributions are no longer a refusal: the table is sized to the
+    // scene and every slot holds the shim's one hit group, so a hit resolves
+    // to a valid record whichever slot the application chose.
+    if (!shaderCommitsProcedural) return false;
+
     std::lock_guard<std::mutex> g(g_lock);
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
         if (!t.valid) continue;
-        if (t.maxContribution != 0) {
+        // A procedural hit group reached by TRIANGLE geometry is the direction
+        // that goes wrong: the triangle hit runs the closest-hit, which labels
+        // it procedural. Measured as 8022 hits committed that should not have
+        // been. The other direction is safe, see the header.
+        if (t.anyTriangles) {
             if (why)
-                *why = "the scene uses nonzero "
-                       "InstanceContributionToHitGroupIndex, so a single hit "
-                       "group record would not be the one the ray resolves to";
-            return true;
-        }
-        if (t.anyTriangles && t.anyProcedural) {
-            if (why)
-                *why = "the scene reaches both triangle and procedural geometry "
-                       "from one top-level structure, and a hit group record is "
-                       "one or the other";
+                *why = "this shader commits procedural hits, and the scene also "
+                       "holds triangle geometry, whose hits would run the "
+                       "procedural closest-hit and be committed wrongly";
             return true;
         }
     }
