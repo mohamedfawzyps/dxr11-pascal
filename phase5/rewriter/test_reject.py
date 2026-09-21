@@ -24,6 +24,7 @@ import rayquery
 OPAQUE = os.path.join('phase5', 'dxil', 'rayquery_opaque.ll')
 ALPHA = os.path.join('phase5', 'dxil', 'rayquery_alpha.ll')
 INDEP = os.path.join('phase5', 'cases', 'rayquery_indep.ll')
+IDS = os.path.join('phase5', 'cases', 'rayquery_ids.ll')
 
 
 def load(path):
@@ -69,6 +70,8 @@ def main():
     # common real alpha test there is.
     if os.path.isfile(INDEP):
         ok.append(expect_ok('rayquery_indep (resource in loop)', load(INDEP)))
+    if os.path.isfile(IDS):
+        ok.append(expect_ok('rayquery_ids (instance + primitive)', load(IDS)))
 
     print('\n-- cases the brief says have no valid lowering --')
 
@@ -126,6 +129,18 @@ def main():
                             'i32 %v33, %dx.types.Handle %v2, i32 0, i32 255')
     ok.append(expect_reject('no loop, not FORCE_OPAQUE', noflag,
                             'no lowering is defined'))
+
+    # CommittedGeometryIndex is recognised and still has no lowering, because
+    # GeometryIndex() in a DXR 1.0 hit shader is ITSELF a Tier 1.1 feature.
+    # Measured: such a library sets shader flag 0x2000000 and
+    # CreateStateObject on the GTX 1070 returns E_INVALIDARG. Refusing is the
+    # only correct answer, so it must not quietly start being accepted.
+    if os.path.isfile(IDS):
+        geom = load(IDS).replace(
+            '@dx.op.rayQuery_StateScalar.i32(i32 207',
+            '@dx.op.rayQuery_StateScalar.i32(i32 209')
+        ok.append(expect_reject('CommittedGeometryIndex', geom,
+                                'itself a Tier 1.1 feature'))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

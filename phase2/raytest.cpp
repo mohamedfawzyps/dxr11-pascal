@@ -267,6 +267,11 @@ static const char* g_csFile = nullptr;
 // legal, so this costs the existing cases nothing.
 static const UINT kMaskCount = 8;
 
+// --multi builds a scene where InstanceIndex and PrimitiveIndex actually
+// vary. Against the default one-triangle, one-instance scene every correct
+// answer is 0, so a lowering that returned a constant 0 would pass.
+static bool g_multi = false;
+
 static bool g_table = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
@@ -470,6 +475,60 @@ static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
     UavBarrier(g.list.Get(), result.Get());
     g.flush();  // scratch stays alive until here
     return result;
+}
+
+// Two instances side by side, each a quad of TWO triangles. Across the
+// screen: left half is instance 0 and right half instance 1, and within each
+// quad the diagonal splits primitive 0 from primitive 1. So both indices vary
+// per pixel and a constant answer cannot pass.
+static Scene BuildSceneMulti(Gpu& g, bool opaque) {
+    Scene s;
+    const float qx = 0.4f, qy = 0.8f;
+    const float verts[18] = {
+        -qx, -qy, 0.0f,   qx, -qy, 0.0f,  -qx,  qy, 0.0f,   // primitive 0
+         qx, -qy, 0.0f,   qx,  qy, 0.0f,  -qx,  qy, 0.0f,   // primitive 1
+    };
+    s.vb = CreateBuffer(g.device.Get(), sizeof(verts), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(s.vb->Map(0, &none, &p), "map vb"); std::memcpy(p, verts, sizeof(verts));
+    s.vb->Unmap(0, nullptr);
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geo{};
+    geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geo.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+    geo.Triangles.VertexBuffer.StartAddress = s.vb->GetGPUVirtualAddress();
+    geo.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+    geo.Triangles.VertexCount = 6;
+    geo.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    geo.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
+    bi.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    bi.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    bi.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    bi.NumDescs = 1; bi.pGeometryDescs = &geo;
+    s.blas = BuildAS(g, bi);
+
+    D3D12_RAYTRACING_INSTANCE_DESC inst[2]{};
+    for (int i = 0; i < 2; ++i) {
+        inst[i].Transform[0][0] = inst[i].Transform[1][1] = inst[i].Transform[2][2] = 1.0f;
+        inst[i].Transform[0][3] = (i == 0) ? -0.6f : 0.6f;   // side by side
+        inst[i].InstanceMask = 0xFF;
+        inst[i].AccelerationStructure = s.blas->GetGPUVirtualAddress();
+    }
+    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, inst, sizeof(inst));
+    instBuf->Unmap(0, nullptr);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = 2; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    s.tlas = BuildAS(g, ti);
+    return s;
 }
 
 static Scene BuildScene(Gpu& g, bool opaque) {
@@ -718,7 +777,14 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg });
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
-    sc.MaxPayloadSizeInBytes = 16;      // float t + float2 bary + uint hit
+    // Must be at least the payload the rewriter emits, PAYLOAD_BYTES in
+    // phase5/rewriter/lower.py, currently 28: float t, float2 bary, uint hit,
+    // then the instance and primitive indices. It is a MAXIMUM, so declaring
+    // 28 costs the 16-byte hand-written shaders nothing. Getting this wrong
+    // shows up as CreateStateObject returning E_INVALIDARG, which is a real
+    // coupling: the payload size is part of the state object contract, not a
+    // free choice for whatever generates the shaders.
+    sc.MaxPayloadSizeInBytes = 28;
     sc.MaxAttributeSizeInBytes = 8;     // float2 barycentrics
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
 
@@ -845,7 +911,8 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
 
     Gpu g; g.init(device.Get());
     Dxc dxc; dxc.init();
-    Scene scene = BuildScene(g, pattern == Pattern::Opaque);
+    Scene scene = g_multi ? BuildSceneMulti(g, pattern == Pattern::Opaque)
+                          : BuildScene(g, pattern == Pattern::Opaque);
 
     // Constant buffer.
     SceneCB cbData{ kWidth, kHeight, kHalfExtent, kCamZ, kTMin, kTMax, 0, 0 };
@@ -940,6 +1007,12 @@ int main(int argc, char** argv) {
         // Pull --roundtrip out of argv so the positional arguments below are
         // unaffected by it.
         for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--multi") == 0) {
+                g_multi = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
             if (std::strcmp(argv[i], "--cs") == 0 && i + 1 < argc) {
                 g_csFile = argv[i + 1];
                 for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];

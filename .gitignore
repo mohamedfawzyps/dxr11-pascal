@@ -47,3 +47,7 @@ phase5/out/
 # Generated from phase5/cases/*.hlsl by build_phase5.bat
 phase5/cases/*.ll
 phase5/cases/*.dxil
+
+# Generated from the reference shaders on demand
+phase5/cases/reference/*.ll
+phase5/cases/reference/*.dxil

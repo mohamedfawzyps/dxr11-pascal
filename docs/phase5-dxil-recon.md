@@ -714,19 +714,110 @@ diffing to confirm the substitution actually applied this time:
 And 6333 + 8117 = 14450, the opaque hit count, so the accepted and rejected
 sets partition it exactly. As before, neither number was arranged.
 
+## The committed index accessors, and one that cannot be lowered at all
+
+`phase5/cases/rayquery_ids.hlsl` is the second independent shader, using the
+committed accessors the whitelist did not cover. In real code a hit is only the
+beginning and these indices are what material data is looked up with, so they
+were the obvious next thing a real engine would hit.
+
+The refusal fired correctly, and named the numbers:
+
+    UNSUPPORTED: unrecognised rayQuery opcode 207 ... This project has only
+    verified 178, 179, 180, 182, 184, 185, 193, 194, 200.
+
+DXC then supplied both halves, the way the recon established:
+
+| RayQuery | | DXR 1.0 equivalent | |
+|---|---|---|---|
+| CommittedInstanceIndex | 207 | `InstanceIndex()` | 142 |
+| CommittedGeometryIndex | 209 | `GeometryIndex()` | 213 |
+| CommittedPrimitiveIndex | 210 | `PrimitiveIndex()` | 161 |
+
+All three are `rayQuery_StateScalar.i32`, the same LLVM function as 184 and
+185. That is now five opcodes sharing one function, and it keeps vindicating
+the decision to dispatch on operand 0 rather than the callee name.
+
+### CommittedGeometryIndex has no lowering on Tier 1.0
+
+Adding all three produced a library the validator rejected:
+
+    error: Flags must match usage.
+    note: Flags declared=16, actual=33554448
+
+33554448 is 0x2000010, so something set bit 25. Removing each opcode in turn
+identified `geometryIndex` as the cause. Setting the flag to match let it
+validate, and then the real answer arrived from the hardware:
+
+    CreateStateObject (hr=0x80070057)    E_INVALIDARG, on the GTX 1070
+
+**`GeometryIndex()` in a DXR 1.0 hit shader is itself a Tier 1.1 feature.**
+There is nothing on this hardware to lower `CommittedGeometryIndex` onto. This
+is the first Tier 1.1 feature found that this approach cannot emulate, and it
+is worth stating plainly rather than filing as a limitation of the rewriter.
+
+A route exists in principle: encode the geometry index in the shader table,
+with one hit group record per geometry, and read it from the shader record.
+That means the shim rebuilding the application's SBT, which is a much larger
+change than anything here. Not attempted, and recorded so the option is not
+lost.
+
+The rewriter therefore recognises 209 specifically so it can explain itself,
+and refuses it. It does not emit `dx.op.geometryIndex` at all, because doing so
+would produce a library the driver rejects.
+
+### The payload is part of the state object contract
+
+Supporting the two that do work meant growing the payload from 16 to 28 bytes.
+`CreateStateObject` then failed with `E_INVALIDARG` again, for a different
+reason: the harness declared `MaxPayloadSizeInBytes = 16`.
+
+Worth recording because it is a coupling, not a harness bug. **Whatever
+generates the shaders does not get to choose the payload size freely**, it has
+to agree with the state object's shader config. For a lowered compute shader
+the shim creates that state object itself, so it controls both, but the two
+must be changed together.
+
+### Verified on a scene where the indices actually vary
+
+Against the default scene, one triangle in one instance, every correct answer
+is 0 and a lowering returning a constant would pass. So `raytest --multi`
+builds two instances side by side, each a quad of two triangles: the left half
+of the screen is instance 0 and the right half instance 1, and within each quad
+the diagonal separates primitive 0 from primitive 1.
+
+The shader packs both indices into the Result's float fields, so the existing
+diff checks them.
+
+    WARP RayQuery (ground truth)       65536 rays, 18496 hits
+    automated lowering on the 1070     65536 rays, 18496 hits
+    0 hit/miss mismatches, 0 value mismatches
+
+### Sensitivity
+
+Swapping the two payload fields the closest-hit writes, so instance and
+primitive land in each other's slots, after diffing to confirm the edit applied:
+
+    swapped    value mismatches: 9248    RESULT: DIVERGE
+
+9248 is exactly half of 18496, which is what an even spread of the four
+(instance, primitive) combinations predicts, since only the half where the two
+differ is affected by a swap. That the number falls out at exactly half is
+independent evidence the scene varies both indices as intended.
+
 ## Next
 
-The regression is now five shaders and ten analysis checks, all passing. The
-independent shader did its job and found a real false refusal on the first try,
-which is the best argument for doing it again rather than assuming the next one
-would pass.
+Six render cases and twelve analysis checks, all passing. Two independent
+shaders have now been written and both found something the Phase 2 pair could
+not: the first a false refusal, the second a Tier 1.1 feature with no lowering
+at all.
 
-1. **More independent shaders**, especially ones using committed accessors
-   outside the whitelist (`CommittedInstanceIndex`, `CommittedPrimitiveIndex`,
-   `CommittedGeometryIndex`). Those are refused today and are common in real
-   code, so they are the next thing a real engine would hit.
+1. **Wire the rewriter into the proxy**, at `CreateStateObject` and the compute
+   pipeline path. This is now the largest untested gap, and it forces the tier
+   question: reporting Tier 1.1 entitles an app to emit RayQuery, so the flip
+   and a working rewriter have to land together, with anything refused failing
+   loudly rather than rendering wrong.
 2. **Dynamic descriptor indexing**, currently refused.
-3. **Wire the rewriter into the proxy**, at `CreateStateObject` and the compute
-   pipeline path. That forces the tier question: reporting Tier 1.1 entitles an
-   app to emit RayQuery, so the flip and a working rewriter have to land
-   together, with anything refused failing loudly rather than rendering wrong.
+3. More independent shaders, since the first two each found a real defect.
+   Untried and plausible: `RayQuery` with a non-default `RAY_FLAG` combination,
+   `Abort()`, procedural primitives, and committed object-space accessors.

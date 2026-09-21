@@ -26,7 +26,10 @@ $cases = @(
        desc = 'descriptor-table root signature, no array; DXIL body is identical' },
     @{ name = 'indep'; src = 'phase5\cases\rayquery_indep.ll'; pat = 'alpha'; flags = @();
        gt = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
-       desc = 'independently written: resource READ INSIDE the Proceed loop' }
+       desc = 'independently written: resource READ INSIDE the Proceed loop' },
+    @{ name = 'ids'; src = 'phase5\cases\rayquery_ids.ll'; pat = 'opaque'; flags = @('--multi');
+       gt = @('--cs', 'phase5\cases\rayquery_ids.hlsl', '--multi');
+       desc = 'CommittedInstanceIndex and CommittedPrimitiveIndex, on a scene where both vary' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

@@ -19,6 +19,29 @@ import rayquery as rq
 PAYLOAD = '%struct.Payload'
 ATTRS = '%struct.BuiltInTriangleIntersectionAttributes'
 
+# One payload shape carrying every committed accessor the whitelist supports.
+# Tailoring it per shader would save a few bytes and cost a lot of ways to get
+# the offsets wrong; the brief puts correctness well ahead of that.
+#   0 float t | 1 <2 x float> bary | 2 i32 hit | 3 inst | 4 prim | 5 geom
+PAYLOAD_TYPE = '{ float, <2 x float>, i32, i32, i32, i32 }'
+PAYLOAD_BYTES = 28
+PAYLOAD_FIELD = {
+    rq.COMMITTED_RAY_T: (0, 'float', 8),
+    rq.COMMITTED_BARY: (1, '<2 x float>', 4),
+    rq.COMMITTED_STATUS: (2, 'i32', 4),
+    rq.COMMITTED_INSTANCE_INDEX: (3, 'i32', 4),
+    rq.COMMITTED_PRIMITIVE_INDEX: (4, 'i32', 4),
+    rq.COMMITTED_GEOMETRY_INDEX: (5, 'i32', 4),
+}
+# Which dx.op gives each field in a DXR 1.0 closest-hit, read off DXC output.
+CH_SOURCE = {
+    3: ('i32', 'call i32 @dx.op.instanceIndex.i32(i32 142)'),
+    4: ('i32', 'call i32 @dx.op.primitiveIndex.i32(i32 161)'),
+    # Field 5, geometry index, is deliberately absent: see NO_LOWERING in
+    # rayquery.py. Emitting dx.op.geometryIndex would set shader flag
+    # 0x2000000 and the state object would then be refused by the driver.
+}
+
 
 class LowerError(Exception):
     pass
@@ -239,13 +262,15 @@ def _edit_query(module, q, edits, exports):
 def _trace_block(q, ra, exit_label):
     """Payload init plus the TraceRay that replaces the inline query."""
     flags = q.ray_flags
-    lines = [
-        '  %%rq.plT = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 0' % (PAYLOAD, PAYLOAD),
-        '  store float 0.000000e+00, float* %rq.plT, align 8',
-        '  %%rq.plB = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 1' % (PAYLOAD, PAYLOAD),
-        '  store <2 x float> zeroinitializer, <2 x float>* %rq.plB, align 4',
-        '  %%rq.plH = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 2' % (PAYLOAD, PAYLOAD),
-        '  store i32 0, i32* %rq.plH, align 4',
+    lines = []
+    for idx, ty, align in [(0, 'float', 8), (1, '<2 x float>', 4), (2, 'i32', 4),
+                           (3, 'i32', 4), (4, 'i32', 4), (5, 'i32', 4)]:
+        zero = '0.000000e+00' if ty == 'float' else (
+            'zeroinitializer' if ty.startswith('<') else '0')
+        lines.append('  %%rq.pl%d = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 %d'
+                     % (idx, PAYLOAD, PAYLOAD, idx))
+        lines.append('  store %s %s, %s* %%rq.pl%d, align %d' % (ty, zero, ty, idx, align))
+    lines += [
         '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, i32 %d, '
         '%s, i32 0, i32 0, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%rq.pl)'
         '  ; TraceRay(...)' % (
@@ -317,24 +342,23 @@ def _check_loop_isolated(fn, q, header, latch, body):
 def _edit_committed(q, edits):
     """Committed accessors become payload reads."""
     for block, instr in q.committed_ops:
-        op = instr.dxop
-        if op == rq.COMMITTED_STATUS:
-            edits[instr.index] = '  %s = load i32, i32* %%rq.plH, align 4' % instr.result
-        elif op == rq.COMMITTED_RAY_T:
-            edits[instr.index] = '  %s = load float, float* %%rq.plT, align 8' % instr.result
-        elif op == rq.COMMITTED_BARY:
+        idx, ty, align = PAYLOAD_FIELD[instr.dxop]
+        if instr.dxop == rq.COMMITTED_BARY:
             comp = re.match(r'i8\s+(\d+)', instr.args[2].strip()).group(1)
             tmp = '%%rq.bv%s' % instr.result[1:]
             edits[instr.index] = (
-                '  %s = load <2 x float>, <2 x float>* %%rq.plB, align 4\n'
+                '  %s = load <2 x float>, <2 x float>* %%rq.pl1, align 4\n'
                 '  %s = extractelement <2 x float> %s, i32 %s'
                 % (tmp, instr.result, tmp, comp))
+        else:
+            edits[instr.index] = '  %s = load %s, %s* %%rq.pl%d, align %d' % (
+                instr.result, ty, ty, idx, align)
 
 
 # --- generated text --------------------------------------------------------
 
 def _add_types_and_globals(text, globals_):
-    decls = ['%s = type { float, <2 x float>, i32 }' % PAYLOAD,
+    decls = ['%s = type %s' % (PAYLOAD, PAYLOAD_TYPE),
              '%s = type { <2 x float> }' % ATTRS, '']
     seen = set()
     for sym, gty, elem, _ in globals_.values():
@@ -363,7 +387,11 @@ def _swap_declarations(text, q, globals_):
            'i32, i32, float, float, float, float, float, float, float, float, %s*) #1'
            % (PAYLOAD[1:], PAYLOAD),
            '', '; Function Attrs: nounwind readonly',
-           'declare float @dx.op.rayTCurrent.f32(i32) #2']
+           'declare float @dx.op.rayTCurrent.f32(i32) #2',
+           '', '; Function Attrs: nounwind readnone',
+           'declare i32 @dx.op.instanceIndex.i32(i32) #0',
+           '', '; Function Attrs: nounwind readnone',
+           'declare i32 @dx.op.primitiveIndex.i32(i32) #0']
     if q.loop:
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.ignoreHit(i32) #3']
@@ -390,18 +418,27 @@ def _append_shaders(text, module, q, exports, table, globals_):
     fns = []
     if q.loop:
         fns.append(_anyhit(module, q, exports, table, globals_))
-    fns.append('''define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #1 {{
-  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()
-  %ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0
-  %b = load <2 x float>, <2 x float>* %ap, align 4
-  %pt = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 0
-  store float %t, float* %pt, align 4
-  %pb = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 1
-  store <2 x float> %b, <2 x float>* %pb, align 4
-  %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2
-  store i32 1, i32* %ph, align 4
-  ret void
-}}'''.format(ch=exports['closesthit'], pl=PAYLOAD, at=ATTRS))
+    ch = ['define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #1 {{'
+          .format(ch=exports['closesthit'], pl=PAYLOAD, at=ATTRS),
+          '  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
+          '  %ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
+          '  %b = load <2 x float>, <2 x float>* %ap, align 4',
+          '  %pt = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 0'.format(pl=PAYLOAD),
+          '  store float %t, float* %pt, align 4',
+          '  %pb = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 1'.format(pl=PAYLOAD),
+          '  store <2 x float> %b, <2 x float>* %pb, align 4',
+          '  %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2'.format(pl=PAYLOAD),
+          '  store i32 1, i32* %ph, align 4']
+    # The index fields. Emitted unconditionally: unused ones cost a dead call
+    # the driver removes, and making them conditional is another place to get
+    # the payload layout wrong.
+    for idx, (ty, call) in sorted(CH_SOURCE.items()):
+        ch.append('  %%id%d = %s' % (idx, call))
+        ch.append('  %%pi%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                  % (idx, PAYLOAD, PAYLOAD, idx))
+        ch.append('  store %s %%id%d, %s* %%pi%d, align 4' % (ty, idx, ty, idx))
+    ch += ['  ret void', '}']
+    fns.append('\n'.join(ch))
     fns.append('''define void @{ms}({pl}* noalias nocapture %p) #1 {{
   %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2
   store i32 0, i32* %ph, align 4
@@ -550,7 +587,7 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
         # payload size only, and hit shaders carry both.
         props = ['i32 8', 'i32 %d' % kind]
         if payload:
-            props += ['i32 6', 'i32 16']
+            props += ['i32 6', 'i32 %d' % PAYLOAD_BYTES]
         if attrs:
             props += ['i32 7', 'i32 8']
         props += ['i32 5', '!%d' % zero]

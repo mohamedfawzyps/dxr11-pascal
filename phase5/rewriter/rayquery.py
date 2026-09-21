@@ -32,6 +32,12 @@ CANDIDATE_TYPE = 185
 CANDIDATE_BARY = 193
 COMMITTED_BARY = 194
 COMMITTED_RAY_T = 200
+# Read off DXC output the same way as the rest. All three share the
+# StateScalar.i32 function with 184 and 185, which is why operand 0 is the only
+# safe discriminator.
+COMMITTED_INSTANCE_INDEX = 207
+COMMITTED_GEOMETRY_INDEX = 209
+COMMITTED_PRIMITIVE_INDEX = 210
 
 # Opcode -> short name, for messages. Membership in this table is what makes
 # an opcode supported; the numbers NOT here are deliberately absent because
@@ -46,6 +52,31 @@ KNOWN = {
     CANDIDATE_BARY: 'CandidateTriangleBarycentrics',
     COMMITTED_BARY: 'CommittedTriangleBarycentrics',
     COMMITTED_RAY_T: 'CommittedRayT',
+    COMMITTED_INSTANCE_INDEX: 'CommittedInstanceIndex',
+    COMMITTED_GEOMETRY_INDEX: 'CommittedGeometryIndex',
+    COMMITTED_PRIMITIVE_INDEX: 'CommittedPrimitiveIndex',
+}
+
+# Everything the generated closest-hit can put in the payload. Used by both the
+# analysis, to decide what is a committed read, and the lowering, to lay the
+# payload out.
+COMMITTED_OPS = (COMMITTED_STATUS, COMMITTED_BARY, COMMITTED_RAY_T,
+                 COMMITTED_INSTANCE_INDEX, COMMITTED_GEOMETRY_INDEX,
+                 COMMITTED_PRIMITIVE_INDEX)
+
+# CommittedGeometryIndex is recognised so the refusal can explain itself, but
+# it has NO lowering on this hardware. Its DXR 1.0 equivalent, GeometryIndex()
+# in a hit shader, is itself a Tier 1.1 feature: measured, a library using it
+# sets shader flag 0x2000000 and CreateStateObject on the GTX 1070 fails with
+# E_INVALIDARG. The known route would be to encode the geometry index in the
+# shader table with one hit group record per geometry, which means the shim
+# rebuilding the application's SBT. Not attempted.
+NO_LOWERING = {
+    COMMITTED_GEOMETRY_INDEX:
+        'CommittedGeometryIndex has no lowering on Tier 1.0. Its DXR 1.0 '
+        'equivalent, GeometryIndex() in a hit shader, is itself a Tier 1.1 '
+        'feature and CreateStateObject rejects it on this hardware. Encoding '
+        'the index in the shader table would work but is not implemented.',
 }
 
 RAY_FLAG = [
@@ -202,7 +233,9 @@ def _collect(fn, q):
             q.commits.append((block, instr))
         elif op in (CANDIDATE_TYPE, CANDIDATE_BARY):
             q.candidate_ops.append((block, instr))
-        elif op in (COMMITTED_STATUS, COMMITTED_BARY, COMMITTED_RAY_T):
+        elif op in COMMITTED_OPS:
+            if op in NO_LOWERING:
+                raise Unsupported(NO_LOWERING[op])
             q.committed_ops.append((block, instr))
 
     if q.trace is None:
@@ -268,7 +301,7 @@ def _reject_function(fn, q):
         for label in body:
             blk = fn.block(label)
             for instr in blk.instrs:
-                if instr.dxop in (COMMITTED_STATUS, COMMITTED_BARY, COMMITTED_RAY_T):
+                if instr.dxop in COMMITTED_OPS:
                     raise Unsupported(
                         'committed state is read inside the Proceed loop; the '
                         'any-hit shader is a separate invocation and cannot '
