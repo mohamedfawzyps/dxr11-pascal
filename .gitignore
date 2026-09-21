@@ -7,3 +7,8 @@ build/
 raytest.exe
 *.bin
 D3D12/
+
+d3d12.dll
+*.lib
+*.exp
+*.ilk
