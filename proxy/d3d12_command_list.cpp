@@ -9,6 +9,7 @@
 #include "proxy_log.h"
 #include "command_signature.h"
 #include "rq_pipeline.h"
+#include "as_tracker.h"
 
 #include <windows.h>
 #include <cstring>
@@ -500,7 +501,14 @@ void STDMETHODCALLTYPE Dxr11CommandList::BeginRenderPass(UINT n, const D3D12_REN
 void STDMETHODCALLTYPE Dxr11CommandList::EndRenderPass() { WorkBarrier(); FWD(EndRenderPass()); }
 void STDMETHODCALLTYPE Dxr11CommandList::InitializeMetaCommand(ID3D12MetaCommand* m, const void* d, SIZE_T s) { WorkBarrier(); FWD(InitializeMetaCommand(m, d, s)); }
 void STDMETHODCALLTYPE Dxr11CommandList::ExecuteMetaCommand(ID3D12MetaCommand* m, const void* d, SIZE_T s) { WorkBarrier(); FWD(ExecuteMetaCommand(m, d, s)); }
-void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) { WorkBarrier(); FWD(BuildRaytracingAccelerationStructure(d, n, p)); }
+void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) {
+    WorkBarrier();
+    // Bottom-level geometry descriptions arrive as CPU memory, so the geometry
+    // type of every structure can be learned here for nothing. The shader
+    // table needs it: a record has to match the geometry that resolves to it.
+    astrack::NoteBuild(d);
+    FWD(BuildRaytracingAccelerationStructure(d, n, p));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { WorkBarrier(); FWD(CopyRaytracingAccelerationStructure(d, s, m)); }
 void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s) {

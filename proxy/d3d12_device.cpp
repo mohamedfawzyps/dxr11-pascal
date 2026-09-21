@@ -44,9 +44,10 @@ static void NoteRayQuery(bool tier11, const char* where, const void* code, SIZE_
     if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
     ProxyLog("[dxr11-proxy] %s: shader USES RAYQUERY (SFI0 bit 20), %zu bytes.\n",
              where, (size_t)size);
-    ProxyLog("[dxr11-proxy]   tier reported to the app is %s. The DXIL rewriter "
-             "is not wired in yet, so this is forwarded unchanged and the "
-             "driver will decide.\n", tier11 ? "1.1" : "1.0");
+    ProxyLog("[dxr11-proxy]   tier reported to the app is %s. On Tier 1.0 with "
+             "DXR11_TIER11=1 this is lowered and run; otherwise it is "
+             "forwarded unchanged and the driver decides.\n",
+             tier11 ? "1.1" : "1.0");
 }
 
 // A pipeline state stream is a packed sequence of subobjects, each a type enum

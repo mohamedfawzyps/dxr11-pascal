@@ -1404,21 +1404,80 @@ That is the second limit found in this project's strongest oracle, after "it
 proves agreement, not correctness". It also proves agreement only where both
 produce something.
 
+## Acceleration structure interception: the cheap half
+
+`proxy/as_tracker.{h,cpp}` is the first half of what the shader table needs.
+The two halves turned out to be very different in cost, which is the finding.
+
+Recall why any of this is needed. A record in the shader table has to match the
+geometry that resolves to it:
+
+    index = RayContributionToHitGroupIndex
+          + MultiplierForGeometryContributionToShaderIndex * GeometryIndex
+          + InstanceContributionToHitGroupIndex
+
+The first two are the shim's, in the `DispatchRays` call. The third is the
+APPLICATION'S, baked into the instance descriptions when it built its top-level
+structure.
+
+### BLAS geometry types are free
+
+`D3D12_RAYTRACING_GEOMETRY_DESC` arrives as **CPU memory** in the build call, so
+the geometry type of every bottom-level structure can simply be read and
+remembered. No copy, no sync, no cost. `ARRAY_OF_POINTERS` is handled as well as
+`ARRAY`; anything else is left `kUnknown` rather than guessed at.
+
+Verified on the Phase 4 probe, which builds one of each:
+
+    bottom-level AS at 0x9185000: 1 geometry, triangles
+    bottom-level AS at 0x9435000: 1 geometry, procedural AABBs
+    top-level AS build seen, 2 instances. ...
+
+and it distinguishes correctly rather than always saying the same thing:
+
+    raytest triangle scene     1 geometry, triangles
+    raytest --proc scene       1 geometry, procedural AABBs
+
+### TLAS instance data is NOT free, and that is the whole problem
+
+`InstanceDescs` is a **GPU virtual address**. The contributions are in GPU
+memory, so reading them means a copy and a sync per top-level build, in engines
+that rebuild their TLAS every frame. The machinery exists, it is what the Phase
+4 indirect `DispatchRays` split does, but it is a real per-frame cost and a
+substantial piece of work.
+
+Nothing is guessed in the meantime. A top-level build logs, once, exactly what
+is not known:
+
+    top-level AS build seen, N instances. Their
+    InstanceContributionToHitGroupIndex values live in GPU memory and are NOT
+    read; the shader table still assumes they are all zero.
+
+So the limitation is now **visible at runtime** rather than only written down,
+which is the point of doing this half first.
+
+### Where that leaves the two open problems
+
+Both still need the expensive half.
+
+- **Nonzero `InstanceContributionToHitGroupIndex`**, which already constrains
+  triangle-only scenes, needs the maximum contribution so the table can be
+  sized. One number, but it is in GPU memory.
+- **Mixed triangle and procedural** needs the full instance-to-BLAS map, so a
+  record of the right TYPE can be placed at every index. That is the geometry
+  types this half now has, joined to the instance data it does not.
+
+Note also that lists are only wrapped on Tier 1.0 devices, so nothing is
+tracked on WARP. That is correct, since the shim does nothing there, but it
+does mean the tracking cannot be observed on the ground-truth path.
+
 ## Next
 
-All the lowering Phase 5 set out to do is done. What remains is not lowering.
-
-1. **Acceleration structure interception.** Tracking the geometry type of every
-   BLAS and the contribution index of every instance is what unblocks BOTH
-   mixed triangle-and-procedural queries AND the nonzero
-   `InstanceContributionToHitGroupIndex` case that already limits triangles. It
-   is the largest remaining piece of work and it is dispatch machinery, not
-   shader translation.
+1. **The TLAS half.** Copy the instance descriptions and read them back, the
+   same machinery as the Phase 4 indirect DispatchRays split. It unblocks both
+   open problems at once, and it is the last structural piece of the shim. The
+   cost is a copy and a sync per top-level build, which for an engine that
+   rebuilds every frame is not nothing.
 2. **Dynamic descriptor indexing**, still refused.
 3. **Only then consider making the tier flip the default**, once enough real
    software has run through it that the refusal list is trusted.
-
-Four accessors stay permanently refused and must keep failing loudly: Candidate
-and CommittedGeometryIndex, which are Tier 1.1 on the DXR 1.0 side too, and
-`*InstanceContributionToHitGroupIndex`, which HLSL does not expose to a hit
-shader at all.
