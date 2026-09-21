@@ -11,8 +11,9 @@ Version 1.
   PASSED. See docs/phase3-proxy.md.
 - Phase 4 probe: DONE, ground truth captured. See docs/phase4-probe.md.
   Headline: the Tier 1.1 ray flags ALREADY WORK on the GTX 1070, verified
-  against WARP to the ray, so that feature needs no shim at all. Two features
-  remain. Flip CheckFeatureSupport to Tier 1.1 last.
+  against WARP to the ray, so that feature needs no shim at all. The other
+  two needed work and are now done, see below. Flip CheckFeatureSupport to
+  Tier 1.1 last.
 - Device7 wrapper extension: DONE. Dxr11Device now implements ID3D12Device7,
   so AddToStateObject and CreateProtectedResourceSession1 route through the
   shim. Verified by running the Phase 4 probe through the proxy: the
@@ -26,7 +27,46 @@ Version 1.
   new state object. On Tier 1.1 both forward untouched, so the shim stays
   transparent where it is not needed. The Phase 4 probe on hardware now
   matches the WARP ground truth exactly, 14450 + 2312 + 48774 = 65536.
-  Next action: indirect DispatchRays.
+- Indirect DispatchRays: WORKING on the GTX 1070. See
+  docs/phase4-indirect-design.md. This was the last of the three non-shader
+  features, so **all of Phase 4 now works**.
+
+  How it fits together. `CreateCommandSignature` on a DISPATCH_RAYS signature
+  returns `Dxr11CommandSignature`, a stand-in that is deliberately not a real
+  signature. `ExecuteIndirect` on one records the barriers and a readback copy
+  of the argument buffer, then queues a dispatch instead of recording it. The
+  recording is thereby cut into segments. At submit time the queue hook
+  submits a segment, syncs once, reads the dimensions the GPU produced, and
+  issues real `DispatchRays` calls on pooled command lists before submitting
+  the continuation.
+
+  Because the split lands in the middle of a recording, binding state has to
+  survive it. Each queued dispatch carries its own snapshot of the compute
+  root bindings, and the continuation replays the graphics state too, since
+  `SetPipelineState1` clobbers the graphics PSO. Still NOT tracked: stream
+  output targets, predication, sample positions, shading rate. Nothing tested
+  so far sets one across a split.
+
+  Adjacent dispatches share one sync: a split only queues, and the segment
+  stays open until the application records work that must be ordered after it.
+  Worth 15 to 28 percent on eight dispatches.
+
+  Next action: Phase 5, the DXIL rewriter. Note that Phase 4 is NOT finished in
+  the sense the build order means it, because `CheckFeatureSupport` still
+  reports Tier 1.0 on purpose. Flipping it entitles an application to emit
+  RayQuery, so it waits for Phase 5 or for a RayQuery detector that fails
+  clearly.
+
+  Three architecture findings, each of which cost a wrong design first:
+  - **Wrap the command list, hook the queue.** Not symmetric, and both halves
+    were established by measurement rather than argument.
+  - Wrapping the command QUEUE breaks DXGI. Creation succeeds and looks fine;
+    `Present` then access-violates (0xC000041D) and both Microsoft samples die.
+    Testing only `CreateSwapChainForHwnd` will not catch this.
+  - Hooking a command LIST's vtable does not work. Command lists get per-object
+    heap vtables, so patching the image vtable passes a self-test and then
+    never intercepts a real call. Queues do share an image vtable, which is why
+    the queue half works; the hook patches slot 10 and self-tests on install.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -62,7 +102,11 @@ Dev machine (Windows x64), everything under `C:\DW`:
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`,
   `build_sample.bat`, `build_phase4.bat`.
   `build_phase4.bat` builds the Tier 1.1 probe into `phase4out\`, a directory
-  with no proxy in it so the probe measures the real runtime.
+  with no proxy in it so the probe measures the real runtime; copy `d3d12.dll`
+  in to measure the shim instead. `tier11probe.exe [warp|hw]` runs the three
+  feature probes, and takes `-debug` for the debug layer, `-gfxsplit` for
+  graphics state across a split, `-batchsplit` for dispatch batching and its
+  control, `-time` and `-pipeline` for the split cost.
   `build_sample.bat` builds a Microsoft DXR 1.0 sample used to validate the
   proxy, with cl.exe and no NuGet restore, into `sampletest\<SampleName>\`.
   Helpers live in `tools\`.
@@ -277,13 +321,22 @@ measures all three on WARP (Tier 1.1 ground truth) and on the 1070:
 - `ID3D12Device7` **is present on the 1070**, so `AddToStateObject` is callable
   there and the wrapper must cover Device7 before any of this works.
 
-**Warning:** reporting Tier 1.1 entitles the app to emit RayQuery. Until
-phase 5 works, either keep reporting 1.0, or detect RayQuery DXIL and fail
-clearly. A shim that claims 1.1 and then crashes is worse than one that
-claims 1.0.
+**Result: all three features PASSED (2026-09-21).** Ray flags needed no shim.
+AddToStateObject is emulated by strip, cache and rebuild,
+docs/phase4-addtostateobject.md. Indirect DispatchRays is emulated by splitting
+the command list around the dispatch, docs/phase4-indirect-design.md. Each is
+checked against WARP as ground truth, and the regression suite is raytest ALL
+MATCH, the probe on hardware matching on both argument-buffer shapes, and both
+Microsoft samples unchanged with the debug layer clean.
 
-Main engineering cost here is command list splitting for the indirect case:
-preserving resource state and `ExecuteCommandLists` ordering across the break.
+The estimate of the engineering cost was right: command list splitting was
+the bulk of it, and preserving binding state across the break was the part that
+kept being subtly wrong.
+
+**Still open, on purpose:** `CheckFeatureSupport` reports Tier 1.0. Reporting
+Tier 1.1 entitles the app to emit RayQuery, so until phase 5 works, either keep
+reporting 1.0 or detect RayQuery DXIL and fail clearly. A shim that claims 1.1
+and then crashes is worse than one that claims 1.0.
 
 ### Phase 5: the DXIL rewriter (months)
 
