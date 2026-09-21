@@ -239,26 +239,52 @@ Version 1.
     bytes, while the DXR 1.0 probe and HelloWorld stay SILENT, so DXR 1.0
     libraries do not false-positive.
 
-  **A DECISION IS NEEDED before the transform can follow detection into the
-  proxy.** The rewriter is about 1100 lines of Python and the proxy is a C++
-  DLL in an application's address space, so one cannot call the other. There is
-  also a second problem that is easy to miss: **the rewriter works on TEXT and
-  the proxy receives BITCODE**, so a C++ port needs disassembly and assembly
-  too, which means the shim would have to ship and load `dxcompiler.dll` and
-  `dxil.dll` at runtime. Probably acceptable for a compatibility shim, but a
-  deployment consequence rather than an implementation detail. The three
-  options and their costs are in docs/phase5-dxil-recon.md; only porting to C++
-  with DXC loaded meets the no-application-modification goal, and it is a piece
-  of work the size of all of Phase 5 so far. Decide it deliberately.
+  That fork is now DECIDED and the port is done, see below.
 
-  Next action, in order.
-  1. **The fork above.** Nothing else moves the project toward shipping.
-  2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
-  3. More independent shaders. Both written so far found something the Phase 2
-     pair could not: the first a false refusal, the second a feature with no
-     lowering at all. Untried and plausible: non-default `RAY_FLAG`
-     combinations, `Abort()`, procedural primitives, and the committed
-     object-space accessors.
+- The C++ port: **DONE, and byte-identical to the Python.**
+  `proxy/rewriter/` is the analysis and the lowering in C++, 1689 lines against
+  the Python's 1303, built into `phase5out\dxrw.exe` by `build_rewriter.bat`.
+  `ll_model` ports parsing, CFG, dominators and natural loops; `rq_analyze`
+  ports find, classify and refuse; `rq_lower` ports the transform.
+
+  **The bar was byte-identical output, not "the tests still pass."** A port is
+  exactly the case where passing tests is too weak: both implementations are
+  checked against the same six cases, so a shared misunderstanding passes
+  twice. All six match exactly, and the refusals agree message for message. The
+  comparison is part of `.\tools\run_rewriter_test.ps1`, so the two cannot
+  drift apart quietly.
+
+  It was sensitive on its first run, and what it caught was a bug in the
+  PYTHON: `_append_shaders` used `re.search(r'^\}\s*$', text, re.M)`, and in
+  multiline mode `\s*` also eats the following newlines, so the insertion point
+  drifted and produced a run of blank lines nobody intended. Both sides now do
+  it on lines.
+
+  Two things MSVC forces, worth knowing before touching this code:
+  - **`std::regex` has no multiline mode at all.** Every pattern that used one
+    became a line operation, which is clearer, and is what exposed the bug
+    above.
+  - **A raw string ending in `)"` terminates early.** `R"( ... !"(\w+)" ... )"`
+    is not the string it looks like. Use `R"RX( ... )RX"` when the pattern
+    contains a quote.
+
+  Next action, in order. The tier flip is still blocked, by two unwritten
+  pieces rather than by the transform.
+  1. **The DXC host in C++.** The rewriter works on text, the proxy receives
+     bitcode. Container to text and back needs `IDxcCompiler::Disassemble`,
+     `IDxcAssembler` and `dxil.dll` for signing, loaded from the proxy. Small
+     next to the port, and it makes the rewriter callable on what the proxy
+     actually gets. This is the DXC runtime dependency the fork accepted.
+  2. **The dispatch path.** Lowering a compute shader to a library is half the
+     job. The application then calls `Dispatch`, which has to become
+     `DispatchRays` against a state object and shader table the shim builds and
+     owns. The larger of the two, and nothing is written.
+  3. Only then the tier flip, with anything refused failing loudly.
+
+  Independent of all that: dynamic descriptor indexing is still refused, and
+  more independent shaders are still the cheapest way to find what has been
+  assumed. Untried: non-default `RAY_FLAG` combinations, `Abort()`, procedural
+  primitives, committed object-space accessors.
 
   What is NOT generic, written down so it is not rediscovered:
   - Resource arrays work, but only with a **constant, uniform** index. Dynamic
@@ -726,6 +752,13 @@ hypothesis.
 
 State clearly what is verified versus inferred. Flag uncertainty rather than
 guessing.
+
+**When porting, require identical OUTPUT, not passing tests.** Both
+implementations get checked against the same cases, so a shared
+misunderstanding passes twice. The C++ rewriter had to produce byte-identical
+`.ll` to the Python, and that check failed on its first run and found a bug in
+the ORIGINAL. Also: do not reproduce the original's accidents in a second
+language, fix them in both.
 
 **Test with something you did not write for the purpose.** Every Phase 5 result
 up to the independent shader came from two shaders written to demonstrate one
