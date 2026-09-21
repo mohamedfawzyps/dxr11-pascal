@@ -2,6 +2,22 @@
 
 Version 1.
 
+## Current position (2026-09-21)
+
+- Phase 1 signing test: PASSED. See below and docs/phase1-signing.md.
+- Phase 2 hand-lowering test: PASSED, bit-exact on both patterns. See
+  docs/phase2-lowering.md.
+- Phase 3a forwarding-only proxy: written, NOT yet built or validated.
+  Next action: run `build_proxy.bat`, drop `d3d12.dll` beside a Microsoft DXR
+  1.0 sample exe, confirm it renders and that `%TEMP%\dxr11_proxy.log` shows
+  the D3D12CreateDevice line. Then Phase 3b, the ID3D12Device5 wrapper.
+
+Dev machine (Windows x64) toolchain paths:
+- DXC: `C:\DW\DXC`
+- Agility SDK 1.619.5: `C:\DW\microsoft.direct3d.d3d12.1.619.5`
+- Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`.
+  Run them from an "x64 Native Tools Command Prompt for VS".
+
 ## What this is
 
 A user-mode D3D12 layer (proxy `d3d12.dll`) that makes GPUs reporting
