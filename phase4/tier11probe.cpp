@@ -83,6 +83,7 @@ static bool g_pipeline = false;
 static bool g_dxgiQueue = false;
 static bool g_hookTest = false;
 static bool g_queueVTable = false;
+static bool g_gfxSplit = false;
 static int g_filler = 4;
 static int g_frames = 60;
 static uint32_t g_rayCount = 1u << 20;   // 1M rays, enough that Pascal does real work
@@ -281,9 +282,10 @@ struct Dxc {
     // itself refused a construct rather than aborting the whole run.
     ComPtr<IDxcBlob> tryCompile(const char* src, const wchar_t* target,
                                 const std::vector<std::wstring>& defines,
-                                std::string& err) {
+                                std::string& err, const wchar_t* entry = nullptr) {
         DxcBuffer buf{ src, std::strlen(src), DXC_CP_UTF8 };
         std::vector<const wchar_t*> args = { L"-T", target };
+        if (entry) { args.push_back(L"-E"); args.push_back(entry); }
         for (auto& d : defines) { args.push_back(L"-D"); args.push_back(d.c_str()); }
         ComPtr<IDxcResult> res;
         HRESULT hr = compiler->Compile(&buf, args.data(), (UINT32)args.size(),
@@ -1398,6 +1400,219 @@ static void ProbePipeline(Ctx& c, uint32_t rayCount, int fillerPasses, int frame
     std::printf("   behind one sync buys nothing.\n");
 }
 
+
+// ---------------------------------------------------------------------------
+// Does graphics state survive a command list split?
+//
+// The split closes the application's command list and opens a fresh one, and a
+// fresh list has NO state. The shim replays what the app had set, but replaying
+// only compute state is not enough: a draw recorded after the split also needs
+// its pipeline state, root signature and parameters, topology, viewports,
+// scissors, render targets and vertex buffers.
+//
+// So: bind all of that, force a split with a GPU-argument indirect ray dispatch,
+// then draw. If the replay is complete the triangle appears in the render
+// target. If anything is missing the draw is dropped or wrong, and the target
+// keeps its clear colour.
+// ---------------------------------------------------------------------------
+static const char* kGfxVS = R"HLSL(
+struct VSIn  { float2 pos : POSITION; };
+struct VSOut { float4 pos : SV_Position; };
+VSOut main(VSIn i) { VSOut o; o.pos = float4(i.pos, 0, 1); return o; }
+)HLSL";
+
+static const char* kGfxPS = R"HLSL(
+cbuffer C : register(b0) { float4 tint; };
+float4 main(float4 pos : SV_Position) : SV_Target { return tint; }
+)HLSL";
+
+static void ProbeGfxSplit(Ctx& c) {
+    std::printf("\n-- does graphics state survive a split? --\n");
+
+    std::string err;
+    auto vs = c.dxc.tryCompile(kGfxVS, L"vs_6_0", {}, err, L"main");
+    if (!vs) { std::printf("   [!] VS: %s\n", err.c_str()); return; }
+    auto ps = c.dxc.tryCompile(kGfxPS, L"ps_6_0", {}, err, L"main");
+    if (!ps) { std::printf("   [!] PS: %s\n", err.c_str()); return; }
+
+    // Graphics root signature: four root constants, so root parameters are
+    // exercised too and not just the pipeline state.
+    D3D12_ROOT_PARAMETER rp{};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.Num32BitValues = 4;
+    rp.Constants.ShaderRegister = 0;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 1; rsd.pParameters = &rp;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    ComPtr<ID3DBlob> blob, rerr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rerr))) {
+        std::printf("   [!] graphics root signature failed\n"); return;
+    }
+    ComPtr<ID3D12RootSignature> grs;
+    HR(c.g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+        IID_PPV_ARGS(&grs)), "CreateRootSignature(gfx)");
+
+    D3D12_INPUT_ELEMENT_DESC elem{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                                   D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = grs.Get();
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.InputLayout = { &elem, 1 };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D12PipelineState> pso;
+    if (FAILED(c.g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) {
+        std::printf("   [!] graphics PSO failed\n"); return;
+    }
+
+    // A triangle covering the whole target.
+    const float verts[6] = { -1.0f, -3.0f,  -1.0f, 1.0f,  3.0f, 1.0f };
+    auto vb = CreateBuffer(c.g.device.Get(), sizeof(verts), D3D12_HEAP_TYPE_UPLOAD,
+                           D3D12_RESOURCE_STATE_GENERIC_READ);
+    { void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+      HR(vb->Map(0, &none, &p), "map vb"); std::memcpy(p, verts, sizeof(verts));
+      vb->Unmap(0, nullptr); }
+    D3D12_VERTEX_BUFFER_VIEW vbv{ vb->GetGPUVirtualAddress(), sizeof(verts), sizeof(float) * 2 };
+
+    const UINT kRT = 64;
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = kRT; td.Height = kRT; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear{}; clear.Format = td.Format;
+    ComPtr<ID3D12Resource> rt;
+    HR(c.g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&rt)), "rt");
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtvd{};
+    rtvd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rtvd.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> rtvHeap;
+    HR(c.g.device->CreateDescriptorHeap(&rtvd, IID_PPV_ARGS(&rtvHeap)), "rtv heap");
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    c.g.device->CreateRenderTargetView(rt.Get(), nullptr, rtv);
+
+    // Readback for the result.
+    const UINT rowPitch = (kRT * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                          ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    auto rb = CreateBuffer(c.g.device.Get(), (UINT64)rowPitch * kRT,
+                           D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    // The indirect ray dispatch that forces the split, with GPU-written args.
+    ComPtr<ID3D12StateObject> so;
+    std::string why;
+    auto lib = c.dxc.tryCompile(kLibHLSL, L"lib_6_3", {}, why);
+    if (!lib) { std::printf("   [!] rt library: %s\n", why.c_str()); return; }
+    if (FAILED(MakeStateObject(c, lib.Get(), false, so))) {
+        std::printf("   [!] rt state object failed\n"); return;
+    }
+    ComPtr<ID3D12StateObjectProperties> props;
+    HR(so.As(&props), "props");
+    auto sbtRay  = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"RayGen"));
+    auto sbtMiss = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"Miss"));
+    const void* hitIds[2] = { props->GetShaderIdentifier(L"HitGroup"),
+                              props->GetShaderIdentifier(L"HitGroupProc") };
+    auto sbtHit = MakeSBT(c.g.device.Get(), hitIds, 2);
+    auto dr = MakeDispatchDesc(sbtRay.Get(), sbtMiss.Get(), sbtHit.Get(), 2);
+
+    D3D12_INDIRECT_ARGUMENT_DESC arg{}; arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    D3D12_COMMAND_SIGNATURE_DESC csd{};
+    csd.ByteStride = sizeof(D3D12_DISPATCH_RAYS_DESC);
+    csd.NumArgumentDescs = 1; csd.pArgumentDescs = &arg;
+    ComPtr<ID3D12CommandSignature> cs;
+    if (FAILED(c.g.device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&cs)))) {
+        std::printf("   [!] DISPATCH_RAYS signature unavailable, cannot force a split\n");
+        return;
+    }
+    auto upArgs = CreateBuffer(c.g.device.Get(), sizeof(dr), D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_STATE_GENERIC_READ);
+    { void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+      HR(upArgs->Map(0, &none, &p), "map args"); std::memcpy(p, &dr, sizeof(dr));
+      upArgs->Unmap(0, nullptr); }
+    auto gpuArgs = CreateBuffer(c.g.device.Get(), sizeof(dr), D3D12_HEAP_TYPE_DEFAULT,
+                                D3D12_RESOURCE_STATE_COMMON);
+
+    // --- one recording: bind graphics, split in the middle, then draw --------
+    auto& cl = c.g.list;
+    const FLOAT black[4] = { 0, 0, 0, 1 };
+    cl->ClearRenderTargetView(rtv, black, 0, nullptr);
+
+    D3D12_VIEWPORT vp{ 0, 0, (FLOAT)kRT, (FLOAT)kRT, 0, 1 };
+    D3D12_RECT sr{ 0, 0, (LONG)kRT, (LONG)kRT };
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sr);
+    cl->SetPipelineState(pso.Get());
+    cl->SetGraphicsRootSignature(grs.Get());
+    const float tint[4] = { 0.0f, 1.0f, 0.0f, 1.0f };     // green
+    cl->SetGraphicsRoot32BitConstants(0, 4, tint, 0);
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->IASetVertexBuffers(0, 1, &vbv);
+
+    // The split. Everything above must survive it.
+    cl->CopyBufferRegion(gpuArgs.Get(), 0, upArgs.Get(), 0, sizeof(dr));
+    Transition(cl.Get(), gpuArgs.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    cl->SetPipelineState1(so.Get());
+    BindRoots(cl.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+              c.scene.tlas->GetGPUVirtualAddress(), c.out->GetGPUVirtualAddress());
+    cl->ExecuteIndirect(cs.Get(), 1, gpuArgs.Get(), 0, nullptr, 0);
+
+    // SetPipelineState1 replaces the bound pipeline, so ANY app has to re-bind
+    // its graphics PSO before drawing again, split or no split. Re-bind exactly
+    // that one thing and nothing else: everything the draw still needs, the
+    // render target, viewport, scissor, topology, vertex buffer, root signature
+    // and root constants, has to have survived on its own.
+    cl->SetPipelineState(pso.Get());
+
+    // The draw that only works if the rest of the graphics state came back.
+    cl->DrawInstanced(3, 1, 0, 0);
+
+    Transition(cl.Get(), rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = rb.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = td.Format;
+    dst.PlacedFootprint.Footprint.Width = kRT;
+    dst.PlacedFootprint.Footprint.Height = kRT;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = rowPitch;
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = rt.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    c.g.flush();
+
+    uint8_t* p = nullptr;
+    D3D12_RANGE all{ 0, (SIZE_T)rowPitch * kRT };
+    HR(rb->Map(0, &all, (void**)&p), "map rb");
+    uint32_t green = 0, black_ = 0, other = 0;
+    for (UINT y = 0; y < kRT; ++y) {
+        for (UINT x = 0; x < kRT; ++x) {
+            const uint8_t* px = p + (size_t)y * rowPitch + (size_t)x * 4;
+            if (px[0] < 16 && px[1] > 200 && px[2] < 16) ++green;
+            else if (px[0] < 16 && px[1] < 16 && px[2] < 16) ++black_;
+            else ++other;
+        }
+    }
+    D3D12_RANGE noWrite{ 0, 0 }; rb->Unmap(0, &noWrite);
+
+    const UINT total = kRT * kRT;
+    std::printf("   render target after the split: %u green, %u black, %u other (of %u)\n",
+                green, black_, other, total);
+    std::printf("   RESULT                       : %s\n",
+                (green == total) ? "graphics state survived the split"
+                                 : "DIVERGE, the draw did not land");
+}
+
 // ---------------------------------------------------------------------------
 // Hook test: drive a REAL ExecuteIndirect on Tier 1.0 hardware.
 //
@@ -1792,6 +2007,10 @@ static void RunAdapter(Adapter which) {
     auto addLib = c.dxc.tryCompile(kAddLibHLSL, L"lib_6_3", {}, err);
     if (!addLib) { std::printf("\n[!] addition library failed to compile: %s\n", err.c_str()); return; }
 
+    if (g_gfxSplit) {
+        ProbeGfxSplit(c);                               c.drain("gfxsplit");
+        return;
+    }
     if (g_queueVTable) {
         ProbeQueueVTable(c);                            c.drain("queuevtable");
         return;
@@ -1831,6 +2050,7 @@ int main(int argc, char** argv) {
             else if (std::strcmp(argv[i], "-dxgiqueue") == 0) g_dxgiQueue = true;
             else if (std::strcmp(argv[i], "-hooktest") == 0) g_hookTest = true;
             else if (std::strcmp(argv[i], "-queuevtable") == 0) g_queueVTable = true;
+            else if (std::strcmp(argv[i], "-gfxsplit") == 0) g_gfxSplit = true;
             else if (std::strcmp(argv[i], "-filler") == 0 && i + 1 < argc) g_filler = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-frames") == 0 && i + 1 < argc) g_frames = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-rays") == 0 && i + 1 < argc) g_rayCount = (uint32_t)std::strtoul(argv[++i], nullptr, 10);

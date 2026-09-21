@@ -53,6 +53,59 @@ void Dxr11Bindings::Replay(ID3D12GraphicsCommandList4* cl) const {
     if (stateObject) cl->SetPipelineState1(stateObject);
 }
 
+void Dxr11GfxState::Retain() {
+    if (pso) pso->AddRef();
+    if (rootSig) rootSig->AddRef();
+}
+void Dxr11GfxState::ReleaseAll() {
+    if (pso) { pso->Release(); pso = nullptr; }
+    if (rootSig) { rootSig->Release(); rootSig = nullptr; }
+}
+void Dxr11GfxState::Replay(ID3D12GraphicsCommandList4* cl) const {
+    // Same ordering rule as the compute side: the root signature clears the root
+    // parameters, so it goes first. Everything is guarded by a flag recording
+    // whether the application ever set it, because replaying a value it never
+    // set would be an invention rather than a restoration.
+    if (pso) cl->SetPipelineState(pso);
+    if (rootSig) {
+        cl->SetGraphicsRootSignature(rootSig);
+        for (UINT i = 0; i < kMaxRootParams; ++i) {
+            const Dxr11RootParam& r = roots[i];
+            switch (r.kind) {
+            case Dxr11RootParam::Table: cl->SetGraphicsRootDescriptorTable(i, r.table); break;
+            case Dxr11RootParam::CBV:   cl->SetGraphicsRootConstantBufferView(i, r.address); break;
+            case Dxr11RootParam::SRV:   cl->SetGraphicsRootShaderResourceView(i, r.address); break;
+            case Dxr11RootParam::UAV:   cl->SetGraphicsRootUnorderedAccessView(i, r.address); break;
+            case Dxr11RootParam::Constants:
+                if (!r.constants.empty())
+                    cl->SetGraphicsRoot32BitConstants(i, (UINT)r.constants.size(), r.constants.data(), 0);
+                break;
+            default: break;
+            }
+        }
+    }
+    if (hasTopology) cl->IASetPrimitiveTopology(topology);
+    if (!viewports.empty()) cl->RSSetViewports((UINT)viewports.size(), viewports.data());
+    if (!scissors.empty()) cl->RSSetScissorRects((UINT)scissors.size(), scissors.data());
+    if (hasBlendFactor) cl->OMSetBlendFactor(blendFactor);
+    if (hasStencilRef) cl->OMSetStencilRef(stencilRef);
+    if (hasRTs) {
+        cl->OMSetRenderTargets(numRTs, numRTs ? rtHandles : nullptr, rtsSingleHandle,
+                               hasDSV ? &dsvHandle : nullptr);
+    }
+    if (hasIB) cl->IASetIndexBuffer(&ib);
+    for (UINT i = 0; i < kMaxVBs; ++i)
+        if (vbMask & (1ul << i)) cl->IASetVertexBuffers(i, 1, &vbs[i]);
+    if (hasDepthBounds || hasViewInstanceMask) {
+        ID3D12GraphicsCommandList1* cl1 = nullptr;
+        if (SUCCEEDED(cl->QueryInterface(__uuidof(ID3D12GraphicsCommandList1), (void**)&cl1)) && cl1) {
+            if (hasDepthBounds) cl1->OMSetDepthBounds(depthMin, depthMax);
+            if (hasViewInstanceMask) cl1->SetViewInstanceMask(viewInstanceMask);
+            cl1->Release();
+        }
+    }
+}
+
 Dxr11CommandList* Dxr11CommandList::From(ID3D12CommandList* maybe) {
     if (!maybe) return nullptr;
     Dxr11CommandList* self = nullptr;
@@ -71,6 +124,8 @@ Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
 }
 
 Dxr11CommandList::~Dxr11CommandList() {
+    m_bindings.ReleaseAll();
+    m_gfx.ReleaseAll();
     if (m_real6) m_real6->Release();
     if (m_real5) m_real5->Release();
     if (m_real)  m_real->Release();
@@ -141,6 +196,8 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Close() { return FWD(Close()); }
 HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) {
     m_segments.clear();
     m_bindings.ReleaseAll();
+    m_gfx.ReleaseAll();
+    m_gfx = Dxr11GfxState{};
     for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i)
         m_bindings.roots[i] = Dxr11RootParam{};
     m_allocator = a;
@@ -155,12 +212,31 @@ void STDMETHODCALLTYPE Dxr11CommandList::CopyTextureRegion(const D3D12_TEXTURE_C
 void STDMETHODCALLTYPE Dxr11CommandList::CopyResource(ID3D12Resource* d, ID3D12Resource* s) { FWD(CopyResource(d, s)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyTiles(ID3D12Resource* r, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) { FWD(CopyTiles(r, c, sz, b, off, f)); }
 void STDMETHODCALLTYPE Dxr11CommandList::ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT f) { FWD(ResolveSubresource(d, ds, s, ss, f)); }
-void STDMETHODCALLTYPE Dxr11CommandList::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) { FWD(IASetPrimitiveTopology(t)); }
-void STDMETHODCALLTYPE Dxr11CommandList::RSSetViewports(UINT n, const D3D12_VIEWPORT* v) { FWD(RSSetViewports(n, v)); }
-void STDMETHODCALLTYPE Dxr11CommandList::RSSetScissorRects(UINT n, const D3D12_RECT* r) { FWD(RSSetScissorRects(n, r)); }
-void STDMETHODCALLTYPE Dxr11CommandList::OMSetBlendFactor(const FLOAT f[4]) { FWD(OMSetBlendFactor(f)); }
-void STDMETHODCALLTYPE Dxr11CommandList::OMSetStencilRef(UINT s) { FWD(OMSetStencilRef(s)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState(ID3D12PipelineState* p) { FWD(SetPipelineState(p)); }
+void STDMETHODCALLTYPE Dxr11CommandList::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) {
+    m_gfx.hasTopology = true; m_gfx.topology = t;
+    FWD(IASetPrimitiveTopology(t));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::RSSetViewports(UINT n, const D3D12_VIEWPORT* v) {
+    if (v) m_gfx.viewports.assign(v, v + n); else m_gfx.viewports.clear();
+    FWD(RSSetViewports(n, v));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::RSSetScissorRects(UINT n, const D3D12_RECT* r) {
+    if (r) m_gfx.scissors.assign(r, r + n); else m_gfx.scissors.clear();
+    FWD(RSSetScissorRects(n, r));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::OMSetBlendFactor(const FLOAT f[4]) {
+    if (f) { m_gfx.hasBlendFactor = true; std::memcpy(m_gfx.blendFactor, f, sizeof(m_gfx.blendFactor)); }
+    FWD(OMSetBlendFactor(f));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::OMSetStencilRef(UINT s) {
+    m_gfx.hasStencilRef = true; m_gfx.stencilRef = s;
+    FWD(OMSetStencilRef(s));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState(ID3D12PipelineState* p) {
+    if (m_gfx.pso) m_gfx.pso->Release();
+    m_gfx.pso = p; if (p) p->AddRef();
+    FWD(SetPipelineState(p));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) { FWD(ResourceBarrier(n, b)); }
 
 // A bundle is created through CreateCommandList too, so it arrives wrapped.
@@ -189,12 +265,20 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootSignature(ID3D12RootSigna
         m_bindings.roots[i] = Dxr11RootParam{};
     FWD(SetComputeRootSignature(r));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootSignature(ID3D12RootSignature* r) { FWD(SetGraphicsRootSignature(r)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootSignature(ID3D12RootSignature* r) {
+    if (m_gfx.rootSig) m_gfx.rootSig->Release();
+    m_gfx.rootSig = r; if (r) r->AddRef();
+    for (UINT i = 0; i < Dxr11GfxState::kMaxRootParams; ++i) m_gfx.roots[i] = Dxr11RootParam{};
+    FWD(SetGraphicsRootSignature(r));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
     if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::Table; m_bindings.roots[i].table = h; }
     FWD(SetComputeRootDescriptorTable(i, h));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { FWD(SetGraphicsRootDescriptorTable(i, h)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
+    if (i < Dxr11GfxState::kMaxRootParams) { m_gfx.roots[i].kind = Dxr11RootParam::Table; m_gfx.roots[i].table = h; }
+    FWD(SetGraphicsRootDescriptorTable(i, h));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstant(UINT i, UINT v, UINT o) {
     if (i < Dxr11Bindings::kMaxRootParams) {
         Dxr11RootParam& r = m_bindings.roots[i];
@@ -204,7 +288,15 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstant(UINT i, UIN
     }
     FWD(SetComputeRoot32BitConstant(i, v, o));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRoot32BitConstant(UINT i, UINT v, UINT o) { FWD(SetGraphicsRoot32BitConstant(i, v, o)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRoot32BitConstant(UINT i, UINT v, UINT o) {
+    if (i < Dxr11GfxState::kMaxRootParams) {
+        Dxr11RootParam& r = m_gfx.roots[i];
+        r.kind = Dxr11RootParam::Constants;
+        if (r.constants.size() < (size_t)o + 1) r.constants.resize((size_t)o + 1, 0);
+        r.constants[o] = v;
+    }
+    FWD(SetGraphicsRoot32BitConstant(i, v, o));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) {
     if (i < Dxr11Bindings::kMaxRootParams && d) {
         Dxr11RootParam& r = m_bindings.roots[i];
@@ -214,26 +306,66 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstants(UINT i, UI
     }
     FWD(SetComputeRoot32BitConstants(i, n, d, o));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) { FWD(SetGraphicsRoot32BitConstants(i, n, d, o)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) {
+    if (i < Dxr11GfxState::kMaxRootParams && d) {
+        Dxr11RootParam& r = m_gfx.roots[i];
+        r.kind = Dxr11RootParam::Constants;
+        if (r.constants.size() < (size_t)o + n) r.constants.resize((size_t)o + n, 0);
+        std::memcpy(r.constants.data() + o, d, (size_t)n * sizeof(UINT));
+    }
+    FWD(SetGraphicsRoot32BitConstants(i, n, d, o));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
     if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::CBV; m_bindings.roots[i].address = a; }
     FWD(SetComputeRootConstantBufferView(i, a));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetGraphicsRootConstantBufferView(i, a)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (i < Dxr11GfxState::kMaxRootParams) { m_gfx.roots[i].kind = Dxr11RootParam::CBV; m_gfx.roots[i].address = a; }
+    FWD(SetGraphicsRootConstantBufferView(i, a));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
     if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::SRV; m_bindings.roots[i].address = a; }
     FWD(SetComputeRootShaderResourceView(i, a));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetGraphicsRootShaderResourceView(i, a)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (i < Dxr11GfxState::kMaxRootParams) { m_gfx.roots[i].kind = Dxr11RootParam::SRV; m_gfx.roots[i].address = a; }
+    FWD(SetGraphicsRootShaderResourceView(i, a));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
     if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::UAV; m_bindings.roots[i].address = a; }
     FWD(SetComputeRootUnorderedAccessView(i, a));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetGraphicsRootUnorderedAccessView(i, a)); }
-void STDMETHODCALLTYPE Dxr11CommandList::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) { FWD(IASetIndexBuffer(v)); }
-void STDMETHODCALLTYPE Dxr11CommandList::IASetVertexBuffers(UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) { FWD(IASetVertexBuffers(s, n, v)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (i < Dxr11GfxState::kMaxRootParams) { m_gfx.roots[i].kind = Dxr11RootParam::UAV; m_gfx.roots[i].address = a; }
+    FWD(SetGraphicsRootUnorderedAccessView(i, a));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) {
+    if (v) { m_gfx.hasIB = true; m_gfx.ib = *v; } else { m_gfx.hasIB = false; }
+    FWD(IASetIndexBuffer(v));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::IASetVertexBuffers(UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) {
+    for (UINT i = 0; i < n; ++i) {
+        const UINT slot = s + i;
+        if (slot >= Dxr11GfxState::kMaxVBs) break;
+        if (v) { m_gfx.vbs[slot] = v[i]; m_gfx.vbMask |= (1ul << slot); }
+        else   { m_gfx.vbMask &= ~(1ul << slot); }
+    }
+    FWD(IASetVertexBuffers(s, n, v));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SOSetTargets(UINT s, UINT n, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* v) { FWD(SOSetTargets(s, n, v)); }
-void STDMETHODCALLTYPE Dxr11CommandList::OMSetRenderTargets(UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rt, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) { FWD(OMSetRenderTargets(n, rt, single, ds)); }
+void STDMETHODCALLTYPE Dxr11CommandList::OMSetRenderTargets(UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rt, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    m_gfx.hasRTs = true;
+    m_gfx.rtsSingleHandle = single;
+    m_gfx.numRTs = n;
+    // With a single handle the array holds ONE entry describing a contiguous
+    // range, so copying n of them would read past the end.
+    const UINT copy = single ? (n ? 1u : 0u) : n;
+    for (UINT i = 0; i < copy && i < Dxr11GfxState::kMaxRTs; ++i)
+        if (rt) m_gfx.rtHandles[i] = rt[i];
+    m_gfx.hasDSV = (ds != nullptr);
+    if (ds) m_gfx.dsvHandle = *ds;
+    FWD(OMSetRenderTargets(n, rt, single, ds));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE v, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT n, const D3D12_RECT* r) { FWD(ClearDepthStencilView(v, f, d, s, n, r)); }
 void STDMETHODCALLTYPE Dxr11CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE v, const FLOAT c[4], UINT n, const D3D12_RECT* r) { FWD(ClearRenderTargetView(v, c, n, r)); }
 void STDMETHODCALLTYPE Dxr11CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const UINT v[4], UINT n, const D3D12_RECT* r) { FWD(ClearUnorderedAccessViewUint(g, c, res, v, n, r)); }
@@ -327,10 +459,16 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
 
 void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { FWD(AtomicCopyBufferUINT(d, dof, s, sof, n, dep, ranges)); }
 void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT64(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { FWD(AtomicCopyBufferUINT64(d, dof, s, sof, n, dep, ranges)); }
-void STDMETHODCALLTYPE Dxr11CommandList::OMSetDepthBounds(FLOAT a, FLOAT b) { FWD(OMSetDepthBounds(a, b)); }
+void STDMETHODCALLTYPE Dxr11CommandList::OMSetDepthBounds(FLOAT a, FLOAT b) {
+    m_gfx.hasDepthBounds = true; m_gfx.depthMin = a; m_gfx.depthMax = b;
+    FWD(OMSetDepthBounds(a, b));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetSamplePositions(UINT a, UINT b, D3D12_SAMPLE_POSITION* p) { FWD(SetSamplePositions(a, b, p)); }
 void STDMETHODCALLTYPE Dxr11CommandList::ResolveSubresourceRegion(ID3D12Resource* d, UINT ds, UINT x, UINT y, ID3D12Resource* s, UINT ss, D3D12_RECT* r, DXGI_FORMAT f, D3D12_RESOLVE_MODE m) { FWD(ResolveSubresourceRegion(d, ds, x, y, s, ss, r, f, m)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetViewInstanceMask(UINT m) { FWD(SetViewInstanceMask(m)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetViewInstanceMask(UINT m) {
+    m_gfx.hasViewInstanceMask = true; m_gfx.viewInstanceMask = m;
+    FWD(SetViewInstanceMask(m));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::WriteBufferImmediate(UINT c, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* p, const D3D12_WRITEBUFFERIMMEDIATE_MODE* m) { FWD(WriteBufferImmediate(c, p, m)); }
 void STDMETHODCALLTYPE Dxr11CommandList::SetProtectedResourceSession(ID3D12ProtectedResourceSession* s) { FWD(SetProtectedResourceSession(s)); }
 void STDMETHODCALLTYPE Dxr11CommandList::BeginRenderPass(UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rt, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds, D3D12_RENDER_PASS_FLAGS f) { FWD(BeginRenderPass(n, rt, ds, f)); }
@@ -446,8 +584,12 @@ bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
     m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList5), (void**)&m_real5);
     m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList6), (void**)&m_real6);
 
-    // A fresh list has no state, so give the application back what it had set.
+    // A fresh list has no state at all, so give the application back everything
+    // it had set. The dispatch-only list gets only the compute half, since that
+    // is all DispatchRays uses; the continuation needs the graphics half too,
+    // because the app carries on recording draws into it.
     m_bindings.Replay(m_real);
+    m_gfx.Replay(m_real);
     return true;
 }
 

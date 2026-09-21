@@ -47,7 +47,9 @@ struct Dxr11RootParam {
     std::vector<UINT>           constants;
 };
 
-// Enough state to make a DispatchRays behave as the application intended.
+// Enough state to make a DispatchRays behave as the application intended. This
+// is the COMPUTE pipeline only, which is what DispatchRays uses, and it is all
+// the dispatch-only list needs.
 struct Dxr11Bindings {
     static const UINT kMaxRootParams = 64;   // a root signature is 64 DWORDs
 
@@ -61,6 +63,53 @@ struct Dxr11Bindings {
     // Replays in dependency order: heaps, then root signature (which clears the
     // root parameters), then the parameters, then the state object.
     void Replay(ID3D12GraphicsCommandList4* cl) const;
+};
+
+// Everything else Reset clears.
+//
+// The dispatch-only list does not need any of this. The CONTINUATION segment
+// does: the application carries on recording into it believing its graphics
+// state is still bound, and a fresh command list has none. Tracking only root
+// parameters would not be enough, since a draw also needs its pipeline state,
+// topology, viewports, targets and buffers.
+struct Dxr11GfxState {
+    static const UINT kMaxRootParams = 64;
+    static const UINT kMaxRTs = 8;
+    static const UINT kMaxVBs = 32;
+
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12RootSignature* rootSig = nullptr;
+    Dxr11RootParam       roots[kMaxRootParams];
+
+    bool hasTopology = false;
+    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+    std::vector<D3D12_VIEWPORT> viewports;
+    std::vector<D3D12_RECT>     scissors;
+
+    bool  hasBlendFactor = false;  FLOAT blendFactor[4] = { 0, 0, 0, 0 };
+    bool  hasStencilRef = false;   UINT  stencilRef = 0;
+
+    bool hasRTs = false;
+    UINT numRTs = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtHandles[kMaxRTs]{};
+    BOOL rtsSingleHandle = FALSE;
+    bool hasDSV = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle{};
+
+    bool hasIB = false;  D3D12_INDEX_BUFFER_VIEW ib{};
+    unsigned long vbMask = 0;  D3D12_VERTEX_BUFFER_VIEW vbs[kMaxVBs]{};
+
+    bool  hasDepthBounds = false;  FLOAT depthMin = 0, depthMax = 1;
+    bool  hasViewInstanceMask = false;  UINT viewInstanceMask = 0;
+
+    void Retain();
+    void ReleaseAll();
+    void Replay(ID3D12GraphicsCommandList4* cl) const;
+
+    // NOT tracked, and nothing has needed it yet: stream output targets,
+    // predication, sample positions and shading rate. Each would be a few more
+    // fields here if an application turns out to set them across a split.
 };
 
 // A dispatch that could not be issued at record time. The readback buffer
@@ -236,5 +285,6 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Fence>                m_fence;
     UINT64                                             m_fenceValue = 0;
     Microsoft::WRL::ComPtr<ID3D12Device5>              m_device;
-    Dxr11Bindings                                      m_bindings;
+    Dxr11Bindings                                      m_bindings;   // compute
+    Dxr11GfxState                                      m_gfx;        // everything else
 };

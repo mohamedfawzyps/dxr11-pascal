@@ -864,3 +864,63 @@ buffers this reads like a formality because of state promotion, and it is not.
   the compute root signature, so this is sufficient for the dispatch itself, but
   a split also resets graphics state for whatever the application records
   afterwards. No test app has tripped on it; a real engine might.
+
+## Graphics state across a split
+
+Tracking only compute state was not enough, and tracking only graphics *root
+parameters* would not have been either. A split opens a fresh command list, and
+a fresh list has no state at all, so a draw recorded after the split needs its
+pipeline state, root signature and parameters, topology, viewports, scissors,
+render targets and vertex buffers back as well.
+
+`Dxr11GfxState` now carries all of that, plus blend factor, stencil reference,
+index buffer, depth bounds and view instance mask. Everything is guarded by a
+flag recording whether the application ever set it, because replaying a value it
+never set would be an invention rather than a restoration.
+
+The two halves are used differently, which is the point of keeping them apart:
+
+- the **dispatch-only list** gets the compute half only, since that is all
+  `DispatchRays` uses
+- the **continuation segment** gets both, because the application carries on
+  recording draws into it
+
+One subtlety worth recording: with `RTsSingleHandleToDescriptorRange` set,
+`OMSetRenderTargets` is given ONE handle describing a contiguous range, not `n`
+of them, so copying `n` entries would read past the end of the caller's array.
+
+### Tested, and the test was checked for sensitivity
+
+`tier11probe.exe -gfxsplit` binds a full graphics pipeline, forces a split with a
+GPU-argument indirect ray dispatch, then draws a triangle covering a small render
+target and counts the pixels.
+
+    CONTROL: WARP, no proxy, no split     4096 green   draw lands
+    hardware through the proxy, split     4096 green   draw lands
+
+The first version of this test was **wrong and passed for the wrong reason**.
+`SetPipelineState1` replaces the bound pipeline, so any application has to
+re-bind its graphics PSO before drawing again, split or not. The test did not,
+so the control failed on WARP while the proxy path "passed" only because our
+replay happened to re-bind the PSO the test had abandoned. The test now re-binds
+exactly that one thing and nothing else, so everything else has to survive on its
+own merits.
+
+It was then checked for sensitivity, by disabling the graphics replay and
+re-running:
+
+    graphics replay DISABLED, split path  0 green, 4096 black   DIVERGE
+
+so the test genuinely measures the replay rather than passing regardless.
+
+### Regression
+
+raytest ALL MATCH, probe on hardware MATCH on both argument-buffer shapes and
+AddToStateObject still fine, HelloWorld 0 of 14400 pixels differ at 2140 against
+2137 fps, SimpleLighting 1386 against 1387 fps.
+
+### Still not tracked
+
+Stream output targets, predication, sample positions and shading rate. Each is a
+few more fields if an application turns out to set one across a split, and none
+is set by anything tested so far.
