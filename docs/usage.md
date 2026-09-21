@@ -24,6 +24,16 @@ the Agility SDK yourself, and the paths are set at the top of the build
 scripts. The defaults expect them at `C:\DW\DXC` and
 `C:\DW\microsoft.direct3d.d3d12.1.619.5`.
 
+## The short way
+
+`tools\dxr11-setup.bat` does steps 2 to 4 for you: pick the .exe, click
+Install, and the settings and the log are on the same window. It copies files
+and writes a two line .ini, nothing else, and it is a readable PowerShell
+script if you want to check that before running it.
+
+The rest of this page is the same thing by hand, and is worth reading when
+something does not work.
+
 ## 2. Build
 
 ```
