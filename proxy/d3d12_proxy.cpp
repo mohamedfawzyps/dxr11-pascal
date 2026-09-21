@@ -23,12 +23,14 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <cstdio>
+#include <string>
 #include <cstdarg>
 #include <cwchar>
 
 #include "proxy_log.h"
 #include "version.h"
 #include "config.h"
+#include "rewriter/dxc_host.h"
 #include "rewriter/dxc_host.h"
 #include "d3d12_device.h"
 
@@ -150,13 +152,40 @@ const char* ProxyIidName(const IID& iid) {
 static bool WrapEnabled() {
     static bool on = [] {
         const cfg::Flag f = cfg::Get("DXR11_NO_WRAP", "nowrap", false);
-        if (f.value)
+        if (f.value) {
             ProxyLog("[dxr-tier-11-proxy-log] device wrapping DISABLED (nowrap on, from %s). "
                      "Nothing is translated, including the Tier 1.1 answer.\n",
                      f.source);
-        else
-            ProxyLog("[dxr-tier-11-proxy-log] device wrapping enabled\n");
-        return !f.value;
+            return false;
+        }
+
+        // Without DXC there is nothing left to do, so do nothing at all.
+        //
+        // Everything the wrapper still handles is a Tier 1.1 feature:
+        // AddToStateObject, indirect DispatchRays, and the command list and
+        // acceleration structure machinery those need. Without DXC the shim
+        // reports Tier 1.0, and an application that reads the tier it was
+        // given never calls any of them. The wrapper would sit in the path of
+        // every device and command list call waiting for work that cannot
+        // arrive.
+        //
+        // That is risk with no benefit, and the risk is not theoretical: the
+        // wrapper hooks a queue vtable and wraps every command list. Standing
+        // aside is one less thing that can be wrong in somebody's game.
+        //
+        // The log survives: the lines that say what happened come from this
+        // file, not from the wrapper.
+        std::string why;
+        if (!dxch::Available(&why)) {
+            ProxyLog("[dxr-tier-11-proxy-log] standing aside entirely: %s. The "
+                     "application gets the real device untouched, which is what "
+                     "it would have had with no shim installed at all.\n",
+                     why.c_str());
+            return false;
+        }
+
+        ProxyLog("[dxr-tier-11-proxy-log] device wrapping enabled\n");
+        return true;
     }();
     return on;
 }

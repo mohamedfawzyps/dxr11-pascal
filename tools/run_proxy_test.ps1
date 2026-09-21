@@ -103,6 +103,18 @@ if (-not ('PxTest' -as [type])) { Add-Type -TypeDefinition $helper -ReferencedAs
 $dir = Split-Path -Parent $Exe
 $proxySrc = Join-Path $PSScriptRoot "..\d3d12.dll"
 $proxyDst = Join-Path $dir "d3d12.dll"
+
+# DXC has to go beside it, or this test silently stops testing anything.
+#
+# The shim now stands aside entirely when dxcompiler.dll and dxil.dll are
+# missing: it hands over the real device and wraps nothing. That is the right
+# behaviour and it would make this comparison vacuous, because "pixel
+# identical" would be comparing the unmodified path against itself. The point
+# of this test is that the WRAPPER is transparent, so the wrapper has to be
+# running.
+# Left in place afterwards, as the proxy DLL already is. The baseline run
+# deletes d3d12.dll and so has no shim regardless of what else is in the folder.
+$dxcNames = @('dxcompiler.dll', 'dxil.dll')
 $log = Join-Path $env:TEMP "dxr11_proxy.log"
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
 
@@ -149,6 +161,17 @@ Write-Host "-- baseline (no proxy) --"
 $base = Invoke-Run -Label "baseline"
 
 Copy-Item -LiteralPath $proxySrc -Destination $proxyDst -Force
+foreach ($n in $dxcNames) {
+    $src = Join-Path $PSScriptRoot "..\$n"
+    $dst = Join-Path $dir $n
+    if ((Test-Path $src) -and -not (Test-Path $dst)) {
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+    }
+}
+if (-not (Test-Path (Join-Path $dir 'dxcompiler.dll'))) {
+    Write-Host '  WARNING: no dxcompiler.dll, so the shim will stand aside and this'
+    Write-Host '           comparison proves nothing. Run build_proxy.bat first.'
+}
 Write-Host "-- through proxy --"
 $prox = Invoke-Run -Label "proxied"
 

@@ -17,6 +17,56 @@ build.
 
 ---
 
+## 0.12.0 (2026-09-22)
+
+### Without DXC the shim now stands aside completely
+
+0.11.0 stopped claiming Tier 1.1 when `dxcompiler.dll` and `dxil.dll` are
+missing. This goes further: it stops wrapping the device at all.
+
+Everything the wrapper still handles is a Tier 1.1 feature, `AddToStateObject`,
+indirect `DispatchRays`, and the command list and acceleration structure
+machinery those need. Reporting Tier 1.0 means an application that reads the
+tier it was given never calls any of them, so the wrapper would sit in the path
+of every device and command list call waiting for work that cannot arrive.
+
+That is risk with no benefit, and the risk is not theoretical: the wrapper
+hooks a queue vtable and wraps every command list.
+
+    standing aside entirely: dxcompiler.dll is not next to the shim ... The
+    application gets the real device untouched, which is what it would have had
+    with no shim installed at all.
+
+The log survives, because the lines that say what happened come from the proxy
+layer rather than from the wrapper.
+
+**The cost:** DXC is now loaded at device creation rather than at the first
+RayQuery shader. The lazy loading noted in earlier work is gone when DXC is
+present. Two `LoadLibrary` calls at startup, in exchange for doing nothing at
+all when it is absent.
+
+### A test had quietly stopped testing anything
+
+`run_proxy_test.ps1` compares a Microsoft sample with and without the shim and
+asserts the frames are pixel identical. Its whole purpose is to show the
+WRAPPER is transparent.
+
+The sample folders contain no DXC, so after the change above the shim stood
+aside there and the comparison became the unmodified path against itself. It
+would have passed forever while proving nothing.
+
+The script now copies DXC beside the proxy, and warns loudly if it cannot. Both
+samples are verified again with the wrapper actually running.
+
+That is the fourth time in this project a test was found measuring nothing, and
+the first where a correct change to the product caused it.
+
+### Renamed
+
+The log prefix is `[dxr-tier-11-proxy-log]`, since `dxr11` reads as DirectX 11.
+
+---
+
 ## 0.11.0 (2026-09-22)
 
 ### Tier 1.1 is no longer claimed without DXC
