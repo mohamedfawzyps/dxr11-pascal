@@ -91,7 +91,7 @@ bool StateObjectStore::Append(const D3D12_STATE_OBJECT_DESC& desc,
             // exactly one. We keep the base's. If an app ever needs to RAISE a
             // config (a bigger payload, say) this is where that would show up,
             // so make it visible rather than silent.
-            ProxyLog("[dxr11-proxy]   merge: dropping duplicate %s from addition\n",
+            ProxyLog("[dxr-tier-11-proxy-log]   merge: dropping duplicate %s from addition\n",
                      TypeName(src.Type));
             // A placeholder keeps index arithmetic aligned for association
             // fixups that refer to it by position.
@@ -254,7 +254,7 @@ D3D12_STATE_OBJECT_DESC StateObjectStore::Desc(D3D12_STATE_OBJECT_TYPE type) {
                 if (m_final[j].Type == want) { targetIdx = j; break; }
             }
             if (targetIdx == kDropped) {
-                ProxyLog("[dxr11-proxy]   merge: association target %s vanished\n",
+                ProxyLog("[dxr-tier-11-proxy-log]   merge: association target %s vanished\n",
                          TypeName(want));
                 continue;
             }

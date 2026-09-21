@@ -651,8 +651,8 @@ result no longer holds on that runtime.
 Result, and note the second line, which is what the command list hook never
 managed:
 
-    [dxr11-proxy] queue hook installed: vtable 00007FF80167DD08 slot 10, self-test passed
-    [dxr11-proxy] ExecuteCommandLists intercepted (first real call), n=1
+    [dxr-tier-11-proxy-log] queue hook installed: vtable 00007FF80167DD08 slot 10, self-test passed
+    [dxr-tier-11-proxy-log] ExecuteCommandLists intercepted (first real call), n=1
 
 Regression with the hook live: raytest ALL MATCH, HelloWorld **0 of 14400 pixels
 differ** at 2125 against 2142 fps, SimpleLighting 1384 against 1381 fps. The
@@ -694,7 +694,7 @@ cannot be submitted.
 
 First run with the wrapper at `ID3D12GraphicsCommandList4`:
 
-    [dxr11-proxy] command list QI PASSED THROUGH UNWRAPPED: {55050859-4024-474C-87F5-6472EAEE44EA}
+    [dxr-tier-11-proxy-log] command list QI PASSED THROUGH UNWRAPPED: {55050859-4024-474C-87F5-6472EAEE44EA}
 
 That is `ID3D12GraphicsCommandList5`, and SimpleLighting asks for it. An
 unwrapped list there would have bypassed `ExecuteIndirect` entirely and silently.
@@ -806,7 +806,7 @@ uses, a GPU-written argument buffer.
 
 matching the WARP ground truth exactly, with the log showing the mechanism:
 
-    [dxr11-proxy] split dispatch issued: 256x256x1, dimensions read back from the GPU
+    [dxr-tier-11-proxy-log] split dispatch issued: 256x256x1, dimensions read back from the GPU
 
 ### How it works
 

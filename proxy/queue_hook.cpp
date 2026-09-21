@@ -39,7 +39,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
 
     static LONG once = 0;
     if (InterlockedCompareExchange(&once, 1, 0) == 0)
-        ProxyLog("[dxr11-proxy] ExecuteCommandLists intercepted (first real call), n=%u\n",
+        ProxyLog("[dxr-tier-11-proxy-log] ExecuteCommandLists intercepted (first real call), n=%u\n",
                  NumCommandLists);
 
     // The reason this hook exists: swap our wrappers back for the real lists
@@ -107,7 +107,7 @@ bool Dxr11InstallQueueHook(ID3D12CommandQueue* sample) {
     if (g_hookedVTable) {
         // Measured to be one shared vtable for every queue, so a second distinct
         // one means the assumption has broken on this runtime. Say so.
-        ProxyLog("[dxr11-proxy] queue hook: a SECOND queue vtable appeared (%p, had %p). "
+        ProxyLog("[dxr-tier-11-proxy-log] queue hook: a SECOND queue vtable appeared (%p, had %p). "
                  "The shared-vtable assumption does not hold here.\n",
                  (void*)vt, (void*)g_hookedVTable);
         ReleaseSRWLockExclusive(&g_lock);
@@ -116,7 +116,7 @@ bool Dxr11InstallQueueHook(ID3D12CommandQueue* sample) {
 
     void* original = nullptr;
     if (!PatchSlot(vt, kExecuteCommandListsSlot, (void*)&Hook_ExecuteCommandLists, &original)) {
-        ProxyLog("[dxr11-proxy] queue hook: VirtualProtect failed on vtable %p\n", (void*)vt);
+        ProxyLog("[dxr-tier-11-proxy-log] queue hook: VirtualProtect failed on vtable %p\n", (void*)vt);
         ReleaseSRWLockExclusive(&g_lock);
         return false;
     }
@@ -135,14 +135,14 @@ bool Dxr11InstallQueueHook(ID3D12CommandQueue* sample) {
         PatchSlot(vt, kExecuteCommandListsSlot, original, nullptr);
         g_original = nullptr;
         g_hookedVTable = nullptr;
-        ProxyLog("[dxr11-proxy] queue hook: SELF-TEST FAILED, slot %zu is not "
+        ProxyLog("[dxr-tier-11-proxy-log] queue hook: SELF-TEST FAILED, slot %zu is not "
                  "ExecuteCommandLists. Hook removed.\n", kExecuteCommandListsSlot);
         ReleaseSRWLockExclusive(&g_lock);
         return false;
     }
 
     g_active = true;
-    ProxyLog("[dxr11-proxy] queue hook installed: vtable %p slot %zu, self-test passed\n",
+    ProxyLog("[dxr-tier-11-proxy-log] queue hook installed: vtable %p slot %zu, self-test passed\n",
              (void*)vt, kExecuteCommandListsSlot);
     ReleaseSRWLockExclusive(&g_lock);
     return true;

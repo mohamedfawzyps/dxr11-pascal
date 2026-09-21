@@ -93,8 +93,8 @@ and the 1070. Through the proxy it still produces the Phase 2 result exactly:
 
 The log caught all four device creations (WARP and hardware, twice):
 
-    [dxr11-proxy] attached to process
-    [dxr11-proxy] D3D12CreateDevice fl=0xc000 hr=0x00000000 device=00000268EECA6E90
+    [dxr-tier-11-proxy-log] attached to process
+    [dxr-tier-11-proxy-log] D3D12CreateDevice fl=0xc000 hr=0x00000000 device=00000268EECA6E90
     ... x4
 
 **2. `D3D12RaytracingHelloWorld`, the Microsoft DXR 1.0 sample.** Windowed,
@@ -110,10 +110,10 @@ without the proxy and the window was captured at t=5s in both runs:
 
 Proxy log from the sample run:
 
-    [dxr11-proxy] attached to process
-    [dxr11-proxy] D3D12CreateDevice fl=0xb000 hr=0x00000001 device=0000000000000000
-    [dxr11-proxy] D3D12CreateDevice fl=0xb000 hr=0x00000000 device=0000021FF78F41B0
-    [dxr11-proxy] D3D12CreateDevice fl=0xb000 hr=0x00000000 device=0000021FF7D02E10
+    [dxr-tier-11-proxy-log] attached to process
+    [dxr-tier-11-proxy-log] D3D12CreateDevice fl=0xb000 hr=0x00000001 device=0000000000000000
+    [dxr-tier-11-proxy-log] D3D12CreateDevice fl=0xb000 hr=0x00000000 device=0000021FF78F41B0
+    [dxr-tier-11-proxy-log] D3D12CreateDevice fl=0xb000 hr=0x00000000 device=0000021FF7D02E10
 
 The first line is `hr = S_FALSE` with a null device: that is the documented
 capability-probe form of `D3D12CreateDevice` (null `ppDevice`), used by
@@ -204,7 +204,7 @@ through `ID3D12Device7`. Anything else is passed to the real device **and
 logged**, so we find out what apps actually ask for instead of guessing. The
 samples produce exactly one such line:
 
-    [dxr11-proxy] device QI PASSED THROUGH UNWRAPPED: ID3D12InfoQueue
+    [dxr-tier-11-proxy-log] device QI PASSED THROUGH UNWRAPPED: ID3D12InfoQueue
 
 which is correct: the debug layer wants the real InfoQueue.
 
@@ -225,8 +225,8 @@ back a vtable the device cannot honour.
 Verified by running the Phase 4 probe through the proxy. On WARP the call lands
 in our wrapper and succeeds:
 
-    [dxr11-proxy] device wrapper created (real=..., Device6=yes, Device7=yes)
-    [dxr11-proxy] AddToStateObject additions=4 grow-from=... hr=0x00000000
+    [dxr-tier-11-proxy-log] device wrapper created (real=..., Device6=yes, Device7=yes)
+    [dxr-tier-11-proxy-log] AddToStateObject additions=4 grow-from=... hr=0x00000000
 
 with the probe still reporting identical results, and no
 `QI PASSED THROUGH UNWRAPPED` line anywhere. On the 1070 the wrapper also
@@ -277,9 +277,9 @@ one ordinary prologue that x64 unwind info can describe.
 With that in place the debug layer is fully back, and it now validates the
 wrapper for us:
 
-    [dxr11-proxy] thunk D3D12CoreRegisterLayers -> 00007FF82676F190
-    [dxr11-proxy] thunk D3D12CoreGetLayeredDeviceSize -> 00007FF826761E90
-    [dxr11-proxy] thunk D3D12CoreCreateLayeredDevice -> 00007FF8267622E0
+    [dxr-tier-11-proxy-log] thunk D3D12CoreRegisterLayers -> 00007FF82676F190
+    [dxr-tier-11-proxy-log] thunk D3D12CoreGetLayeredDeviceSize -> 00007FF826761E90
+    [dxr-tier-11-proxy-log] thunk D3D12CoreCreateLayeredDevice -> 00007FF8267622E0
     Direct3D Adapter (0): VID:10DE, PID:1B81 - NVIDIA GeForce GTX 1070
     | D3D12 State Object ...: Raytracing Pipeline
     D3D12 WARNING: ... CREATERESOURCE_STATE_IGNORED

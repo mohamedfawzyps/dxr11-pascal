@@ -174,7 +174,7 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::QueryInterface(REFIID riid, void** p
     // Device8 and above, and the log is how we find out an app needs it.
     HRESULT hr = m_real->QueryInterface(riid, ppvObject);
     if (SUCCEEDED(hr))
-        ProxyLog("[dxr11-proxy] command list QI PASSED THROUGH UNWRAPPED: %s\n",
+        ProxyLog("[dxr-tier-11-proxy-log] command list QI PASSED THROUGH UNWRAPPED: %s\n",
                  ProxyIidName(riid));
     return hr;
 }
@@ -229,7 +229,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         if (astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why)) {
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
-                ProxyLog("[dxr11-proxy] lowered RayQuery dispatch REFUSED: %s. "
+                ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
                          "Nothing is drawn for it.\n", why.c_str());
             return;
         }
@@ -443,12 +443,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
     }
 
     if (countBuf) {
-        ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): a count buffer is not "
+        ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH_RAYS): a count buffer is not "
                  "supported yet, dispatch SKIPPED\n");
         return;
     }
     if (!args) {
-        ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): null argument buffer\n");
+        ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH_RAYS): null argument buffer\n");
         return;
     }
 
@@ -463,12 +463,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
 
     if (!cpuVisible) {
         if (maxCount != 1) {
-            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): MaxCommandCount=%u with a "
+            ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH_RAYS): MaxCommandCount=%u with a "
                      "GPU-written argument buffer is not supported, dispatch SKIPPED\n", maxCount);
             return;
         }
         if (!QueueSplit(args, argOffset)) {
-            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): split failed, "
+            ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH_RAYS): split failed, "
                      "dispatch SKIPPED\n");
         }
         return;
@@ -482,7 +482,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
         const UINT64 offset = argOffset + (UINT64)i * stride;
         D3D12_RANGE readRange{ (SIZE_T)offset, (SIZE_T)(offset + sizeof(desc)) };
         if (FAILED(args->Map(0, &readRange, (void**)&p)) || !p) {
-            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): could not map the "
+            ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH_RAYS): could not map the "
                      "argument buffer, dispatch SKIPPED\n");
             return;
         }
@@ -492,7 +492,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
 
         static LONG once = 0;
         if (InterlockedCompareExchange(&once, 1, 0) == 0)
-            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS) -> direct DispatchRays "
+            ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH_RAYS) -> direct DispatchRays "
                      "%ux%ux%u, read from a CPU-visible argument buffer at record time\n",
                      desc.Width, desc.Height, desc.Depth);
 
@@ -578,7 +578,7 @@ void Dxr11CommandList::CaptureInstances(
     if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
         static LONG once = 0;
         if (InterlockedCompareExchange(&once, 1, 0) == 0)
-            ProxyLog("[dxr11-proxy] top-level AS: ARRAY_OF_POINTERS instance "
+            ProxyLog("[dxr-tier-11-proxy-log] top-level AS: ARRAY_OF_POINTERS instance "
                      "descriptions are not read (each pointer is itself a GPU "
                      "address, needing a second dependent copy).\n");
         return;
@@ -588,7 +588,7 @@ void Dxr11CommandList::CaptureInstances(
     if (!src.resource) {
         static LONG once = 0;
         if (InterlockedCompareExchange(&once, 1, 0) == 0)
-            ProxyLog("[dxr11-proxy] top-level AS: instance buffer at 0x%llX is not "
+            ProxyLog("[dxr-tier-11-proxy-log] top-level AS: instance buffer at 0x%llX is not "
                      "a tracked resource, so its descriptions cannot be read.\n",
                      static_cast<unsigned long long>(in.InstanceDescs));
         return;
@@ -635,7 +635,7 @@ void Dxr11CommandList::CaptureInstances(
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
-        ProxyLog("[dxr11-proxy] top-level AS: could not create the instance "
+        ProxyLog("[dxr-tier-11-proxy-log] top-level AS: could not create the instance "
                  "readback buffer.\n");
         return;
     }
@@ -664,7 +664,7 @@ void Dxr11CommandList::CaptureInstances(
 bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     ID3D12Device5* dev = RealDevice();
     if (!dev || !m_allocator) {
-        ProxyLog("[dxr11-proxy] split: no device or allocator (was Reset called?)\n");
+        ProxyLog("[dxr-tier-11-proxy-log] split: no device or allocator (was Reset called?)\n");
         return false;
     }
 
@@ -679,7 +679,7 @@ bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
-        ProxyLog("[dxr11-proxy] split: could not create the readback buffer\n");
+        ProxyLog("[dxr-tier-11-proxy-log] split: could not create the readback buffer\n");
         return false;
     }
 
@@ -719,7 +719,7 @@ void Dxr11CommandList::FlushQueuedSplit() {
     if (!dev || !m_allocator) return;
 
     if (FAILED(m_real->Close())) {
-        ProxyLog("[dxr11-proxy] split: Close failed on the segment\n");
+        ProxyLog("[dxr-tier-11-proxy-log] split: Close failed on the segment\n");
         return;
     }
 
@@ -733,7 +733,7 @@ void Dxr11CommandList::FlushQueuedSplit() {
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> next;
     if (FAILED(dev->CreateCommandList(0, m_real->GetType(), m_allocator.Get(), nullptr,
                                       IID_PPV_ARGS(&next)))) {
-        ProxyLog("[dxr11-proxy] split: could not open the continuation segment\n");
+        ProxyLog("[dxr-tier-11-proxy-log] split: could not open the continuation segment\n");
         return;
     }
 
@@ -757,7 +757,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
 
     if (!m_fence) {
         if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
-            ProxyLog("[dxr11-proxy] split submit: could not create a fence\n");
+            ProxyLog("[dxr-tier-11-proxy-log] split submit: could not create a fence\n");
             return false;
         }
     }
@@ -791,7 +791,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 pend.readback->Unmap(0, &noWrite);
             }
             if (!desc.Width || !desc.Height || !desc.Depth) {
-                ProxyLog("[dxr11-proxy] split: dimensions read back as %ux%ux%u, "
+                ProxyLog("[dxr-tier-11-proxy-log] split: dimensions read back as %ux%ux%u, "
                          "dispatch skipped\n", desc.Width, desc.Height, desc.Depth);
                 continue;
             }
@@ -806,7 +806,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             if (!slot) {
                 Dxr11DispatchList fresh;
                 if (FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&fresh.alloc)))) {
-                    ProxyLog("[dxr11-proxy] split submit: allocator creation failed\n");
+                    ProxyLog("[dxr-tier-11-proxy-log] split submit: allocator creation failed\n");
                     continue;
                 }
                 m_dispatchPool.push_back(fresh);
@@ -817,7 +817,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             if (FAILED(slot->alloc->Reset()) ||
                 FAILED(dev->CreateCommandList(0, m_real->GetType(), slot->alloc.Get(),
                                               nullptr, IID_PPV_ARGS(&slot->list)))) {
-                ProxyLog("[dxr11-proxy] split submit: dispatch list creation failed\n");
+                ProxyLog("[dxr-tier-11-proxy-log] split submit: dispatch list creation failed\n");
                 continue;
             }
 
@@ -836,7 +836,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
 
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
-                ProxyLog("[dxr11-proxy] split dispatch issued: %ux%ux%u, dimensions "
+                ProxyLog("[dxr-tier-11-proxy-log] split dispatch issued: %ux%ux%u, dimensions "
                          "read back from the GPU\n", desc.Width, desc.Height, desc.Depth);
         }
         // One line per segment, whatever its size, so a test can tell "two
@@ -844,7 +844,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
         // because a real application splits on every frame.
         static LONG segLogs = 0;
         if (InterlockedIncrement(&segLogs) <= 8)
-            ProxyLog("[dxr11-proxy] split: one sync for %zu dispatch%s\n",
+            ProxyLog("[dxr-tier-11-proxy-log] split: one sync for %zu dispatch%s\n",
                      seg.pendings.size(), seg.pendings.size() == 1 ? "" : "es");
     }
 

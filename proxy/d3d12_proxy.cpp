@@ -151,11 +151,11 @@ static bool WrapEnabled() {
     static bool on = [] {
         const cfg::Flag f = cfg::Get("DXR11_NO_WRAP", "nowrap", false);
         if (f.value)
-            ProxyLog("[dxr11-proxy] device wrapping DISABLED (nowrap on, from %s). "
+            ProxyLog("[dxr-tier-11-proxy-log] device wrapping DISABLED (nowrap on, from %s). "
                      "Nothing is translated, including the Tier 1.1 answer.\n",
                      f.source);
         else
-            ProxyLog("[dxr11-proxy] device wrapping enabled\n");
+            ProxyLog("[dxr-tier-11-proxy-log] device wrapping enabled\n");
         return !f.value;
     }();
     return on;
@@ -184,7 +184,7 @@ extern "C" void* Dxr11ResolveThunk(unsigned index) {
     if (!cache[index]) {
         HMODULE h = RealD3D12();
         cache[index] = h ? (void*)GetProcAddress(h, g_thunkNames[index]) : nullptr;
-        ProxyLog("[dxr11-proxy] thunk %s -> %p\n", g_thunkNames[index], cache[index]);
+        ProxyLog("[dxr-tier-11-proxy-log] thunk %s -> %p\n", g_thunkNames[index], cache[index]);
     }
     return cache[index];
 }
@@ -210,13 +210,13 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
     // "could this adapter make this device" and returns S_FALSE without
     // producing an object. Nothing to wrap.
     if (!ppDevice) {
-        ProxyLog("[dxr11-proxy] D3D12CreateDevice fl=0x%x hr=0x%08lx (capability probe)\n",
+        ProxyLog("[dxr-tier-11-proxy-log] D3D12CreateDevice fl=0x%x hr=0x%08lx (capability probe)\n",
                  (unsigned)fl, (unsigned long)hr);
         return hr;
     }
 
     if (FAILED(hr) || !*ppDevice) {
-        ProxyLog("[dxr11-proxy] D3D12CreateDevice fl=0x%x hr=0x%08lx device=null\n",
+        ProxyLog("[dxr-tier-11-proxy-log] D3D12CreateDevice fl=0x%x hr=0x%08lx device=null\n",
                  (unsigned)fl, (unsigned long)hr);
         return hr;
     }
@@ -231,16 +231,16 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
             // handed us for the caller.
             static_cast<IUnknown*>(realDevice)->Release();
             *ppDevice = wrapped;
-            ProxyLog("[dxr11-proxy] D3D12CreateDevice fl=0x%x hr=0x%08lx real=%p wrapped=%p as %s\n",
+            ProxyLog("[dxr-tier-11-proxy-log] D3D12CreateDevice fl=0x%x hr=0x%08lx real=%p wrapped=%p as %s\n",
                      (unsigned)fl, (unsigned long)hr, realDevice, wrapped, ProxyIidName(riid));
             return hr;
         }
-        ProxyLog("[dxr11-proxy] D3D12CreateDevice fl=0x%x hr=0x%08lx real=%p NOT wrapped (0x%08lx)\n",
+        ProxyLog("[dxr-tier-11-proxy-log] D3D12CreateDevice fl=0x%x hr=0x%08lx real=%p NOT wrapped (0x%08lx)\n",
                  (unsigned)fl, (unsigned long)hr, realDevice, (unsigned long)whr);
         return hr;
     }
 
-    ProxyLog("[dxr11-proxy] D3D12CreateDevice fl=0x%x hr=0x%08lx device=%p (wrapping off)\n",
+    ProxyLog("[dxr-tier-11-proxy-log] D3D12CreateDevice fl=0x%x hr=0x%08lx device=%p (wrapping off)\n",
              (unsigned)fl, (unsigned long)hr, realDevice);
     return hr;
 }
@@ -297,7 +297,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
         // loaded here: the host loads lazily, so an application that never
         // uses RayQuery pays nothing for this.
         dxch::SetHostModule(self);
-        ProxyLog("[dxr11-proxy] attached to process, version " DXR11_VERSION "\n");
+        ProxyLog("[dxr-tier-11-proxy-log] attached to process, version " DXR11_VERSION "\n");
     }
     return TRUE;
 }

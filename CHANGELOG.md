@@ -34,7 +34,7 @@ crashes and the cause is only in a log, after the fact.
 Verified both directions in a directory containing nothing but the executable
 and `d3d12.dll`:
 
-    [dxr11-proxy] NOT reporting Tier 1.1: dxcompiler.dll is not next to the
+    [dxr-tier-11-proxy-log] NOT reporting Tier 1.1: dxcompiler.dll is not next to the
     shim ... Tier 1.0 is reported instead, which is honest
 
 then with the two DXC files added, the claim returns. NOT in the automated
@@ -80,7 +80,7 @@ stray `.ini` can never change what the test scripts measure.
 
 ### The log says which DXC produced a shader
 
-    [dxr11-proxy] rewriter using dxcompiler 1.10.2605.37, dxil 1.10.2605.37
+    [dxr-tier-11-proxy-log] rewriter using dxcompiler 1.10.2605.37, dxil 1.10.2605.37
 
 The first question about any signing or validation failure is which compiler
 was involved, and the log could not answer it. Read from the file version

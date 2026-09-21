@@ -63,9 +63,9 @@ that may appear only once.
 The merge drops a repeated singleton when the base already has one, keeping the
 base's, and logs each drop:
 
-    [dxr11-proxy]   merge: dropping duplicate STATE_OBJECT_CONFIG from addition
-    [dxr11-proxy]   merge: dropping duplicate RAYTRACING_SHADER_CONFIG from addition
-    [dxr11-proxy]   merge: dropping duplicate RAYTRACING_PIPELINE_CONFIG from addition
+    [dxr-tier-11-proxy-log]   merge: dropping duplicate STATE_OBJECT_CONFIG from addition
+    [dxr-tier-11-proxy-log]   merge: dropping duplicate RAYTRACING_SHADER_CONFIG from addition
+    [dxr-tier-11-proxy-log]   merge: dropping duplicate RAYTRACING_PIPELINE_CONFIG from addition
 
 Dropped entries leave a placeholder so index arithmetic still works, and an
 association that pointed at a dropped singleton is retargeted at the surviving

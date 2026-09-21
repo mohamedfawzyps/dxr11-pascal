@@ -58,11 +58,11 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandSignature::GetPrivateData(REFGUID, UINT* p
     return DXGI_ERROR_NOT_FOUND;
 }
 HRESULT STDMETHODCALLTYPE Dxr11CommandSignature::SetPrivateData(REFGUID, UINT, const void*) {
-    ProxyLog("[dxr11-proxy] SetPrivateData on a DISPATCH_RAYS signature stand-in is ignored\n");
+    ProxyLog("[dxr-tier-11-proxy-log] SetPrivateData on a DISPATCH_RAYS signature stand-in is ignored\n");
     return E_NOTIMPL;
 }
 HRESULT STDMETHODCALLTYPE Dxr11CommandSignature::SetPrivateDataInterface(REFGUID, const IUnknown*) {
-    ProxyLog("[dxr11-proxy] SetPrivateDataInterface on a DISPATCH_RAYS signature stand-in is ignored\n");
+    ProxyLog("[dxr-tier-11-proxy-log] SetPrivateDataInterface on a DISPATCH_RAYS signature stand-in is ignored\n");
     return E_NOTIMPL;
 }
 HRESULT STDMETHODCALLTYPE Dxr11CommandSignature::SetName(LPCWSTR) { return S_OK; }

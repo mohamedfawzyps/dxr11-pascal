@@ -70,7 +70,7 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         g_summary.maxContribution = t.maxContribution;
 
     if (g_summary.tlasRead <= 4)
-        ProxyLog("[dxr11-proxy] top-level AS at 0x%llX READ: %u instances, max "
+        ProxyLog("[dxr-tier-11-proxy-log] top-level AS at 0x%llX READ: %u instances, max "
                  "InstanceContributionToHitGroupIndex %u, geometry reached: %s%s%s, "
                  "%u instance(s) pointing at an unseen bottom-level structure.\n",
                  static_cast<unsigned long long>(tlas), t.instanceCount,
@@ -85,7 +85,7 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     static bool warnedContribution = false;
     if (t.maxContribution != 0 && !warnedContribution) {
         warnedContribution = true;
-        ProxyLog("[dxr11-proxy] NOTE: this scene uses nonzero hit group "
+        ProxyLog("[dxr-tier-11-proxy-log] NOTE: this scene uses nonzero hit group "
                  "contributions (max %u), so a lowered RayQuery dispatch needs "
                  "%u hit group records rather than one.\n",
                  t.maxContribution, t.maxContribution + 1);
@@ -93,7 +93,7 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     static bool warnedMixed = false;
     if (t.anyTriangles && t.anyProcedural && !warnedMixed) {
         warnedMixed = true;
-        ProxyLog("[dxr11-proxy] NOTE: this scene reaches BOTH triangle and "
+        ProxyLog("[dxr-tier-11-proxy-log] NOTE: this scene reaches BOTH triangle and "
                  "procedural geometry from one top-level structure. A lowered "
                  "RayQuery dispatch builds records of one type only, which is "
                  "safe for a triangle-only shader and not for one that commits "
@@ -127,7 +127,7 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
         if (!g_summary.sawTopLevel) {
             g_summary.sawTopLevel = true;
             if (src.resource) {
-                ProxyLog("[dxr11-proxy] top-level AS build seen, %u instances. "
+                ProxyLog("[dxr-tier-11-proxy-log] top-level AS build seen, %u instances. "
                          "Instance buffer at 0x%llX RESOLVED to resource %p + "
                          "0x%llX, out of %u tracked buffers, so the "
                          "descriptions can be read from it.\n",
@@ -137,7 +137,7 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
                          static_cast<unsigned long long>(src.offset),
                          static_cast<unsigned>(restrack::Count()));
             } else {
-                ProxyLog("[dxr11-proxy] top-level AS build seen, %u instances. "
+                ProxyLog("[dxr-tier-11-proxy-log] top-level AS build seen, %u instances. "
                          "Instance buffer at 0x%llX did NOT resolve to any of %u "
                          "tracked buffers, so the contributions cannot be "
                          "copied; the table assumes zero.\n",
@@ -191,7 +191,7 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
     // One line per distinct structure. An engine builds a great many, so this
     // is capped; the counts in the summary stay accurate regardless.
     if (g_summary.blasCount <= 8)
-        ProxyLog("[dxr11-proxy] bottom-level AS at 0x%llX: %u geometr%s, %s\n",
+        ProxyLog("[dxr-tier-11-proxy-log] bottom-level AS at 0x%llX: %u geometr%s, %s\n",
                  static_cast<unsigned long long>(desc->DestAccelerationStructureData),
                  info.geometryCount, info.geometryCount == 1 ? "y" : "ies",
                  KindName(info.kind));
@@ -260,7 +260,7 @@ void AfterSubmit(ID3D12CommandQueue* queue) {
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
         } else {
-            ProxyLog("[dxr11-proxy] top-level AS at 0x%llX: could not map the "
+            ProxyLog("[dxr-tier-11-proxy-log] top-level AS at 0x%llX: could not map the "
                      "instance readback buffer.\n",
                      static_cast<unsigned long long>(pr.tlas));
         }

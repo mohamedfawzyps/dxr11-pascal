@@ -86,7 +86,7 @@ the shim checks, and says so rather than letting an application discover it at
 the first shader:
 
 ```
-[dxr11-proxy] NOT reporting Tier 1.1: dxcompiler.dll is not next to the shim
+[dxr-tier-11-proxy-log] NOT reporting Tier 1.1: dxcompiler.dll is not next to the shim
 ... Tier 1.0 is reported instead, which is honest, and the application will
 simply not use inline ray tracing.
 ```
@@ -182,11 +182,11 @@ type %TEMP%\dxr11_proxy.log
 A healthy start looks like this:
 
 ```
-[dxr11-proxy] attached to process, version 0.11.0
-[dxr11-proxy] device wrapping enabled
-[dxr11-proxy] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
-[dxr11-proxy] DXR11_TIER11=1: reporting Tier 1.1 to the application.
-[dxr11-proxy] queue hook installed: vtable ... slot 10, self-test passed
+[dxr-tier-11-proxy-log] attached to process, version 0.11.0
+[dxr-tier-11-proxy-log] device wrapping enabled
+[dxr-tier-11-proxy-log] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
+[dxr-tier-11-proxy-log] DXR11_TIER11=1: reporting Tier 1.1 to the application.
+[dxr-tier-11-proxy-log] queue hook installed: vtable ... slot 10, self-test passed
 ```
 
 The first line proves the shim loaded at all, and says which build. If the
@@ -196,14 +196,14 @@ this guide matters.
 Then, when a RayQuery shader arrives:
 
 ```
-[dxr11-proxy] CreateComputePipelineState: shader USES RAYQUERY (SFI0 bit 20), 4812 bytes.
-[dxr11-proxy] RayQuery compute shader lowered and ready: 4812 -> 8948 bytes, numthreads(8,8,1)
+[dxr-tier-11-proxy-log] CreateComputePipelineState: shader USES RAYQUERY (SFI0 bit 20), 4812 bytes.
+[dxr-tier-11-proxy-log] RayQuery compute shader lowered and ready: 4812 -> 8948 bytes, numthreads(8,8,1)
 ```
 
 or, when it cannot be lowered:
 
 ```
-[dxr11-proxy] RayQuery compute shader NOT lowered: <the reason>
+[dxr-tier-11-proxy-log] RayQuery compute shader NOT lowered: <the reason>
 ```
 
 A refused shader is forwarded unchanged, so the driver reports its own error

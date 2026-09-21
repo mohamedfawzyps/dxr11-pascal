@@ -147,7 +147,7 @@ what it took to notice.
 The version is compiled into the DLL and logged on attach, so a log file
 identifies its own build:
 
-    [dxr11-proxy] attached to process, version 0.11.0
+    [dxr-tier-11-proxy-log] attached to process, version 0.11.0
 
 ## Documentation
 

@@ -81,6 +81,15 @@ $btnRemove.Location = New-Object Drawing.Point(145, 174)
 $btnRemove.Size = New-Object Drawing.Size(120, 30)
 $form.Controls.Add($btnRemove)
 
+# Only appears when DXC is missing, because that is the only time it means
+# anything. A button that is always there is a button nobody reads.
+$btnGetDxc = New-Object Windows.Forms.Button
+$btnGetDxc.Text = 'Get DXC...'
+$btnGetDxc.Location = New-Object Drawing.Point(285, 174)
+$btnGetDxc.Size = New-Object Drawing.Size(120, 30)
+$btnGetDxc.Visible = $false
+$form.Controls.Add($btnGetDxc)
+
 Add-Label '3. Settings' 15 220 300 $true | Out-Null
 
 $chkTier = New-Object Windows.Forms.CheckBox
@@ -152,13 +161,18 @@ function Update-Status {
                    (Test-Path (Join-Path $script:targetDir 'dxil.dll'))
         if ($haveDxc) {
             $lblDeps.Text = 'dxcompiler.dll and dxil.dll are present, so RayQuery shaders can be rewritten.'
+            $lblDeps.ForeColor = [Drawing.Color]::Gray
+            $btnGetDxc.Visible = $false
         } else {
-            $lblDeps.Text = 'dxcompiler.dll and dxil.dll are MISSING. Ray tracing shaders cannot be rewritten without them. Get them from the DXC releases page and copy them here.'
+            $lblDeps.Text = 'dxcompiler.dll and dxil.dll are MISSING, so ray tracing will NOT switch on. The game still runs normally without them.'
+            $lblDeps.ForeColor = [Drawing.Color]::FromArgb(163, 45, 45)
+            $btnGetDxc.Visible = $true
         }
     } else {
         $lblStatus.Text = 'Not installed.'
         $lblStatus.ForeColor = [Drawing.Color]::FromArgb(163, 45, 45)
         $lblDeps.Text = ''
+        $btnGetDxc.Visible = $false
     }
     Read-Ini
 }
@@ -196,6 +210,19 @@ function Write-Ini {
     $lblLogHint.Text = "Saved to $ini"
 }
 
+function Open-DxcPage {
+    Start-Process 'https://github.com/microsoft/DirectXShaderCompiler/releases'
+    [Windows.Forms.MessageBox]::Show(
+        "On that page, open the newest release and download the .zip.`n`n" +
+        "Inside it, go to bin\x64\ and copy these two files:`n" +
+        "    dxcompiler.dll`n" +
+        "    dxil.dll`n`n" +
+        "Put them in:`n$script:targetDir`n`n" +
+        "Take both from the SAME release. A mismatched pair fails to sign.`n`n" +
+        "Then come back here and the status will turn green.",
+        'What to download', 'OK', 'Information') | Out-Null
+}
+
 $btnBrowse.Add_Click({
     $d = New-Object Windows.Forms.OpenFileDialog
     $d.Filter = 'Programs (*.exe)|*.exe'
@@ -223,7 +250,29 @@ $btnInstall.Add_Click({
     }
     $lblLogHint.Text = "Copied $copied"
     Update-Status
+
+    $haveDxc = (Test-Path (Join-Path $script:targetDir 'dxcompiler.dll')) -and
+               (Test-Path (Join-Path $script:targetDir 'dxil.dll'))
+    if (-not $haveDxc) {
+        # Said here rather than from inside the game. A dialog raised by a
+        # proxy DLL during device creation blocks the application's startup
+        # thread, and lands behind an exclusive fullscreen window where nobody
+        # can see it. This is the moment BEFORE the mistake, in a program the
+        # user opened on purpose.
+        $answer = [Windows.Forms.MessageBox]::Show(
+            "Installed, but ray tracing will not switch on yet.`n`n" +
+            "The shim needs dxcompiler.dll and dxil.dll to rewrite ray tracing " +
+            "shaders. They are not in the game folder, and they are not shipped " +
+            "here because they belong to Microsoft.`n`n" +
+            "Without them the game runs exactly as it did before, just without " +
+            "ray tracing. Nothing will break.`n`n" +
+            "Open the download page now?",
+            'Two more files needed', 'YesNo', 'Warning')
+        if ($answer -eq 'Yes') { Open-DxcPage }
+    }
 })
+
+$btnGetDxc.Add_Click({ Open-DxcPage })
 
 $btnRemove.Add_Click({
     $answer = [Windows.Forms.MessageBox]::Show(

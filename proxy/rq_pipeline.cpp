@@ -232,9 +232,9 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
 
     static LONG onceVer = 0;
     if (InterlockedCompareExchange(&onceVer, 1, 0) == 0)
-        ProxyLog("[dxr11-proxy] rewriter using %s\n", dxch::Versions());
+        ProxyLog("[dxr-tier-11-proxy-log] rewriter using %s\n", dxch::Versions());
 
-    ProxyLog("[dxr11-proxy] RayQuery compute shader lowered and ready: "
+    ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader lowered and ready: "
              "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
              static_cast<size_t>(desc->CS.BytecodeLength), lib.size(),
              self->m_threads[0], self->m_threads[1], self->m_threads[2],
@@ -339,7 +339,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
         const size_t had = m_kinds.size();
         std::string why;
         if (!BuildTable(recordKinds, &why)) {
-            ProxyLog("[dxr11-proxy] lowered RayQuery dispatch SKIPPED: the scene "
+            ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch SKIPPED: the scene "
                      "needs %u hit group records and the table could not be "
                      "rebuilt (%s).\n",
                      static_cast<unsigned>(recordKinds.size()), why.c_str());
@@ -352,7 +352,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
             if (proc && !tri && !m_servesProc) ++rejecting;
             else if (tri && !proc && !m_servesTri) ++rejecting;
         }
-        ProxyLog("[dxr11-proxy] shader table rebuilt for the scene: %u -> %u hit "
+        ProxyLog("[dxr-tier-11-proxy-log] shader table rebuilt for the scene: %u -> %u hit "
                  "group records, %u of them rejecting geometry this shader does "
                  "not serve (it commits %s).\n",
                  static_cast<unsigned>(had),

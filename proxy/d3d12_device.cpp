@@ -45,9 +45,9 @@ static void NoteRayQuery(bool tier11, const char* where, const void* code, SIZE_
     if (!code || !size || !Dxr11ContainerUsesRayQuery(code, size)) return;
     static LONG once = 0;
     if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
-    ProxyLog("[dxr11-proxy] %s: shader USES RAYQUERY (SFI0 bit 20), %zu bytes.\n",
+    ProxyLog("[dxr-tier-11-proxy-log] %s: shader USES RAYQUERY (SFI0 bit 20), %zu bytes.\n",
              where, (size_t)size);
-    ProxyLog("[dxr11-proxy]   tier reported to the app is %s. On Tier 1.0 with "
+    ProxyLog("[dxr-tier-11-proxy-log]   tier reported to the app is %s. On Tier 1.0 with "
              "DXR11_TIER11=1 this is lowered and run; otherwise it is "
              "forwarded unchanged and the driver decides.\n",
              tier11 ? "1.1" : "1.0");
@@ -106,7 +106,7 @@ Dxr11Device::Dxr11Device(ID3D12Device5* real)
         m_real->QueryInterface(__uuidof(ID3D12Device6), (void**)&m_real6);
         m_real->QueryInterface(__uuidof(ID3D12Device7), (void**)&m_real7);
     }
-    ProxyLog("[dxr11-proxy] device wrapper created (real=%p, Device6=%s, Device7=%s, tier=%s)\n",
+    ProxyLog("[dxr-tier-11-proxy-log] device wrapper created (real=%p, Device6=%s, Device7=%s, tier=%s)\n",
              (void*)m_real, m_real6 ? "yes" : "no", m_real7 ? "yes" : "no",
              m_tier11 ? "1.1" : "1.0");
 }
@@ -149,7 +149,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::QueryInterface(REFIID riid, void** ppvObj
 
     HRESULT hr = m_real->QueryInterface(riid, ppvObject);
     if (SUCCEEDED(hr)) {
-        ProxyLog("[dxr11-proxy] device QI PASSED THROUGH UNWRAPPED: %s\n",
+        ProxyLog("[dxr-tier-11-proxy-log] device QI PASSED THROUGH UNWRAPPED: %s\n",
                  ProxyIidName(riid));
     }
     return hr;
@@ -162,7 +162,7 @@ ULONG STDMETHODCALLTYPE Dxr11Device::AddRef() {
 ULONG STDMETHODCALLTYPE Dxr11Device::Release() {
     LONG n = InterlockedDecrement(&m_refs);
     if (n == 0) {
-        ProxyLog("[dxr11-proxy] device wrapper destroyed (real=%p)\n", (void*)m_real);
+        ProxyLog("[dxr-tier-11-proxy-log] device wrapper destroyed (real=%p)\n", (void*)m_real);
         delete this;
     }
     return (ULONG)n;
@@ -243,8 +243,8 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
         }
         // Refusing is not failing. Forward the original and let the driver
         // give the application its own error, with our reason in the log.
-        ProxyLog("[dxr11-proxy] RayQuery compute shader NOT lowered: %s\n"
-                 "[dxr11-proxy]   forwarding unchanged; the driver will reject it\n",
+        ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader NOT lowered: %s\n"
+                 "[dxr-tier-11-proxy-log]   forwarding unchanged; the driver will reject it\n",
                  why.c_str());
     }
     FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState));
@@ -295,7 +295,7 @@ static bool CanHonourTier11() {
     static const bool ok = [] {
         std::string why;
         if (dxch::Available(&why)) return true;
-        ProxyLog("[dxr11-proxy] NOT reporting Tier 1.1: %s. Tier 1.0 is reported "
+        ProxyLog("[dxr-tier-11-proxy-log] NOT reporting Tier 1.1: %s. Tier 1.0 is reported "
                  "instead, which is honest, and the application will simply not "
                  "use inline ray tracing. Put dxcompiler.dll and dxil.dll next to "
                  "d3d12.dll to enable it.\n", why.c_str());
@@ -314,7 +314,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature
             o5->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
-                ProxyLog("[dxr11-proxy] reporting Tier 1.1 to the application "
+                ProxyLog("[dxr-tier-11-proxy-log] reporting Tier 1.1 to the application "
                          "(tier11 on, from %s). RayQuery shaders will be "
                          "rewritten; anything the rewriter refuses is logged and "
                          "forwarded, and the driver then rejects it.\n",
@@ -396,7 +396,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandSignature(const D3D12_COMMAN
     // Anything else is a shape we have not seen and cannot emulate, so refuse
     // rather than guess.
     if (pDesc->NumArgumentDescs != 1) {
-        ProxyLog("[dxr11-proxy] CreateCommandSignature: DISPATCH_RAYS alongside %u other "
+        ProxyLog("[dxr-tier-11-proxy-log] CreateCommandSignature: DISPATCH_RAYS alongside %u other "
                  "arguments is not supported\n", pDesc->NumArgumentDescs - 1);
         return E_INVALIDARG;
     }
@@ -406,7 +406,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandSignature(const D3D12_COMMAN
     if (!sig) return E_OUTOFMEMORY;
     HRESULT hr = sig->QueryInterface(riid, ppvCommandSignature);
     sig->Release();
-    ProxyLog("[dxr11-proxy] CreateCommandSignature: DISPATCH_RAYS stand-in created "
+    ProxyLog("[dxr-tier-11-proxy-log] CreateCommandSignature: DISPATCH_RAYS stand-in created "
              "(ByteStride=%u) hr=0x%08lx\n", pDesc->ByteStride, (unsigned long)hr);
     return hr;
 }
@@ -510,7 +510,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
     std::string why;
     if (!store->Append(*pDesc, false, why)) {
         // Refuse rather than build something subtly different from the request.
-        ProxyLog("[dxr11-proxy] CreateStateObject: cannot cache subobjects (%s); "
+        ProxyLog("[dxr-tier-11-proxy-log] CreateStateObject: cannot cache subobjects (%s); "
                  "additions will not work for this object\n", why.c_str());
         delete store;
         FWD(CreateStateObject(pDesc, riid, ppStateObject));
@@ -519,7 +519,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
 
     D3D12_STATE_OBJECT_DESC stripped = store->Desc(pDesc->Type);
     HRESULT hr = m_real->CreateStateObject(&stripped, riid, ppStateObject);
-    ProxyLog("[dxr11-proxy] CreateStateObject: stripped ALLOW_STATE_OBJECT_ADDITIONS, "
+    ProxyLog("[dxr-tier-11-proxy-log] CreateStateObject: stripped ALLOW_STATE_OBJECT_ADDITIONS, "
              "%u subobjects cached, hr=0x%08lx\n",
              (unsigned)store->Count(), (unsigned long)hr);
     if (FAILED(hr) || !ppStateObject || !*ppStateObject) { delete store; return hr; }
@@ -560,7 +560,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::SetBackgroundProcessingMode(D3D12_BACKGRO
 HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT_DESC* pAddition, ID3D12StateObject* pStateObjectToGrowFrom, REFIID riid, void** ppNewStateObject) {
     if (m_tier11 && m_real7) {
         HRESULT hr = m_real7->AddToStateObject(pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
-        ProxyLog("[dxr11-proxy] AddToStateObject forwarded (tier 1.1) hr=0x%08lx\n",
+        ProxyLog("[dxr-tier-11-proxy-log] AddToStateObject forwarded (tier 1.1) hr=0x%08lx\n",
                  (unsigned long)hr);
         return hr;
     }
@@ -568,7 +568,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT
 
     StateObjectStore* base = StateObjectCacheGet(pStateObjectToGrowFrom);
     if (!base) {
-        ProxyLog("[dxr11-proxy] AddToStateObject: no cached subobjects for %p. The "
+        ProxyLog("[dxr-tier-11-proxy-log] AddToStateObject: no cached subobjects for %p. The "
                  "object was not created through this shim, or its creation did "
                  "not request ALLOW_STATE_OBJECT_ADDITIONS.\n",
                  (void*)pStateObjectToGrowFrom);
@@ -583,7 +583,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT
     D3D12_STATE_OBJECT_DESC baseDesc = base->Desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
     if (!merged->Append(baseDesc, false, why) ||
         !merged->Append(*pAddition, /*dropDuplicateSingletons=*/true, why)) {
-        ProxyLog("[dxr11-proxy] AddToStateObject: merge failed (%s)\n", why.c_str());
+        ProxyLog("[dxr-tier-11-proxy-log] AddToStateObject: merge failed (%s)\n", why.c_str());
         delete merged;
         return E_INVALIDARG;
     }
@@ -591,7 +591,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT
 
     D3D12_STATE_OBJECT_DESC full = merged->Desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
     HRESULT hr = m_real->CreateStateObject(&full, riid, ppNewStateObject);
-    ProxyLog("[dxr11-proxy] AddToStateObject EMULATED: base %u + addition %u -> "
+    ProxyLog("[dxr-tier-11-proxy-log] AddToStateObject EMULATED: base %u + addition %u -> "
              "%u subobjects, rebuilt hr=0x%08lx\n",
              (unsigned)baseDesc.NumSubobjects, (unsigned)pAddition->NumSubobjects,
              (unsigned)full.NumSubobjects, (unsigned long)hr);
@@ -622,7 +622,7 @@ HRESULT Dxr11WrapDevice(IUnknown* realDevice, REFIID riid, void** ppDevice) {
     if (FAILED(hr) || !dev5) {
         // Pre-DXR runtime, or a device that does not reach Device5. Nothing to
         // wrap; the caller keeps the real device.
-        ProxyLog("[dxr11-proxy] no ID3D12Device5 on this device (hr=0x%08lx), not wrapping\n",
+        ProxyLog("[dxr-tier-11-proxy-log] no ID3D12Device5 on this device (hr=0x%08lx), not wrapping\n",
                  (unsigned long)hr);
         return E_NOINTERFACE;
     }
