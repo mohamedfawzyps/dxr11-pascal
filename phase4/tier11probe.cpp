@@ -36,10 +36,12 @@
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <stdexcept>
+#include <functional>
 
 using Microsoft::WRL::ComPtr;
 
@@ -76,6 +78,12 @@ enum class Adapter { Warp, Hardware };
 // probe. An E_INVALIDARG from a state object call is almost never diagnosable
 // without it: the layer names the actual rule that was broken.
 static bool g_debug = false;
+static bool g_timing = false;
+static bool g_pipeline = false;
+static int g_filler = 4;
+static int g_frames = 60;
+static uint32_t g_rayCount = 1u << 20;   // 1M rays, enough that Pascal does real work
+static int g_iters = 20;
 
 static void Throw(const char* what, HRESULT hr) {
     char buf[256];
@@ -159,6 +167,80 @@ void Isect() {
     // needed. Testing XY containment and solving for the front face in z keeps
     // the result independent of how conservatively a given implementation calls
     // the intersection shader, which matters when comparing WARP to hardware.
+    float3 o = ObjectRayOrigin();
+    float3 d = ObjectRayDirection();
+    if (o.x < kBoxMin.x || o.x > kBoxMax.x) return;
+    if (o.y < kBoxMin.y || o.y > kBoxMax.y) return;
+    float t = (kBoxMax.z - o.z) / d.z;
+    if (t < RayTMin() || t > RayTCurrent()) return;
+    ProcAttr a; a.unused = 0;
+    ReportHit(t, 0, a);
+}
+[shader("closesthit")]
+void ClosestHitProc(inout Payload p, ProcAttr a) {
+    p.t = RayTCurrent(); p.bary = float2(0, 0); p.hit = 2;
+}
+)HLSL";
+
+// --- timing library --------------------------------------------------------
+//
+// Used only by the -time mode, to price the two candidate strategies for
+// indirect DispatchRays. See docs/phase4-indirect-design.md.
+//
+// Rays are indexed linearly rather than as a 2D grid, which matches how Unreal
+// actually dispatches: a compaction pass produces a 1D list of surviving rays
+// and the dispatch covers that count.
+//
+// BOUNDED=1 adds exactly the work strategy S2 costs every thread: one buffer
+// load, one compare, and an early return for threads past the real ray count.
+static const char* kTimingHLSL = R"HLSL(
+#ifndef BOUNDED
+#define BOUNDED 0
+#endif
+cbuffer CB : register(b0) {
+    uint width; uint height; float halfExtent; float camZ;
+    float tMin; float tMax; float2 _pad;
+};
+RaytracingAccelerationStructure scene : register(t0);
+ByteAddressBuffer dimsBuf : register(t1);
+struct Result { float t; float bx; float by; uint hit; };
+RWStructuredBuffer<Result> outBuf : register(u0);
+struct Payload { float t; float2 bary; uint hit; };
+
+[shader("raygeneration")]
+void RayGen() {
+    uint idx = DispatchRaysIndex().x;
+#if BOUNDED
+    uint realCount = dimsBuf.Load(0);
+    if (idx >= realCount) return;
+#endif
+    uint px = idx % width;
+    uint py = idx / width;
+    float u = ((px + 0.5) / width)  * 2.0 - 1.0;
+    float v = ((py + 0.5) / height) * 2.0 - 1.0;
+    RayDesc ray;
+    ray.Origin    = float3(u * halfExtent, v * halfExtent, camZ);
+    ray.Direction = float3(0, 0, -1);
+    ray.TMin = tMin; ray.TMax = tMax;
+
+    Payload p; p.t = 0; p.bary = float2(0, 0); p.hit = 0;
+    TraceRay(scene, RAY_FLAG_FORCE_OPAQUE, 0xFF, 0, 0, 0, ray, p);
+
+    Result r; r.t = p.t; r.bx = p.bary.x; r.by = p.bary.y; r.hit = p.hit;
+    outBuf[idx] = r;
+}
+[shader("closesthit")]
+void ClosestHit(inout Payload p, BuiltInTriangleIntersectionAttributes attr) {
+    p.t = RayTCurrent(); p.bary = attr.barycentrics; p.hit = 1;
+}
+[shader("miss")]
+void Miss(inout Payload p) { p.hit = 0; }
+
+struct ProcAttr { float unused; };
+static const float3 kBoxMin = float3(-1.45, -0.40, -1.10);
+static const float3 kBoxMax = float3(-1.05,  0.40, -0.90);
+[shader("intersection")]
+void Isect() {
     float3 o = ObjectRayOrigin();
     float3 d = ObjectRayDirection();
     if (o.x < kBoxMin.x || o.x > kBoxMax.x) return;
@@ -423,6 +505,38 @@ static void BindRoots(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs,
     cl->SetComputeRootUnorderedAccessView(2, out);
 }
 
+// Timing mode adds t1, the buffer holding the real ray count that a bounded
+// raygen reads. Kept separate so the feature probes above stay untouched.
+static ComPtr<ID3D12RootSignature> MakeRootSigTiming(ID3D12Device* dev) {
+    D3D12_ROOT_PARAMETER params[4]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].Descriptor.ShaderRegister = 0;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 4; rd.pParameters = params;
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    if (FAILED(hr)) Throw("D3D12SerializeRootSignature(timing)", hr);
+    ComPtr<ID3D12RootSignature> rs;
+    HR(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+        IID_PPV_ARGS(&rs)), "CreateRootSignature(timing)");
+    return rs;
+}
+
+static void BindRootsTiming(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs,
+        D3D12_GPU_VIRTUAL_ADDRESS cb, D3D12_GPU_VIRTUAL_ADDRESS tlas,
+        D3D12_GPU_VIRTUAL_ADDRESS out, D3D12_GPU_VIRTUAL_ADDRESS dims) {
+    cl->SetComputeRootSignature(rs);
+    cl->SetComputeRootConstantBufferView(0, cb);
+    cl->SetComputeRootShaderResourceView(1, tlas);
+    cl->SetComputeRootUnorderedAccessView(2, out);
+    cl->SetComputeRootShaderResourceView(3, dims);
+}
+
 // One shader table holding `n` records, each a bare shader identifier padded to
 // the record alignment. Record stride is therefore kRecStride, not idSize.
 static const UINT kIdSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;          // 32
@@ -526,7 +640,8 @@ struct Ctx {
 // Build a raytracing state object from one or two libraries.
 // `allowAdditions` sets the config flag AddToStateObject requires.
 static HRESULT MakeStateObject(Ctx& c, IDxcBlob* lib, bool allowAdditions,
-                               ComPtr<ID3D12StateObject>& so) {
+                               ComPtr<ID3D12StateObject>& so,
+                               ID3D12RootSignature* rootSig = nullptr) {
     std::vector<D3D12_STATE_SUBOBJECT> subs;
 
     D3D12_STATE_OBJECT_CONFIG cfg{};
@@ -557,7 +672,7 @@ static HRESULT MakeStateObject(Ctx& c, IDxcBlob* lib, bool allowAdditions,
     sc.MaxAttributeSizeInBytes = 8;
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
 
-    ID3D12RootSignature* rsPtr = c.rs.Get();
+    ID3D12RootSignature* rsPtr = rootSig ? rootSig : c.rs.Get();
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &rsPtr });
 
     D3D12_RAYTRACING_PIPELINE_CONFIG pc{}; pc.MaxTraceRecursionDepth = 1;
@@ -842,6 +957,416 @@ static void ProbeRayFlags(Ctx& c) {
 }
 
 // ---------------------------------------------------------------------------
+// Timing mode: price the two candidate strategies for indirect DispatchRays.
+//
+// The dimensions of an indirect ray dispatch do not exist until the GPU has run,
+// so with identical results required there are only two options:
+//
+//   S1  split the command list, submit, wait on the CPU, read the dimensions
+//       back, then dispatch directly. Always correct, costs a pipeline bubble.
+//   S2  over-dispatch a bound G and have the raygen early-out past the real
+//       count. No sync at all, costs the wasted thread launches.
+//
+// Neither cost is knowable by argument, so measure both. Everything here runs
+// the same ray workload; only the dispatch strategy changes.
+// ---------------------------------------------------------------------------
+static double NowMs() {
+    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+static void ProbeTiming(Ctx& c, uint32_t rayCount, int iters) {
+    // The ray grid has to match the ray count, or most rays land outside the
+    // scene, miss instantly, and the "baseline" measures nothing. Square it up
+    // so the hit fraction matches the feature probes (~22%).
+    uint32_t side = 1;
+    while ((uint64_t)(side + 1) * (side + 1) <= rayCount) ++side;
+    rayCount = side * side;
+
+    std::printf("\n-- timing: indirect DispatchRays strategies --\n");
+    std::printf("   %u rays over a %ux%u grid, %d timed iterations each\n",
+                rayCount, side, side, iters);
+
+    auto rs = MakeRootSigTiming(c.g.device.Get());
+
+    // Own constant buffer, so width/height describe the timing grid rather than
+    // the 256x256 one the feature probes use.
+    SceneCB cbData{ side, side, kHalfExtent, kCamZ, kTMin, kTMax, 0, 0 };
+    UINT64 cbSize = (sizeof(SceneCB) + 255) & ~255ull;
+    auto cb = CreateBuffer(c.g.device.Get(), cbSize, D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    {
+        void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+        HR(cb->Map(0, &none, &p), "map timing cb");
+        std::memcpy(p, &cbData, sizeof(cbData));
+        cb->Unmap(0, nullptr);
+    }
+
+    std::string err;
+    auto libPlain = c.dxc.tryCompile(kTimingHLSL, L"lib_6_3", { L"BOUNDED=0" }, err);
+    if (!libPlain) { std::printf("   [!] plain timing shader failed: %s\n", err.c_str()); return; }
+    auto libBound = c.dxc.tryCompile(kTimingHLSL, L"lib_6_3", { L"BOUNDED=1" }, err);
+    if (!libBound) { std::printf("   [!] bounded timing shader failed: %s\n", err.c_str()); return; }
+
+    ComPtr<ID3D12StateObject> soPlain, soBound;
+    HRESULT hr = MakeStateObject(c, libPlain.Get(), false, soPlain, rs.Get());
+    if (FAILED(hr)) { std::printf("   [!] plain state object: %s\n", HrStr(hr).c_str()); return; }
+    hr = MakeStateObject(c, libBound.Get(), false, soBound, rs.Get());
+    if (FAILED(hr)) { std::printf("   [!] bounded state object: %s\n", HrStr(hr).c_str()); return; }
+
+    auto sbtFor = [&](ID3D12StateObject* so, ComPtr<ID3D12Resource>& ray,
+                      ComPtr<ID3D12Resource>& miss, ComPtr<ID3D12Resource>& hit) {
+        ComPtr<ID3D12StateObjectProperties> props;
+        HR(so->QueryInterface(IID_PPV_ARGS(&props)), "props");
+        ray  = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"RayGen"));
+        miss = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"Miss"));
+        const void* ids[2] = { props->GetShaderIdentifier(L"HitGroup"),
+                               props->GetShaderIdentifier(L"HitGroupProc") };
+        hit = MakeSBT(c.g.device.Get(), ids, 2);
+    };
+    ComPtr<ID3D12Resource> rayP, missP, hitP, rayB, missB, hitB;
+    sbtFor(soPlain.Get(), rayP, missP, hitP);
+    sbtFor(soBound.Get(), rayB, missB, hitB);
+    auto drPlain = MakeDispatchDesc(rayP.Get(), missP.Get(), hitP.Get(), 2);
+    auto drBound = MakeDispatchDesc(rayB.Get(), missB.Get(), hitB.Get(), 2);
+
+    // Output sized for the real ray count. The bounded shader never writes past
+    // it, which is the whole point of the early-out.
+    const UINT64 outSize = (UINT64)rayCount * sizeof(Result);
+    auto out = CreateBuffer(c.g.device.Get(), outSize, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    // dims lives in a DEFAULT heap and is filled by a GPU copy, exactly like
+    // Unreal's DispatchRaysDescBuffer. Buffers promote out of COMMON on their
+    // own, so no barriers are needed around it.
+    auto dims = CreateBuffer(c.g.device.Get(), 16, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_COMMON);
+    auto dimsUpload = CreateBuffer(c.g.device.Get(), 16, D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto dimsReadback = CreateBuffer(c.g.device.Get(), 16, D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    {
+        void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+        HR(dimsUpload->Map(0, &none, &p), "map dims upload");
+        uint32_t v[4] = { rayCount, 1, 1, 0 };
+        std::memcpy(p, v, sizeof(v));
+        dimsUpload->Unmap(0, nullptr);
+    }
+
+    auto bind = [&](ID3D12StateObject* so) {
+        c.g.list->SetPipelineState1(so);
+        BindRootsTiming(c.g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
+                        c.scene.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
+                        dims->GetGPUVirtualAddress());
+    };
+
+    // --- baseline: one submit, no split ------------------------------------
+    auto runDirect = [&](ID3D12StateObject* so, D3D12_DISPATCH_RAYS_DESC dr, UINT width) {
+        c.g.list->CopyBufferRegion(dims.Get(), 0, dimsUpload.Get(), 0, 16);
+        bind(so);
+        dr.Width = width; dr.Height = 1; dr.Depth = 1;
+        c.g.list->DispatchRays(&dr);
+        UavBarrier(c.g.list.Get(), out.Get());
+        c.g.flush();
+    };
+
+    // --- S1: split the list, sync, read back, then dispatch ----------------
+    auto runSplit = [&]() {
+        // Segment A: the app's work that produces the dimensions, then our
+        // readback copy. Closing here is the split.
+        c.g.list->CopyBufferRegion(dims.Get(), 0, dimsUpload.Get(), 0, 16);
+        c.g.list->CopyBufferRegion(dimsReadback.Get(), 0, dims.Get(), 0, 16);
+        c.g.flush();                       // submit + CPU wait: the bubble
+
+        uint32_t got = 0;
+        void* rp = nullptr; D3D12_RANGE full{ 0, 16 };
+        HR(dimsReadback->Map(0, &full, &rp), "map dims readback");
+        std::memcpy(&got, rp, sizeof(got));
+        D3D12_RANGE nowrite{ 0, 0 }; dimsReadback->Unmap(0, &nowrite);
+
+        // Segment B: the dispatch we could only now build.
+        bind(soPlain.Get());
+        auto dr = drPlain; dr.Width = got; dr.Height = 1; dr.Depth = 1;
+        c.g.list->DispatchRays(&dr);
+        UavBarrier(c.g.list.Get(), out.Get());
+        c.g.flush();
+    };
+
+    auto timeIt = [&](const char* label, const std::function<void()>& body, double baseline) {
+        for (int i = 0; i < 2; ++i) body();          // warm up
+        double t0 = NowMs();
+        for (int i = 0; i < iters; ++i) body();
+        double ms = (NowMs() - t0) / iters;
+        if (baseline > 0.0)
+            std::printf("   %-34s %8.3f ms   %+6.1f%%\n", label, ms,
+                        (ms / baseline - 1.0) * 100.0);
+        else
+            std::printf("   %-34s %8.3f ms\n", label, ms);
+        return ms;
+    };
+
+    double base = timeIt("direct DispatchRays (baseline)",
+                         [&] { runDirect(soPlain.Get(), drPlain, rayCount); }, 0.0);
+    double splitMs = timeIt("S1  split + CPU sync + dispatch",
+                            [&] { runSplit(); }, base);
+    timeIt("S2  bounded shader, G = 1x",
+           [&] { runDirect(soBound.Get(), drBound, rayCount); }, base);
+    timeIt("S2  bounded shader, G = 2x",
+           [&] { runDirect(soBound.Get(), drBound, rayCount * 2); }, base);
+    timeIt("S2  bounded shader, G = 4x",
+           [&] { runDirect(soBound.Get(), drBound, rayCount * 4); }, base);
+    double over10 = timeIt("S2  bounded shader, G = 10x",
+                           [&] { runDirect(soBound.Get(), drBound, rayCount * 10); }, base);
+
+    std::printf("   note: S2 rows do the SAME real ray work as the baseline;\n");
+    std::printf("         the extra threads read one uint and return.\n");
+
+    // The absolute numbers belong to this toy scene. These two coefficients do
+    // not: one is a property of submit-and-wait, the other of a thread that
+    // early-outs. Both carry over to a real frame where the ray work is far
+    // heavier, which is the case that actually decides the strategy.
+    const double perSplitMs = splitMs - base;
+    const double wastedThreads = (double)rayCount * 9.0;   // the 10x row adds 9N
+    const double perThreadNs = (over10 - base) * 1e6 / wastedThreads;
+
+    std::printf("\n   derived, and these are the numbers that transfer:\n");
+    std::printf("     S1 fixed cost per split        %8.3f ms\n", perSplitMs);
+    std::printf("     S2 cost per early-out thread   %8.4f ns\n", perThreadNs);
+    std::printf("\n   for a frame with D indirect ray dispatches of A rays each,\n");
+    std::printf("   over-dispatched to G*A:\n");
+    std::printf("     S1 overhead = D * %.3f ms            (independent of scene cost)\n", perSplitMs);
+    std::printf("     S2 overhead = D * (G-1) * A * %.4f ns\n", perThreadNs);
+    std::printf("   break-even at G-1 = %.1f  for A = 1M rays per dispatch\n",
+                perSplitMs * 1e6 / (perThreadNs * 1048576.0));
+}
+
+// ---------------------------------------------------------------------------
+// Pipelined timing: what a mid-frame CPU sync actually costs in a renderer that
+// keeps the CPU ahead of the GPU.
+//
+// The -time mode measures the sync round trip on an idle GPU, which is a floor.
+// The real damage is different: a renderer overlaps CPU recording of frame N+1
+// with GPU execution of frame N, and a mid-frame wait collapses that overlap.
+// Throughput then goes from roughly max(CPU, GPU) to roughly CPU + GPU.
+//
+// So this harness needs both halves to be non-trivial, or there is nothing to
+// lose and the sync looks free. GPU work is scaled with filler dispatch passes;
+// CPU work is a synthetic busy-wait standing in for recording cost, swept so the
+// shape of the curve is visible rather than a single number.
+// ---------------------------------------------------------------------------
+namespace {
+struct Pipe {
+    static const int kInFlight = 3;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> alloc[kInFlight];
+    ComPtr<ID3D12GraphicsCommandList4> list;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 next = 1;
+    UINT64 slotVal[kInFlight] = { 0, 0, 0 };
+    HANDLE evt = nullptr;
+    int slot = 0;
+
+    void init(ID3D12Device5* dev) {
+        D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        HR(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)), "pipe queue");
+        for (int i = 0; i < kInFlight; ++i)
+            HR(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&alloc[i])), "pipe allocator");
+        HR(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0].Get(),
+            nullptr, IID_PPV_ARGS(&list)), "pipe list");
+        HR(list->Close(), "pipe list close");
+        HR(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "pipe fence");
+        evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    void waitFor(UINT64 v) {
+        if (fence->GetCompletedValue() >= v) return;
+        HR(fence->SetEventOnCompletion(v, evt), "pipe wait");
+        WaitForSingleObject(evt, INFINITE);
+    }
+    // Block only until this slot's previous frame is done, which is what keeps
+    // the CPU at most kInFlight frames ahead rather than fully serialized.
+    void beginFrame(int frameIndex) {
+        slot = frameIndex % kInFlight;
+        waitFor(slotVal[slot]);
+        HR(alloc[slot]->Reset(), "pipe alloc reset");
+        HR(list->Reset(alloc[slot].Get(), nullptr), "pipe list reset");
+    }
+    void submit() {
+        HR(list->Close(), "pipe close");
+        ID3D12CommandList* l[] = { list.Get() };
+        queue->ExecuteCommandLists(1, l);
+        HR(queue->Signal(fence.Get(), next), "pipe signal");
+        slotVal[slot] = next++;
+    }
+    // The split: submit, block until it lands, then keep recording into the same
+    // allocator. Legal because the previously recorded list has finished.
+    void submitAndWaitThenContinue() {
+        submit();
+        waitFor(slotVal[slot]);
+        HR(list->Reset(alloc[slot].Get(), nullptr), "pipe list reset 2");
+    }
+    void drain() { waitFor(next - 1); }
+};
+} // namespace
+
+static void BusyWaitMs(double ms) {
+    if (ms <= 0.0) return;
+    const double end = NowMs() + ms;
+    while (NowMs() < end) { /* stand-in for CPU recording cost */ }
+}
+
+static void ProbePipeline(Ctx& c, uint32_t rayCount, int fillerPasses, int frames) {
+    uint32_t side = 1;
+    while ((uint64_t)(side + 1) * (side + 1) <= rayCount) ++side;
+    rayCount = side * side;
+
+    std::printf("\n-- pipelined timing: cost of a mid-frame sync --\n");
+    std::printf("   %u rays over %ux%u, %d filler passes, %d frames, %d in flight\n",
+                rayCount, side, side, fillerPasses, frames, Pipe::kInFlight);
+
+    auto rs = MakeRootSigTiming(c.g.device.Get());
+    std::string err;
+    auto lib = c.dxc.tryCompile(kTimingHLSL, L"lib_6_3", { L"BOUNDED=0" }, err);
+    if (!lib) { std::printf("   [!] shader: %s\n", err.c_str()); return; }
+    ComPtr<ID3D12StateObject> so;
+    HRESULT hr = MakeStateObject(c, lib.Get(), false, so, rs.Get());
+    if (FAILED(hr)) { std::printf("   [!] state object: %s\n", HrStr(hr).c_str()); return; }
+    ComPtr<ID3D12StateObjectProperties> props;
+    HR(so.As(&props), "props");
+    auto sbtRay  = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"RayGen"));
+    auto sbtMiss = MakeSBT(c.g.device.Get(), props->GetShaderIdentifier(L"Miss"));
+    const void* ids[2] = { props->GetShaderIdentifier(L"HitGroup"),
+                           props->GetShaderIdentifier(L"HitGroupProc") };
+    auto sbtHit = MakeSBT(c.g.device.Get(), ids, 2);
+    auto dr = MakeDispatchDesc(sbtRay.Get(), sbtMiss.Get(), sbtHit.Get(), 2);
+
+    SceneCB cbData{ side, side, kHalfExtent, kCamZ, kTMin, kTMax, 0, 0 };
+    UINT64 cbSize = (sizeof(SceneCB) + 255) & ~255ull;
+    auto cb = CreateBuffer(c.g.device.Get(), cbSize, D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    { void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+      HR(cb->Map(0, &none, &p), "map cb"); std::memcpy(p, &cbData, sizeof(cbData));
+      cb->Unmap(0, nullptr); }
+
+    const UINT64 outSize = (UINT64)rayCount * sizeof(Result);
+    auto out = CreateBuffer(c.g.device.Get(), outSize, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto dims = CreateBuffer(c.g.device.Get(), 16, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_COMMON);
+    auto dimsUpload = CreateBuffer(c.g.device.Get(), 16, D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto dimsReadback = CreateBuffer(c.g.device.Get(), 16, D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    { void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+      HR(dimsUpload->Map(0, &none, &p), "map dims");
+      uint32_t v[4] = { rayCount, 1, 1, 0 };
+      std::memcpy(p, v, sizeof(v)); dimsUpload->Unmap(0, nullptr); }
+
+    Pipe pipe; pipe.init(c.g.device.Get());
+
+    auto bind = [&](ID3D12GraphicsCommandList4* cl) {
+        cl->SetPipelineState1(so.Get());
+        BindRootsTiming(cl, rs.Get(), cb->GetGPUVirtualAddress(),
+                        c.scene.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
+                        dims->GetGPUVirtualAddress());
+    };
+    auto recordFiller = [&](ID3D12GraphicsCommandList4* cl) {
+        for (int i = 0; i < fillerPasses; ++i) {
+            bind(cl);
+            auto d = dr; d.Width = rayCount; d.Height = 1; d.Depth = 1;
+            cl->DispatchRays(&d);
+            UavBarrier(cl, out.Get());
+        }
+    };
+
+    // Baseline: one submit per frame, CPU never waits on this frame's GPU work.
+    auto runBaseline = [&](double cpuMs) {
+        for (int f = 0; f < frames; ++f) {
+            pipe.beginFrame(f);
+            BusyWaitMs(cpuMs);
+            recordFiller(pipe.list.Get());
+            pipe.list->CopyBufferRegion(dims.Get(), 0, dimsUpload.Get(), 0, 16);
+            bind(pipe.list.Get());
+            auto d = dr; d.Width = rayCount; d.Height = 1; d.Depth = 1;
+            pipe.list->DispatchRays(&d);
+            UavBarrier(pipe.list.Get(), out.Get());
+            pipe.submit();
+        }
+        pipe.drain();
+    };
+
+    // S1: identical work, but the CPU blocks mid-frame to read the dimensions.
+    // `splits` models an engine with several indirect ray dispatches per frame;
+    // the filler is divided between them so total GPU work stays constant.
+    auto runSplitN = [&](double cpuMs, int splits) {
+        for (int f = 0; f < frames; ++f) {
+            pipe.beginFrame(f);
+            BusyWaitMs(cpuMs);
+            for (int s = 0; s < splits; ++s) {
+                for (int i = 0; i < fillerPasses / splits; ++i) {
+                    bind(pipe.list.Get());
+                    auto d = dr; d.Width = rayCount; d.Height = 1; d.Depth = 1;
+                    pipe.list->DispatchRays(&d);
+                    UavBarrier(pipe.list.Get(), out.Get());
+                }
+                pipe.list->CopyBufferRegion(dims.Get(), 0, dimsUpload.Get(), 0, 16);
+                pipe.list->CopyBufferRegion(dimsReadback.Get(), 0, dims.Get(), 0, 16);
+                pipe.submitAndWaitThenContinue();      // the overlap dies here
+
+                uint32_t got = 0;
+                void* rp = nullptr; D3D12_RANGE full{ 0, 16 };
+                HR(dimsReadback->Map(0, &full, &rp), "map readback");
+                std::memcpy(&got, rp, sizeof(got));
+                D3D12_RANGE nowrite{ 0, 0 }; dimsReadback->Unmap(0, &nowrite);
+
+                bind(pipe.list.Get());
+                auto d = dr; d.Width = got; d.Height = 1; d.Depth = 1;
+                pipe.list->DispatchRays(&d);
+                UavBarrier(pipe.list.Get(), out.Get());
+            }
+            pipe.submit();
+        }
+        pipe.drain();
+    };
+    auto runSplit = [&](double cpuMs) { runSplitN(cpuMs, 1); };
+
+    auto measure = [&](const std::function<void(double)>& fn, double cpuMs) {
+        fn(cpuMs);                       // warm up
+        double t0 = NowMs();
+        fn(cpuMs);
+        return (NowMs() - t0) / frames;
+    };
+
+    std::printf("\n   CPU ms/frame    baseline    with split    overhead\n");
+    std::printf("   ------------  ----------  ------------  ----------\n");
+    for (double cpuMs : { 0.0, 1.0, 2.0, 4.0, 8.0 }) {
+        double b = measure(runBaseline, cpuMs);
+        double s = measure(runSplit, cpuMs);
+        std::printf("   %10.1f    %8.3f      %8.3f    %+7.1f%%\n",
+                    cpuMs, b, s, (s / b - 1.0) * 100.0);
+    }
+    std::printf("\n   baseline should track max(CPU, GPU); a collapsed pipeline\n");
+    std::printf("   tracks CPU + GPU instead. The gap is what the sync really costs.\n");
+
+    // Does the penalty multiply with the number of indirect dispatches per
+    // frame, or saturate once the pipeline has already collapsed? This decides
+    // whether batching several dispatches behind one sync is worth building.
+    const double cpuFixed = 2.0;     // near the worst case, where CPU ~= GPU
+    std::printf("\n   splits per frame, CPU fixed at %.1f ms:\n", cpuFixed);
+    std::printf("   splits   with split    vs baseline\n");
+    std::printf("   ------  ----------  -------------\n");
+    double b1 = measure(runBaseline, cpuFixed);
+    for (int splits : { 1, 2, 4 }) {
+        if (fillerPasses % splits != 0) continue;
+        double s = measure([&](double cpu) { runSplitN(cpu, splits); }, cpuFixed);
+        std::printf("   %6d    %8.3f      %+7.1f%%\n", splits, s, (s / b1 - 1.0) * 100.0);
+    }
+    std::printf("   if this is flat, the damage saturates and batching dispatches\n");
+    std::printf("   behind one sync buys nothing.\n");
+}
+
+// ---------------------------------------------------------------------------
 static ComPtr<IDXGIAdapter1> PickAdapter(IDXGIFactory6* factory, Adapter which) {
     ComPtr<IDXGIAdapter1> adapter;
     if (which == Adapter::Warp) {
@@ -938,6 +1463,14 @@ static void RunAdapter(Adapter which) {
     auto addLib = c.dxc.tryCompile(kAddLibHLSL, L"lib_6_3", {}, err);
     if (!addLib) { std::printf("\n[!] addition library failed to compile: %s\n", err.c_str()); return; }
 
+    if (g_pipeline) {
+        ProbePipeline(c, g_rayCount, g_filler, g_frames); c.drain("pipeline");
+        return;
+    }
+    if (g_timing) {
+        ProbeTiming(c, g_rayCount, g_iters);            c.drain("timing");
+        return;
+    }
     ProbeIndirect(c, lib.Get());                        c.drain("indirect");
     ProbeAddToStateObject(c, lib.Get(), addLib.Get());  c.drain("addto");
     ProbeRayFlags(c);                                   c.drain("rayflags");
@@ -949,13 +1482,19 @@ int main(int argc, char** argv) {
         const char* pick = nullptr;
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "-debug") == 0) g_debug = true;
+            else if (std::strcmp(argv[i], "-time") == 0) g_timing = true;
+            else if (std::strcmp(argv[i], "-pipeline") == 0) g_pipeline = true;
+            else if (std::strcmp(argv[i], "-filler") == 0 && i + 1 < argc) g_filler = std::atoi(argv[++i]);
+            else if (std::strcmp(argv[i], "-frames") == 0 && i + 1 < argc) g_frames = std::atoi(argv[++i]);
+            else if (std::strcmp(argv[i], "-rays") == 0 && i + 1 < argc) g_rayCount = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
+            else if (std::strcmp(argv[i], "-iters") == 0 && i + 1 < argc) g_iters = std::atoi(argv[++i]);
             else pick = argv[i];
         }
         if (pick) {
             warp = std::strcmp(pick, "warp") == 0;
             hw   = std::strcmp(pick, "hw") == 0;
             if (!warp && !hw) {
-                std::fprintf(stderr, "usage: tier11probe.exe [warp|hw] [-debug]\n");
+                std::fprintf(stderr, "usage: tier11probe.exe [warp|hw] [-debug] [-time [-rays N] [-iters N]]\n");
                 return 2;
             }
         }
