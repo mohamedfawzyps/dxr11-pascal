@@ -24,14 +24,15 @@ ATTRS = '%struct.BuiltInTriangleIntersectionAttributes'
 # the offsets wrong; the brief puts correctness well ahead of that.
 #   0 float t | 1 <2 x float> bary | 2 i32 hit | 3 inst | 4 prim | 5 geom
 #   0 t | 1 bary | 2 hit | 3 inst | 4 prim | 5 unused | 6 instanceID
-#   7 hitKind | 8 worldToObject, 12 floats
+#   7 hitKind | 8 worldToObject, 12 floats | 9 aborted
 #
 # The LAYOUT is fixed even though the matrix is only sometimes read: variable
 # offsets across two implementations is a good way to get one of them subtly
 # wrong. The per-invocation COST is what is made conditional instead, since the
 # closest-hit only fetches the matrix when the shader actually reads it.
-PAYLOAD_TYPE = '{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float] }'
-PAYLOAD_BYTES = 84
+PAYLOAD_TYPE = ('{ float, <2 x float>, i32, i32, i32, i32, i32, i32, '
+                '[12 x float], i32 }')
+PAYLOAD_BYTES = 88
 PAYLOAD_FIELD = {
     rq.COMMITTED_RAY_T: (0, 'float', 8),
     rq.COMMITTED_BARY: (1, '<2 x float>', 4),
@@ -293,7 +294,8 @@ def _trace_block(q, ra, exit_label):
     lines = []
     for idx, ty, align in [(0, 'float', 8), (1, '<2 x float>', 4), (2, 'i32', 4),
                            (3, 'i32', 4), (4, 'i32', 4), (5, 'i32', 4),
-                           (6, 'i32', 4), (7, 'i32', 4), (8, '[12 x float]', 4)]:
+                           (6, 'i32', 4), (7, 'i32', 4), (8, '[12 x float]', 4),
+                           (9, 'i32', 4)]:
         zero = '0.000000e+00' if ty == 'float' else (
             'zeroinitializer' if (ty.startswith('<') or ty.startswith('[')) else '0')
         lines.append('  %%rq.pl%d = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 %d'
@@ -561,6 +563,23 @@ def _anyhit(module, q, exports, table, globals_):
                 # candidates, so this test is a tautology here.
                 subst[i.result] = '0'
 
+    # Abort() has no direct DXR 1.0 equivalent. An any-hit shader can only
+    # IgnoreHit (reject and CONTINUE) or AcceptHitAndEndSearch (accept and
+    # stop); there is no "reject and stop", which is what a bare Abort needs.
+    #
+    # So it becomes a payload flag, which covers both shapes uniformly. Abort
+    # sets it, and every later any-hit invocation ignores its candidate
+    # immediately. A commit followed by an abort still accepts, because the
+    # control flow still falls through; a bare abort still rejects. In both
+    # cases nothing further is committed, which is what stopping traversal
+    # means for the result.
+    #
+    # Traversal itself carries on, so this is slower than the ideal.
+    # AcceptHitAndEndSearch would be exact for the commit-then-abort case, but
+    # only after proving the commit dominates the abort in the same iteration,
+    # and correctness comes first here.
+    aborts = bool(q.aborts)
+
     order = [header] + sorted(l for l in body if l not in (header, latch))
     out = ['define void @%s(%s* noalias nocapture %%p, %s* nocapture readonly %%attr) #1 {'
            % (exports['anyhit'], PAYLOAD, ATTRS),
@@ -578,6 +597,15 @@ def _anyhit(module, q, exports, table, globals_):
         if i.dxop == 57 and i.result in used:
             out.append(_handle_text(i, table, globals_))
 
+    if aborts:
+        out.append('  %%rq.pab = getelementptr inbounds %s, %s* %%p, i32 0, i32 9'
+                   % (PAYLOAD, PAYLOAD))
+        out.append('  %rq.abv = load i32, i32* %rq.pab, align 4')
+        out.append('  %rq.abc = icmp ne i32 %rq.abv, 0')
+        out.append('  br i1 %rq.abc, label %rq.reject, label %rq.body')
+        out.append('')
+        out.append('rq.body:')
+
     for label in order:
         blk = fn.block(label)
         if label != header:
@@ -585,6 +613,9 @@ def _anyhit(module, q, exports, table, globals_):
             out.append('%s:' % label[1:])
         for i in blk.instrs:
             if i.dxop == rq.CANDIDATE_TYPE or i.dxop == rq.COMMIT_NON_OPAQUE:
+                continue
+            if i.dxop == rq.ABORT:
+                out.append('  store i32 1, i32* %rq.pab, align 4')
                 continue
             if i.dxop == rq.CANDIDATE_BARY:
                 comp = re.match(r'i8\s+(\d+)', i.args[2].strip()).group(1)

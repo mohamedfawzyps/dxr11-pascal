@@ -29,6 +29,7 @@ enum Opcode {
     kAllocate = 178,
     kTraceInline = 179,
     kProceed = 180,
+    kAbort = 181,
     kCommitNonOpaque = 182,
     kCommittedStatus = 184,
     kCandidateType = 185,
@@ -87,6 +88,7 @@ struct Query {
     const llm::Block* traceBlock = nullptr;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> proceeds;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> commits;
+    std::vector<std::pair<const llm::Block*, const llm::Instr*>> aborts;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> candidateOps;
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> committedOps;
     bool hasLoop = false;

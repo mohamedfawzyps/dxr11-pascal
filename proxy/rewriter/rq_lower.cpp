@@ -18,14 +18,14 @@ const char* kAttrs = "%struct.BuiltInTriangleIntersectionAttributes";
 // the offsets wrong; the brief puts correctness well ahead of that.
 //   0 float t | 1 <2 x float> bary | 2 i32 hit | 3 inst | 4 prim | 5 geom
 //   0 t | 1 bary | 2 hit | 3 inst | 4 prim | 5 unused | 6 instanceID
-//   7 hitKind | 8 worldToObject, 12 floats
+//   7 hitKind | 8 worldToObject, 12 floats | 9 aborted
 //
 // The LAYOUT is fixed even though the matrix is only sometimes read: variable
 // offsets across two implementations is a good way to get one of them subtly
 // wrong. The per-invocation COST is what is made conditional instead.
 const char* kPayloadType =
-    "{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float] }";
-const int kPayloadBytes = 84;
+    "{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float], i32 }";
+const int kPayloadBytes = 88;
 // HitKind() is an integer; the RayQuery form is a bool.
 const int kHitKindFront = 254;
 
@@ -385,6 +385,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             { 0, "float", 8 }, { 1, "<2 x float>", 4 }, { 2, "i32", 4 },
             { 3, "i32", 4 }, { 4, "i32", 4 }, { 5, "i32", 4 },
             { 6, "i32", 4 }, { 7, "i32", 4 }, { 8, "[12 x float]", 4 },
+            { 9, "i32", 4 },
         };
         for (const auto& f : init) {
             const std::string zero =
@@ -602,6 +603,24 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     if (i.DxOp() == kCandidateType) subst[i.result] = "0";
             }
 
+            // Abort() has no direct DXR 1.0 equivalent. An any-hit shader
+            // can only IgnoreHit (reject and CONTINUE) or
+            // AcceptHitAndEndSearch (accept and stop); there is no "reject and
+            // stop", which is what a bare Abort needs.
+            //
+            // So it becomes a payload flag, covering both shapes uniformly.
+            // Abort sets it and every later invocation ignores its candidate
+            // at once. Commit-then-abort still accepts, because the control
+            // flow still falls through; a bare abort still rejects. Either
+            // way nothing further is committed, which is what stopping
+            // traversal means for the result.
+            //
+            // Traversal itself carries on, so this is slower than the ideal.
+            // AcceptHitAndEndSearch would be exact for commit-then-abort, but
+            // only after proving the commit dominates the abort in the same
+            // iteration, and correctness comes first.
+            const bool aborts = !q.aborts.empty();
+
             std::vector<std::string> order{ q.loop.header };
             {
                 std::vector<std::string> rest;
@@ -638,6 +657,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         ah.push_back(t);
                     }
 
+            if (aborts) {
+                ah.push_back(std::string("  %rq.pab = getelementptr inbounds ") +
+                             kPayload + ", " + kPayload + "* %p, i32 0, i32 9");
+                ah.push_back("  %rq.abv = load i32, i32* %rq.pab, align 4");
+                ah.push_back("  %rq.abc = icmp ne i32 %rq.abv, 0");
+                ah.push_back("  br i1 %rq.abc, label %rq.reject, label %rq.body");
+                ah.push_back("");
+                ah.push_back("rq.body:");
+            }
+
             for (const auto& lbl : order) {
                 const llm::Block* b = fn.FindBlock(lbl);
                 if (!b) continue;
@@ -648,6 +677,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 for (const auto& i : b->instrs) {
                     const int op = i.DxOp();
                     if (op == kCandidateType || op == kCommitNonOpaque) continue;
+                    if (op == kAbort) {
+                        ah.push_back("  store i32 1, i32* %rq.pab, align 4");
+                        continue;
+                    }
                     if (op == kCandidateFrontFace) {
                         // RayQuery returns a bool; HitKind() is an integer.
                         const std::string hk = "%rq.hk" + i.result.substr(1);

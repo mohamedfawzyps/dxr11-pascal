@@ -1253,14 +1253,87 @@ Coverage against Unreal's 24 accessors goes from 8 to 19. What remains is the
 four permanently blocked (geometry index and instance contribution to hit group
 index) and `CommitProceduralPrimitiveHit` plus `Abort()`.
 
+## Abort(): 20 of 24, and a limit on what can be verified
+
+`Abort()` is opcode 181. The brief offers two mappings, and only one of them is
+exact, which is the interesting part.
+
+A DXR 1.0 any-hit shader has exactly two terminators: `IgnoreHit()`, which
+rejects the candidate and CONTINUES traversal, and `AcceptHitAndEndSearch()`,
+which accepts it and stops. **There is no "reject and stop"**, and that is
+precisely what a bare `Abort()` needs. So `AcceptHitAndEndSearch` is exact only
+for the commit-then-abort shape, and covers nothing else.
+
+The payload flag covers both, uniformly:
+
+    payload gains `aborted`; Abort() stores 1
+    the any-hit prologue ignores its candidate at once if the flag is set
+
+Commit-then-abort still accepts, because the control flow still falls through.
+A bare abort still rejects. In both cases nothing further is committed, which
+is what stopping traversal means for the RESULT. Traversal itself carries on,
+so this is slower than the ideal; `AcceptHitAndEndSearch` would be exact for
+the commit case, but only after proving the commit dominates the abort in the
+same iteration, and correctness comes before that.
+
+The generated any-hit reads exactly as intended:
+
+    %rq.abv = load i32, i32* %rq.pab
+    %rq.abc = icmp ne i32 %rq.abv, 0
+    br i1 %rq.abc, label %rq.reject, label %rq.body
+    ...
+    bb13:  store i32 1, i32* %rq.pab   ; commit then abort -> accept
+           br label %rq.accept
+    bb16:  store i32 1, i32* %rq.pab   ; bare abort -> reject
+           br label %rq.reject
+
+### What CANNOT be verified, and why
+
+**`Abort()` is inherently order-dependent.** Its whole effect is to stop at
+whichever candidate traversal happens to reach first, and that order is
+implementation-defined. WARP and NVIDIA may legitimately visit in different
+orders, so anything order-dependent, the committed t, the barycentrics, which
+instance was hit, **cannot be compared between them at all**. No test of those
+would be meaningful, and one that appeared to pass would be luck.
+
+So the test observes only WHETHER there was a hit, which with
+commit-then-abort is order-independent: a hit occurs exactly when some
+candidate passes, whatever order they are seen in.
+
+    WARP RayQuery (ground truth)      65536 rays, 10377 hits
+    lowered, on the GTX 1070          65536 rays, 10377 hits   MATCH
+
+That still has teeth. Pre-setting the abort flag, so every candidate is ignored:
+
+    abort flag pre-set    65536 rays, 0 hits
+    hit/miss mismatches: 10377    RESULT: DIVERGE
+
+So the flag, its initialisation and the prologue check are all exercised. What
+is NOT established is the TIMING, that traversal stops at the right candidate,
+and no comparison against WARP can establish it. Stated here rather than left
+for someone to assume the green tick covers it.
+
+### Where that leaves coverage
+
+Twenty of Unreal's 24 accessors. What remains is
+`CommitProceduralPrimitiveHit`, needing the generated intersection shader, and
+the four that are permanently refused.
+
+    eight shaders lowered, C++ and Python BYTE-IDENTICAL on every one
+    six shaders end to end through the proxy on the 1070, all MATCH
+    12 of 12 refusals behaved
+
 ## Next
 
-1. **`Abort()`**, four uses in Epic's shaders. The brief maps it to
-   `AcceptHitAndEndSearch()`, so it is small, and it takes coverage to 20.
-2. **Procedural primitives**, needing the generated intersection shader. The
-   largest remaining piece of lowering, and genuinely new work rather than
-   another table entry. Takes coverage to 21, the practical maximum.
-3. **Dynamic descriptor indexing**, still refused.
-4. Four accessors stay permanently refused, and must keep failing loudly:
-   Candidate and CommittedGeometryIndex are Tier 1.1 on the DXR 1.0 side too,
-   and `*InstanceContributionToHitGroupIndex` has no HLSL intrinsic at all.
+1. **Procedural primitives.** `CommitProceduralPrimitiveHit` needs a generated
+   INTERSECTION shader, which this project has never built. It is the last
+   piece of lowering, genuinely new work rather than another table entry, and
+   takes coverage to 21, the practical maximum against Unreal.
+2. **Dynamic descriptor indexing**, still refused.
+3. **Only then consider making the tier flip the default**, once enough real
+   software has run through it that the refusal list is trusted.
+
+Four accessors stay permanently refused and must keep failing loudly: Candidate
+and CommittedGeometryIndex, which are Tier 1.1 on the DXR 1.0 side too, and
+`*InstanceContributionToHitGroupIndex`, which HLSL does not expose to a hit
+shader at all.

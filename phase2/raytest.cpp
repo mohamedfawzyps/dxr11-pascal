@@ -785,7 +785,7 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     // shows up as CreateStateObject returning E_INVALIDARG, which is a real
     // coupling: the payload size is part of the state object contract, not a
     // free choice for whatever generates the shaders.
-    sc.MaxPayloadSizeInBytes = 84;
+    sc.MaxPayloadSizeInBytes = 88;
     sc.MaxAttributeSizeInBytes = 8;     // float2 barycentrics
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
 

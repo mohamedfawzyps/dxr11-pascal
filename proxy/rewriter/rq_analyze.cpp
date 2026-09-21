@@ -12,6 +12,7 @@ const std::map<int, const char*>& KnownTable() {
         { kAllocate, "AllocateRayQuery" },
         { kTraceInline, "TraceRayInline" },
         { kProceed, "Proceed" },
+        { kAbort, "Abort" },
         { kCommitNonOpaque, "CommitNonOpaqueTriangleHit" },
         { kCommittedStatus, "CommittedStatus" },
         { kCandidateType, "CandidateType" },
@@ -170,6 +171,8 @@ std::string Collect(const llm::Function& fn, Query& q) {
                 q.proceeds.emplace_back(&b, &i);
             } else if (op == kCommitNonOpaque) {
                 q.commits.emplace_back(&b, &i);
+            } else if (op == kAbort) {
+                q.aborts.emplace_back(&b, &i);
             } else if (IsCandidateOp(op)) {
                 q.candidateOps.emplace_back(&b, &i);
             } else if (IsCommittedOp(op)) {
@@ -210,6 +213,12 @@ std::string RejectFunction(const llm::Function& fn, const Query& q) {
                        "raygen changes lane occupancy";
         }
     }
+    for (const auto& a : q.aborts) {
+        if (!q.hasLoop || !q.loop.body.count(a.first->label))
+            return "Abort() outside the Proceed loop; traversal can only be "
+                   "stopped from the generated any-hit shader";
+    }
+
     if (q.hasLoop) {
         for (const auto& label : q.loop.body) {
             const llm::Block* blk = fn.FindBlock(label);

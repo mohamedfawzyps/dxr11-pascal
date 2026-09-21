@@ -37,6 +37,8 @@ $cases = @(
        desc = 'built-in alpha-tested RayQuery, generated any-hit' },
     @{ name = 'indep';   pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
        desc = 'independent shader, resource read in the Proceed loop, numthreads(16,16,1)' },
+    @{ name = 'abort';   pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_abort.hlsl', '--multi');
+       desc = 'Abort(), order-independent observable only' },
     @{ name = 'acc';     pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi');
        desc = 'the 11 accessors from the Unreal survey, end to end' },
     @{ name = 'ids';     pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_ids.hlsl', '--multi');

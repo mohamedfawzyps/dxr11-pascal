@@ -26,6 +26,7 @@ import re
 ALLOCATE = 178
 TRACE_INLINE = 179
 PROCEED = 180
+ABORT = 181
 COMMIT_NON_OPAQUE = 182
 COMMITTED_STATUS = 184
 CANDIDATE_TYPE = 185
@@ -62,6 +63,7 @@ KNOWN = {
     ALLOCATE: 'AllocateRayQuery',
     TRACE_INLINE: 'TraceRayInline',
     PROCEED: 'Proceed',
+    ABORT: 'Abort',
     COMMIT_NON_OPAQUE: 'CommitNonOpaqueTriangleHit',
     COMMITTED_STATUS: 'CommittedStatus',
     CANDIDATE_TYPE: 'CandidateType',
@@ -154,6 +156,7 @@ class Query(object):
         self.trace_block = None
         self.proceeds = []          # [(block, instr)]
         self.commits = []
+        self.aborts = []
         self.candidate_ops = []
         self.committed_ops = []
         self.loop = None            # (header, latch, body) or None
@@ -266,6 +269,8 @@ def _collect(fn, q):
             q.proceeds.append((block, instr))
         elif op == COMMIT_NON_OPAQUE:
             q.commits.append((block, instr))
+        elif op == ABORT:
+            q.aborts.append((block, instr))
         elif op in CANDIDATE_OPS:
             q.candidate_ops.append((block, instr))
         elif op in COMMITTED_OPS:
@@ -330,6 +335,12 @@ def _reject_function(fn, q):
         if instr.callee and '.wave' in instr.callee.lower():
             raise Unsupported('shader uses wave intrinsics around the query; '
                               'promotion to raygen changes lane occupancy')
+
+    for block, instr in q.aborts:
+        if not q.loop or block.label not in q.loop[2]:
+            raise Unsupported(
+                'Abort() outside the Proceed loop; traversal can only be '
+                'stopped from the generated any-hit shader')
 
     if q.loop:
         _, _, body = q.loop
