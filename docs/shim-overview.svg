@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="540" viewBox="0 0 680 540" role="img">
+<title>How the dxr11-pascal shim sits between an application and the real D3D12 runtime</title>
+<desc>Two stacks compared. Without the shim, the app talks to the Windows d3d12.dll in System32, then the driver and GPU, which reports raytracing tier 1.0. With the shim, our own d3d12.dll sits beside the executable and loads first, then forwards to the untouched Windows d3d12.dll and on to the driver and GPU. Below, three boxes show that our layer answers tier 1.1, rewrites RayQuery shaders into DXR 1.0, and passes everything else straight through.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<style>
+text{font-family:"Segoe UI",system-ui,sans-serif}
+.th{font-size:14px;font-weight:500;fill:#2C2C2A}
+.ts{font-size:12px;font-weight:400;fill:#5F5E5A}
+.thp{font-size:14px;font-weight:500;fill:#26215C}
+.tsp{font-size:12px;font-weight:400;fill:#534AB7}
+.bg{fill:#F1EFE8;stroke:#5F5E5A;stroke-width:.5}
+.bp{fill:#EEEDFE;stroke:#534AB7;stroke-width:.5}
+.arr{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+</style>
+</defs>
+<rect x="0" y="0" width="680" height="540" fill="#FFFFFF"/>
+
+<text x="188" y="62" class="th" text-anchor="middle">without the shim</text>
+<text x="493" y="62" class="th" text-anchor="middle">with the shim</text>
+
+<rect x="65" y="80" width="245" height="58" rx="4" class="bg"/>
+<text x="188" y="104" class="th" text-anchor="middle">the app</text>
+<text x="188" y="123" class="ts" text-anchor="middle">wants ray tracing</text>
+<line x1="188" y1="138" x2="188" y2="203" class="arr" marker-end="url(#arrow)"/>
+<rect x="65" y="203" width="245" height="58" rx="4" class="bg"/>
+<text x="188" y="227" class="th" text-anchor="middle">windows d3d12.dll</text>
+<text x="188" y="246" class="ts" text-anchor="middle">the real one, in system32</text>
+<line x1="188" y1="261" x2="188" y2="326" class="arr" marker-end="url(#arrow)"/>
+<rect x="65" y="326" width="245" height="58" rx="4" class="bg"/>
+<text x="188" y="350" class="th" text-anchor="middle">driver and gpu</text>
+<text x="188" y="369" class="ts" text-anchor="middle">gtx 1070, says tier 1.0</text>
+
+<rect x="370" y="80" width="245" height="58" rx="4" class="bg"/>
+<text x="493" y="104" class="th" text-anchor="middle">the app</text>
+<text x="493" y="123" class="ts" text-anchor="middle">wants ray tracing</text>
+<line x1="493" y1="138" x2="493" y2="162" class="arr" marker-end="url(#arrow)"/>
+<rect x="370" y="162" width="245" height="58" rx="4" class="bp"/>
+<text x="493" y="186" class="thp" text-anchor="middle">our d3d12.dll</text>
+<text x="493" y="205" class="tsp" text-anchor="middle">beside the .exe, loads first</text>
+<line x1="493" y1="220" x2="493" y2="244" class="arr" marker-end="url(#arrow)"/>
+<rect x="370" y="244" width="245" height="58" rx="4" class="bg"/>
+<text x="493" y="268" class="th" text-anchor="middle">windows d3d12.dll</text>
+<text x="493" y="287" class="ts" text-anchor="middle">the real one, untouched</text>
+<line x1="493" y1="302" x2="493" y2="326" class="arr" marker-end="url(#arrow)"/>
+<rect x="370" y="326" width="245" height="58" rx="4" class="bg"/>
+<text x="493" y="350" class="th" text-anchor="middle">driver and gpu</text>
+<text x="493" y="369" class="ts" text-anchor="middle">does the real ray tracing</text>
+
+<text x="40" y="424" class="ts">what the purple layer does</text>
+<rect x="40" y="440" width="186" height="62" rx="4" class="bp"/>
+<text x="133" y="466" class="thp" text-anchor="middle">answers tier 1.1</text>
+<text x="133" y="486" class="tsp" text-anchor="middle">only when switched on</text>
+<rect x="247" y="440" width="186" height="62" rx="4" class="bp"/>
+<text x="340" y="466" class="thp" text-anchor="middle">rewrites shaders</text>
+<text x="340" y="486" class="tsp" text-anchor="middle">rayquery to dxr 1.0</text>
+<rect x="454" y="440" width="186" height="62" rx="4" class="bg"/>
+<text x="547" y="466" class="th" text-anchor="middle">everything else</text>
+<text x="547" y="486" class="ts" text-anchor="middle">passes straight through</text>
+</svg>

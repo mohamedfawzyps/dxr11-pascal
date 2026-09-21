@@ -11,6 +11,11 @@ on a GTX 1070.
 **A RayQuery compute shader, unmodified, runs on a GTX 1070 and produces
 bit-exact output against WARP.**
 
+![How the shim sits between an application and the real D3D12 runtime](docs/shim-overview.svg)
+
+The purple layer is this entire project. Everything else already exists on the
+machine, and the GPU does all of the actual ray tracing.
+
 ## The premise
 
 NVIDIA's driver has supported DXR 1.0 on Pascal since driver 425.31 (April

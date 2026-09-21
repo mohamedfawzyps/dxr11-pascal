@@ -2,6 +2,14 @@
 
 Step by step, from a clean checkout to a running application.
 
+![How the shim sits between an application and the real D3D12 runtime](shim-overview.svg)
+
+Worth understanding before anything else: the shim is a DLL that sits beside
+the application's .exe, because Windows searches that directory before
+`System32`. Nothing is installed and nothing in `System32` is touched. The real
+runtime, the driver and the GPU are all untouched, and the GPU still does every
+ray.
+
 ## 1. What you need
 
 - Windows x64 and a GPU that reports `D3D12_RAYTRACING_TIER_1_0`. NVIDIA
