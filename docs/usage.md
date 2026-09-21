@@ -51,11 +51,56 @@ game or project root. For Unreal that usually means:
 | Unreal Editor | `Engine\Binaries\Win64\UnrealEditor.exe` |
 | A packaged game | `<Project>\Binaries\Win64\<Project>.exe` |
 
-DXC is loaded at runtime, by full path, from beside the shim. If the
-application turns out to need it (it only loads when a RayQuery shader
-actually arrives), copy `dxcompiler.dll` and `dxil.dll` into the same
-directory. The shim deliberately never loads them by name, because the
-application may already have its own copy of a different version loaded.
+### Which files go in that directory
+
+| File | Needed | Why |
+|---|---|---|
+| `d3d12.dll` | always | the shim itself |
+| `dxcompiler.dll` | for RayQuery | rewrites the shader |
+| `dxil.dll` | for RayQuery | signs the result, nothing runs unsigned |
+
+Those are the only three. You do **not** need `D3D12Core.dll`, which an
+application using the Agility SDK ships for itself, and you do **not** need
+`d3d12SDKLayers.dll`, which is only for the debug layer and comes from the
+Graphics Tools optional Windows feature.
+
+The two DXC files are loaded **lazily**, only when a RayQuery shader actually
+arrives, and by FULL PATH from beside the shim. A plain DXR 1.0 application
+never touches them. The full path matters: a bare load by name would find the
+application's own copy of DXC, of whatever version, which is not the one this
+was built against.
+
+If they are missing, the log says so and the shader is forwarded unchanged:
+
+```
+[dxr11-proxy] RayQuery compute shader NOT lowered: dxcompiler.dll is not next
+to the shim; the rewriter needs it
+```
+
+### Where to get DXC
+
+Download a release from Microsoft and copy `dxcompiler.dll` and `dxil.dll`
+out of `bin\x64\`:
+
+- https://github.com/microsoft/DirectXShaderCompiler/releases
+
+They are not redistributed here on purpose. `dxil.dll` in particular is a
+Microsoft binary with its own terms, so you get it from Microsoft.
+
+**Which version.** This was built and tested against DXC 1.10.2605.37, the
+`dxc_2026_08_11` release. A newer one should work and is the better default:
+DXIL is pinned to LLVM 3.7 bitcode so the text format does not move between
+versions, Microsoft only ever appends `dx.op` opcode numbers rather than
+renumbering them, and the rewriter refuses any opcode it does not recognise
+rather than guessing, so a newer compiler produces a clean refusal in the
+worst case and not a wrong shader.
+
+An OLDER one may not work. `dxil.dll` cannot sign a shader model newer than
+itself, and a mismatched `dxcompiler.dll` and `dxil.dll` pair can fail
+validation. Take both files from the same release.
+
+**Only one version has actually been tested.** If something fails at signing
+or validation, the version you used is the first thing to say in a bug report.
 
 ## 4. Turn it on
 
