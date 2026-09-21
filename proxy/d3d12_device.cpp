@@ -14,6 +14,7 @@
 #include "d3d12_command_list.h"
 #include "command_signature.h"
 #include "dxil_scan.h"
+#include "rq_pipeline.h"
 
 #include <windows.h>
 #include <new>
@@ -223,6 +224,25 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
     if (pDesc)
         NoteRayQuery(m_tier11, "CreateComputePipelineState",
                      pDesc->CS.pShaderBytecode, (SIZE_T)pDesc->CS.BytecodeLength);
+
+    // A RayQuery compute shader cannot run here as a compute shader at all, so
+    // lower it and hand back a stand-in that carries the state object and
+    // shader table instead. On Tier 1.1 hardware there is nothing to do.
+    if (!m_tier11 && pDesc && pDesc->CS.pShaderBytecode &&
+        Dxr11ContainerUsesRayQuery(pDesc->CS.pShaderBytecode,
+                                   (SIZE_T)pDesc->CS.BytecodeLength) &&
+        ppPipelineState && riid == __uuidof(ID3D12PipelineState)) {
+        std::string why;
+        if (auto* pso = Dxr11RayQueryPso::TryCreate(m_real, pDesc, &why)) {
+            *ppPipelineState = pso;
+            return S_OK;
+        }
+        // Refusing is not failing. Forward the original and let the driver
+        // give the application its own error, with our reason in the log.
+        ProxyLog("[dxr11-proxy] RayQuery compute shader NOT lowered: %s\n"
+                 "[dxr11-proxy]   forwarding unchanged; the driver will reject it\n",
+                 why.c_str());
+    }
     FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState));
 }
 // Wrapped, not hooked. Hooking a command list does not work: it swaps to a
@@ -236,7 +256,37 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_CO
     if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) WrapList(riid, ppCommandList);
     return hr;
 }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) { FWD(CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize)); }
+// The tier flip, OPT-IN. Reporting Tier 1.1 entitles an application to emit
+// RayQuery, and the brief is explicit that a shim which claims 1.1 and then
+// fails is worse than one that claims 1.0. So this stays off by default until
+// the dispatch path has been proven on more than the harness: set
+// DXR11_TIER11=1 to turn it on.
+static bool Tier11Requested() {
+    static const bool on = [] {
+        char buf[8]{};
+        return GetEnvironmentVariableA("DXR11_TIER11", buf, sizeof(buf)) && buf[0] == '1';
+    }();
+    return on;
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) {
+    const HRESULT hr = m_real->CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize);
+    if (SUCCEEDED(hr) && Tier11Requested() && !m_tier11 &&
+        Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
+        FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) {
+        auto* o5 = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pFeatureSupportData);
+        if (o5->RaytracingTier == D3D12_RAYTRACING_TIER_1_0) {
+            o5->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
+            static LONG once = 0;
+            if (InterlockedCompareExchange(&once, 1, 0) == 0)
+                ProxyLog("[dxr11-proxy] DXR11_TIER11=1: reporting Tier 1.1 to the "
+                         "application. RayQuery shaders will be rewritten; anything "
+                         "the rewriter refuses is logged and forwarded, and the "
+                         "driver then rejects it.\n");
+        }
+    }
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) { FWD(CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap)); }
 UINT STDMETHODCALLTYPE Dxr11Device::GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) { FWD(GetDescriptorHandleIncrementSize(DescriptorHeapType)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateRootSignature(UINT nodeMask, const void* pBlobWithRootSignature, SIZE_T blobLengthInBytes, REFIID riid, void** ppvRootSignature) { FWD(CreateRootSignature(nodeMask, pBlobWithRootSignature, blobLengthInBytes, riid, ppvRootSignature)); }

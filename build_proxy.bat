@@ -35,7 +35,7 @@ if errorlevel 1 exit /b 1
 
 cl /nologo /EHsc /std:c++17 /O2 /W4 %INCS% /I "C:\DW\DXC\inc" /LD ^
    /Fo:"%~dp0obj\\" ^
-   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp proxy\state_object_cache.cpp proxy\queue_hook.cpp proxy\d3d12_command_list.cpp proxy\command_signature.cpp proxy\dxil_scan.cpp ^
+   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp proxy\state_object_cache.cpp proxy\queue_hook.cpp proxy\d3d12_command_list.cpp proxy\command_signature.cpp proxy\dxil_scan.cpp proxy\rq_pipeline.cpp ^
    proxy\rewriter\dxc_host.cpp proxy\rewriter\ll_model.cpp ^
    proxy\rewriter\rq_analyze.cpp proxy\rewriter\rq_lower.cpp ^
    /Fe:d3d12.dll ^

@@ -54,6 +54,13 @@ std::string NoLoweringReason(int op);
 bool IsCommittedOp(int op);
 std::string FlagNames(int value);
 
+// The compute shader's [numthreads(x,y,z)], read from the entry point's
+// properties (tag 4). DispatchRays takes a RAY COUNT where Dispatch takes
+// thread GROUPS, and the lowered raygen uses DispatchRaysIndex where the
+// original used SV_DispatchThreadID, so the ray grid is groups * numthreads.
+// Returns false if the module does not declare one.
+bool NumThreads(const llm::Module& m, int out[3]);
+
 struct Query {
     const llm::Function* fn = nullptr;
     std::string handle;

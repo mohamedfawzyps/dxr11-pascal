@@ -266,3 +266,51 @@ AnalyzeResult Analyze(const llm::Module& m) {
 }
 
 }  // namespace rq
+
+namespace rq {
+
+bool NumThreads(const llm::Module& m, int out[3]) {
+    // !dx.entryPoints -> the entry record -> its properties node -> tag 4.
+    std::smatch mm;
+    if (!std::regex_search(m.text, mm,
+                           std::regex(R"(!dx\.entryPoints\s*=\s*!\{!(\d+)\})")))
+        return false;
+
+    auto nodeBody = [&](const std::string& id, std::string* body) {
+        const std::regex re("!" + id + R"( = !\{(.*)\}\s*)");
+        for (const auto& line : llm::SplitLines(m.text)) {
+            std::smatch lm;
+            if (std::regex_match(line, lm, re)) { *body = lm[1].str(); return true; }
+        }
+        return false;
+    };
+
+    std::string entry;
+    if (!nodeBody(mm[1].str(), &entry)) return false;
+    auto fields = llm::SplitArgs(entry);
+    if (fields.size() < 5) return false;
+
+    std::string props;
+    if (fields[4].empty() || fields[4][0] != '!') return false;
+    if (!nodeBody(fields[4].substr(1), &props)) return false;
+
+    // Properties are tag/value pairs; tag 4 names the numthreads node.
+    auto pf = llm::SplitArgs(props);
+    for (size_t i = 0; i + 1 < pf.size(); i += 2) {
+        if (pf[i] != "i32 4") continue;
+        std::string nt;
+        if (pf[i + 1].empty() || pf[i + 1][0] != '!') return false;
+        if (!nodeBody(pf[i + 1].substr(1), &nt)) return false;
+        auto v = llm::SplitArgs(nt);
+        if (v.size() != 3) return false;
+        for (int k = 0; k < 3; ++k) {
+            std::smatch vm;
+            if (!std::regex_match(v[k], vm, std::regex(R"(i32\s+(\d+))"))) return false;
+            out[k] = std::stoi(vm[1].str());
+        }
+        return true;
+    }
+    return false;
+}
+
+}  // namespace rq

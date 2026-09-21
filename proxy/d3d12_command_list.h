@@ -143,6 +143,8 @@ struct Dxr11DispatchList {
 // {A6B41C7E-2E5D-4C3B-9F80-1D4E6A0F2B91}
 extern const GUID IID_Dxr11CommandList;
 
+class Dxr11RayQueryPso;
+
 class Dxr11CommandList : public ID3D12GraphicsCommandList6 {
 public:
     // Takes ownership of one reference on `real`, and acquires its own on the
@@ -295,6 +297,11 @@ private:
     // Null when the runtime does not offer them; QueryInterface then refuses the
     // matching IID rather than handing back a vtable it cannot honour.
     ID3D12GraphicsCommandList5* m_real5;
+    // The lowered RayQuery pipeline currently bound, if any. Not owned:
+    // the application holds the reference, and it must outlive its own
+    // Dispatch calls for any pipeline state, ours included.
+    Dxr11RayQueryPso* m_rqPso = nullptr;
+
     ID3D12GraphicsCommandList6* m_real6;
     LONG                        m_refs;
 

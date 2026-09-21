@@ -8,6 +8,7 @@
 #include "d3d12_command_list.h"
 #include "proxy_log.h"
 #include "command_signature.h"
+#include "rq_pipeline.h"
 
 #include <windows.h>
 #include <cstring>
@@ -211,7 +212,17 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
 void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) { WorkBarrier(); FWD(ClearState(p)); }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawIndexedInstanced(UINT a, UINT b, UINT c, INT d, UINT e) { WorkBarrier(); FWD(DrawIndexedInstanced(a, b, c, d, e)); }
-void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) { WorkBarrier(); FWD(Dispatch(x, y, z)); }
+void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
+    WorkBarrier();
+    // If the bound pipeline is a lowered RayQuery shader, the application's
+    // Dispatch becomes DispatchRays. Its root bindings need no translation:
+    // DXR's global root signature IS the compute root signature.
+    if (m_rqPso) {
+        m_rqPso->DispatchAsRays(m_real, x, y, z);
+        return;
+    }
+    FWD(Dispatch(x, y, z));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 n) { WorkBarrier(); FWD(CopyBufferRegion(d, dof, s, sof, n)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* b) { WorkBarrier(); FWD(CopyTextureRegion(d, x, y, z, s, b)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyResource(ID3D12Resource* d, ID3D12Resource* s) { WorkBarrier(); FWD(CopyResource(d, s)); }
@@ -238,6 +249,13 @@ void STDMETHODCALLTYPE Dxr11CommandList::OMSetStencilRef(UINT s) {
     FWD(OMSetStencilRef(s));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState(ID3D12PipelineState* p) {
+    // Our stand-in is not a real pipeline state and must never reach the
+    // driver. Remember it; Dispatch is where it does its work.
+    if (auto* rq = Dxr11RayQueryPso::From(p)) {
+        m_rqPso = rq;
+        return;
+    }
+    m_rqPso = nullptr;
     if (m_gfx.pso) m_gfx.pso->Release();
     m_gfx.pso = p; if (p) p->AddRef();
     FWD(SetPipelineState(p));

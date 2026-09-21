@@ -1029,15 +1029,83 @@ root signature and bindings carried across. Nothing of that exists. Until it
 does, a rewritten shader has nowhere to run, which is why detection still only
 logs.
 
+## The dispatch path, and RayQuery running on Pascal
+
+    RayQuery compute shader, unmodified, on a GTX 1070:
+
+    opaque, numthreads(8,8,1)                      14450 hits   MATCH
+    alpha-tested, generated any-hit                 8117 hits   MATCH
+    independent, resource in loop, numthreads(16,16,1)  6333 hits   MATCH
+    CommittedInstanceIndex + PrimitiveIndex, multi scene 18496 hits   MATCH
+
+    0 mismatches throughout, against WARP running the same shader natively.
+
+That is the project's goal reached: an application compiles RayQuery, creates a
+compute pipeline and calls `Dispatch`, none of which can work on Tier 1.0
+hardware, and it works.
+
+### What the shim substitutes
+
+`CheckFeatureSupport` reports Tier 1.1, so the application will emit RayQuery
+at all. `proxy/rq_pipeline.{h,cpp}` does the rest:
+
+| the application calls | the shim does |
+|---|---|
+| `CreateComputePipelineState` | lowers the DXIL, builds a state object and shader table, returns a stand-in |
+| `SetPipelineState` | recognises the stand-in and remembers it, never forwarding it |
+| `Dispatch(gx,gy,gz)` | `SetPipelineState1` then `DispatchRays` |
+
+`Dxr11RayQueryPso` is an `ID3D12PipelineState` the application holds and never
+inspects, standing in for machinery it knows nothing about. The same shape as
+`Dxr11CommandSignature` in the indirect DispatchRays work, for the same reason.
+
+### The thing that made this tractable
+
+**DXR's global root signature IS the compute root signature.**
+`SetComputeRootSignature` and `SetComputeRoot*View` are exactly what
+`DispatchRays` consumes, so the application's bindings carry across with no
+translation at all. The compute PSO's root signature becomes the state object's
+`GLOBAL_ROOT_SIGNATURE` subobject and everything downstream just works. Most of
+the feared difficulty here simply was not there.
+
+### The one real conversion
+
+`Dispatch` counts thread GROUPS; `DispatchRays` counts RAYS. The lowered raygen
+reads `DispatchRaysIndex` where the original read `SV_DispatchThreadID`, which
+is the global thread id, so the ray grid is the group count times the shader's
+`numthreads`. That size is read out of the entry point's properties, tag 4,
+before the lowering removes it.
+
+The overhang is harmless: a shader that bounds-checked its threads bounds-checks
+its rays identically. The 16x16 case exists in the regression precisely because
+everything else is 8x8, and a hardcoded group size would have passed every
+other test.
+
+### The tier flip is OPT-IN, and the gate is tested
+
+Reporting Tier 1.1 entitles an application to emit RayQuery, and the brief is
+explicit that a shim which claims 1.1 and then fails is worse than one that
+claims 1.0. So the flip is off unless `DXR11_TIER11=1`.
+
+`.\tools\run_dispatch_test.ps1` checks the gate as a case of its own: without
+the variable, the shim must still report Tier 1.0 and the same RayQuery shader
+must still be refused. It is. Nothing about the default behaviour changed, and
+`D3D12RaytracingHelloWorld` is still pixel-identical at unchanged fps.
+
+A shader the rewriter refuses is logged and forwarded unchanged, so the
+application gets the driver's own error rather than a silently wrong render.
+
 ## Next
 
-1. **The dispatch path.** `CreateComputePipelineState` on a RayQuery shader has
-   to produce a shim-owned state object and shader table, `SetPipelineState`
-   has to recognise it, and `Dispatch` has to become `DispatchRays` with the
-   thread-group-to-ray-grid mapping worked out. This is the last structural
-   piece, and it is the largest thing left in Phase 5.
-2. **Then the tier flip**, with anything the rewriter refuses failing loudly
-   rather than rendering wrong.
+The path is complete: RayQuery in, correct pixels out, on Tier 1.0 hardware.
+What remains is coverage and confidence rather than structure.
 
-Independent of both: dynamic descriptor indexing is still refused, and more
-independent shaders remain the cheapest way to find what has been assumed.
+1. **A real application.** Everything so far is the Phase 2 harness and shaders
+   written for this project. An engine will use shapes nobody here has thought
+   of, and it is the only way to find out which.
+2. **Dynamic descriptor indexing**, still refused, and common in engines.
+3. **More independent shaders.** Both written so far found something. Untried:
+   non-default `RAY_FLAG` combinations, `Abort()`, procedural primitives,
+   committed object-space accessors.
+4. **Then consider making the tier flip the default**, once enough real
+   software has run through it that the refusal list is trusted.
