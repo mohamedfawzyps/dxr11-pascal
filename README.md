@@ -59,8 +59,9 @@ because somebody put it there, so the install is the opt-in, and asking for a
 second one through an environment variable mostly produced reports that the
 shim does nothing.
 
-Turning it off is one step either way: delete the DLL, or put `tier11 = 0` in a
-`dxr11.ini` beside it.
+Turning it off is `tier11 = 0` in a `dxr11.ini` beside the DLL. Uninstalling is
+deleting the DLL. Both are one step, and they are different things: the first
+leaves the shim loaded and forwarding, the second leaves no trace at all.
 
 ## Using it
 
@@ -146,7 +147,7 @@ what it took to notice.
 The version is compiled into the DLL and logged on attach, so a log file
 identifies its own build:
 
-    [dxr11-proxy] attached to process, version 0.10.0
+    [dxr11-proxy] attached to process, version 0.11.0
 
 ## Documentation
 

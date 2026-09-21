@@ -17,6 +17,40 @@ build.
 
 ---
 
+## 0.11.0 (2026-09-22)
+
+### Tier 1.1 is no longer claimed without DXC
+
+Claiming Tier 1.1 is a promise to translate RayQuery, and that promise cannot
+be kept without `dxcompiler.dll` and `dxil.dll`. The shim now checks, and
+reports the real tier when they are absent.
+
+This was the exact failure the project refuses to ship, and 0.10.0 had
+introduced it by making the tier claim the default: copy the DLL on its own,
+forget the other two files, and an application is told it may emit RayQuery,
+does so, and the driver rejects a shader nobody could rewrite. The application
+crashes and the cause is only in a log, after the fact.
+
+Verified both directions in a directory containing nothing but the executable
+and `d3d12.dll`:
+
+    [dxr11-proxy] NOT reporting Tier 1.1: dxcompiler.dll is not next to the
+    shim ... Tier 1.0 is reported instead, which is honest
+
+then with the two DXC files added, the claim returns. NOT in the automated
+suite: it needs a directory without DXC and the test harness compiles its own
+shaders with DXC. Verified by hand, and said plainly here rather than implied.
+
+The cost is that DXC now loads at the first feature query rather than at the
+first shader. That is the point: better to find out early.
+
+### Renamed
+
+`tools/dxr11-setup.*` is now `tools/dxr-tier-11-setup.*`. "dxr11" reads as
+DirectX 11 at a glance, which is the opposite of what this does.
+
+---
+
 ## 0.10.0 (2026-09-22)
 
 Makes the thing usable without a terminal. No change to any translation, and

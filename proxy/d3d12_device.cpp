@@ -17,6 +17,7 @@
 #include "rq_pipeline.h"
 #include "res_tracker.h"
 #include "config.h"
+#include "rewriter/dxc_host.h"
 
 #include <windows.h>
 #include <new>
@@ -276,13 +277,40 @@ static cfg::Flag Tier11Requested() {
     return f;
 }
 
+// Claiming Tier 1.1 is a promise to translate RayQuery, and that promise
+// cannot be kept without DXC: the rewriter needs dxcompiler.dll to convert a
+// container to text and back, and dxil.dll to sign the result.
+//
+// So the claim is conditional on them being there. Without this, copying the
+// shim next to an application and forgetting the other two files produces the
+// one failure this project refuses to ship: the application is told it may
+// emit RayQuery, does so, and the driver rejects a shader nobody could rewrite.
+// The application sees a crash; the log is the only place the real cause
+// appears, and by then it has already happened.
+//
+// Checking here forces DXC to load earlier than it otherwise would, which is
+// the point. Better to find out at the first feature query than at the first
+// shader.
+static bool CanHonourTier11() {
+    static const bool ok = [] {
+        std::string why;
+        if (dxch::Available(&why)) return true;
+        ProxyLog("[dxr11-proxy] NOT reporting Tier 1.1: %s. Tier 1.0 is reported "
+                 "instead, which is honest, and the application will simply not "
+                 "use inline ray tracing. Put dxcompiler.dll and dxil.dll next to "
+                 "d3d12.dll to enable it.\n", why.c_str());
+        return false;
+    }();
+    return ok;
+}
+
 HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) {
     const HRESULT hr = m_real->CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize);
     if (SUCCEEDED(hr) && Tier11Requested().value && !m_tier11 &&
         Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
         FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) {
         auto* o5 = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pFeatureSupportData);
-        if (o5->RaytracingTier == D3D12_RAYTRACING_TIER_1_0) {
+        if (o5->RaytracingTier == D3D12_RAYTRACING_TIER_1_0 && CanHonourTier11()) {
             o5->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)

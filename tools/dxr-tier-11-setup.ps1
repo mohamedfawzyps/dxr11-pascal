@@ -9,9 +9,9 @@
 # no toolchain, it is readable by anyone who wants to check what it does to
 # their game folder before running it, and the whole job is copying files.
 #
-#   powershell -ExecutionPolicy Bypass -File tools\dxr11-setup.ps1
+#   powershell -ExecutionPolicy Bypass -File tools\dxr-tier-11-setup.ps1
 #
-# or run tools\dxr11-setup.bat, which does that for you.
+# or run tools\dxr-tier-11-setup.bat, which does that for you.
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -189,7 +189,7 @@ function Write-Ini {
     $t = if ($chkTier.Checked) { '1' } else { '0' }
     $n = if ($chkNoWrap.Checked) { '1' } else { '0' }
     @(
-        '; Written by dxr11-setup. Safe to edit by hand.',
+        '; Written by dxr-tier-11-setup. Safe to edit by hand.',
         "tier11 = $t",
         "nowrap = $n"
     ) | Set-Content $ini -Encoding ascii

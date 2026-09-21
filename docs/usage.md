@@ -26,7 +26,7 @@ scripts. The defaults expect them at `C:\DW\DXC` and
 
 ## The short way
 
-`tools\dxr11-setup.bat` does steps 2 to 4 for you: pick the .exe, click
+`tools\dxr-tier-11-setup.bat` does steps 2 to 4 for you: pick the .exe, click
 Install, and the settings and the log are on the same window. It copies files
 and writes a two line .ini, nothing else, and it is a readable PowerShell
 script if you want to check that before running it.
@@ -80,12 +80,19 @@ never touches them. The full path matters: a bare load by name would find the
 application's own copy of DXC, of whatever version, which is not the one this
 was built against.
 
-If they are missing, the log says so and the shader is forwarded unchanged:
+**Without them, Tier 1.1 is not reported at all.** Claiming Tier 1.1 is a
+promise to translate RayQuery, and that promise cannot be kept without DXC. So
+the shim checks, and says so rather than letting an application discover it at
+the first shader:
 
 ```
-[dxr11-proxy] RayQuery compute shader NOT lowered: dxcompiler.dll is not next
-to the shim; the rewriter needs it
+[dxr11-proxy] NOT reporting Tier 1.1: dxcompiler.dll is not next to the shim
+... Tier 1.0 is reported instead, which is honest, and the application will
+simply not use inline ray tracing.
 ```
+
+The application then behaves exactly as it would with no shim present, which is
+a working program without ray tracing rather than a crash.
 
 ### Where to get DXC
 
@@ -175,7 +182,7 @@ type %TEMP%\dxr11_proxy.log
 A healthy start looks like this:
 
 ```
-[dxr11-proxy] attached to process, version 0.10.0
+[dxr11-proxy] attached to process, version 0.11.0
 [dxr11-proxy] device wrapping enabled
 [dxr11-proxy] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
 [dxr11-proxy] DXR11_TIER11=1: reporting Tier 1.1 to the application.
