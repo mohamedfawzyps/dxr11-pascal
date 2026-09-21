@@ -47,7 +47,23 @@ $cases = @(
     @{ name = 'both'; src = 'phase5\cases\rayquery_both.ll'; pat = 'alpha';
        flags = @('--mixed', '--contrib', '--both');
        gt = @('--cs', 'phase5\cases\rayquery_both.hlsl', '--mixed', '--contrib');
-       desc = 'commits BOTH kinds: two hit groups from one Proceed loop' }
+       desc = 'commits BOTH kinds: two hit groups from one Proceed loop' },
+    # DYNAMIC descriptor indexing: the array index is a cbuffer load, so the
+    # element is reached by a real getelementptr INSTRUCTION rather than a
+    # folded constant expression. Ground truth is the built-in shader, as for
+    # the `table` case, because --table binds the real output at slot 2 and
+    # decoys elsewhere: a mishandled index writes nowhere visible. Measured,
+    # with the index poisoned to a constant 0: 0 hits instead of 14450.
+    @{ name = 'dyn'; src = 'phase5\cases\rayquery_dyn.ll'; pat = 'opaque';
+       flags = @('--table');
+       desc = 'resource array indexed by a value the compiler cannot fold' },
+    # The same, through NonUniformResourceIndex, which marks the getelementptr
+    # with !dx.nonuniform. The index happens to be wave-uniform so the RESULT
+    # is the same; what this checks is that the metadata survives and the
+    # module still validates and signs.
+    @{ name = 'dynnu'; src = 'phase5\cases\rayquery_dynnu.ll'; pat = 'opaque';
+       flags = @('--table');
+       desc = 'dynamic index through NonUniformResourceIndex' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

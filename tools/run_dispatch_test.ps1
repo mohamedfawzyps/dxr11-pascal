@@ -75,7 +75,23 @@ $cases = @(
     # two closest-hits, because a triangle hit reports committed status 1 and a
     # procedural one 2. Two REAL hit groups, one per record.
     @{ name = 'both'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_both.hlsl', '--mixed', '--contrib');
-       desc = 'a query committing BOTH triangle and procedural hits' }
+       desc = 'a query committing BOTH triangle and procedural hits' },
+    # Resource arrays through a descriptor table, now that RunRayQuery honours
+    # --table and these can run as compute shaders at all. --table binds the
+    # real output at slot 2 and decoys at 0, 1 and 3, so a mishandled index
+    # writes nowhere visible and the case reports 0 hits.
+    @{ name = 'table'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_table.hlsl', '--table');
+       desc = 'resource array at a CONSTANT index, through a descriptor table' },
+    # The index is a cbuffer load, so the element is reached by a real
+    # getelementptr INSTRUCTION rather than a folded constant expression.
+    # Measured, with the index poisoned to a constant 0: 0 hits, not 14450.
+    @{ name = 'dyn'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dyn.hlsl', '--table');
+       desc = 'DYNAMIC descriptor indexing, the index computed at runtime' },
+    # The same through NonUniformResourceIndex, which marks the getelementptr
+    # with !dx.nonuniform. The value is wave-uniform so the RESULT is the same;
+    # what this checks is that the metadata survives the whole path.
+    @{ name = 'dynnu'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynnu.hlsl', '--table');
+       desc = 'dynamic index through NonUniformResourceIndex' }
 )
 
 $failed = 0

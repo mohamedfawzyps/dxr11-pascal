@@ -29,3 +29,12 @@ DXC rather than from reasoning, and kept so the answer can be re-checked.
   `lower.py` and `rq_lower.cpp` now emit as `AnyHitNull` and `IsectNull`, which
   are what let the shader table carry a record of the right TYPE at an index
   reached by geometry the lowered shader does not serve.
+
+- `lib_dynarray_ref.hlsl` - what does a resource array indexed by a NON-constant
+  compile to in a library, and what does `NonUniformResourceIndex` add? Compile
+  with `-T lib_6_5`. Answers: the constant case's folded getelementptr
+  EXPRESSION becomes a real getelementptr INSTRUCTION on the same global,
+  followed by the same load and `createHandleForLib`; and
+  `NonUniformResourceIndex` attaches `!dx.nonuniform !N` to that instruction,
+  where the node is `!{i32 1}`. Nothing else changes, no new opcode and no
+  annotateHandle. That is the form `lower.py` and `rq_lower.cpp` now emit.

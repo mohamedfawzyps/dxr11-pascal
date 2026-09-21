@@ -211,31 +211,54 @@ def _handle_text(instr, table, globals_):
     fnname, _ = _handle_fn(elem)
     raw = '%%rq.raw.%s' % instr.result[1:]
 
+    pre = ''
     if gty == elem:
         src = '{ty}* @{sym}'.format(ty=elem, sym=sym)
     else:
-        # A resource array. DXC reaches the element through a constant
-        # getelementptr on the array global, and hands createHandleForLib
-        # the ELEMENT type. Matched against a DXC-built library.
+        # A resource array. DXC reaches the element through a getelementptr on
+        # the array global and hands createHandleForLib the ELEMENT type.
+        # Matched against a DXC-built library, see
+        # phase5/cases/reference/lib_array_ref.hlsl for the constant form and
+        # lib_dynarray_ref.hlsl for the dynamic one.
         idx = re.match(r'i32\s+(\d+)$', instr.args[3].strip())
-        if not idx:
-            raise rq.Unsupported(
-                'resource array indexed by a non-constant (%s); dynamic '
-                'descriptor indexing is not supported'
-                % instr.args[3].strip())
-        nonuni = instr.args[4].strip()
-        if nonuni not in ('i1 false', 'i1 0'):
-            raise rq.Unsupported(
-                'resource array indexed non-uniformly; not supported')
-        src = ('{elem}* getelementptr inbounds ({gty}, {gty}* @{sym}, '
-               'i32 0, i32 {i})').format(elem=elem, gty=gty, sym=sym,
-                                         i=idx.group(1))
+        nonuni = instr.args[4].strip() not in ('i1 false', 'i1 0')
+        if idx:
+            # A constant index folds into a constant getelementptr EXPRESSION,
+            # inline in the call. Nothing is computed at runtime.
+            src = ('{elem}* getelementptr inbounds ({gty}, {gty}* @{sym}, '
+                   'i32 0, i32 {i})').format(elem=elem, gty=gty, sym=sym,
+                                             i=idx.group(1))
+        else:
+            # A dynamic index cannot be a constant expression, so it becomes a
+            # real getelementptr INSTRUCTION on the same global, with the
+            # index operand carried across untouched. Same three steps DXC
+            # emits: getelementptr, load, createHandleForLib.
+            gep = '%%rq.gep.%s' % instr.result[1:]
+            # NonUniformResourceIndex shows up as !dx.nonuniform on the
+            # getelementptr, and dropping it would be a silently wrong lowering
+            # rather than a missing feature. The node id is not known until the
+            # metadata is rebuilt, so a placeholder stands in until then.
+            md = '  ; index is dynamic'
+            tag = ', !dx.nonuniform !RQNU' if nonuni else ''
+            pre = ('  {gep} = getelementptr inbounds {gty}, {gty}* @{sym}, '
+                   'i32 0, {idx}{tag}\n').format(
+                       gep=gep, gty=gty, sym=sym,
+                       idx=instr.args[3].strip(), tag=tag)
+            src = '{elem}* {gep}'.format(elem=elem, gep=gep)
 
-    return (
+    return pre + (
         '  {raw} = load {elem}, {src}, align 4\n'
         '  {res} = call %dx.types.Handle @{fn}(i32 160, {elem} {raw})'
         '  ; CreateHandleForLib(Resource)'
     ).format(raw=raw, elem=elem, src=src, res=instr.result, fn=fnname)
+
+
+def _dynamic_index(instr):
+    """The index operand of a createHandle, when it is NOT a constant."""
+    if instr.dxop != 57 or len(instr.args) < 4:
+        return None
+    arg = instr.args[3].strip()
+    return None if re.match(r'i32\s+\d+$', arg) else arg
 
 
 def _edit_resources(module, q, edits, table, globals_):
@@ -372,6 +395,19 @@ def _check_loop_isolated(fn, q, header, latch, body):
     # a texture or buffer in the loop body, so refusing this would have blocked
     # the most common shape there is.
     handles = {i.result for _, i in fn.instrs() if i.dxop == 57 and i.result}
+
+    # But that exemption holds only for a handle the MODULE fully determines.
+    # A dynamically indexed one depends on a value computed in the raygen, and
+    # recreating it in the any-hit would need that value, which is exactly the
+    # caller state the payload cannot carry. So this one IS refused, precisely,
+    # rather than being swept up by the generic message below.
+    for _, i in fn.instrs():
+        if i.result in used and _dynamic_index(i):
+            raise rq.Unsupported(
+                'resource handle %s is indexed dynamically (%s) and used inside '
+                'the Proceed loop; the index is computed in the raygen and the '
+                'any-hit shader is a separate invocation that cannot see it'
+                % (i.result, _dynamic_index(i)))
     outside = {u for u in used
                if u not in defined and u != q.handle and u not in handles}
     if outside:
@@ -951,6 +987,11 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
     eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
     eps.append(entry(exports['isectnull'], '()', 8, False, False))
     eps.append(entry(exports['raygen'], '()', 7, False, False))
+
+    # Allocated LAST, so a shader that does not index dynamically keeps every
+    # other node id exactly where it was.
+    if '!RQNU' in text:
+        text = text.replace('!RQNU', '!%d' % node('i32 1'))
 
     text = text.replace('!dx.entryPoints = !{!%d}' % old_entry,
                         '!dx.typeAnnotations = !{!%d}\n!dx.entryPoints = !{%s}'

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'hand'))
 from dxil import Module
 from llnorm import normalize
 import rayquery
+import lower
 
 OPAQUE = os.path.join('phase5', 'dxil', 'rayquery_opaque.ll')
 ALPHA = os.path.join('phase5', 'dxil', 'rayquery_alpha.ll')
@@ -74,6 +75,27 @@ def expect_pattern(name, text, want):
     except rayquery.Unsupported as e:
         print('  FAILED   %-34s unexpectedly refused: %s' % (name, e))
         return False
+
+
+def expect_lower_reject(name, text, must_mention):
+    """Refused by the LOWERING rather than by the analysis.
+
+    Some refusals live in lower.py, because they are about whether the loop
+    body can be transplanted rather than about what the query does. They were
+    not covered here at all until a new one needed proving reachable.
+    """
+    try:
+        m = Module(text)
+        q = rayquery.analyze(m)
+        lower.lower(m, q)
+        print('  FAILED   %-34s was LOWERED, should have been refused' % name)
+        return False
+    except rayquery.Unsupported as e:
+        if must_mention.lower() not in str(e).lower():
+            print('  FAILED   %-34s refused for the wrong reason: %s' % (name, e))
+            return False
+        print('  refused  %-34s %s' % (name, str(e).split(';')[0][:52]))
+        return True
 
 
 def main():
@@ -189,6 +211,22 @@ def main():
             m.group(0) + '\n  call void '
             '@dx.op.rayQuery_CommitNonOpaqueTriangleHit(i32 182, i32 %s)' % handle)
         ok.append(expect_pattern('triangle AND procedural commits', mixed, 5))
+
+    # A resource handle indexed DYNAMICALLY and used inside the Proceed loop.
+    # The handle exemption in the isolation check is only sound when the module
+    # fully determines the handle; a dynamic index makes it depend on a value
+    # computed in the raygen, which the any-hit cannot see. Provoked from the
+    # independent shader, which is the one that genuinely reads a resource in
+    # its loop body.
+    if os.path.isfile(INDEP):
+        dyn = load(INDEP)
+        m = re.search(r'^.*dx\.op\.createHandle\(i32 57, i8 0.*$', dyn, re.M)
+        assert m, 'the independent case no longer creates an SRV handle'
+        dyn = dyn.replace(m.group(0),
+                          re.sub(r'(i32 57, i8 0, i32 \d+), i32 \d+',
+                                 r'\1, i32 %v1', m.group(0)))
+        ok.append(expect_lower_reject('dynamic handle used in the loop', dyn,
+                                      'indexed dynamically'))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

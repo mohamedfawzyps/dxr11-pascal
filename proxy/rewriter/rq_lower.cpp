@@ -250,28 +250,41 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         const std::string raw = "%rq.raw." + instr.result.substr(1);
 
         std::string src;
+        std::string pre;
         if (g->gty == g->elem) {
             src = g->elem + "* @" + g->sym;
         } else {
-            // A resource array. DXC reaches the element through a constant
-            // getelementptr on the array global, and hands createHandleForLib
-            // the ELEMENT type. Matched against a DXC-built library.
-            std::string a3 = Trim(instr.args[3]);
-            std::smatch im;
-            if (!std::regex_match(a3, im, kI32End)) {
-                handleErr = "resource array indexed by a non-constant (" + a3 +
-                            "); dynamic descriptor indexing is not supported";
-                return "";
-            }
+            // A resource array. DXC reaches the element through a
+            // getelementptr on the array global and hands createHandleForLib
+            // the ELEMENT type. Matched against a DXC-built library, see
+            // phase5/cases/reference/lib_array_ref.hlsl for the constant form
+            // and lib_dynarray_ref.hlsl for the dynamic one.
+            const std::string a3 = Trim(instr.args[3]);
             const std::string nonuni = Trim(instr.args[4]);
-            if (nonuni != "i1 false" && nonuni != "i1 0") {
-                handleErr = "resource array indexed non-uniformly; not supported";
-                return "";
+            const bool nu = (nonuni != "i1 false" && nonuni != "i1 0");
+            std::smatch im;
+            if (std::regex_match(a3, im, kI32End)) {
+                // A constant index folds into a constant getelementptr
+                // EXPRESSION, inline in the call. Nothing runs at runtime.
+                src = g->elem + "* getelementptr inbounds (" + g->gty + ", " +
+                      g->gty + "* @" + g->sym + ", i32 0, i32 " + im[1].str() + ")";
+            } else {
+                // A dynamic index cannot be a constant expression, so it
+                // becomes a real getelementptr INSTRUCTION on the same global,
+                // with the index operand carried across untouched.
+                const std::string gep = "%rq.gep." + instr.result.substr(1);
+                // NonUniformResourceIndex shows up as !dx.nonuniform on the
+                // getelementptr, and dropping it would be a silently wrong
+                // lowering rather than a missing feature. The node id is not
+                // known until the metadata is rebuilt, so a placeholder stands
+                // in until then.
+                pre = "  " + gep + " = getelementptr inbounds " + g->gty + ", " +
+                      g->gty + "* @" + g->sym + ", i32 0, " + a3 +
+                      (nu ? ", !dx.nonuniform !RQNU" : "") + "\n";
+                src = g->elem + "* " + gep;
             }
-            src = g->elem + "* getelementptr inbounds (" + g->gty + ", " + g->gty +
-                  "* @" + g->sym + ", i32 0, i32 " + im[1].str() + ")";
         }
-        return "  " + raw + " = load " + g->elem + ", " + src + ", align 4\n" +
+        return pre + "  " + raw + " = load " + g->elem + ", " + src + ", align 4\n" +
                "  " + instr.result + " = call %dx.types.Handle @" + fn +
                "(i32 160, " + g->elem + " " + raw + ")  ; CreateHandleForLib(Resource)";
     };
@@ -347,6 +360,27 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             for (const auto& i : b.instrs)
                 if (i.DxOp() == kCreateHandle && !i.result.empty())
                     handles.insert(i.result);
+
+        // But that exemption holds only for a handle the MODULE fully
+        // determines. A dynamically indexed one depends on a value computed in
+        // the raygen, and recreating it in the any-hit would need that value,
+        // which is exactly the caller state the payload cannot carry. So this
+        // one IS refused, precisely, rather than being swept up by the generic
+        // message below.
+        static const std::regex kConstIdx(R"(^i32\s+\d+$)");
+        for (const auto& b : fn.blocks) {
+            for (const auto& i : b.instrs) {
+                if (i.DxOp() != kCreateHandle || i.result.empty()) continue;
+                if (!used.count(i.result) || i.args.size() < 4) continue;
+                const std::string a3 = Trim(i.args[3]);
+                if (std::regex_match(a3, kConstIdx)) continue;
+                r.error = "resource handle " + i.result + " is indexed dynamically (" +
+                          a3 + ") and used inside the Proceed loop; the index is "
+                          "computed in the raygen and the any-hit shader is a "
+                          "separate invocation that cannot see it";
+                return r;
+            }
+        }
         std::vector<std::string> outside;
         for (const auto& u : used)
             if (!defined.count(u) && u != q.handle && !handles.count(u))
@@ -1168,6 +1202,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (i) epJoined += ", ";
             epJoined += "!" + std::to_string(eps[i]);
         }
+        // Allocated LAST, so a shader that does not index dynamically keeps
+        // every other node id exactly where it was.
+        if (out.find("!RQNU") != std::string::npos)
+            out = Replace(out, "!RQNU", "!" + std::to_string(node("i32 1")));
+
         out = Replace(out, "!dx.entryPoints = !{!" + oldEntry + "}",
                       "!dx.typeAnnotations = !{!" + std::to_string(annId) + "}\n"
                       "!dx.entryPoints = !{" + epJoined + "}");

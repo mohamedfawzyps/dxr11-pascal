@@ -769,6 +769,42 @@ static ComPtr<ID3D12Resource> MakeAlphaMask(ID3D12Device* dev) {
     return buf;
 }
 
+// Build the four-entry UAV descriptor table --table needs, with the REAL
+// output at kTableSlot and a decoy everywhere else, so a shader that resolves
+// the wrong index writes nowhere visible. `decoy` is returned so the caller
+// keeps it alive.
+static ComPtr<ID3D12DescriptorHeap> MakeTableHeap(
+        ID3D12Device* dev, ID3D12Resource* out,
+        ComPtr<ID3D12Resource>& decoy) {
+    const UINT64 bytes = (UINT64)kWidth * kHeight * sizeof(Result);
+    decoy = CreateBuffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = kTableSize;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap");
+
+    const UINT stride = dev->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto base = heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < kTableSize; ++i) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.Buffer.NumElements = kWidth * kHeight;
+        ud.Buffer.StructureByteStride = sizeof(Result);
+        D3D12_CPU_DESCRIPTOR_HANDLE h{ base.ptr + (SIZE_T)i * stride };
+        // Only the slot the shader indexes gets the real buffer.
+        dev->CreateUnorderedAccessView(i == kTableSlot ? out : decoy.Get(),
+                                       nullptr, &ud, h);
+    }
+    return heap;
+}
+
 static void BindRoots(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs,
         D3D12_GPU_VIRTUAL_ADDRESS cb, D3D12_GPU_VIRTUAL_ADDRESS tlas,
         D3D12_GPU_VIRTUAL_ADDRESS out, D3D12_GPU_VIRTUAL_ADDRESS mask = 0) {
@@ -817,7 +853,11 @@ static ComPtr<ID3D12RootSignature> MakeRootSigTable(ID3D12Device* dev) {
 // ---------------------------------------------------------------------------
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
-    auto rs = MakeRootSig(g.device.Get());
+    // --table has to reach this side too, or a shader written against a
+    // descriptor table cannot run as a RayQuery compute shader at all, which
+    // is what kept the array cases out of the proxy's dispatch path.
+    auto rs = g_table ? MakeRootSigTable(g.device.Get())
+                      : MakeRootSig(g.device.Get());
     std::string fromFile;
     if (g_csFile) {
         auto bytes = ReadAll(g_csFile);
@@ -835,10 +875,25 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
        "CreateComputePipelineState");
 
     auto mask = MakeAlphaMask(g.device.Get());
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Resource> decoy;
+    if (g_table) heap = MakeTableHeap(g.device.Get(), out, decoy);
+
     g.list->SetPipelineState(pso.Get());
-    BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
-              s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
-              mask->GetGPUVirtualAddress());
+    if (g_table) {
+        ID3D12DescriptorHeap* heaps[] = { heap.Get() };
+        g.list->SetDescriptorHeaps(1, heaps);
+        g.list->SetComputeRootSignature(rs.Get());
+        g.list->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress());
+        g.list->SetComputeRootShaderResourceView(1, s.tlas->GetGPUVirtualAddress());
+        g.list->SetComputeRootDescriptorTable(
+            2, heap->GetGPUDescriptorHandleForHeapStart());
+        g.list->SetComputeRootShaderResourceView(3, mask->GetGPUVirtualAddress());
+    } else {
+        BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
+                  s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
+                  mask->GetGPUVirtualAddress());
+    }
     // Group count sized for the smallest thread group any of these shaders
     // uses. A 16x16 shader then gets more groups than it needs, which is safe
     // because every one of them bounds checks; too FEW groups would not be.
@@ -890,34 +945,7 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     auto mask = MakeAlphaMask(g.device.Get());
     ComPtr<ID3D12DescriptorHeap> heap;
     ComPtr<ID3D12Resource> decoy;
-    if (g_table) {
-        const UINT64 bytes = (UINT64)kWidth * kHeight * sizeof(Result);
-        decoy = CreateBuffer(g.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = kTableSize;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
-           "CreateDescriptorHeap");
-
-        const UINT stride = g.device->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        auto base = heap->GetCPUDescriptorHandleForHeapStart();
-        for (UINT i = 0; i < kTableSize; ++i) {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
-            ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            ud.Format = DXGI_FORMAT_UNKNOWN;
-            ud.Buffer.NumElements = kWidth * kHeight;
-            ud.Buffer.StructureByteStride = sizeof(Result);
-            D3D12_CPU_DESCRIPTOR_HANDLE h{ base.ptr + (SIZE_T)i * stride };
-            // Only the slot the shader indexes gets the real buffer.
-            g.device->CreateUnorderedAccessView(
-                i == kTableSlot ? out : decoy.Get(), nullptr, &ud, h);
-        }
-    }
+    if (g_table) heap = MakeTableHeap(g.device.Get(), out, decoy);
 
     // --- state object subobjects ---
     std::vector<D3D12_STATE_SUBOBJECT> subs;

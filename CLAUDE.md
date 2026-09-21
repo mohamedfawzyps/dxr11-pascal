@@ -5,7 +5,7 @@ Version 1.
 ## Current position (2026-09-21)
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
-GTX 1070 and produces bit-exact output against WARP. Eleven render cases, 0
+GTX 1070 and produces bit-exact output against WARP. Fourteen render cases, 0
 mismatches, plus two refusal gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
@@ -26,12 +26,23 @@ primitives works rather than being refused.
 a query that commits BOTH triangle and procedural hits, which lowers to an
 any-hit AND an intersection shader from one Proceed loop.
 
-What is left is not shader translation and not table building:
-- **one thing no shim can fix**, an application that routes both geometry kinds
-  to the SAME hit group record, since a record is one type or the other;
-- **dynamic descriptor indexing**, the last refusal that is a limitation of
-  this rewriter rather than a fact about DXR 1.0;
-- and the four accessors DXR 1.0 offers nothing to lower onto.
+**NOTHING IS LEFT ON THE REWRITER'S OWN LIST.** Dynamic descriptor indexing
+was the last shape it had simply not been taught, and it now works, uniform and
+non-uniform. Every remaining refusal is a fact about DXR 1.0 or about what the
+APPLICATION did:
+
+- `Candidate`/`CommittedGeometryIndex`, Tier 1.1 on the DXR 1.0 side too;
+- `*InstanceContributionToHitGroupIndex`, which HLSL does not expose at all;
+- RayQuery in a pixel, vertex, mesh or amplification shader;
+- RayQuery inside an existing DXR 1.0 shader;
+- groupshared memory or wave intrinsics around the query;
+- multiple concurrent RayQuery objects;
+- a loop body reading caller locals that do not fit the payload;
+- an application routing both geometry kinds to ONE hit group record.
+
+So the next question is not what to build but **WHAT TO RUN**: real software,
+enough of it that the refusal list is trusted, before the tier flip stops being
+opt-in.
 
 See the entries below and docs/phase5-dxil-recon.md.
 
@@ -171,11 +182,13 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
       procedural primitives, generated intersection            MATCH
       the 11 accessors from the Unreal survey                  MATCH
       commits BOTH kinds, two hit groups            9160 hits   MATCH
+      resource array at a DYNAMIC index            14450 hits   MATCH
+      the same through NonUniformResourceIndex     14450 hits   MATCH
 
   All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
-  Ten render cases, each also checked byte-identical between the Python and
-  the C++ on both the `.ll` path and the container path, and thirteen analysis
-  checks, run by `.\tools\run_rewriter_test.ps1`.
+  Twelve render cases, each also checked byte-identical between the Python and
+  the C++ on both the `.ll` path and the container path, and fourteen analysis
+  and lowering checks, run by `.\tools\run_rewriter_test.ps1`.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
                      dominators and natural loops
@@ -662,11 +675,44 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
     in the new code immediately. **When new code fails, run the OLD code
     through the new path before believing the new code is wrong.**
 
-  Next action, in order of value.
-  1. **Dynamic descriptor indexing**, still refused. The last shape on the list
-     that is a limitation of this rewriter rather than a fact about DXR 1.0.
-  2. **Only then consider making the tier flip the default**, once enough real
-     software has run through it that the refusal list is trusted.
+- Dynamic descriptor indexing: **DONE, and it was the last rewriter
+  limitation.** Uniform and non-uniform, both bit-exact and both end to end
+  through the proxy.
+  - **DXC answered the shape, as usual.**
+    `phase5/cases/reference/lib_dynarray_ref.hlsl`: the constant case's folded
+    getelementptr EXPRESSION simply becomes a real getelementptr INSTRUCTION on
+    the same global, with the same load and the same `createHandleForLib` after
+    it. `NonUniformResourceIndex` attaches `!dx.nonuniform !N`, the node being
+    `!{i32 1}`. No new opcode, no `annotateHandle`, nothing else moves. It was
+    smaller than its place on the list suggested.
+  - The non-uniform tag is emitted through a placeholder resolved when the
+    metadata is rebuilt, and its node is allocated LAST so a shader that indexes
+    statically keeps every other node id exactly where it was.
+  - **Dropping the non-uniform tag was never an option**: that would be a
+    silently wrong lowering rather than a missing feature.
+  - The test index is `width / 128`, which is 2 at runtime because `--table`
+    binds the real output at slot 2 and decoys at 0, 1 and 3. Writing the 2
+    literally would have made this the existing `table` case and proved
+    nothing. **Sensitivity: with the index poisoned to a constant 0, the same
+    scene renders 0 hits instead of 14450**, because the write lands on a decoy.
+  - **A dynamic index inside the Proceed loop IS refused**, precisely. The
+    isolation check exempts resource handles from caller state, which is sound
+    only when the MODULE fully determines the handle; a dynamic index makes it
+    depend on a value computed in the raygen, which the any-hit cannot see.
+  - Proving that reachable needed a new kind of check: **refusals that live in
+    the LOWERING rather than the analysis had no coverage at all**, including
+    the two isolation refusals that predate this work.
+
+- **A harness gap this uncovered.** `RunRayQuery` never honoured `--table`, so
+  a shader written against a descriptor table could not run as a RayQuery
+  compute shader at all, and the array cases had only ever been tested through
+  `--lib`. They had never been through the proxy's dispatch path. Fixed, and
+  the `table` case is now in the dispatch suite too, which is coverage that was
+  previously IMPOSSIBLE rather than merely absent.
+
+  Next action. **Not a feature: exposure.** Run real software through it, until
+  the refusal list is trusted, and only then consider making the tier flip the
+  default.
 
   Four accessors stay PERMANENTLY refused and must keep failing loudly:
   Candidate and `CommittedGeometryIndex`, which are Tier 1.1 on the DXR 1.0
@@ -674,8 +720,10 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   expose to a hit shader at all.
 
   What is NOT generic, written down so it is not rediscovered:
-  - Resource arrays work, but only with a **constant, uniform** index. Dynamic
-    and non-uniform indexing are refused, as is `createHandleFromHeap`.
+  - Resource arrays work with a constant index, a dynamic one, and a
+    non-uniform one. `createHandleFromHeap` is still refused. A dynamically
+    indexed handle used INSIDE the Proceed loop is refused too, because the
+    index is raygen state the any-hit cannot see.
   - The payload layout is FIXED, now 88 bytes, and carries exactly the
     committed accessors the whitelist supports. It is a state object contract:
     `PAYLOAD_BYTES` and `MaxPayloadSizeInBytes` move together or
@@ -1086,8 +1134,8 @@ clarity. The transform itself is a costed fork, see the position section.
 
 **Rewriter result (2026-09-21).** `phase5/rewriter/` automates the transform
 and reproduces both hand lowerings bit-exactly against WARP, 14450 and 8117 of
-65536 rays, 0 mismatches. It refuses eight distinct shapes it cannot lower,
-each provoked by a test. Opcodes are a whitelist; unknown ones stop the lowering
+65536 rays, 0 mismatches. It refuses eight distinct shapes in the analysis and
+one more in the lowering, each provoked by a test. Opcodes are a whitelist; unknown ones stop the lowering
 rather than being guessed at.
 
 **Patterns 1 and 3 both work by hand (2026-09-21).** `phase5/hand/make_lib.py`
@@ -1158,6 +1206,11 @@ anything.
 - `--both` makes the harness build TWO hit groups and a two-record hit table,
   for a library that commits both kinds. Only the `--lib` path needs it; the
   proxy builds its own.
+- `--table` binds a four-entry UAV descriptor table with the real output at
+  slot 2 and decoys at 0, 1 and 3, so a shader that resolves the wrong index
+  writes nowhere visible. **Both** sides honour it now; until dynamic indexing
+  was added the RayQuery side did not, which quietly kept every array case out
+  of the proxy's dispatch path.
 - `DXR11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
   drains the InfoQueue. Both halves are needed: the layer reports through
   `OutputDebugString`, so without the drain a console sees nothing and its

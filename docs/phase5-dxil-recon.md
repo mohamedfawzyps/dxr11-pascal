@@ -1743,25 +1743,99 @@ procedural one, and nothing in the shim can undo it:
     the scene routes BOTH triangle and procedural geometry to the same hit group
     record, which can only be one of the two. Nothing is drawn for it.
 
+### Dynamic descriptor indexing: the last rewriter limitation
+
+Everything else still refused is a fact about DXR 1.0. This one was not: it was
+a shape the rewriter had not been taught. It is now supported, uniform and
+non-uniform, and it was smaller than its place on the list suggested.
+
+**DXC answered it, as usual.** `phase5/cases/reference/lib_dynarray_ref.hlsl`
+asked what a library does with a non-constant array index. The constant case
+folds a getelementptr EXPRESSION into the `createHandleForLib` argument; the
+dynamic case emits a real getelementptr INSTRUCTION on the same global,
+followed by the same load and the same call. `NonUniformResourceIndex` attaches
+`!dx.nonuniform !N` to that instruction, with the node being `!{i32 1}`. No new
+opcode, no `annotateHandle`, nothing else moves.
+
+So the lowering is: constant index as before, otherwise emit the getelementptr
+as an instruction with the index operand carried across untouched. The
+non-uniform tag is emitted through a placeholder, resolved when the metadata is
+rebuilt, and its node is allocated LAST so a shader that indexes statically
+keeps every other node id exactly where it was.
+
+**Dropping the non-uniform tag was never an option.** It would be a silently
+wrong lowering rather than a missing feature, so it is carried or the shader is
+refused. It is carried.
+
+    dyn     14450 hits   MATCH      index from a cbuffer load
+    dynnu   14450 hits   MATCH      the same through NonUniformResourceIndex
+
+both bit-exact, and both end to end through the proxy as well as through the
+`.ll` and container paths.
+
+**The index is `width / 128`**, which is 2 at runtime because `--table` binds
+the real output at slot 2 and decoys at 0, 1 and 3. Writing the 2 literally
+would have made this `rayquery_table` again and proved nothing. The sensitivity
+check: with the index poisoned to a constant 0, the same scene renders **0
+hits** instead of 14450, because the write lands on a decoy.
+
+### What a dynamic index costs inside the Proceed loop
+
+The loop isolation check exempts resource handles from "caller state", because
+a handle names a resource and the any-hit shader can create its own. **That
+exemption is only sound when the MODULE fully determines the handle.** A
+dynamically indexed one depends on a value computed in the raygen, and the
+any-hit is a separate invocation that cannot see it.
+
+So that case is refused, precisely rather than by the generic message:
+
+    resource handle %v2 is indexed dynamically (i32 %v1) and used inside the
+    Proceed loop; the index is computed in the raygen and the any-hit shader is
+    a separate invocation that cannot see it
+
+Provoked in `test_reject.py` from the independent shader, which is the one that
+genuinely reads a resource in its loop body. That needed a new kind of check
+there: **refusals that live in the lowering rather than the analysis had no
+coverage at all** until now, including the two isolation refusals that predate
+this work.
+
+### A gap in the harness this uncovered
+
+`RunRayQuery` never honoured `--table`. It always built the root-descriptor
+signature, so a shader written against a descriptor table could not run as a
+RayQuery compute shader at all, and the array cases could only ever be tested
+through `--lib`. They had never been through the proxy's dispatch path.
+
+That is fixed: the compute side builds the same table the TraceRay side does.
+The `table` case is now in the dispatch suite too, which is coverage that was
+previously impossible rather than merely absent.
+
 ### Regression
 
-13 checks in `.\tools\run_dispatch_test.ps1`: 11 render cases, all MATCH against
-WARP, plus two refusal gates. The rewriter suite is 10 cases byte-identical
-between the Python and the C++, on both the `.ll` path and the container path,
-with all 13 analysis checks behaving. The probe on hardware still gives
+16 checks in `.\tools\run_dispatch_test.ps1`: 14 render cases, all MATCH against
+WARP, plus two refusal gates. The rewriter suite is 12 cases byte-identical
+between the Python and the C++ on both the `.ll` path and the container path,
+with 14 analysis and lowering checks behaving. The probe on hardware still gives
 14450 + 2312 + 48774 = 65536 on both argument-buffer shapes,
 `D3D12RaytracingHelloWorld` is 0 of 14400 pixels different,
 `D3D12RaytracingSimpleLighting` runs at baseline fps, and the debug layer is
-silent through the new state objects.
-
-One refusal test changed from a refusal to an ACCEPTANCE, since committing both
-kinds is now lowered. It checks the pattern NUMBER rather than merely that the
-shader was accepted: falling back to a neighbouring pattern would also be
-accepted, and would also be wrong.
+silent.
 
 ## Next
 
-1. **Dynamic descriptor indexing**, still refused. The last shape on the list
-   that is a rewriter limitation rather than a fact about DXR 1.0.
-2. **Only then consider making the tier flip the default**, once enough real
-   software has run through it that the refusal list is trusted.
+**Nothing on the rewriter's own list.** Every remaining refusal is a fact about
+DXR 1.0 or about what the application did, not a shape this rewriter has yet to
+learn:
+
+- `Candidate`/`CommittedGeometryIndex`, Tier 1.1 on the DXR 1.0 side too;
+- `*InstanceContributionToHitGroupIndex`, which HLSL does not expose at all;
+- RayQuery in a pixel, vertex, mesh or amplification shader;
+- RayQuery inside an existing DXR 1.0 shader;
+- groupshared memory or wave intrinsics around the query;
+- multiple concurrent RayQuery objects;
+- a loop body reading caller locals that do not fit the payload;
+- an application routing both geometry kinds to one hit group record.
+
+So the next question is not what to build but **what to run**: real software,
+enough of it that the refusal list is trusted, before the tier flip stops being
+opt-in.
