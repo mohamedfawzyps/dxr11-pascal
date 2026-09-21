@@ -4,6 +4,19 @@ Version 1.
 
 ## Current position (2026-09-21)
 
+**THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
+GTX 1070 and produces bit-exact output against WARP. Four shaders, two
+patterns, 0 mismatches. Run `.\tools\run_dispatch_test.ps1`.
+
+The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
+was missing. Nothing in this project implements ray tracing.
+
+Two things this does NOT yet establish, both of which matter more than the
+headline. Everything proven is the Phase 2 harness plus four shaders written
+for this project; a real engine will use shapes nobody here has thought of.
+And the tier flip is deliberately OPT-IN, behind `DXR11_TIER11=1`, because the
+refusal list is not trusted yet.
+
 - Phase 1 signing test: PASSED. See below and docs/phase1-signing.md.
 - Phase 2 hand-lowering test: PASSED, bit-exact on both patterns. See
   docs/phase2-lowering.md.
@@ -291,27 +304,45 @@ Version 1.
   - **Load lazily and once.** HelloWorld runs through the proxy with the whole
     rewriter linked in and loads no DXC at all, still pixel-identical.
 
-  **ONE piece now stands between this and the tier flip, and it is the largest
-  thing left in Phase 5.**
+- The dispatch path: **DONE. RayQuery compute shaders run on the 1070.**
+  `proxy/rq_pipeline.{h,cpp}`. What the shim substitutes:
 
-  **The dispatch path.** Lowering a compute shader to a library is half the
-  job. The application then calls `Dispatch`, and that has to become
-  `DispatchRays`. Concretely: `CreateComputePipelineState` on a RayQuery shader
-  must produce a state object and shader table the shim builds and OWNS,
-  `SetPipelineState` must recognise it, `Dispatch` must map the thread group
-  grid onto a ray grid, and the root signature and bindings have to be carried
-  across. None of it exists. Until it does a rewritten shader has nowhere to
-  run, which is why detection still only logs.
+      CreateComputePipelineState  lowers the DXIL, builds a state object and
+                                  shader table, returns a stand-in
+      SetPipelineState            recognises the stand-in, never forwards it
+      Dispatch(gx,gy,gz)          SetPipelineState1 then DispatchRays
 
-  Next action, in order.
-  1. **The dispatch path**, above.
-  2. **Then the tier flip**, with anything the rewriter refuses failing loudly
-     rather than rendering wrong.
+  `Dxr11RayQueryPso` is an `ID3D12PipelineState` the application holds and
+  never inspects, the same shape as `Dxr11CommandSignature` and for the same
+  reason.
 
-  Independent of both: dynamic descriptor indexing is still refused, and more
-  independent shaders are still the cheapest way to find what has been assumed.
-  Untried: non-default `RAY_FLAG` combinations, `Abort()`, procedural
-  primitives, committed object-space accessors.
+  **What made this tractable was a fact, not a technique: DXR's global root
+  signature IS the compute root signature.** `SetComputeRootSignature` and
+  `SetComputeRoot*View` are exactly what `DispatchRays` consumes, so the
+  application's bindings carry across with NO translation, and the compute
+  PSO's root signature simply becomes the state object's
+  `GLOBAL_ROOT_SIGNATURE`. Most of the feared difficulty was not there.
+
+  The one real conversion: `Dispatch` counts thread GROUPS, `DispatchRays`
+  counts RAYS. The lowered raygen reads `DispatchRaysIndex` where the original
+  read `SV_DispatchThreadID`, so the ray grid is groups times `numthreads`,
+  read from the entry point's properties (tag 4) before the lowering strips
+  them. The overhang is harmless: a shader that bounds-checked its threads
+  bounds-checks its rays identically. **The `numthreads(16,16,1)` case is in
+  the regression precisely because everything else is 8x8** and a hardcoded
+  group size would have passed every other test.
+
+  Next action. The structure is complete, so what is left is coverage and
+  confidence.
+  1. **A real application.** Everything proven is this project's own harness
+     and shaders. An engine will use shapes nobody here has thought of, and it
+     is the only way to find out which.
+  2. **Dynamic descriptor indexing**, still refused, and common in engines.
+  3. **More independent shaders.** Both written so far found something.
+     Untried: non-default `RAY_FLAG` combinations, `Abort()`, procedural
+     primitives, committed object-space accessors.
+  4. **Only then consider making the tier flip the default**, once enough real
+     software has run through it that the refusal list is trusted.
 
   What is NOT generic, written down so it is not rediscovered:
   - Resource arrays work, but only with a **constant, uniform** index. Dynamic
@@ -645,9 +676,17 @@ The estimate of the engineering cost was right: command list splitting was
 the bulk of it, and preserving binding state across the break was the part that
 kept being subtly wrong.
 
-**Still open, on purpose:** `CheckFeatureSupport` reports Tier 1.0. Reporting
-Tier 1.1 entitles the app to emit RayQuery, and a shim that claims 1.1 and then
-crashes is worse than one that claims 1.0.
+**The tier flip is now possible but OPT-IN, on purpose.** `DXR11_TIER11=1`
+makes `CheckFeatureSupport` report Tier 1.1 and turns on the RayQuery rewriting
+path. Without it the shim reports Tier 1.0 and behaves exactly as before, and
+`.\tools\run_dispatch_test.ps1` tests that gate as a case of its own.
+
+It stays off by default because reporting 1.1 entitles an application to emit
+RayQuery, and a shim that claims 1.1 and then fails is worse than one that
+claims 1.0. The refusal list has only been exercised against this project's own
+shaders. A shader the rewriter refuses is logged and forwarded unchanged, so
+the application gets the driver's own error rather than a silently wrong
+render.
 
 The proxy now DETECTS RayQuery, see the position section, but that does not
 unblock the flip. Detection says when RayQuery arrives; it does nothing about
@@ -691,6 +730,12 @@ and rewrite `!dx.entryPoints` with `!dx.typeAnnotations`. The application's own
 code never moves between modules, so its resource bindings and handles cannot be
 got wrong in transit. Emitting a container from scratch is pointless when the
 input module already has the right resources, handles and types.
+
+**Result: WORKING (2026-09-21).** A RayQuery compute shader, unmodified, runs
+on the GTX 1070 and matches WARP bit-exactly. Four shaders covering both
+patterns, 0 mismatches. `.\tools\run_dispatch_test.ps1`. The dispatch path is
+`proxy/rq_pipeline.{h,cpp}`; see the position section for how it works and what
+is still untested.
 
 **DXC host (2026-09-21).** `proxy/rewriter/dxc_host.{h,cpp}` converts a
 container to text and back and signs the result, loading DXC by full path from
