@@ -132,8 +132,11 @@ Version 1.
       pattern 3, alpha-tested, generated any-hit    8117 hits   MATCH
       resource array indexed [2], via a table      14450 hits   MATCH
       descriptor-table root signature, no array    14450 hits   MATCH
+      independent shader, resource read in loop     6333 hits   MATCH
 
   All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
+  Five render cases and ten analysis checks, run by
+  `.\tools\run_rewriter_test.ps1`.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
                      dominators and natural loops
@@ -179,12 +182,34 @@ Version 1.
     points at the output and 0, 1 and 3 point at a decoy, so a dropped index
     writes nowhere visible.
 
+  **An independently written shader found a false refusal, on the first try.**
+  `phase5/cases/rayquery_indep.hlsl` is deliberately not descended from the
+  Phase 2 pair: 16x16 group, the query behind a helper function, `continue`
+  inside the loop, accessors in a different order, and a RESOURCE READ INSIDE
+  THE PROCEED LOOP, which is what a real alpha test does. 6333 of 65536 rays,
+  bit-exact against WARP running the same shader.
+  - The loop isolation check refused it, because the `alphaMask` handle is
+    created outside the loop and used inside. Right in principle, wrong here:
+    **a resource handle is not caller state.** It names a resource, and every
+    shader in the library can reach the same one.
+  - This mattered. Refusing it would have blocked the most common real alpha
+    test there is, the one that samples a texture or buffer per candidate. The
+    Phase 2 pair could never have exposed it, because its alpha rule is pure
+    arithmetic on the barycentrics.
+  - Fixed: `createHandle` results are exempt from the isolation check, and the
+    any-hit recreates each handle the body uses under the SAME SSA name it had
+    in the raygen, so the transplanted instructions need no rewriting. Genuine
+    caller locals are still refused.
+  - `raytest --cs <file.hlsl>` compiles a given shader for the ground-truth
+    side, so any independent shader can be its own oracle through WARP.
+
   Next action, in order of how likely each is to break it.
-  1. A second, **independently written** RayQuery shader, not descended from
-     the Phase 2 pair. Everything proven so far descends from two shaders
-     written to demonstrate one lowering, so an accidental shared assumption is
-     a real risk. Descriptor tables were supposed to be the danger and were
-     not; something else will be.
+  1. **More independent shaders.** The first one found a real defect
+     immediately, which is the argument for writing another rather than
+     assuming it would pass. Most valuable: committed accessors outside the
+     whitelist, `CommittedInstanceIndex`, `CommittedPrimitiveIndex`,
+     `CommittedGeometryIndex`. Refused today and common in real code, so they
+     are the next thing a real engine hits.
   2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
   3. Wire the rewriter into the proxy at `CreateStateObject` and the compute
      pipeline path. That forces the tier question: reporting Tier 1.1 entitles
@@ -639,6 +664,13 @@ hypothesis.
 
 State clearly what is verified versus inferred. Flag uncertainty rather than
 guessing.
+
+**Test with something you did not write for the purpose.** Every Phase 5 result
+up to the independent shader came from two shaders written to demonstrate one
+lowering, and they shared an assumption none of them could reveal: that a
+Proceed loop never touches a resource. The first genuinely independent shader
+found it immediately. A suite that only contains cases built to pass is
+measuring itself.
 
 ## Preferences
 
