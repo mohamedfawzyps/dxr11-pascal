@@ -27,6 +27,9 @@ $cases = @(
     @{ name = 'indep'; src = 'phase5\cases\rayquery_indep.ll'; pat = 'alpha'; flags = @();
        gt = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
        desc = 'independently written: resource READ INSIDE the Proceed loop' },
+    @{ name = 'acc'; src = 'phase5\cases\rayquery_acc.ll'; pat = 'alpha'; flags = @('--multi');
+       gt = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi');
+       desc = 'the 11 accessors added after surveying Unreal' },
     @{ name = 'ids'; src = 'phase5\cases\rayquery_ids.ll'; pat = 'opaque'; flags = @('--multi');
        gt = @('--cs', 'phase5\cases\rayquery_ids.hlsl', '--multi');
        desc = 'CommittedInstanceIndex and CommittedPrimitiveIndex, on a scene where both vary' }

@@ -21,6 +21,17 @@ const std::map<int, const char*>& KnownTable() {
         { kCommittedInstanceIndex, "CommittedInstanceIndex" },
         { kCommittedGeometryIndex, "CommittedGeometryIndex" },
         { kCommittedPrimitiveIndex, "CommittedPrimitiveIndex" },
+        { kCandidateWorldToObject, "CandidateWorldToObject" },
+        { kCommittedWorldToObject, "CommittedWorldToObject" },
+        { kCandidateFrontFace, "CandidateTriangleFrontFace" },
+        { kCommittedFrontFace, "CommittedTriangleFrontFace" },
+        { kCandidateRayT, "CandidateTriangleRayT" },
+        { kCandidateInstanceIndex, "CandidateInstanceIndex" },
+        { kCandidateInstanceID, "CandidateInstanceID" },
+        { kCandidatePrimitiveIndex, "CandidatePrimitiveIndex" },
+        { kCandidateObjectRayOrigin, "CandidateObjectRayOrigin" },
+        { kCandidateObjectRayDirection, "CandidateObjectRayDirection" },
+        { kCommittedInstanceID, "CommittedInstanceID" },
     };
     return t;
 }
@@ -63,7 +74,16 @@ std::string NoLoweringReason(int op) {
 bool IsCommittedOp(int op) {
     return op == kCommittedStatus || op == kCommittedBary || op == kCommittedRayT ||
            op == kCommittedInstanceIndex || op == kCommittedGeometryIndex ||
-           op == kCommittedPrimitiveIndex;
+           op == kCommittedPrimitiveIndex || op == kCommittedInstanceID ||
+           op == kCommittedFrontFace || op == kCommittedWorldToObject;
+}
+
+bool IsCandidateOp(int op) {
+    return op == kCandidateType || op == kCandidateBary ||
+           op == kCandidateWorldToObject || op == kCandidateFrontFace ||
+           op == kCandidateRayT || op == kCandidateInstanceIndex ||
+           op == kCandidateInstanceID || op == kCandidatePrimitiveIndex ||
+           op == kCandidateObjectRayOrigin || op == kCandidateObjectRayDirection;
 }
 
 std::string FlagNames(int value) {
@@ -150,7 +170,7 @@ std::string Collect(const llm::Function& fn, Query& q) {
                 q.proceeds.emplace_back(&b, &i);
             } else if (op == kCommitNonOpaque) {
                 q.commits.emplace_back(&b, &i);
-            } else if (op == kCandidateType || op == kCandidateBary) {
+            } else if (IsCandidateOp(op)) {
                 q.candidateOps.emplace_back(&b, &i);
             } else if (IsCommittedOp(op)) {
                 q.committedOps.emplace_back(&b, &i);

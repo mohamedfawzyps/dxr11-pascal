@@ -162,9 +162,16 @@ int Instr::DxOp() const {
 }
 
 std::vector<std::string> Instr::Uses() const {
+    // Phi incoming VALUES count. They were missed at first, and a phi is
+    // exactly how a value escapes a loop, so the loop isolation check was
+    // blind to the one shape it exists to catch.
     std::vector<std::string> out;
     for (const auto& a : args) {
         std::string n = OperandName(a);
+        if (!n.empty()) out.push_back(n);
+    }
+    for (const auto& in : phiIncoming) {
+        std::string n = OperandName(in.first);
         if (!n.empty()) out.push_back(n);
     }
     return out;

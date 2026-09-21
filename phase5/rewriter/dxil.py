@@ -110,10 +110,18 @@ class Instr(object):
         return int(m.group(1)) if m else None
 
     def uses(self):
-        """Operand names this instruction reads."""
+        """Operand names this instruction reads.
+
+        Phi incoming VALUES count. They were missed at first, and a phi is
+        exactly how a value escapes a loop, so the loop isolation check was
+        blind to the one shape it exists to catch."""
         out = []
         for a in self.args:
             n = operand_name(a)
+            if n:
+                out.append(n)
+        for val, _blk in self.phi_incoming:
+            n = operand_name(val)
             if n:
                 out.append(n)
         return out

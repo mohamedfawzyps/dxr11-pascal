@@ -106,9 +106,15 @@ def main():
 
     # An opcode we have never seen. Refuse rather than guess: 184 and 185 share
     # one LLVM function, so a near miss here renders the wrong thing silently.
+    # 250 is used because it is genuinely unobserved: 191 was this test's
+    # example until it turned out to be CandidateTriangleFrontFace.
+    # 250 is used because it is genuinely unobserved. This test said 191 until
+    # the Unreal survey turned 191 into CandidateTriangleFrontFace, at which
+    # point the "unverified" case quietly became a verified one and the check
+    # started passing shaders it was written to refuse.
     unknown = opaque.replace(
         '  %v35 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 184, i32 %v33)',
-        '  %v35 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 191, i32 %v33)')
+        '  %v35 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 250, i32 %v33)')
     ok.append(expect_reject('unverified rayQuery opcode', unknown,
                             'refusing rather than guessing'))
 

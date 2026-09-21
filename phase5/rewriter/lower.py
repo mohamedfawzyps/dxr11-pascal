@@ -23,8 +23,15 @@ ATTRS = '%struct.BuiltInTriangleIntersectionAttributes'
 # Tailoring it per shader would save a few bytes and cost a lot of ways to get
 # the offsets wrong; the brief puts correctness well ahead of that.
 #   0 float t | 1 <2 x float> bary | 2 i32 hit | 3 inst | 4 prim | 5 geom
-PAYLOAD_TYPE = '{ float, <2 x float>, i32, i32, i32, i32 }'
-PAYLOAD_BYTES = 28
+#   0 t | 1 bary | 2 hit | 3 inst | 4 prim | 5 unused | 6 instanceID
+#   7 hitKind | 8 worldToObject, 12 floats
+#
+# The LAYOUT is fixed even though the matrix is only sometimes read: variable
+# offsets across two implementations is a good way to get one of them subtly
+# wrong. The per-invocation COST is what is made conditional instead, since the
+# closest-hit only fetches the matrix when the shader actually reads it.
+PAYLOAD_TYPE = '{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float] }'
+PAYLOAD_BYTES = 84
 PAYLOAD_FIELD = {
     rq.COMMITTED_RAY_T: (0, 'float', 8),
     rq.COMMITTED_BARY: (1, '<2 x float>', 4),
@@ -32,11 +39,32 @@ PAYLOAD_FIELD = {
     rq.COMMITTED_INSTANCE_INDEX: (3, 'i32', 4),
     rq.COMMITTED_PRIMITIVE_INDEX: (4, 'i32', 4),
     rq.COMMITTED_GEOMETRY_INDEX: (5, 'i32', 4),
+    rq.COMMITTED_INSTANCE_ID: (6, 'i32', 4),
+    rq.COMMITTED_FRONT_FACE: (7, 'i32', 4),
+    rq.COMMITTED_WORLD_TO_OBJECT: (8, '[12 x float]', 4),
 }
+
+# RayQuery -> DXR 1.0, for accessors read in the ANY-HIT shader. Measured from
+# DXC output on both sides. The operand shape is identical apart from the query
+# handle, which simply goes away.
+CANDIDATE_MAP = {
+    rq.CANDIDATE_INSTANCE_INDEX:  ('i32', 'dx.op.instanceIndex.i32', 142, 0),
+    rq.CANDIDATE_INSTANCE_ID:     ('i32', 'dx.op.instanceID.i32', 141, 0),
+    rq.CANDIDATE_PRIMITIVE_INDEX: ('i32', 'dx.op.primitiveIndex.i32', 161, 0),
+    rq.CANDIDATE_RAY_T:           ('float', 'dx.op.rayTCurrent.f32', 154, 0),
+    rq.CANDIDATE_OBJECT_RAY_ORIGIN:    ('float', 'dx.op.objectRayOrigin.f32', 149, 1),
+    rq.CANDIDATE_OBJECT_RAY_DIRECTION: ('float', 'dx.op.objectRayDirection.f32', 150, 1),
+    rq.CANDIDATE_WORLD_TO_OBJECT:      ('float', 'dx.op.worldToObject.f32', 152, 2),
+}
+# HitKind() is an integer; the RayQuery form is a bool. 254 is
+# HIT_KIND_TRIANGLE_FRONT_FACE.
+HIT_KIND_FRONT = 254
 # Which dx.op gives each field in a DXR 1.0 closest-hit, read off DXC output.
 CH_SOURCE = {
     3: ('i32', 'call i32 @dx.op.instanceIndex.i32(i32 142)'),
     4: ('i32', 'call i32 @dx.op.primitiveIndex.i32(i32 161)'),
+    6: ('i32', 'call i32 @dx.op.instanceID.i32(i32 141)'),
+    7: ('i32', 'call i32 @dx.op.hitKind.i32(i32 143)'),
     # Field 5, geometry index, is deliberately absent: see NO_LOWERING in
     # rayquery.py. Emitting dx.op.geometryIndex would set shader flag
     # 0x2000000 and the state object would then be refused by the driver.
@@ -264,9 +292,10 @@ def _trace_block(q, ra, exit_label):
     flags = q.ray_flags
     lines = []
     for idx, ty, align in [(0, 'float', 8), (1, '<2 x float>', 4), (2, 'i32', 4),
-                           (3, 'i32', 4), (4, 'i32', 4), (5, 'i32', 4)]:
+                           (3, 'i32', 4), (4, 'i32', 4), (5, 'i32', 4),
+                           (6, 'i32', 4), (7, 'i32', 4), (8, '[12 x float]', 4)]:
         zero = '0.000000e+00' if ty == 'float' else (
-            'zeroinitializer' if ty.startswith('<') else '0')
+            'zeroinitializer' if (ty.startswith('<') or ty.startswith('[')) else '0')
         lines.append('  %%rq.pl%d = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 %d'
                      % (idx, PAYLOAD, PAYLOAD, idx))
         lines.append('  store %s %s, %s* %%rq.pl%d, align %d' % (ty, zero, ty, idx, align))
@@ -343,7 +372,23 @@ def _edit_committed(q, edits):
     """Committed accessors become payload reads."""
     for block, instr in q.committed_ops:
         idx, ty, align = PAYLOAD_FIELD[instr.dxop]
-        if instr.dxop == rq.COMMITTED_BARY:
+        if instr.dxop == rq.COMMITTED_FRONT_FACE:
+            tmp = '%%rq.ff%s' % instr.result[1:]
+            edits[instr.index] = (
+                '  %s = load i32, i32* %%rq.pl7, align 4\n'
+                '  %s = icmp eq i32 %s, %d'
+                % (tmp, instr.result, tmp, HIT_KIND_FRONT))
+        elif instr.dxop == rq.COMMITTED_WORLD_TO_OBJECT:
+            row = re.match(r'i32\s+(\d+)', instr.args[2].strip()).group(1)
+            col = re.match(r'i8\s+(\d+)', instr.args[3].strip()).group(1)
+            slot = int(row) * 4 + int(col)
+            ptr = '%%rq.w%s' % instr.result[1:]
+            edits[instr.index] = (
+                '  %s = getelementptr inbounds [12 x float], [12 x float]* '
+                '%%rq.pl8, i32 0, i32 %d\n'
+                '  %s = load float, float* %s, align 4'
+                % (ptr, slot, instr.result, ptr))
+        elif instr.dxop == rq.COMMITTED_BARY:
             comp = re.match(r'i8\s+(\d+)', instr.args[2].strip()).group(1)
             tmp = '%%rq.bv%s' % instr.result[1:]
             edits[instr.index] = (
@@ -391,7 +436,27 @@ def _swap_declarations(text, q, globals_):
            '', '; Function Attrs: nounwind readnone',
            'declare i32 @dx.op.instanceIndex.i32(i32) #0',
            '', '; Function Attrs: nounwind readnone',
-           'declare i32 @dx.op.primitiveIndex.i32(i32) #0']
+           'declare i32 @dx.op.primitiveIndex.i32(i32) #0',
+           '', '; Function Attrs: nounwind readnone',
+           'declare i32 @dx.op.instanceID.i32(i32) #0',
+           '', '; Function Attrs: nounwind readnone',
+           'declare i32 @dx.op.hitKind.i32(i32) #0',
+           ]
+    # An UNUSED declare is itself a validation error, so these three are
+    # emitted only when something actually calls them. The rest above are
+    # always used, because the generated closest-hit reads them every time.
+    used_ops = {i.dxop for _, i in q.candidate_ops} | {i.dxop for _, i in q.committed_ops}
+    conditional = [
+        ({rq.CANDIDATE_WORLD_TO_OBJECT, rq.COMMITTED_WORLD_TO_OBJECT},
+         'declare float @dx.op.worldToObject.f32(i32, i32, i8) #0'),
+        ({rq.CANDIDATE_OBJECT_RAY_ORIGIN},
+         'declare float @dx.op.objectRayOrigin.f32(i32, i8) #0'),
+        ({rq.CANDIDATE_OBJECT_RAY_DIRECTION},
+         'declare float @dx.op.objectRayDirection.f32(i32, i8) #0'),
+    ]
+    for ops, decl in conditional:
+        if used_ops & ops:
+            new += ['', '; Function Attrs: nounwind readnone', decl]
     if q.loop:
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.ignoreHit(i32) #3']
@@ -414,6 +479,7 @@ def _swap_declarations(text, q, globals_):
 
 
 def _append_shaders(text, module, q, exports, table, globals_):
+    # q is used below to decide whether the closest-hit fetches the matrix.
     """Emit the generated shader set after the raygen."""
     fns = []
     if q.loop:
@@ -437,6 +503,23 @@ def _append_shaders(text, module, q, exports, table, globals_):
         ch.append('  %%pi%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
                   % (idx, PAYLOAD, PAYLOAD, idx))
         ch.append('  store %s %%id%d, %s* %%pi%d, align 4' % (ty, idx, ty, idx))
+
+    # Twelve fetches and twelve stores, so they are emitted ONLY when the
+    # shader actually reads the matrix. The payload field exists either way,
+    # because a layout that changes shape is a layout that gets an offset
+    # wrong; it is the per-invocation work that is worth avoiding.
+    if any(i.dxop == rq.COMMITTED_WORLD_TO_OBJECT for _, i in q.committed_ops):
+        ch.append('  %pw = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 8'
+                  .format(pl=PAYLOAD))
+        for r in range(3):
+            for c in range(4):
+                s = r * 4 + c
+                ch.append('  %%w%d = call float @dx.op.worldToObject.f32'
+                          '(i32 152, i32 %d, i8 %d)  ; WorldToObject(row,col)'
+                          % (s, r, c))
+                ch.append('  %%pw%d = getelementptr inbounds [12 x float], '
+                          '[12 x float]* %%pw, i32 0, i32 %d' % (s, s))
+                ch.append('  store float %%w%d, float* %%pw%d, align 4' % (s, s))
     ch += ['  ret void', '}']
     fns.append('\n'.join(ch))
     fns.append('''define void @{ms}({pl}* noalias nocapture %p) #1 {{
@@ -507,6 +590,20 @@ def _anyhit(module, q, exports, table, globals_):
                 comp = re.match(r'i8\s+(\d+)', i.args[2].strip()).group(1)
                 out.append('  %s = extractelement <2 x float> %%rq.ab, i32 %s'
                            % (i.result, comp))
+                continue
+            if i.dxop == rq.CANDIDATE_FRONT_FACE:
+                # RayQuery returns a bool; HitKind() is an integer.
+                hk = '%%rq.hk%s' % i.result[1:]
+                out.append('  %s = call i32 @dx.op.hitKind.i32(i32 143)'
+                           '  ; HitKind()' % hk)
+                out.append('  %s = icmp eq i32 %s, %d' % (i.result, hk, HIT_KIND_FRONT))
+                continue
+            if i.dxop in CANDIDATE_MAP:
+                # Same operands as the RayQuery form, minus the query handle.
+                ty, callee, op, extra = CANDIDATE_MAP[i.dxop]
+                args = ['i32 %d' % op] + [a.strip() for a in i.args[2:2 + extra]]
+                out.append('  %s = call %s @%s(%s)'
+                           % (i.result, ty, callee, ', '.join(args)))
                 continue
             line = i.line
             for old, new in subst.items():

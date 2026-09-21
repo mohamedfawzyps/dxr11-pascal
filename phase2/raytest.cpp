@@ -778,13 +778,14 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
     // Must be at least the payload the rewriter emits, PAYLOAD_BYTES in
-    // phase5/rewriter/lower.py, currently 28: float t, float2 bary, uint hit,
-    // then the instance and primitive indices. It is a MAXIMUM, so declaring
+    // phase5/rewriter/lower.py, currently 84: t, bary, hit, the instance,
+    // primitive and instance ID, the hit kind, and the 3x4 world-to-object
+    // matrix. It is a MAXIMUM, so declaring
     // 28 costs the 16-byte hand-written shaders nothing. Getting this wrong
     // shows up as CreateStateObject returning E_INVALIDARG, which is a real
     // coupling: the payload size is part of the state object contract, not a
     // free choice for whatever generates the shaders.
-    sc.MaxPayloadSizeInBytes = 28;
+    sc.MaxPayloadSizeInBytes = 84;
     sc.MaxAttributeSizeInBytes = 8;     // float2 barycentrics
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
 

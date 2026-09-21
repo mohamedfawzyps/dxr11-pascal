@@ -39,6 +39,22 @@ COMMITTED_INSTANCE_INDEX = 207
 COMMITTED_GEOMETRY_INDEX = 209
 COMMITTED_PRIMITIVE_INDEX = 210
 
+# The accessors a real engine uses, added after surveying Unreal. All read off
+# DXC output, and every DXR 1.0 target was compiled and its SFI0 checked first,
+# because GeometryIndex proved an intrinsic can look ordinary and be secretly
+# Tier 1.1.
+CANDIDATE_WORLD_TO_OBJECT = 187
+CANDIDATE_FRONT_FACE = 191
+COMMITTED_FRONT_FACE = 192
+COMMITTED_WORLD_TO_OBJECT = 189
+CANDIDATE_RAY_T = 199
+CANDIDATE_INSTANCE_INDEX = 201
+CANDIDATE_INSTANCE_ID = 202
+CANDIDATE_PRIMITIVE_INDEX = 204
+CANDIDATE_OBJECT_RAY_ORIGIN = 205
+CANDIDATE_OBJECT_RAY_DIRECTION = 206
+COMMITTED_INSTANCE_ID = 208
+
 # Opcode -> short name, for messages. Membership in this table is what makes
 # an opcode supported; the numbers NOT here are deliberately absent because
 # this project has not observed them and will not guess.
@@ -55,14 +71,33 @@ KNOWN = {
     COMMITTED_INSTANCE_INDEX: 'CommittedInstanceIndex',
     COMMITTED_GEOMETRY_INDEX: 'CommittedGeometryIndex',
     COMMITTED_PRIMITIVE_INDEX: 'CommittedPrimitiveIndex',
+    CANDIDATE_WORLD_TO_OBJECT: 'CandidateWorldToObject',
+    CANDIDATE_FRONT_FACE: 'CandidateTriangleFrontFace',
+    COMMITTED_FRONT_FACE: 'CommittedTriangleFrontFace',
+    COMMITTED_WORLD_TO_OBJECT: 'CommittedWorldToObject',
+    CANDIDATE_RAY_T: 'CandidateTriangleRayT',
+    CANDIDATE_INSTANCE_INDEX: 'CandidateInstanceIndex',
+    CANDIDATE_INSTANCE_ID: 'CandidateInstanceID',
+    CANDIDATE_PRIMITIVE_INDEX: 'CandidatePrimitiveIndex',
+    CANDIDATE_OBJECT_RAY_ORIGIN: 'CandidateObjectRayOrigin',
+    CANDIDATE_OBJECT_RAY_DIRECTION: 'CandidateObjectRayDirection',
+    COMMITTED_INSTANCE_ID: 'CommittedInstanceID',
 }
+
+# Read in the any-hit shader, where they need no payload at all: the candidate
+# under test IS what a DXR 1.0 hit-shader intrinsic reports.
+CANDIDATE_OPS = (CANDIDATE_TYPE, CANDIDATE_BARY, CANDIDATE_WORLD_TO_OBJECT,
+                 CANDIDATE_FRONT_FACE, CANDIDATE_RAY_T, CANDIDATE_INSTANCE_INDEX,
+                 CANDIDATE_INSTANCE_ID, CANDIDATE_PRIMITIVE_INDEX,
+                 CANDIDATE_OBJECT_RAY_ORIGIN, CANDIDATE_OBJECT_RAY_DIRECTION)
 
 # Everything the generated closest-hit can put in the payload. Used by both the
 # analysis, to decide what is a committed read, and the lowering, to lay the
 # payload out.
 COMMITTED_OPS = (COMMITTED_STATUS, COMMITTED_BARY, COMMITTED_RAY_T,
                  COMMITTED_INSTANCE_INDEX, COMMITTED_GEOMETRY_INDEX,
-                 COMMITTED_PRIMITIVE_INDEX)
+                 COMMITTED_PRIMITIVE_INDEX, COMMITTED_INSTANCE_ID,
+                 COMMITTED_FRONT_FACE, COMMITTED_WORLD_TO_OBJECT)
 
 # CommittedGeometryIndex is recognised so the refusal can explain itself, but
 # it has NO lowering on this hardware. Its DXR 1.0 equivalent, GeometryIndex()
@@ -231,7 +266,7 @@ def _collect(fn, q):
             q.proceeds.append((block, instr))
         elif op == COMMIT_NON_OPAQUE:
             q.commits.append((block, instr))
-        elif op in (CANDIDATE_TYPE, CANDIDATE_BARY):
+        elif op in CANDIDATE_OPS:
             q.candidate_ops.append((block, instr))
         elif op in COMMITTED_OPS:
             if op in NO_LOWERING:

@@ -17,7 +17,7 @@ namespace {
 const UINT kIdSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;                  // 32
 const UINT kRecAlign = D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT;        // 32
 const UINT kTableAlign = D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;       // 64
-const UINT kPayloadBytes = 28;   // must match PAYLOAD_BYTES in rq_lower.cpp
+const UINT kPayloadBytes = 84;   // must match PAYLOAD_BYTES in rq_lower.cpp
 const UINT kAttrBytes = 8;
 
 UINT AlignUp(UINT v, UINT a) { return (v + a - 1) & ~(a - 1); }

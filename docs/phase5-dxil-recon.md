@@ -1176,20 +1176,91 @@ refuses, or merely separate functions, which is fine, cannot be determined by
 reading the source. It needs the compiled DXIL, and compiling it needs the
 engine.
 
+## The 11 accessors: coverage 8 of 24 becomes 19 of 24
+
+The survey said 11 of the 16 gaps were mechanically addable. They are added,
+in both implementations, and they work.
+
+| RayQuery | | DXR 1.0 | |
+|---|---|---|---|
+| CandidateInstanceIndex | 201 | `instanceIndex` | 142 |
+| CandidateInstanceID | 202 | `instanceID` | 141 |
+| CandidatePrimitiveIndex | 204 | `primitiveIndex` | 161 |
+| CandidateTriangleRayT | 199 | `rayTCurrent` | 154 |
+| CandidateObjectRayOrigin | 205 | `objectRayOrigin` | 149 |
+| CandidateObjectRayDirection | 206 | `objectRayDirection` | 150 |
+| CandidateWorldToObject | 187 | `worldToObject` | 152 |
+| CandidateTriangleFrontFace | 191 | `hitKind` == 254 | 143 |
+| CommittedInstanceID | 208 | `instanceID`, via payload | 141 |
+| CommittedTriangleFrontFace | 192 | `hitKind`, via payload | 143 |
+| CommittedWorldToObject | 189 | `worldToObject`, via payload | 152 |
+
+The operand shape is IDENTICAL on both sides apart from the query handle, which
+simply goes away. `StateMatrix(op, handle, i32 row, i8 col)` becomes
+`worldToObject(152, i32 row, i8 col)`. That uniformity is why eleven accessors
+cost one small table rather than eleven special cases.
+
+Two do need conversion. `*TriangleFrontFace` returns `i1` in RayQuery while
+`HitKind()` is an integer, so it becomes `icmp eq i32 hk, 254`. And the
+world-to-object matrix is twelve floats, so it travels in the payload as
+`[12 x float]` indexed `row * 4 + col`.
+
+### The payload: fixed layout, conditional cost
+
+The payload grows from 28 to 84 bytes, almost all of it the matrix. The LAYOUT
+is fixed even when the matrix is unread, because variable field offsets across
+two implementations is an excellent way to get one of them subtly wrong. What
+is made conditional is the per-invocation COST: the closest-hit emits its
+twelve fetches and twelve stores only when the shader actually reads the
+matrix. Memory is the cheap axis here; work per hit is not.
+
+`MaxPayloadSizeInBytes` had to move with it in two places, the harness and
+`rq_pipeline.cpp`. That coupling was already documented and it bit exactly as
+predicted.
+
+### Two bugs the work exposed
+
+**The loop isolation check was blind to phi nodes.** The first version of the
+test shader accumulated a value across candidates and read it after the loop,
+which cannot be lowered. The rewriter did not refuse it; it produced IR the
+assembler rejected with `use of undefined value '%v64'`.
+
+The cause: `Uses()` collected operands from call arguments only, and a phi is
+not a call. **A phi is exactly how a value escapes a loop**, so the check was
+blind to the one shape it exists to catch. Fixed in both implementations, and
+the shader is now correctly refused with "value %v64 defined in the Proceed
+loop is used after it". The test shader was rewritten to do what a real alpha
+test does: let the candidate accessors decide the commit and nothing else.
+
+**A refusal test quietly stopped testing anything.** `test_reject.py` used
+opcode 191 as its example of something unverified. The Unreal survey turned 191
+into `CandidateTriangleFrontFace`, so the "unverified" case became a verified
+one and the check started accepting what it was written to refuse. It now uses
+250, which is genuinely unobserved, with a comment saying why.
+
+That is the second time in this project a test has decayed rather than failed.
+Worth the general lesson: a test whose premise is a fact about the world needs
+re-checking when that fact changes.
+
+### Results
+
+    seven shaders lowered, C++ and Python BYTE-IDENTICAL on every one
+    acc, the new accessor shader     18496 hits   MATCH, 0 mismatches
+    12 of 12 refusals behaved
+    five shaders end to end through the proxy on the 1070, all MATCH
+
+Coverage against Unreal's 24 accessors goes from 8 to 19. What remains is the
+four permanently blocked (geometry index and instance contribution to hit group
+index) and `CommitProceduralPrimitiveHit` plus `Abort()`.
+
 ## Next
 
-The structure is finished; the gap is coverage, and it is now measured rather
-than guessed.
-
-1. **The 11 mechanically addable accessors.** Each maps to an intrinsic already
-   confirmed available. This is the single biggest step toward real content and
-   the least risky, because the mapping is one table and the failure mode is a
-   refusal.
-2. **`Abort()`**, four uses in Epic's shaders, mapping to
-   `AcceptHitAndEndSearch()`.
-3. **Procedural primitives**, needing the generated intersection shader, which
-   is the largest remaining piece of lowering and is genuinely new work.
-4. Two accessor families stay permanently refused: geometry index, which is
-   Tier 1.1 on the DXR 1.0 side too, and instance contribution to hit group
-   index, which HLSL does not expose to a hit shader at all. Both must keep
-   failing loudly.
+1. **`Abort()`**, four uses in Epic's shaders. The brief maps it to
+   `AcceptHitAndEndSearch()`, so it is small, and it takes coverage to 20.
+2. **Procedural primitives**, needing the generated intersection shader. The
+   largest remaining piece of lowering, and genuinely new work rather than
+   another table entry. Takes coverage to 21, the practical maximum.
+3. **Dynamic descriptor indexing**, still refused.
+4. Four accessors stay permanently refused, and must keep failing loudly:
+   Candidate and CommittedGeometryIndex are Tier 1.1 on the DXR 1.0 side too,
+   and `*InstanceContributionToHitGroupIndex` has no HLSL intrinsic at all.

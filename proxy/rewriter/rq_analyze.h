@@ -38,6 +38,20 @@ enum Opcode {
     kCommittedInstanceIndex = 207,
     kCommittedGeometryIndex = 209,
     kCommittedPrimitiveIndex = 210,
+    // Added after surveying Unreal. All read off DXC output, and every DXR 1.0
+    // target was compiled and its SFI0 checked first, because GeometryIndex
+    // proved an intrinsic can look ordinary and be secretly Tier 1.1.
+    kCandidateWorldToObject = 187,
+    kCommittedWorldToObject = 189,
+    kCandidateFrontFace = 191,
+    kCommittedFrontFace = 192,
+    kCandidateRayT = 199,
+    kCandidateInstanceIndex = 201,
+    kCandidateInstanceID = 202,
+    kCandidatePrimitiveIndex = 204,
+    kCandidateObjectRayOrigin = 205,
+    kCandidateObjectRayDirection = 206,
+    kCommittedInstanceID = 208,
 };
 
 // Non-rayQuery opcodes this pass cares about.
@@ -52,6 +66,9 @@ const char* OpcodeName(int op);
 // Recognised, but with no lowering on Tier 1.0. Empty if the opcode is fine.
 std::string NoLoweringReason(int op);
 bool IsCommittedOp(int op);
+// Read in the any-hit shader, where they need no payload at all: the
+// candidate under test IS what a DXR 1.0 hit-shader intrinsic reports.
+bool IsCandidateOp(int op);
 std::string FlagNames(int value);
 
 // The compute shader's [numthreads(x,y,z)], read from the entry point's
