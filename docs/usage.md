@@ -93,6 +93,29 @@ launchers. Remember you have set it:
 setx DXR11_TIER11 1
 ```
 
+### The whole switch list
+
+The shim reads exactly two environment variables. There are no others.
+
+| Variable | What it does |
+|---|---|
+| `DXR11_TIER11=1` | report Tier 1.1 and rewrite RayQuery shaders |
+| `DXR11_NO_WRAP=1` | hand the application the real device and translate nothing |
+
+`NO_WRAP` is not a companion to the first one, it overrides it. Everything the
+shim does lives on the device object it hands the application, including the
+Tier 1.1 answer, so refusing to hand over that object switches the whole layer
+off. With `NO_WRAP` set the application sees Tier 1.0 whatever else you set.
+
+That leaves four states, and only one of them is the one you want:
+
+| DLL beside the .exe | `TIER11` | `NO_WRAP` | The application sees |
+|---|---|---|---|
+| no | | | Tier 1.0 |
+| yes | unset | unset | Tier 1.0 |
+| yes | **1** | unset | **Tier 1.1, shaders rewritten** |
+| yes | anything | **1** | Tier 1.0, shim loaded but inert |
+
 ## 5. Read the log
 
 Every run writes `%TEMP%\dxr11_proxy.log`. Open it first, always. It is the
@@ -169,11 +192,24 @@ scene layouts it can only partly serve.
 are in the README; those will not change, because DXR 1.0 has nothing to lower
 them onto.
 
-**Turn the debug layer on.** `DXR11_DEBUGLAYER=1` for the test harness. The
-D3D12 debug layer reports through `OutputDebugString`, so a console shows
-nothing without a drain. Note that it does not police everything: it is silent
-on hit group and geometry type mismatches, so its silence is not evidence on
-its own.
+**Turn the D3D12 debug layer on.** The shim does not switch this itself, and
+it does not need to: `dxcpl.exe`, the DirectX Control Panel, forces the debug
+layer on for any executable you name. It comes with the Graphics Tools
+optional Windows feature (Settings, Optional features, Add a feature, Graphics
+Tools). Add the target .exe to its list and enable the debug layer there.
+
+The layer reports through `OutputDebugString`, so its messages do NOT appear in
+a console or in `dxr11_proxy.log`. Read them with DebugView or a debugger
+attached to the process.
+
+`DXR11_DEBUGLAYER=1` turns it on in this project's own test harness, where the
+messages are drained into stdout. That variable does nothing for the shim.
+
+**A warning about reading anything into its silence.** The debug layer does not
+police everything. It is measurably silent on hit group and geometry type
+mismatches, including a case this project confirmed was producing wrong output.
+An oracle that says nothing has to be shown capable of saying something before
+its silence counts as a result.
 
 ## 8. Turning it off
 
