@@ -52,12 +52,31 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         out = heapBuf.data();
     }
     bool anyWrapped = false;
+    bool anySplit = false;
     for (UINT i = 0; i < NumCommandLists; ++i) {
         ID3D12CommandList* real = Dxr11CommandList::Unwrap(ppCommandLists[i]);
         out[i] = real ? real : ppCommandLists[i];
         if (real) anyWrapped = true;
+        Dxr11CommandList* w = Dxr11CommandList::From(ppCommandLists[i]);
+        if (w && w->IsSplit()) anySplit = true;
     }
-    g_original(self, NumCommandLists, anyWrapped ? out : ppCommandLists);
+
+    // Common case: nothing was split, so this is one submission as the app
+    // intended, with our wrappers swapped out.
+    if (!anySplit) {
+        g_original(self, NumCommandLists, anyWrapped ? out : ppCommandLists);
+        return;
+    }
+
+    // A split recording cannot go out as one submission: the dispatch in the
+    // middle can only be recorded once the GPU has produced its dimensions.
+    // Submit each list in turn so ordering is preserved exactly.
+    for (UINT i = 0; i < NumCommandLists; ++i) {
+        Dxr11CommandList* w = Dxr11CommandList::From(ppCommandLists[i]);
+        if (w && w->IsSplit() && w->SubmitSegmented(self, g_original)) continue;
+        ID3D12CommandList* one[] = { out[i] };
+        g_original(self, 1, one);
+    }
 }
 
 bool PatchSlot(void** vtable, size_t index, void* replacement, void** outOriginal) {

@@ -794,9 +794,38 @@ static void ProbeIndirect(Ctx& c, IDxcBlob* lib) {
     c.g.flush();
     uint32_t indTri = 0, indProc = 0;
     c.readback_counts(indTri, indProc, ignore, unwritten, 0);
-    std::printf("   ExecuteIndirect          : %u tri + %u proc hits, %u unwritten\n", indTri, indProc, unwritten);
+    std::printf("   ExecuteIndirect (CPU args): %u tri + %u proc hits, %u unwritten\n", indTri, indProc, unwritten);
     std::printf("   RESULT                   : %s\n",
         (indTri == directTri && indProc == directProc && unwritten == 0) ? "MATCH" : "DIVERGE");
+
+    // --- the case that actually matters -------------------------------------
+    // Unreal never hands ExecuteIndirect a CPU-visible argument buffer. It builds
+    // one on the GPU with CopyBufferRegion immediately before the dispatch, so at
+    // record time nothing in it is valid yet. Reproduce that shape exactly: a
+    // DEFAULT heap buffer filled by a copy recorded just ahead of the dispatch.
+    auto gpuArgs = CreateBuffer(c.g.device.Get(), sizeof(dr), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    c.clear_out();
+    c.g.list->CopyBufferRegion(gpuArgs.Get(), 0, argBuf.Get(), 0, sizeof(dr));
+    // What a well-behaved app does, and what Unreal does: the argument buffer
+    // must be in INDIRECT_ARGUMENT state when ExecuteIndirect reads it.
+    Transition(c.g.list.Get(), gpuArgs.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    c.g.list->SetPipelineState1(so.Get());
+    BindRoots(c.g.list.Get(), c.rs.Get(), c.cb->GetGPUVirtualAddress(),
+              c.scene.tlas->GetGPUVirtualAddress(), c.out->GetGPUVirtualAddress());
+    c.g.list->ExecuteIndirect(cs.Get(), 1, gpuArgs.Get(), 0, nullptr, 0);
+    UavBarrier(c.g.list.Get(), c.out.Get());
+    c.g.flush();
+    uint32_t gpuTri = 0, gpuProc = 0;
+    c.readback_counts(gpuTri, gpuProc, ignore, unwritten, 0);
+    const bool gpuOk = (gpuTri == directTri && gpuProc == directProc && unwritten == 0);
+    std::printf("   ExecuteIndirect (GPU args): %u tri + %u proc hits, %u unwritten\n",
+                gpuTri, gpuProc, unwritten);
+    std::printf("   RESULT                   : %s%s\n", gpuOk ? "MATCH" : "DIVERGE",
+                gpuOk ? "  <- the shape Unreal uses"
+                      : "  <- needs the command list split");
 }
 
 // ---------------------------------------------------------------------------

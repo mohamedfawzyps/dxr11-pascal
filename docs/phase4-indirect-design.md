@@ -795,3 +795,72 @@ The command list split: segment the recording at the `ExecuteIndirect`, submit,
 wait, read the dimensions back, replay the binding state, and issue the direct
 `DispatchRays`. Then batch several dispatches behind one sync, since the
 measurement showed the damage is per split rather than one-off.
+
+## The command list split: S1 complete
+
+Indirect DispatchRays now works on the GTX 1070 for the shape Unreal actually
+uses, a GPU-written argument buffer.
+
+    ExecuteIndirect (CPU args): 14450 tri + 2312 proc hits, 0 unwritten   MATCH
+    ExecuteIndirect (GPU args): 14450 tri + 2312 proc hits, 0 unwritten   MATCH
+
+matching the WARP ground truth exactly, with the log showing the mechanism:
+
+    [dxr11-proxy] split dispatch issued: 256x256x1, dimensions read back from the GPU
+
+### How it works
+
+The wrapper records into a SEQUENCE of real command lists rather than one. At an
+`ExecuteIndirect` whose argument buffer is GPU-only, `BeginSplit`:
+
+1. copies the argument buffer into a shim-owned readback buffer,
+2. closes the current segment,
+3. opens a continuation on the same allocator, which is legal because only one
+   list per allocator may be recording at a time,
+4. replays the binding state into it, since a fresh list has none.
+
+The queue hook then plays the recording back as: submit segment, wait on a
+fence, read the dimensions, record a dispatch-only list now that they are known,
+submit it, then carry on with the next segment. A recording with no indirect ray
+dispatch takes none of this path and costs one comparison.
+
+`Dxr11Bindings` tracks what a `DispatchRays` needs: descriptor heaps, the compute
+root signature, every compute root parameter, and the state object. Replay order
+matters and is not arbitrary: heaps first, then the root signature, **which
+clears the root parameters**, then the parameters, then the state object.
+
+### The barriers are not optional
+
+The first working version read the dimensions back as 0x0x0 and skipped the
+dispatch. The copy was reading the argument buffer with no transition after
+whatever had just written it. D3D12 requires the buffer to be in
+INDIRECT_ARGUMENT state at an `ExecuteIndirect`, so the split now transitions it
+to COPY_SOURCE around the readback copy and back again. Worth remembering: for
+buffers this reads like a formality because of state promotion, and it is not.
+
+### Verified
+
+| | result |
+|---|---|
+| probe, hardware, GPU-written args | **MATCH**, 14450 + 2312, 0 unwritten |
+| probe, hardware, CPU-visible args | MATCH |
+| probe, WARP through the proxy | MATCH, still forwarding untouched |
+| raytest | ALL MATCH |
+| HelloWorld | 0 of 14400 pixels differ, 2117 against 2133 fps |
+| SimpleLighting | 1359 against 1379 fps |
+| debug layer, split active | no errors; only the pre-existing benign buffer-state warnings |
+
+### Known limits, stated rather than hidden
+
+- `MaxCommandCount` above 1 with a GPU-written argument buffer is refused, not
+  guessed. Unreal always passes 1.
+- A count buffer is refused the same way.
+- The dispatch list is kept alive by waiting for it to finish, which adds a
+  second sync per split. Pooling would remove it.
+- Several indirect dispatches in one recording each get their own sync. The
+  pipelined measurement showed the damage is per split, about 0.8 to 1.0 ms
+  each, so batching them behind one sync is the remaining optimisation.
+- Graphics root parameters are not tracked, only compute. `DispatchRays` uses
+  the compute root signature, so this is sufficient for the dispatch itself, but
+  a split also resets graphics state for whatever the application records
+  afterwards. No test app has tripped on it; a real engine might.

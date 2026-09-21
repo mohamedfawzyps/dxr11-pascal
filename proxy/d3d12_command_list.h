@@ -17,6 +17,65 @@
 #pragma once
 
 #include <d3d12.h>
+#include <wrl/client.h>
+#include <vector>
+
+// --- command list splitting -------------------------------------------------
+//
+// An indirect ray dispatch cannot be serviced at record time when its argument
+// buffer lives on the GPU, because the dimensions do not exist yet. The shim
+// therefore records into a SEQUENCE of real command lists, splitting at the
+// ExecuteIndirect, and the queue hook plays them back as:
+//
+//     submit segment N  ->  wait  ->  read the dimensions  ->
+//     record and submit a dispatch-only list  ->  submit segment N+1
+//
+// The dispatch list can only be recorded once the dimensions are known, which is
+// why it is built at submit time rather than during recording.
+//
+// Splitting costs the binding state: Reset clears everything, so whatever the
+// application had set has to be replayed at the head of the continuation
+// segment, and again in the dispatch list. That is what Dxr11Bindings is for.
+
+// One root parameter's last-set value on the compute pipeline, which is the one
+// DispatchRays uses.
+struct Dxr11RootParam {
+    enum Kind : unsigned char { None, Table, Constants, CBV, SRV, UAV };
+    Kind kind = None;
+    D3D12_GPU_DESCRIPTOR_HANDLE table{};
+    D3D12_GPU_VIRTUAL_ADDRESS   address = 0;
+    std::vector<UINT>           constants;
+};
+
+// Enough state to make a DispatchRays behave as the application intended.
+struct Dxr11Bindings {
+    static const UINT kMaxRootParams = 64;   // a root signature is 64 DWORDs
+
+    ID3D12RootSignature* rootSig = nullptr;
+    ID3D12StateObject*   stateObject = nullptr;
+    std::vector<ID3D12DescriptorHeap*> heaps;
+    Dxr11RootParam roots[kMaxRootParams];
+
+    void Retain();      // AddRef everything held
+    void ReleaseAll();  // and let it go
+    // Replays in dependency order: heaps, then root signature (which clears the
+    // root parameters), then the parameters, then the state object.
+    void Replay(ID3D12GraphicsCommandList4* cl) const;
+};
+
+// A dispatch that could not be issued at record time. The readback buffer
+// receives the argument buffer's contents once the preceding segment has run.
+struct Dxr11PendingDispatch {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    UINT64        readbackOffset = 0;
+    Dxr11Bindings bindings;
+};
+
+struct Dxr11Segment {
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;  // closed
+    bool                 hasPending = false;
+    Dxr11PendingDispatch pending;
+};
 
 // Private interface used only so the queue hook can tell one of our wrappers
 // from a real command list. Not exposed to applications.
@@ -35,6 +94,19 @@ public:
     // Returns the real list if `maybeWrapped` is one of ours, else null.
     // Does not change the reference count of the returned pointer.
     static ID3D12CommandList* Unwrap(ID3D12CommandList* maybeWrapped);
+
+    // Returns the wrapper if `maybe` is one of ours, else null. No ref change.
+    static Dxr11CommandList* From(ID3D12CommandList* maybe);
+
+    // True when this recording was split and needs the staged submission below.
+    bool IsSplit() const { return !m_segments.empty(); }
+
+    // Plays the recording back on `queue`, syncing at each split to read the
+    // dispatch dimensions. `submit` is the ORIGINAL ExecuteCommandLists, since
+    // ours is hooked. Returns false if it could not be done, in which case the
+    // caller should fall back to submitting the list as-is.
+    typedef void (STDMETHODCALLTYPE *SubmitFn)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+    bool SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submit);
 
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -142,10 +214,27 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override;
 
 private:
+    // Ends the current segment at an indirect dispatch: copies the arguments to
+    // a readback buffer, closes the segment, opens a fresh one and replays the
+    // bindings into it. Returns false if it could not, and the caller then
+    // refuses the dispatch rather than issuing a wrong one.
+    bool BeginSplit(ID3D12Resource* args, UINT64 argOffset);
+    ID3D12Device5* RealDevice();
+
     ID3D12GraphicsCommandList4* m_real;
     // Null when the runtime does not offer them; QueryInterface then refuses the
     // matching IID rather than handing back a vtable it cannot honour.
     ID3D12GraphicsCommandList5* m_real5;
     ID3D12GraphicsCommandList6* m_real6;
     LONG                        m_refs;
+
+    // Split machinery. Empty and untouched for a recording with no indirect ray
+    // dispatch, which is every recording in every app tested so far.
+    std::vector<Dxr11Segment>                          m_segments;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>     m_allocator;   // the app's, from Reset
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>     m_splitAlloc;  // ours, for dispatch lists
+    Microsoft::WRL::ComPtr<ID3D12Fence>                m_fence;
+    UINT64                                             m_fenceValue = 0;
+    Microsoft::WRL::ComPtr<ID3D12Device5>              m_device;
+    Dxr11Bindings                                      m_bindings;
 };

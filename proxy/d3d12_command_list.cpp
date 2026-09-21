@@ -19,6 +19,49 @@
 const GUID IID_Dxr11CommandList =
     { 0xa6b41c7e, 0x2e5d, 0x4c3b, { 0x9f, 0x80, 0x1d, 0x4e, 0x6a, 0x0f, 0x2b, 0x91 } };
 
+void Dxr11Bindings::Retain() {
+    if (rootSig) rootSig->AddRef();
+    if (stateObject) stateObject->AddRef();
+    for (auto* h : heaps) if (h) h->AddRef();
+}
+void Dxr11Bindings::ReleaseAll() {
+    if (rootSig) { rootSig->Release(); rootSig = nullptr; }
+    if (stateObject) { stateObject->Release(); stateObject = nullptr; }
+    for (auto* h : heaps) if (h) h->Release();
+    heaps.clear();
+}
+void Dxr11Bindings::Replay(ID3D12GraphicsCommandList4* cl) const {
+    // Order matters. Descriptor heaps must be bound before any table that
+    // indexes into them, and SetComputeRootSignature CLEARS the root parameters,
+    // so it has to come before they are restored.
+    if (!heaps.empty()) cl->SetDescriptorHeaps((UINT)heaps.size(), heaps.data());
+    if (rootSig) cl->SetComputeRootSignature(rootSig);
+    for (UINT i = 0; i < kMaxRootParams; ++i) {
+        const Dxr11RootParam& r = roots[i];
+        switch (r.kind) {
+        case Dxr11RootParam::Table:     cl->SetComputeRootDescriptorTable(i, r.table); break;
+        case Dxr11RootParam::CBV:       cl->SetComputeRootConstantBufferView(i, r.address); break;
+        case Dxr11RootParam::SRV:       cl->SetComputeRootShaderResourceView(i, r.address); break;
+        case Dxr11RootParam::UAV:       cl->SetComputeRootUnorderedAccessView(i, r.address); break;
+        case Dxr11RootParam::Constants:
+            if (!r.constants.empty())
+                cl->SetComputeRoot32BitConstants(i, (UINT)r.constants.size(), r.constants.data(), 0);
+            break;
+        default: break;
+        }
+    }
+    if (stateObject) cl->SetPipelineState1(stateObject);
+}
+
+Dxr11CommandList* Dxr11CommandList::From(ID3D12CommandList* maybe) {
+    if (!maybe) return nullptr;
+    Dxr11CommandList* self = nullptr;
+    if (FAILED(maybe->QueryInterface(IID_Dxr11CommandList, (void**)&self)) || !self)
+        return nullptr;
+    self->Release();
+    return self;
+}
+
 Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
     : m_real(real), m_real5(nullptr), m_real6(nullptr), m_refs(1) {
     if (m_real) {
@@ -92,7 +135,17 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::GetDevice(REFIID riid, void** ppv) {
 D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE Dxr11CommandList::GetType() { return FWD(GetType()); }
 
 HRESULT STDMETHODCALLTYPE Dxr11CommandList::Close() { return FWD(Close()); }
-HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) { return FWD(Reset(a, p)); }
+// Reset starts a fresh recording, so any segments from the previous one are
+// stale. It also clears all binding state, which is exactly why a split has to
+// replay it.
+HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) {
+    m_segments.clear();
+    m_bindings.ReleaseAll();
+    for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i)
+        m_bindings.roots[i] = Dxr11RootParam{};
+    m_allocator = a;
+    return FWD(Reset(a, p));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) { FWD(ClearState(p)); }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { FWD(DrawInstanced(a, b, c, d)); }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawIndexedInstanced(UINT a, UINT b, UINT c, INT d, UINT e) { FWD(DrawIndexedInstanced(a, b, c, d, e)); }
@@ -118,20 +171,64 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteBundle(ID3D12GraphicsCommandList
     FWD(ExecuteBundle(real ? static_cast<ID3D12GraphicsCommandList*>(real) : pCommandList));
 }
 
-void STDMETHODCALLTYPE Dxr11CommandList::SetDescriptorHeaps(UINT n, ID3D12DescriptorHeap* const* h) { FWD(SetDescriptorHeaps(n, h)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootSignature(ID3D12RootSignature* r) { FWD(SetComputeRootSignature(r)); }
+// --- binding tracking -------------------------------------------------------
+// Recorded so it can be replayed after a split. Every one of these is still a
+// faithful forward; the bookkeeping is pure addition.
+void STDMETHODCALLTYPE Dxr11CommandList::SetDescriptorHeaps(UINT n, ID3D12DescriptorHeap* const* h) {
+    for (auto* old : m_bindings.heaps) if (old) old->Release();
+    m_bindings.heaps.assign(h, h + n);
+    for (auto* nh : m_bindings.heaps) if (nh) nh->AddRef();
+    FWD(SetDescriptorHeaps(n, h));
+}
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootSignature(ID3D12RootSignature* r) {
+    if (m_bindings.rootSig) m_bindings.rootSig->Release();
+    m_bindings.rootSig = r;
+    if (r) r->AddRef();
+    // Setting a root signature clears the parameters, so forget them too.
+    for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i)
+        m_bindings.roots[i] = Dxr11RootParam{};
+    FWD(SetComputeRootSignature(r));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootSignature(ID3D12RootSignature* r) { FWD(SetGraphicsRootSignature(r)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { FWD(SetComputeRootDescriptorTable(i, h)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
+    if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::Table; m_bindings.roots[i].table = h; }
+    FWD(SetComputeRootDescriptorTable(i, h));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { FWD(SetGraphicsRootDescriptorTable(i, h)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstant(UINT i, UINT v, UINT o) { FWD(SetComputeRoot32BitConstant(i, v, o)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstant(UINT i, UINT v, UINT o) {
+    if (i < Dxr11Bindings::kMaxRootParams) {
+        Dxr11RootParam& r = m_bindings.roots[i];
+        r.kind = Dxr11RootParam::Constants;
+        if (r.constants.size() < (size_t)o + 1) r.constants.resize((size_t)o + 1, 0);
+        r.constants[o] = v;
+    }
+    FWD(SetComputeRoot32BitConstant(i, v, o));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRoot32BitConstant(UINT i, UINT v, UINT o) { FWD(SetGraphicsRoot32BitConstant(i, v, o)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) { FWD(SetComputeRoot32BitConstants(i, n, d, o)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) {
+    if (i < Dxr11Bindings::kMaxRootParams && d) {
+        Dxr11RootParam& r = m_bindings.roots[i];
+        r.kind = Dxr11RootParam::Constants;
+        if (r.constants.size() < (size_t)o + n) r.constants.resize((size_t)o + n, 0);
+        std::memcpy(r.constants.data() + o, d, (size_t)n * sizeof(UINT));
+    }
+    FWD(SetComputeRoot32BitConstants(i, n, d, o));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) { FWD(SetGraphicsRoot32BitConstants(i, n, d, o)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetComputeRootConstantBufferView(i, a)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::CBV; m_bindings.roots[i].address = a; }
+    FWD(SetComputeRootConstantBufferView(i, a));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetGraphicsRootConstantBufferView(i, a)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetComputeRootShaderResourceView(i, a)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::SRV; m_bindings.roots[i].address = a; }
+    FWD(SetComputeRootShaderResourceView(i, a));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetGraphicsRootShaderResourceView(i, a)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetComputeRootUnorderedAccessView(i, a)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (i < Dxr11Bindings::kMaxRootParams) { m_bindings.roots[i].kind = Dxr11RootParam::UAV; m_bindings.roots[i].address = a; }
+    FWD(SetComputeRootUnorderedAccessView(i, a));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetGraphicsRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { FWD(SetGraphicsRootUnorderedAccessView(i, a)); }
 void STDMETHODCALLTYPE Dxr11CommandList::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) { FWD(IASetIndexBuffer(v)); }
 void STDMETHODCALLTYPE Dxr11CommandList::IASetVertexBuffers(UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) { FWD(IASetVertexBuffers(s, n, v)); }
@@ -181,17 +278,23 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
     }
 
     // Can the CPU see the arguments at all? A DEFAULT heap means they are
-    // produced on the GPU and simply do not exist yet.
+    // produced on the GPU and do not exist yet, which is Unreal's case and needs
+    // the command list split.
     D3D12_HEAP_PROPERTIES heap{};
     D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
-    if (FAILED(args->GetHeapProperties(&heap, &heapFlags)) ||
-        (heap.Type != D3D12_HEAP_TYPE_UPLOAD && heap.Type != D3D12_HEAP_TYPE_READBACK)) {
-        static LONG warned = 0;
-        if (InterlockedCompareExchange(&warned, 1, 0) == 0) {
-            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): argument buffer is in a "
-                     "GPU-only heap (type %d). Its contents do not exist yet at record "
-                     "time, so this needs the command list split, which is not built. "
-                     "Dispatch SKIPPED. Output will be wrong, loudly.\n", (int)heap.Type);
+    const bool cpuVisible =
+        SUCCEEDED(args->GetHeapProperties(&heap, &heapFlags)) &&
+        (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK);
+
+    if (!cpuVisible) {
+        if (maxCount != 1) {
+            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): MaxCommandCount=%u with a "
+                     "GPU-written argument buffer is not supported, dispatch SKIPPED\n", maxCount);
+            return;
+        }
+        if (!BeginSplit(args, argOffset)) {
+            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): split failed, "
+                     "dispatch SKIPPED\n");
         }
         return;
     }
@@ -237,7 +340,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteMetaCommand(ID3D12MetaCommand* m
 void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) { FWD(BuildRaytracingAccelerationStructure(d, n, p)); }
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { FWD(CopyRaytracingAccelerationStructure(d, s, m)); }
-void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s) { FWD(SetPipelineState1(s)); }
+void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s) {
+    if (m_bindings.stateObject) m_bindings.stateObject->Release();
+    m_bindings.stateObject = s;
+    if (s) s->AddRef();
+    FWD(SetPipelineState1(s));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) { FWD(DispatchRays(d)); }
 
 // --- ID3D12GraphicsCommandList5 / 6 -----------------------------------------
@@ -253,4 +361,175 @@ void STDMETHODCALLTYPE Dxr11CommandList::RSSetShadingRateImage(ID3D12Resource* i
 }
 void STDMETHODCALLTYPE Dxr11CommandList::DispatchMesh(UINT x, UINT y, UINT z) {
     if (m_real6) m_real6->DispatchMesh(x, y, z);
+}
+
+// --- splitting ---------------------------------------------------------------
+
+ID3D12Device5* Dxr11CommandList::RealDevice() {
+    if (!m_device) {
+        // Ask the REAL list, so this never re-enters the device wrapper.
+        m_real->GetDevice(__uuidof(ID3D12Device5), (void**)m_device.GetAddressOf());
+    }
+    return m_device.Get();
+}
+
+bool Dxr11CommandList::BeginSplit(ID3D12Resource* args, UINT64 argOffset) {
+    ID3D12Device5* dev = RealDevice();
+    if (!dev || !m_allocator) {
+        ProxyLog("[dxr11-proxy] split: no device or allocator (was Reset called?)\n");
+        return false;
+    }
+
+    // Somewhere to put the arguments once the GPU has produced them.
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = sizeof(D3D12_DISPATCH_RAYS_DESC);
+    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
+        ProxyLog("[dxr11-proxy] split: could not create the readback buffer\n");
+        return false;
+    }
+
+    // Last thing in this segment: copy the arguments out.
+    //
+    // The barriers are NOT optional. D3D12 requires the argument buffer to be in
+    // INDIRECT_ARGUMENT state at an ExecuteIndirect, and whatever wrote it, a
+    // copy or a compute shader, needs an execution dependency before this read.
+    // Without them the copy returns stale contents, which showed up as
+    // dimensions of 0x0x0 and a silently skipped dispatch.
+    D3D12_RESOURCE_BARRIER toCopy{};
+    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toCopy.Transition.pResource = args;
+    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    m_real->ResourceBarrier(1, &toCopy);
+
+    m_real->CopyBufferRegion(readback.Get(), 0, args, argOffset, sizeof(D3D12_DISPATCH_RAYS_DESC));
+
+    D3D12_RESOURCE_BARRIER back = toCopy;
+    back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    back.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    m_real->ResourceBarrier(1, &back);
+    if (FAILED(m_real->Close())) {
+        ProxyLog("[dxr11-proxy] split: Close failed on the segment\n");
+        return false;
+    }
+
+    Dxr11Segment seg;
+    seg.list = m_real;                 // keeps its reference
+    seg.hasPending = true;
+    seg.pending.readback = readback;
+    seg.pending.bindings = m_bindings;  // copy, then take our own references
+    seg.pending.bindings.Retain();
+    m_segments.push_back(seg);
+
+    // Open the continuation on the SAME allocator. Legal because the previous
+    // list is closed; only one list per allocator may be recording at a time.
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> next;
+    if (FAILED(dev->CreateCommandList(0, m_real->GetType(), m_allocator.Get(), nullptr,
+                                      IID_PPV_ARGS(&next)))) {
+        ProxyLog("[dxr11-proxy] split: could not open the continuation segment\n");
+        m_segments.pop_back();
+        return false;
+    }
+
+    // Swap the continuation in. The old list is owned by the segment now.
+    if (m_real6) { m_real6->Release(); m_real6 = nullptr; }
+    if (m_real5) { m_real5->Release(); m_real5 = nullptr; }
+    m_real = next.Detach();
+    m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList5), (void**)&m_real5);
+    m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList6), (void**)&m_real6);
+
+    // A fresh list has no state, so give the application back what it had set.
+    m_bindings.Replay(m_real);
+    return true;
+}
+
+bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submit) {
+    ID3D12Device5* dev = RealDevice();
+    if (!dev || !queue || !submit) return false;
+
+    if (!m_fence) {
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
+            ProxyLog("[dxr11-proxy] split submit: could not create a fence\n");
+            return false;
+        }
+    }
+    if (!m_splitAlloc) {
+        if (FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&m_splitAlloc)))) {
+            ProxyLog("[dxr11-proxy] split submit: could not create an allocator\n");
+            return false;
+        }
+    }
+
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!evt) return false;
+
+    for (size_t i = 0; i < m_segments.size(); ++i) {
+        Dxr11Segment& seg = m_segments[i];
+        ID3D12CommandList* one[] = { seg.list.Get() };
+        submit(queue, 1, one);
+        if (!seg.hasPending) continue;
+
+        // The bubble the measurements priced: the CPU cannot go on until the
+        // GPU has produced the dispatch dimensions.
+        ++m_fenceValue;
+        queue->Signal(m_fence.Get(), m_fenceValue);
+        if (m_fence->GetCompletedValue() < m_fenceValue) {
+            m_fence->SetEventOnCompletion(m_fenceValue, evt);
+            WaitForSingleObject(evt, INFINITE);
+        }
+
+        D3D12_DISPATCH_RAYS_DESC desc{};
+        void* p = nullptr;
+        D3D12_RANGE readAll{ 0, sizeof(desc) };
+        if (SUCCEEDED(seg.pending.readback->Map(0, &readAll, &p)) && p) {
+            std::memcpy(&desc, p, sizeof(desc));
+            D3D12_RANGE noWrite{ 0, 0 };
+            seg.pending.readback->Unmap(0, &noWrite);
+        }
+
+        if (desc.Width && desc.Height && desc.Depth) {
+            // Now the dimensions are known, the dispatch can finally be recorded.
+            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> dl;
+            if (SUCCEEDED(m_splitAlloc->Reset()) &&
+                SUCCEEDED(dev->CreateCommandList(0, m_real->GetType(), m_splitAlloc.Get(),
+                                                 nullptr, IID_PPV_ARGS(&dl)))) {
+                seg.pending.bindings.Replay(dl.Get());
+                dl->DispatchRays(&desc);
+                if (SUCCEEDED(dl->Close())) {
+                    ID3D12CommandList* d[] = { dl.Get() };
+                    submit(queue, 1, d);
+                    static LONG once = 0;
+                    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+                        ProxyLog("[dxr11-proxy] split dispatch issued: %ux%ux%u, dimensions "
+                                 "read back from the GPU\n", desc.Width, desc.Height, desc.Depth);
+                }
+            }
+            // The dispatch list must outlive its execution, so keep the CPU here
+            // until the GPU is done with it. Same bubble, already paid for.
+            ++m_fenceValue;
+            queue->Signal(m_fence.Get(), m_fenceValue);
+            if (m_fence->GetCompletedValue() < m_fenceValue) {
+                m_fence->SetEventOnCompletion(m_fenceValue, evt);
+                WaitForSingleObject(evt, INFINITE);
+            }
+        } else {
+            ProxyLog("[dxr11-proxy] split: dimensions read back as %ux%ux%u, dispatch skipped\n",
+                     desc.Width, desc.Height, desc.Depth);
+        }
+    }
+
+    // Finally the tail, the part recorded after the last split.
+    ID3D12CommandList* tail[] = { m_real };
+    submit(queue, 1, tail);
+
+    CloseHandle(evt);
+    return true;
 }
