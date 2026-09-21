@@ -27,6 +27,7 @@
 #include <cwchar>
 
 #include "proxy_log.h"
+#include "version.h"
 #include "rewriter/dxc_host.h"
 #include "d3d12_device.h"
 
@@ -292,7 +293,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
         // loaded here: the host loads lazily, so an application that never
         // uses RayQuery pays nothing for this.
         dxch::SetHostModule(self);
-        ProxyLog("[dxr11-proxy] attached to process\n");
+        ProxyLog("[dxr11-proxy] attached to process, version " DXR11_VERSION "\n");
     }
     return TRUE;
 }

@@ -122,6 +122,14 @@ baseline, and each sensitivity check is measured rather than assumed. Several
 findings in `docs/` are records of tests that passed for the wrong reason and
 what it took to notice.
 
+## Versions
+
+[CHANGELOG.md](CHANGELOG.md) carries the releases and the versioning policy.
+The version is compiled into the DLL and logged on attach, so a log file
+identifies its own build:
+
+    [dxr11-proxy] attached to process, version 0.9.0
+
 ## Documentation
 
 `docs/` carries the reasoning and the measurements behind each phase, including
