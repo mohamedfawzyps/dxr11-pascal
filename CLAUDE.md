@@ -123,20 +123,57 @@ Version 1.
   - `IgnoreHit` is `noreturn nounwind` and a compute module has no attribute
     group for it, so one has to be appended.
 
-  Next action: automate. Both scripts key off exact instruction text, which is
-  fine for a fixed input and useless for a real one. The rewriter has to find
-  the same sites structurally: follow the query handle, match opcodes on
-  operand 0, recognise the rotated loop. `llnorm` first, `dxilrt asm` as the
-  feedback loop, `raytest --lib` as the correctness check. Pattern 2, shadow
-  rays with `ACCEPT_FIRST_HIT_AND_END_SEARCH` and a miss shader only, is not
-  yet attempted and should be the easiest of the three.
+- Phase 5 rewriter: **AUTOMATED, and it matches both hand lowerings.**
+  `phase5/rewriter/` finds the sites structurally, with no input-specific
+  text. `.\tools\run_rewriter_test.ps1` runs it end to end, taking ground
+  truth from WARP every run rather than from a stored baseline.
 
-  Still untested, and all of it matters before this meets a real shader:
-  descriptor tables rather than root descriptors, more than one query per
-  shader, procedural primitives and the intersection path, and every
-  no-valid-lowering case in the "Cases with no valid lowering" table below.
-  Everything proven so far is one compute shader with three root-level
-  bindings and a single query.
+      pattern 1, opaque closest hit               14450 hits   MATCH
+      pattern 3, alpha-tested, generated any-hit   8117 hits   MATCH
+
+  Both bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
+
+      dxil.py        small .ll model: blocks, instructions, dx.op decoding,
+                     dominators and natural loops
+      rayquery.py    finds and classifies the query, refuses what has no lowering
+      lower.py       the transform, driven entirely by the analysis
+      dxrewrite.py   CLI: analyze <in.ll> | lower <in.ll> <out.ll>
+      test_reject.py provokes each refusal by mutating a known-good input
+
+  All three structural handles the recon promised held up, which is the main
+  result: the query handle is a plain `i32` so ownership is one def-use hop;
+  dispatching on the opcode immediate avoids confusing CommittedStatus (184)
+  with CandidateType (185), which share one LLVM function; and dominator-based
+  loop detection reports exactly the header, latch and body the recon worked
+  out by hand. No textual pattern finds that loop.
+
+  **Opcodes are a whitelist** of the nine actually observed in DXC output.
+  Anything else stops the lowering. Given two of them share one LLVM function,
+  a near miss would render the wrong thing silently.
+
+  Pattern 2 also lowers and renders correctly, from an input built by setting
+  `ACCEPT_FIRST_HIT_AND_END_SEARCH` on the opaque shader. CAVEAT: this scene
+  has one triangle layer, so accept-first-hit is indistinguishable from
+  closest-hit in it. The path works; first-hit semantics are not proven.
+
+  Next action: the three things most likely to break it, in order.
+  1. A shader binding through a **descriptor table**. Named below as the most
+     likely failure and never exercised here.
+  2. A second, independently written RayQuery shader, ideally not derived from
+     the Phase 2 pair, to find what has been accidentally assumed.
+  3. Wire the rewriter into the proxy at `CreateStateObject` and the compute
+     pipeline path. That forces the tier question: reporting Tier 1.1 entitles
+     an app to emit RayQuery, so the flip and a working rewriter have to land
+     together, with anything refused failing loudly.
+
+  What is NOT generic, written down so it is not rediscovered:
+  - **Root-level bindings only.** Descriptor tables and `createHandleFromHeap`
+    are untested, and are the most likely thing to break on a real shader.
+  - The payload is fixed at `{float, <2 x float>, i32}`, carrying exactly the
+    three committed accessors the whitelist supports.
+  - One entry point, one query.
+  - No procedural primitive or intersection shader path at all. Such a shader
+    is refused rather than mislowered.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -492,6 +529,12 @@ code never moves between modules, so its resource bindings and handles cannot be
 got wrong in transit. Emitting a container from scratch is pointless when the
 input module already has the right resources, handles and types.
 
+**Rewriter result (2026-09-21).** `phase5/rewriter/` automates the transform
+and reproduces both hand lowerings bit-exactly against WARP, 14450 and 8117 of
+65536 rays, 0 mismatches. It refuses nine distinct shapes it cannot lower, each
+provoked by a test. Opcodes are a whitelist; unknown ones stop the lowering
+rather than being guessed at.
+
 **Patterns 1 and 3 both work by hand (2026-09-21).** `phase5/hand/make_lib.py`
 and `make_lib_alpha.py` lower `rayquery_opaque.ll` and `rayquery_alpha.ll` into
 `lib_6_5` libraries as text. Both render bit-exactly against WARP on the 1070,
@@ -535,6 +578,12 @@ ends matter less now that the text level is available:
 WARP is the oracle throughout. It implements Tier 1.1 correctly in software,
 so any RayQuery shader can be run there for ground truth and diffed against
 the lowered version on the 1070. No RTX card needed.
+
+Phase 5 has its own end-to-end check, `.\tools\run_rewriter_test.ps1`:
+lower each pattern with the rewriter, assemble and sign with `dxilrt`, run on
+the 1070, diff against WARP. It also runs the refusal tests, because an
+analysis that never says no is worth as little as one that never finds
+anything.
 
 `raytest.exe` carries the Phase 5 hooks:
 - `--lib <file.dxil>` makes the TraceRay side load a pre-built library from
