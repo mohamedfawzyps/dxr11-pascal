@@ -12,11 +12,22 @@ Version 1.
   1.0 sample exe, confirm it renders and that `%TEMP%\dxr11_proxy.log` shows
   the D3D12CreateDevice line. Then Phase 3b, the ID3D12Device5 wrapper.
 
-Dev machine (Windows x64) toolchain paths:
-- DXC: `C:\DW\DXC`
-- Agility SDK 1.619.5: `C:\DW\microsoft.direct3d.d3d12.1.619.5`
+Dev machine (Windows x64), everything under `C:\DW`:
+- `C:\DW\dxr11-pascal` - this repository.
+- `C:\DW\DXC` - DirectX Shader Compiler (`inc\dxcapi.h`, `bin\x64\dxcompiler.dll`,
+  `dxil.dll`).
+- `C:\DW\microsoft.direct3d.d3d12.1.619.5` - Agility SDK.
+- `C:\DW\DirectX-Graphics-Samples` - Microsoft samples, source of the DXR 1.0
+  app used to validate the proxy.
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`.
   Run them from an "x64 Native Tools Command Prompt for VS".
+
+Optional read-only reference: a local clone of the Unreal Engine 5.7 NvRTX
+Caustics branch. Useful from Phase 4 on, to see how a shipping engine queries
+the raytracing tier and drives both dispatch paths. Look in
+`Engine/Source/Runtime/D3D12RHI` and grep narrowly, the repo is enormous. It is
+a separate project (see Related); read it for reference, do not vendor it here
+or let it redirect this project's scope.
 
 ## What this is
 
