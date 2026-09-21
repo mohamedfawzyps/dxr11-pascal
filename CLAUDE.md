@@ -12,9 +12,13 @@ Version 1.
 - Phase 4 probe: DONE, ground truth captured. See docs/phase4-probe.md.
   Headline: the Tier 1.1 ray flags ALREADY WORK on the GTX 1070, verified
   against WARP to the ray, so that feature needs no shim at all. Two features
-  remain. Next action: extend Dxr11Device to ID3D12Device7 (a prerequisite,
-  Device7 is present on Tier 1.0 hardware), then AddToStateObject, then
-  indirect DispatchRays. Flip CheckFeatureSupport to Tier 1.1 last.
+  remain. Next action: AddToStateObject, then indirect DispatchRays. Flip
+  CheckFeatureSupport to Tier 1.1 last.
+- Device7 wrapper extension: DONE. Dxr11Device now implements ID3D12Device7,
+  so AddToStateObject and CreateProtectedResourceSession1 route through the
+  shim. Verified by running the Phase 4 probe through the proxy: the
+  AddToStateObject call lands in our wrapper on WARP, and no interface is
+  passed through unwrapped any more. Regression clean on all three apps.
 
   Two findings worth carrying forward, both about the proxy's export table:
   - A proxy d3d12.dll must match the real DLL's export ORDINALS, not just its
@@ -30,13 +34,15 @@ Version 1.
     jumps, which need no signature. Keep the debug layer working: it is the
     tool that catches our own mistakes in phases 4 and 5.
 
-  The device wrapper is `Dxr11Device` in proxy/d3d12_device.{h,cpp}: all 62
-  ID3D12Device5 methods forwarded unchanged. It wraps only the device, not
-  child objects, so ID3D12DeviceChild::GetDevice() still returns the real
-  device; Phase 4 has to handle that. QueryInterface for anything above
-  Device5 is passed through unwrapped AND logged, so watch the log for
-  ID3D12Device7 (AddToStateObject) before relying on Phase 4 interception.
-  DXR11_NO_WRAP=1 disables wrapping, restoring forward-only behaviour.
+  The device wrapper is `Dxr11Device` in proxy/d3d12_device.{h,cpp}: all 65
+  ID3D12Device7 methods forwarded unchanged. Device6 and Device7 are optional,
+  QueryInterface returns E_NOINTERFACE when the real device lacks them. It
+  wraps only the device, not child objects, so ID3D12DeviceChild::GetDevice()
+  still returns the real device; Phase 4 has to handle that if an app trips on
+  it. QueryInterface above Device7 is passed through unwrapped AND logged;
+  nothing in the current test apps does that except ID3D12InfoQueue, which is
+  correct. DXR11_NO_WRAP=1 disables wrapping, restoring forward-only
+  behaviour.
 
 Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\dxr11-pascal` - this repository.

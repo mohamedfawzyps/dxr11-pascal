@@ -16,10 +16,22 @@
 // FWD(method, args...) - forward to the real device, returning its result.
 #define FWD(call) return m_real->call
 
-Dxr11Device::Dxr11Device(ID3D12Device5* real) : m_real(real), m_refs(1) {}
+Dxr11Device::Dxr11Device(ID3D12Device5* real)
+    : m_real(real), m_real6(nullptr), m_real7(nullptr), m_refs(1) {
+    // Optional: a device that stops at Device5 is still wrappable, we just
+    // decline the higher IIDs in QueryInterface.
+    if (m_real) {
+        m_real->QueryInterface(__uuidof(ID3D12Device6), (void**)&m_real6);
+        m_real->QueryInterface(__uuidof(ID3D12Device7), (void**)&m_real7);
+    }
+    ProxyLog("[dxr11-proxy] device wrapper created (real=%p, Device6=%s, Device7=%s)\n",
+             (void*)m_real, m_real6 ? "yes" : "no", m_real7 ? "yes" : "no");
+}
 
 Dxr11Device::~Dxr11Device() {
-    if (m_real) m_real->Release();
+    if (m_real7) m_real7->Release();
+    if (m_real6) m_real6->Release();
+    if (m_real)  m_real->Release();
 }
 
 // --- IUnknown ---------------------------------------------------------------
@@ -39,11 +51,18 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::QueryInterface(REFIID riid, void** ppvObj
     if (riid == __uuidof(IUnknown)      || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12Device)  || riid == __uuidof(ID3D12Device1) ||
         riid == __uuidof(ID3D12Device2) || riid == __uuidof(ID3D12Device3) ||
-        riid == __uuidof(ID3D12Device4) || riid == __uuidof(ID3D12Device5)) {
+        riid == __uuidof(ID3D12Device4) || riid == __uuidof(ID3D12Device5) ||
+        (riid == __uuidof(ID3D12Device6) && m_real6) ||
+        (riid == __uuidof(ID3D12Device7) && m_real7)) {
         AddRef();
-        *ppvObject = static_cast<ID3D12Device5*>(this);
+        *ppvObject = static_cast<ID3D12Device7*>(this);
         return S_OK;
     }
+
+    // Asked for Device6/7 but the real device does not have it. Say so rather
+    // than handing back a pointer whose vtable the device cannot honour.
+    if (riid == __uuidof(ID3D12Device6) || riid == __uuidof(ID3D12Device7))
+        return E_NOINTERFACE;
 
     HRESULT hr = m_real->QueryInterface(riid, ppvObject);
     if (SUCCEEDED(hr)) {
@@ -148,6 +167,36 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateMetaCommand(REFGUID CommandId, UINT
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject) { FWD(CreateStateObject(pDesc, riid, ppStateObject)); }
 void STDMETHODCALLTYPE Dxr11Device::GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) { m_real->GetRaytracingAccelerationStructurePrebuildInfo(pDesc, pInfo); }
 D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE Dxr11Device::CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE SerializedDataType, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* pIdentifierToCheck) { FWD(CheckDriverMatchingIdentifier(SerializedDataType, pIdentifierToCheck)); }
+
+// --- ID3D12Device6 ----------------------------------------------------------
+//
+// Reachable only when QueryInterface handed out a Device6, which it does only
+// when m_real6 exists. The null check is belt and braces.
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE Mode, D3D12_MEASUREMENTS_ACTION MeasurementsAction, HANDLE hEventToSignalUponCompletion, BOOL* pbFurtherMeasurementsDesired) {
+    if (!m_real6) return E_NOINTERFACE;
+    return m_real6->SetBackgroundProcessingMode(Mode, MeasurementsAction, hEventToSignalUponCompletion, pbFurtherMeasurementsDesired);
+}
+
+// --- ID3D12Device7 ----------------------------------------------------------
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT_DESC* pAddition, ID3D12StateObject* pStateObjectToGrowFrom, REFIID riid, void** ppNewStateObject) {
+    if (!m_real7) return E_NOINTERFACE;
+    HRESULT hr = m_real7->AddToStateObject(pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
+    // Still a pure forward. Logged because this is the Phase 4 target: on Tier
+    // 1.0 the driver never gets this far, since CreateStateObject already
+    // refuses ALLOW_STATE_OBJECT_ADDITIONS. Seeing this line with a failure is
+    // the signal that an app needs the emulation.
+    ProxyLog("[dxr11-proxy] AddToStateObject additions=%u grow-from=%p hr=0x%08lx\n",
+             pAddition ? pAddition->NumSubobjects : 0u,
+             (void*)pStateObjectToGrowFrom, (unsigned long)hr);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateProtectedResourceSession1(const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc, REFIID riid, void** ppSession) {
+    if (!m_real7) return E_NOINTERFACE;
+    return m_real7->CreateProtectedResourceSession1(pDesc, riid, ppSession);
+}
 
 // --- creation ---------------------------------------------------------------
 

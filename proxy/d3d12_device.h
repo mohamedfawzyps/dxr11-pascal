@@ -11,6 +11,11 @@
 //   CreateCommandSignature     - indirect DispatchRays
 //   CreateCommandList/List1    - command list interception
 //
+// Interface coverage: IUnknown, ID3D12Object, and ID3D12Device through
+// ID3D12Device7. Device6 and Device7 are only answered when the real device
+// actually offers them. Device8 and above are still passed through unwrapped
+// and logged; extend here when the log shows an app asking for one.
+//
 // Scope limit, deliberate for 3b: we wrap ONLY the device. Child objects
 // (queues, lists, resources, heaps) are handed back exactly as the runtime
 // created them, unwrapped. Two consequences worth knowing:
@@ -28,9 +33,10 @@
 
 #include <d3d12.h>
 
-class Dxr11Device : public ID3D12Device5 {
+class Dxr11Device : public ID3D12Device7 {
 public:
-    // Takes ownership of one reference on `real`.
+    // Takes ownership of one reference on `real`, and acquires its own on the
+    // Device6/Device7 interfaces if the device offers them.
     explicit Dxr11Device(ID3D12Device5* real);
     ~Dxr11Device();
 
@@ -125,8 +131,25 @@ public:
     void    STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) override;
     D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE SerializedDataType, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* pIdentifierToCheck) override;
 
+    // --- ID3D12Device6 ---
+    HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE Mode, D3D12_MEASUREMENTS_ACTION MeasurementsAction, HANDLE hEventToSignalUponCompletion, BOOL* pbFurtherMeasurementsDesired) override;
+
+    // --- ID3D12Device7 ---
+    // AddToStateObject is a Phase 4 target. The Phase 4 probe established that
+    // ID3D12Device7 is present on the GTX 1070 even though it reports Tier 1.0,
+    // so this method is reachable on the target hardware and passing the device
+    // through unwrapped would let an app bypass the shim entirely. See
+    // docs/phase4-probe.md.
+    HRESULT STDMETHODCALLTYPE AddToStateObject(const D3D12_STATE_OBJECT_DESC* pAddition, ID3D12StateObject* pStateObjectToGrowFrom, REFIID riid, void** ppNewStateObject) override;
+    HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc, REFIID riid, void** ppSession) override;
+
 private:
     ID3D12Device5* m_real;
+    // Null when the underlying device does not offer these. QueryInterface
+    // refuses the matching IID in that case, so the higher-level methods are
+    // only ever reached when the corresponding pointer exists.
+    ID3D12Device6* m_real6;
+    ID3D12Device7* m_real7;
     LONG           m_refs;
 };
 

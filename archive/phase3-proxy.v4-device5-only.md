@@ -200,45 +200,16 @@ back exactly as the runtime made them. Two consequences:
    child to hand back to us.
 
 `QueryInterface` answers for `IUnknown`, `ID3D12Object` and `ID3D12Device`
-through `ID3D12Device7`. Anything else is passed to the real device **and
+through `ID3D12Device5`. Anything else is passed to the real device **and
 logged**, so we find out what apps actually ask for instead of guessing. The
 samples produce exactly one such line:
 
     [dxr11-proxy] device QI PASSED THROUGH UNWRAPPED: ID3D12InfoQueue
 
-which is correct: the debug layer wants the real InfoQueue.
-
-### Extended to ID3D12Device7 (2026-09-21)
-
-Originally the wrapper stopped at Device5 and passed Device6 and above through
-unwrapped. The Phase 4 probe closed that question: `ID3D12Device7` **is present
-on the GTX 1070** even though it reports Tier 1.0, so `AddToStateObject` is
-reachable on the target hardware and an unwrapped Device7 would let an app
-bypass the shim entirely. See docs/phase4-probe.md.
-
-The wrapper now covers Device6 (`SetBackgroundProcessingMode`) and Device7
-(`AddToStateObject`, `CreateProtectedResourceSession1`), 65 methods in total.
-Both are optional: the constructor queries for them and `QueryInterface` returns
-`E_NOINTERFACE` for an IID the real device does not offer, rather than handing
-back a vtable the device cannot honour.
-
-Verified by running the Phase 4 probe through the proxy. On WARP the call lands
-in our wrapper and succeeds:
-
-    [dxr11-proxy] device wrapper created (real=..., Device6=yes, Device7=yes)
-    [dxr11-proxy] AddToStateObject additions=4 grow-from=... hr=0x00000000
-
-with the probe still reporting identical results, and no
-`QI PASSED THROUGH UNWRAPPED` line anywhere. On the 1070 the wrapper also
-reports `Device7=yes`, confirming the probe finding from inside the shim.
-
-Regression after the change: raytest ALL MATCH, HelloWorld 0 of 14400 pixels
-differ (2162 vs 2160 fps), SimpleLighting unchanged (1385 vs 1384 fps), and the
-debug build through the wrapper produces 3 debug-layer lines with 0 errors, the
-same set as the no-proxy baseline.
-
-Device8 and above are still passed through unwrapped and logged. Extend when the
-log shows an app asking for one.
+which is correct: the debug layer wants the real InfoQueue. The line to watch
+for is `ID3D12Device7`, which carries `AddToStateObject`, a Phase 4 target. An
+app getting an unwrapped Device7 would bypass the shim, so the wrapper has to
+grow before that phase works.
 
 ## The debug layer needs three undocumented exports
 
