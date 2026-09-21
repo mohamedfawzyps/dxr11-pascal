@@ -3,3 +3,7 @@ build/
 *.exe
 *.pdb
 *.obj
+
+raytest.exe
+*.bin
+D3D12/
