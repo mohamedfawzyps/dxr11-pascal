@@ -12,3 +12,10 @@ DXC rather than from reasoning, and kept so the answer can be re-checked.
   with `-T lib_6_5`. Answer: 142, 161 and 213. Only the first two are
   usable on Tier 1.0; `GeometryIndex` sets shader flag 0x2000000 and the
   GTX 1070 refuses the state object.
+
+- `lib_accessors_ref.hlsl` - are the DXR 1.0 hit-shader intrinsics that would
+  serve Unreal's missing RayQuery accessors actually Tier 1.0? Compile with
+  `-T lib_6_5`. PrimitiveIndex, InstanceIndex, InstanceID, HitKind,
+  RayTCurrent, ObjectRayOrigin, ObjectRayDirection and WorldToObject4x3 all
+  give SFI0=0x0, so all are safe. GeometryIndex gives 0x100000 and
+  InstanceContributionToHitGroupIndex does not exist in HLSL at all.

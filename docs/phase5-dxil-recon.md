@@ -1095,17 +1095,101 @@ must still be refused. It is. Nothing about the default behaviour changed, and
 A shader the rewriter refuses is logged and forwarded unchanged, so the
 application gets the driver's own error rather than a silently wrong render.
 
+## Measured against a real engine: the coverage gap
+
+The next action was "a real application", because every shader proven so far is
+one this project wrote for itself. Two things had to be established before that
+could mean anything.
+
+**No Microsoft sample uses RayQuery.** All eleven D3D12Raytracing samples are
+DXR 1.0. The apparent matches for "inline" were the C++ keyword. So the samples
+cannot exercise this at all, which is worth knowing: passing them proves the
+shim is transparent, never that the rewriter is right.
+
+**Unreal Engine 5.7 is the real RayQuery code available**, nine shader files
+under `Engine/Shaders/Private`. They cannot be compiled standalone, since they
+need UE's preprocessor and a great deal of engine plumbing, so this is a SURVEY
+and not an execution test. It answers a narrower question honestly: what would
+a shipping engine need that this project has not thought of?
+
+### The answer: 8 of 24 accessors
+
+Counting distinct RayQuery accessors across Epic's Lumen and RayTracing
+shaders, by frequency:
+
+    CommittedRayT 11   CandidatePrimitiveIndex 11   CandidateInstanceIndex 11
+    CandidateType 10   CommittedStatus 9            CandidateTriangleRayT 6
+    CommittedInstanceID 4   CommitProceduralPrimitiveHit 4   Abort 4
+    CommittedPrimitiveIndex 3   CommittedInstanceIndex 3
+    ... and thirteen more at 1 or 2 uses each
+
+The rewriter supports **eight**. So as things stand, **not one of Epic's
+RayQuery shaders would lower.** That is the honest result, and it is far more
+useful than another passing test on a shader written to pass.
+
+### What is reassuring
+
+**Every use is in a COMPUTE shader.** The brief calls the pixel-shader case the
+most consequential of the no-lowering cases, since it is legal in DXR 1.1 and
+some engines use it. Unreal does not. The one file that also contains
+`[shader("anyhit")]` and `[shader("closesthit")]` holds separate entry points,
+not a query inside a hit shader.
+
+Epic's template flags are `RAY_FLAG_NONE`, `RAY_FLAG_FORCE_OPAQUE` and
+`RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES`, all of which pass straight through.
+
+### What the gap actually costs, measured not guessed
+
+`GeometryIndex()` was the trap earlier: it looks like an ordinary hit-shader
+intrinsic and is secretly Tier 1.1. So every proposed mapping was checked the
+same way, by compiling it and reading the feature flags, rather than assumed.
+
+| DXR 1.0 intrinsic | SFI0 | serves |
+|---|---|---|
+| `PrimitiveIndex`, `InstanceIndex`, `InstanceID`, `HitKind`, `RayTCurrent`, `ObjectRayOrigin`, `ObjectRayDirection`, `WorldToObject4x3` | **0x0** | 11 of the missing accessors |
+| `GeometryIndex` | **0x100000** | Tier 1.1 only, blocked |
+| `InstanceContributionToHitGroupIndex` | does not exist in HLSL | blocked |
+
+So the sixteen unsupported accessors split:
+
+- **11 mechanically addable.** Each maps to an intrinsic measured to be plain
+  DXR 1.0. There is an elegance here worth recording: the SAME intrinsic serves
+  the Candidate and Committed forms, because in an any-hit shader
+  `PrimitiveIndex()` IS the candidate and in a closest-hit it IS the committed
+  hit. One table, and which generated shader the read lands in decides the
+  meaning.
+- **2 blocked as Tier 1.1**: Candidate and CommittedGeometryIndex, the case
+  already documented.
+- **2 blocked with no intrinsic at all**:
+  `*InstanceContributionToHitGroupIndex`. HLSL does not expose it to a hit
+  shader in any form.
+- **2 structurally larger**: `CommitProceduralPrimitiveHit`, which needs the
+  generated intersection shader this project has never built, and `Abort()`,
+  which the brief maps to `AcceptHitAndEndSearch()` or a payload flag.
+
+### One thing this survey cannot settle
+
+Several of Epic's files declare more than one `RayQuery` object,
+`RayTracingReflectionReorientedParticleMaterialCS.usf` declares five. Whether
+those are concurrent within one entry point after inlining, which the rewriter
+refuses, or merely separate functions, which is fine, cannot be determined by
+reading the source. It needs the compiled DXIL, and compiling it needs the
+engine.
+
 ## Next
 
-The path is complete: RayQuery in, correct pixels out, on Tier 1.0 hardware.
-What remains is coverage and confidence rather than structure.
+The structure is finished; the gap is coverage, and it is now measured rather
+than guessed.
 
-1. **A real application.** Everything so far is the Phase 2 harness and shaders
-   written for this project. An engine will use shapes nobody here has thought
-   of, and it is the only way to find out which.
-2. **Dynamic descriptor indexing**, still refused, and common in engines.
-3. **More independent shaders.** Both written so far found something. Untried:
-   non-default `RAY_FLAG` combinations, `Abort()`, procedural primitives,
-   committed object-space accessors.
-4. **Then consider making the tier flip the default**, once enough real
-   software has run through it that the refusal list is trusted.
+1. **The 11 mechanically addable accessors.** Each maps to an intrinsic already
+   confirmed available. This is the single biggest step toward real content and
+   the least risky, because the mapping is one table and the failure mode is a
+   refusal.
+2. **`Abort()`**, four uses in Epic's shaders, mapping to
+   `AcceptHitAndEndSearch()`.
+3. **Procedural primitives**, needing the generated intersection shader, which
+   is the largest remaining piece of lowering and is genuinely new work.
+4. Two accessor families stay permanently refused: geometry index, which is
+   Tier 1.1 on the DXR 1.0 side too, and instance contribution to hit group
+   index, which HLSL does not expose to a hit shader at all. Both must keep
+   failing loudly.
