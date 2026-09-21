@@ -222,12 +222,37 @@ Version 1.
     one-triangle scene every correct answer is 0 and a lowering returning a
     constant would pass.
 
+- RayQuery detection in the proxy: **DONE.** `proxy/dxil_scan.{h,cpp}`, hooked
+  at `CreateComputePipelineState`, `CreatePipelineState` and
+  `CreateStateObject`. It looked like it needed a bitcode parser in the proxy.
+  It does not: **SFI0 bit 20 is the whole signal.** Measured across every
+  shader in phase5, a plain compute shader reads 0x0, every RayQuery shader
+  reads 0x100000, a DXC-built DXR 1.0 library reads 0x0, and the rewriter's own
+  output reads 0x0. SFI0 is an eight byte container part, so detection is a
+  container walk and a mask with no LLVM involved.
+  - The rewriter's OUTPUT reading 0x0 matters on its own: the lowered library
+    correctly stops claiming Tier 1.1, which is what lets the driver accept it.
+  - Detection deliberately does NOT change what is forwarded. On Tier 1.0 the
+    driver rejects these shaders anyway, and replacing its error with ours
+    would hide information. The log is the clarity.
+  - Verified both ways: raytest reports its RayQuery shader at exactly 4788
+    bytes, while the DXR 1.0 probe and HelloWorld stay SILENT, so DXR 1.0
+    libraries do not false-positive.
+
+  **A DECISION IS NEEDED before the transform can follow detection into the
+  proxy.** The rewriter is about 1100 lines of Python and the proxy is a C++
+  DLL in an application's address space, so one cannot call the other. There is
+  also a second problem that is easy to miss: **the rewriter works on TEXT and
+  the proxy receives BITCODE**, so a C++ port needs disassembly and assembly
+  too, which means the shim would have to ship and load `dxcompiler.dll` and
+  `dxil.dll` at runtime. Probably acceptable for a compatibility shim, but a
+  deployment consequence rather than an implementation detail. The three
+  options and their costs are in docs/phase5-dxil-recon.md; only porting to C++
+  with DXC loaded meets the no-application-modification goal, and it is a piece
+  of work the size of all of Phase 5 so far. Decide it deliberately.
+
   Next action, in order.
-  1. **Wire the rewriter into the proxy**, at `CreateStateObject` and the
-     compute pipeline path. Now the largest untested gap. It forces the tier
-     question: reporting Tier 1.1 entitles an app to emit RayQuery, so the flip
-     and a working rewriter have to land together, with anything refused
-     failing loudly rather than rendering wrong.
+  1. **The fork above.** Nothing else moves the project toward shipping.
   2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
   3. More independent shaders. Both written so far found something the Phase 2
      pair could not: the first a false refusal, the second a feature with no
@@ -565,9 +590,14 @@ the bulk of it, and preserving binding state across the break was the part that
 kept being subtly wrong.
 
 **Still open, on purpose:** `CheckFeatureSupport` reports Tier 1.0. Reporting
-Tier 1.1 entitles the app to emit RayQuery, so until phase 5 works, either keep
-reporting 1.0 or detect RayQuery DXIL and fail clearly. A shim that claims 1.1
-and then crashes is worse than one that claims 1.0.
+Tier 1.1 entitles the app to emit RayQuery, and a shim that claims 1.1 and then
+crashes is worse than one that claims 1.0.
+
+The proxy now DETECTS RayQuery, see the position section, but that does not
+unblock the flip. Detection says when RayQuery arrives; it does nothing about
+it. The tier flip and a working in-proxy transform have to land together.
+Everything Phase 5 has proven runs through the Python tooling, not through the
+shim, and that is the honest gap.
 
 ### Phase 5: the DXIL rewriter
 
@@ -605,6 +635,11 @@ and rewrite `!dx.entryPoints` with `!dx.typeAnnotations`. The application's own
 code never moves between modules, so its resource bindings and handles cannot be
 got wrong in transit. Emitting a container from scratch is pointless when the
 input module already has the right resources, handles and types.
+
+**Proxy detection (2026-09-21).** `proxy/dxil_scan.{h,cpp}` detects RayQuery
+from SFI0 bit 20, no bitcode parsing needed, hooked at the two pipeline
+creation paths and at `CreateStateObject`. Forwards unchanged; the log is the
+clarity. The transform itself is a costed fork, see the position section.
 
 **Rewriter result (2026-09-21).** `phase5/rewriter/` automates the transform
 and reproduces both hand lowerings bit-exactly against WARP, 14450 and 8117 of
