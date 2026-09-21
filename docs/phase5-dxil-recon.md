@@ -1085,7 +1085,7 @@ other test.
 
 Reporting Tier 1.1 entitles an application to emit RayQuery, and the brief is
 explicit that a shim which claims 1.1 and then fails is worse than one that
-claims 1.0. So the flip is off unless `DXR11_TIER11=1`.
+claims 1.0. So the flip is off unless `DXR_TIER11=1`.
 
 `.\tools\run_dispatch_test.ps1` checks the gate as a case of its own: without
 the variable, the shim must still report Tier 1.0 and the same RayQuery shader
@@ -1573,7 +1573,7 @@ silent on BOTH cases, including the one measured to be wrong, so it does not
 police hit group and geometry type agreement and its silence carries no
 information either way. Finding that out needed a fix of its own: `raytest`
 enabled the debug layer only in a `_DEBUG` build, and the layer reports through
-`OutputDebugString`, which a console never sees. It now takes `DXR11_DEBUGLAYER=1`
+`OutputDebugString`, which a console never sees. It now takes `DXR_TIER11_DEBUGLAYER=1`
 and drains the `ID3D12InfoQueue`, the way the Phase 4 probe does. The first
 "silence" observed here was worth nothing at all.
 

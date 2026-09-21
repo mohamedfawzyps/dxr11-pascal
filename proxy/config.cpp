@@ -46,7 +46,7 @@ std::wstring OwnDirectory() {
 void LoadIni() {
     const std::wstring dir = OwnDirectory();
     if (dir.empty()) return;
-    std::ifstream f(dir + L"dxr11.ini");
+    std::ifstream f(dir + L"dxr-tier-11.ini");
     if (!f) return;
     std::string line;
     while (std::getline(f, line)) {
@@ -78,7 +78,7 @@ Flag Get(const char* envName, const char* iniKey, bool fallback) {
 
     auto it = g_ini.find(Lower(iniKey));
     if (it != g_ini.end() && Truthy(it->second, &parsed))
-        return Flag{ parsed, "dxr11.ini" };
+        return Flag{ parsed, "dxr-tier-11.ini" };
 
     return Flag{ fallback, "default" };
 }

@@ -4,7 +4,7 @@
 # creates a compute pipeline and calls Dispatch. None of that can work on Tier
 # 1.0 hardware. Through the shim it does:
 #
-#   CheckFeatureSupport      reports Tier 1.1  (only with DXR11_TIER11=1)
+#   CheckFeatureSupport      reports Tier 1.1  (only with DXR_TIER11=1)
 #   CreateComputePipelineState  lowers the DXIL, builds a state object and
 #                               shader table, returns a stand-in
 #   SetPipelineState         recognises the stand-in
@@ -95,7 +95,7 @@ $cases = @(
 )
 
 $failed = 0
-$env:DXR11_TIER11 = '1'
+$env:DXR_TIER11 = '1'
 foreach ($c in $cases) {
     $n = $c.name
     Write-Host ''
@@ -118,7 +118,7 @@ foreach ($c in $cases) {
     else { Write-Host "  $n : FAIL"; $failed++ }
     Remove-Item $a, $b -ErrorAction SilentlyContinue
 }
-$env:DXR11_TIER11 = ''
+$env:DXR_TIER11 = ''
 
 # Tier 1.1 is ON by default now: a proxy DLL only sits beside an executable
 # because somebody put it there, and that is the opt-in. What has to be proven
@@ -132,7 +132,7 @@ $ErrorActionPreference = 'Continue'
 
 Write-Host ''
 Write-Host '=== tier 1.1 is on by default ==='
-$env:DXR11_TIER11 = ''
+$env:DXR_TIER11 = ''
 $out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1
 Remove-Item dp_gate.bin -ErrorAction SilentlyContinue
 if ($out -match 'needs Tier 1\.1') {
@@ -143,29 +143,29 @@ if ($out -match 'needs Tier 1\.1') {
 }
 
 Write-Host ''
-Write-Host '=== DXR11_TIER11=0 turns it off ==='
-$env:DXR11_TIER11 = '0'
+Write-Host '=== DXR_TIER11=0 turns it off ==='
+$env:DXR_TIER11 = '0'
 $out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1
-$env:DXR11_TIER11 = ''
+$env:DXR_TIER11 = ''
 Remove-Item dp_gate.bin -ErrorAction SilentlyContinue
 if ($out -match 'needs Tier 1\.1') {
-    Write-Host '  refused with DXR11_TIER11=0, as it must'
+    Write-Host '  refused with DXR_TIER11=0, as it must'
 } else {
-    Write-Host '  OFF SWITCH BROKEN: RayQuery was accepted with DXR11_TIER11=0'
+    Write-Host '  OFF SWITCH BROKEN: RayQuery was accepted with DXR_TIER11=0'
     $failed++
 }
 
 # And through the file, which is the path a user without a terminal takes. The
 # env var is cleared above, so this proves the file alone is enough.
 Write-Host ''
-Write-Host '=== dxr11.ini turns it off too ==='
-'tier11 = 0' | Set-Content dxr11.ini -Encoding ascii
+Write-Host '=== dxr-tier-11.ini turns it off too ==='
+'tier11 = 0' | Set-Content dxr-tier-11.ini -Encoding ascii
 $out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1
-Remove-Item dxr11.ini, dp_gate.bin -ErrorAction SilentlyContinue
+Remove-Item dxr-tier-11.ini, dp_gate.bin -ErrorAction SilentlyContinue
 if ($out -match 'needs Tier 1\.1') {
-    Write-Host '  refused with tier11 = 0 in dxr11.ini, as it must'
+    Write-Host '  refused with tier11 = 0 in dxr-tier-11.ini, as it must'
 } else {
-    Write-Host '  INI IGNORED: RayQuery was accepted with tier11 = 0 in dxr11.ini'
+    Write-Host '  INI IGNORED: RayQuery was accepted with tier11 = 0 in dxr-tier-11.ini'
     $failed++
 }
 
@@ -179,12 +179,12 @@ $ErrorActionPreference = 'Stop'
 # the only honest answer.
 Write-Host ''
 Write-Host '=== both kinds collapsed onto one hit group record is refused ==='
-$log = Join-Path $env:TEMP 'dxr11_proxy.log'
+$log = Join-Path $env:TEMP 'dxr-tier-11-proxy.log'
 Remove-Item $log -ErrorAction SilentlyContinue
-$env:DXR11_TIER11 = '1'
+$env:DXR_TIER11 = '1'
 & .\raytest.exe hw rayquery alpha dp_mix.bin --cs phase5\cases\rayquery_proc.hlsl --mixed |
     Out-Null
-$env:DXR11_TIER11 = ''
+$env:DXR_TIER11 = ''
 Remove-Item dp_mix.bin -ErrorAction SilentlyContinue
 if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'routes BOTH triangle and procedural geometry to the same' -Quiet)) {
     Write-Host '  refused, with the reason, as it must'

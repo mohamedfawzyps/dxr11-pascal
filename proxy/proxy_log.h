@@ -1,4 +1,4 @@
-// Shared logging for the proxy. Writes to %TEMP%\dxr11_proxy.log and
+// Shared logging for the proxy. Writes to %TEMP%\dxr-tier-11-proxy.log and
 // OutputDebugString. Definitions live in d3d12_proxy.cpp.
 #pragma once
 

@@ -6,7 +6,7 @@ rem   build_proxy.bat
 rem
 rem Output: d3d12.dll. Copy it into the folder of a DXR 1.0 app's exe and run
 rem the app; Windows loads this proxy, which forwards to the real system
-rem d3d12.dll and (since 3b) wraps the device. Check %TEMP%\dxr11_proxy.log.
+rem d3d12.dll and (since 3b) wraps the device. Check %TEMP%\dxr-tier-11-proxy.log.
 rem
 rem Headers: the Agility SDK ones if present, else the Windows SDK. The device
 rem wrapper's method signatures were transcribed from the Agility 1.619.5
@@ -44,5 +44,5 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Built d3d12.dll. Copy it next to a DXR 1.0 sample exe, run the sample,
-echo then check %%TEMP%%\dxr11_proxy.log.
-echo Set DXR11_NO_WRAP=1 to forward only, without wrapping the device.
+echo then check %%TEMP%%\dxr-tier-11-proxy.log.
+echo Set DXR_TIER11_NOWRAP=1 to forward only, without wrapping the device.

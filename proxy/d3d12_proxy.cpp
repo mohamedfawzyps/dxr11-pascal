@@ -13,9 +13,9 @@
 // import library binds D3D12CreateDevice by ordinal 101, not by name.
 //
 // Build: build_proxy.bat -> d3d12.dll. Copy it next to the target exe.
-// Log:   %TEMP%\dxr11_proxy.log (and OutputDebugString).
+// Log:   %TEMP%\dxr-tier-11-proxy.log (and OutputDebugString).
 //
-// Env:   DXR11_NO_WRAP=1  forward only, do not wrap the device. Useful for
+// Env:   DXR_TIER11_NOWRAP=1  forward only, do not wrap the device. Useful for
 //                         bisecting whether a problem is the wrapper or the
 //                         proxy itself.
 
@@ -63,7 +63,7 @@ void ProxyLog(const char* fmt, ...) {
         char p[MAX_PATH];
         DWORD n = GetTempPathA(MAX_PATH, p);
         if (n == 0 || n >= MAX_PATH) return (FILE*)nullptr;
-        strcat_s(p, MAX_PATH, "dxr11_proxy.log");
+        strcat_s(p, MAX_PATH, "dxr-tier-11-proxy.log");
         FILE* fp = nullptr; fopen_s(&fp, p, "a");
         return fp;
     }();
@@ -151,7 +151,7 @@ const char* ProxyIidName(const IID& iid) {
 
 static bool WrapEnabled() {
     static bool on = [] {
-        const cfg::Flag f = cfg::Get("DXR11_NO_WRAP", "nowrap", false);
+        const cfg::Flag f = cfg::Get("DXR_TIER11_NOWRAP", "nowrap", false);
         if (f.value) {
             ProxyLog("[dxr-tier-11-proxy-log] device wrapping DISABLED (nowrap on, from %s). "
                      "Nothing is translated, including the Tier 1.1 answer.\n",
@@ -326,7 +326,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
         // loaded here: the host loads lazily, so an application that never
         // uses RayQuery pays nothing for this.
         dxch::SetHostModule(self);
-        ProxyLog("[dxr-tier-11-proxy-log] attached to process, version " DXR11_VERSION "\n");
+        ProxyLog("[dxr-tier-11-proxy-log] attached to process, version " DXR_TIER11_VERSION "\n");
     }
     return TRUE;
 }

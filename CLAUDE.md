@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.12.0.
+proxy/version.h, and is currently 0.13.0.
 
 ## Current position (2026-09-22)
 
@@ -60,7 +60,7 @@ only its author runs:
   pass on mostly produced reports that the shim does nothing. The old gate was
   right for development, where the risk was a test run silently flipping, and
   wrong for a release.
-- **Settings come from `dxr11.ini` beside the DLL**, because a file is the only
+- **Settings come from `dxr-tier-11.ini` beside the DLL**, because a file is the only
   mechanism that works regardless of how an application is launched. The
   environment still WINS over the file, deliberately, so a stray `.ini` can
   never change what the test scripts measure. See proxy/config.h.
@@ -843,7 +843,7 @@ only its author runs:
   still returns the real device; Phase 4 has to handle that if an app trips on
   it. QueryInterface above Device7 is passed through unwrapped AND logged;
   nothing in the current test apps does that except ID3D12InfoQueue, which is
-  correct. DXR11_NO_WRAP=1 disables wrapping, restoring forward-only
+  correct. DXR_TIER11_NOWRAP=1 disables wrapping, restoring forward-only
   behaviour.
 
 Dev machine (Windows x64), everything under `C:\DW`:
@@ -861,7 +861,7 @@ Dev machine (Windows x64), everything under `C:\DW`:
   later as a shader refused for no visible reason. `Show refusals only` filters
   the log to the REFUSED and NOTE lines, deduplicated, which is the part of a
   long log anybody actually needs.
-  `dxr11.example.ini` is the settings file to copy and rename.
+  `dxr-tier-11.example.ini` is the settings file to copy and rename.
   `build_phase4.bat` builds the Tier 1.1 probe into `phase4out\`, a directory
   with no proxy in it so the probe measures the real runtime; copy `d3d12.dll`
   in to measure the shim instead. `tier11probe.exe [warp|hw]` runs the three
@@ -1304,7 +1304,7 @@ anything.
   writes nowhere visible. **Both** sides honour it now; until dynamic indexing
   was added the RayQuery side did not, which quietly kept every array case out
   of the proxy's dispatch path.
-- `DXR11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
+- `DXR_TIER11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
   drains the InfoQueue. Both halves are needed: the layer reports through
   `OutputDebugString`, so without the drain a console sees nothing and its
   silence proves nothing. **The harness reads this, the SHIM does not.** For a
@@ -1312,8 +1312,8 @@ anything.
   layer on for any executable you name.
 
 The shim itself reads exactly TWO settings, and no others. `tier11` defaults ON
-and `nowrap` defaults off, each settable in `dxr11.ini` beside the DLL or as
-`DXR11_TIER11` / `DXR11_NO_WRAP` in the environment, which wins. `nowrap` is
+and `nowrap` defaults off, each settable in `dxr-tier-11.ini` beside the DLL or as
+`DXR_TIER11` / `DXR_TIER11_NOWRAP` in the environment, which wins. `nowrap` is
 not a companion to `tier11`, it OVERRIDES it: everything the shim does lives on
 the device object it hands the application, the Tier 1.1 answer included, so
 declining to hand that object over switches the whole layer off.
@@ -1328,7 +1328,7 @@ this project a test passed for the wrong reason:
 - **the debug layer's silence was read as evidence when it was not even
   running.** `raytest` enabled the layer only in a `_DEBUG` build, and the
   layer reports through `OutputDebugString`, which a console never sees. The
-  fix was `DXR11_DEBUGLAYER=1` plus an `ID3D12InfoQueue` drain, as the Phase 4
+  fix was `DXR_TIER11_DEBUGLAYER=1` plus an `ID3D12InfoQueue` drain, as the Phase 4
   probe already does. The control that exposed it: run the layer against a case
   ALREADY KNOWN to be wrong. It stayed silent there too, so the silence meant
   nothing either way.

@@ -169,7 +169,7 @@ directly rather than pixels.
 
 `proxy/d3d12_device.h` / `.cpp` define `Dxr11Device`, which implements
 `ID3D12Device5` and forwards all 62 methods unchanged. `D3D12CreateDevice` now
-wraps the real device and hands back the wrapper. `DXR11_NO_WRAP=1` turns
+wraps the real device and hands back the wrapper. `DXR_TIER11_NOWRAP=1` turns
 wrapping off and restores exact 3a behaviour, which is useful for bisecting.
 
 Signatures were transcribed from the Agility 1.619.5 `d3d12.h` on this machine,
@@ -243,7 +243,7 @@ log shows an app asking for one.
 ## The debug layer needs three undocumented exports
 
 This was the real find of 3b, and it is a **3a bug**, not a wrapper regression:
-`DXR11_NO_WRAP=1`, which is forward-only 3a behaviour, reproduces it.
+`DXR_TIER11_NOWRAP=1`, which is forward-only 3a behaviour, reproduces it.
 
 With the proxy in place the D3D12 debug layer silently did nothing. No adapter
 line, no state object dump, no messages at all, while the same binary without

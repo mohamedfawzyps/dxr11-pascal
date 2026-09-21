@@ -115,7 +115,7 @@ $proxyDst = Join-Path $dir "d3d12.dll"
 # Left in place afterwards, as the proxy DLL already is. The baseline run
 # deletes d3d12.dll and so has no shim regardless of what else is in the folder.
 $dxcNames = @('dxcompiler.dll', 'dxil.dll')
-$log = Join-Path $env:TEMP "dxr11_proxy.log"
+$log = Join-Path $env:TEMP "dxr-tier-11-proxy.log"
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
 
 function Invoke-Run {

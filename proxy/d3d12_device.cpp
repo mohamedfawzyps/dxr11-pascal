@@ -48,7 +48,7 @@ static void NoteRayQuery(bool tier11, const char* where, const void* code, SIZE_
     ProxyLog("[dxr-tier-11-proxy-log] %s: shader USES RAYQUERY (SFI0 bit 20), %zu bytes.\n",
              where, (size_t)size);
     ProxyLog("[dxr-tier-11-proxy-log]   tier reported to the app is %s. On Tier 1.0 with "
-             "DXR11_TIER11=1 this is lowered and run; otherwise it is "
+             "DXR_TIER11=1 this is lowered and run; otherwise it is "
              "forwarded unchanged and the driver decides.\n",
              tier11 ? "1.1" : "1.0");
 }
@@ -271,9 +271,9 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_CO
 // that the shim does nothing.
 //
 // Turning it off is still one step, and either of two: delete the DLL, or set
-// DXR11_TIER11=0. See proxy/config.h for where a value comes from.
+// DXR_TIER11=0. See proxy/config.h for where a value comes from.
 static cfg::Flag Tier11Requested() {
-    static const cfg::Flag f = cfg::Get("DXR11_TIER11", "tier11", true);
+    static const cfg::Flag f = cfg::Get("DXR_TIER11", "tier11", true);
     return f;
 }
 

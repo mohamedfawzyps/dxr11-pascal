@@ -136,7 +136,7 @@ $lblLogHint = Add-Label '' 15 432 620
 $lblLogHint.ForeColor = [Drawing.Color]::Gray
 
 # --- behaviour ---------------------------------------------------------------
-$logPath = Join-Path $env:TEMP 'dxr11_proxy.log'
+$logPath = Join-Path $env:TEMP 'dxr-tier-11-proxy.log'
 
 function Update-Status {
     if (-not $script:targetDir) {
@@ -178,7 +178,7 @@ function Update-Status {
 }
 
 function Read-Ini {
-    $ini = Join-Path $script:targetDir 'dxr11.ini'
+    $ini = Join-Path $script:targetDir 'dxr-tier-11.ini'
     $tier = $true; $nowrap = $false
     if (Test-Path $ini) {
         foreach ($line in Get-Content $ini) {
@@ -199,7 +199,7 @@ function Read-Ini {
 
 function Write-Ini {
     if ($script:suppress -or -not $script:targetDir) { return }
-    $ini = Join-Path $script:targetDir 'dxr11.ini'
+    $ini = Join-Path $script:targetDir 'dxr-tier-11.ini'
     $t = if ($chkTier.Checked) { '1' } else { '0' }
     $n = if ($chkNoWrap.Checked) { '1' } else { '0' }
     @(
@@ -276,10 +276,10 @@ $btnGetDxc.Add_Click({ Open-DxcPage })
 
 $btnRemove.Add_Click({
     $answer = [Windows.Forms.MessageBox]::Show(
-        "Delete d3d12.dll and dxr11.ini from`n$script:targetDir ?`n`nThis restores the original behaviour exactly. dxcompiler.dll and dxil.dll are left alone, since the game may use them itself.",
+        "Delete d3d12.dll and dxr-tier-11.ini from`n$script:targetDir ?`n`nThis restores the original behaviour exactly. dxcompiler.dll and dxil.dll are left alone, since the game may use them itself.",
         'Remove the shim', 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
-    foreach ($n in @('d3d12.dll', 'dxr11.ini')) {
+    foreach ($n in @('d3d12.dll', 'dxr-tier-11.ini')) {
         $p = Join-Path $script:targetDir $n
         if (Test-Path $p) { Remove-Item $p -Force }
     }

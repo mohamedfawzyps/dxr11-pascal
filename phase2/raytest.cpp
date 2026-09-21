@@ -1114,7 +1114,7 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
     wantDebug = true;
 #endif
     { char buf[8]; size_t n = 0;
-      if (getenv_s(&n, buf, sizeof(buf), "DXR11_DEBUGLAYER") == 0 && n > 1 && buf[0] == '1')
+      if (getenv_s(&n, buf, sizeof(buf), "DXR_TIER11_DEBUGLAYER") == 0 && n > 1 && buf[0] == '1')
           wantDebug = true; }
     if (wantDebug) {
         ComPtr<ID3D12Debug> dbg;

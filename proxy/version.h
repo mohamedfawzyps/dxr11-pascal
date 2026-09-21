@@ -9,4 +9,4 @@
 // Keep it in step with the tag and with CHANGELOG.md.
 #pragma once
 
-#define DXR11_VERSION "0.12.0"
+#define DXR_TIER11_VERSION "0.13.0"

@@ -17,6 +17,49 @@ build.
 
 ---
 
+## 0.13.0 (2026-09-22)
+
+### Renamed everything that read as DirectX 11
+
+`dxr11` parses as "DirectX 11" on sight, which is the opposite of what this
+does. The repository was renamed to `pascal-dxr-tier-1.1` for that reason and
+the rest had not caught up.
+
+| Was | Is |
+|---|---|
+| `dxr11.ini` | `dxr-tier-11.ini` |
+| `dxr11.example.ini` | `dxr-tier-11.example.ini` |
+| `DXR11_TIER11` | `DXR_TIER11` |
+| `DXR11_NO_WRAP` | `DXR_TIER11_NOWRAP` |
+| `DXR11_DEBUGLAYER` | `DXR_TIER11_DEBUGLAYER` (test harness only) |
+| `%TEMP%\dxr11_proxy.log` | `%TEMP%\dxr-tier-11-proxy.log` |
+
+**A clean break, with no compatibility shims for the old names.** None of these
+were ever in a published release, so nothing exists to be compatible with.
+Accepting both would be carrying a name this project renamed on purpose.
+
+Internal C++ identifiers are deliberately untouched. `Dxr11Device`,
+`Dxr11CommandList` and the rest are not user-visible, and renaming them would
+be a very large diff for no reader's benefit.
+
+Earlier entries in this file were also left alone. Those releases really did
+use the old names, and rewriting the history would make it describe things that
+never happened.
+
+### Verified
+
+Three behaviours re-checked by name after the sweep, since a rename that
+silently stops reading a setting looks exactly like a working default:
+`dxr-tier-11-proxy.log` is written, `DXR_TIER11=0` turns the tier off, and
+`tier11 = 0` in `dxr-tier-11.ini` does too.
+
+Full regression unchanged: 14 render cases, 4 gates, 12 rewriter cases
+byte-identical on both paths, 14 analysis checks, the probe at
+14450 + 2312 + 48774 = 65536, and `D3D12RaytracingHelloWorld` 0 of 14400 pixels
+different with the wrapper running.
+
+---
+
 ## 0.12.0 (2026-09-22)
 
 ### Without DXC the shim now stands aside completely

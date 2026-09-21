@@ -59,7 +59,7 @@ because somebody put it there, so the install is the opt-in, and asking for a
 second one through an environment variable mostly produced reports that the
 shim does nothing.
 
-Turning it off is `tier11 = 0` in a `dxr11.ini` beside the DLL. Uninstalling is
+Turning it off is `tier11 = 0` in a `dxr-tier-11.ini` beside the DLL. Uninstalling is
 deleting the DLL. Both are one step, and they are different things: the first
 leaves the shim loaded and forwarding, the second leaves no trace at all.
 
@@ -77,12 +77,12 @@ For a `RayQuery` shader to be rewritten, `dxcompiler.dll` and `dxil.dll` have
 to be in that directory too. They load lazily, so a plain DXR 1.0 application
 never needs them.
 
-Settings, if you want any, go in a `dxr11.ini` beside the DLL. See
-[dxr11.example.ini](dxr11.example.ini). A file is used rather than environment
+Settings, if you want any, go in a `dxr-tier-11.ini` beside the DLL. See
+[dxr-tier-11.example.ini](dxr-tier-11.example.ini). A file is used rather than environment
 variables because a game started from Steam or the Epic launcher never sees a
 variable you set in a console.
 
-The log lands in `%TEMP%\dxr11_proxy.log` and says what was intercepted, what
+The log lands in `%TEMP%\dxr-tier-11-proxy.log` and says what was intercepted, what
 was lowered and what was refused, with reasons.
 
 **[docs/usage.md](docs/usage.md) is the step by step guide**, including where
@@ -147,7 +147,7 @@ what it took to notice.
 The version is compiled into the DLL and logged on attach, so a log file
 identifies its own build:
 
-    [dxr-tier-11-proxy-log] attached to process, version 0.12.0
+    [dxr-tier-11-proxy-log] attached to process, version 0.13.0
 
 ## Documentation
 

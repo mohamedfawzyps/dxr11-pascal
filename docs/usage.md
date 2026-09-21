@@ -127,7 +127,7 @@ Steam, from the Epic launcher, from Explorer. Nothing needs a terminal.
 
 ### Turning it off, or changing anything
 
-Copy `dxr11.example.ini` into the same directory, rename it to `dxr11.ini` and
+Copy `dxr-tier-11.example.ini` into the same directory, rename it to `dxr-tier-11.ini` and
 edit it. A file beside the DLL is the only mechanism that works regardless of
 how the application is launched, since an environment variable set in a console
 never reaches a game started by a launcher.
@@ -140,7 +140,7 @@ Environment variables of the same name still work and take priority over the
 file, which is what the test scripts use:
 
 ```
-set DXR11_TIER11=0
+set DXR_TIER11=0
 ```
 
 ### The whole switch list
@@ -149,10 +149,10 @@ The shim reads exactly two environment variables. There are no others.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `tier11` / `DXR11_TIER11` | **on** | report Tier 1.1 and rewrite RayQuery shaders |
-| `nowrap` / `DXR11_NO_WRAP` | off | hand the application the real device and translate nothing |
+| `tier11` / `DXR_TIER11` | **on** | report Tier 1.1 and rewrite RayQuery shaders |
+| `nowrap` / `DXR_TIER11_NOWRAP` | off | hand the application the real device and translate nothing |
 
-Each can be set in `dxr11.ini` beside the DLL, or as an environment variable of
+Each can be set in `dxr-tier-11.ini` beside the DLL, or as an environment variable of
 the upper-case name. The environment wins, so a stray `.ini` can never change
 what the test scripts measure. Values are `1/true/on/yes` or `0/false/off/no`.
 
@@ -172,20 +172,20 @@ That leaves these states:
 
 ## 5. Read the log
 
-Every run writes `%TEMP%\dxr11_proxy.log`. Open it first, always. It is the
+Every run writes `%TEMP%\dxr-tier-11-proxy.log`. Open it first, always. It is the
 only thing that tells you what the shim actually did.
 
 ```
-type %TEMP%\dxr11_proxy.log
+type %TEMP%\dxr-tier-11-proxy.log
 ```
 
 A healthy start looks like this:
 
 ```
-[dxr-tier-11-proxy-log] attached to process, version 0.12.0
+[dxr-tier-11-proxy-log] attached to process, version 0.13.0
 [dxr-tier-11-proxy-log] device wrapping enabled
 [dxr-tier-11-proxy-log] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
-[dxr-tier-11-proxy-log] DXR11_TIER11=1: reporting Tier 1.1 to the application.
+[dxr-tier-11-proxy-log] DXR_TIER11=1: reporting Tier 1.1 to the application.
 [dxr-tier-11-proxy-log] queue hook installed: vtable ... slot 10, self-test passed
 ```
 
@@ -233,7 +233,7 @@ to that directory and not to the project root.
 **The log exists but stops after "attached to process".** The application
 never created a D3D12 device. Something failed earlier, unrelated to the shim.
 
-**Is the shim the problem at all?** Set `DXR11_NO_WRAP=1`. That disables
+**Is the shim the problem at all?** Set `DXR_TIER11_NOWRAP=1`. That disables
 device wrapping and restores plain forwarding while leaving the DLL in place.
 If the symptom persists, it is not the shim's translation. If it clears, it
 is, and the log says what was being translated when it happened.
@@ -253,10 +253,10 @@ optional Windows feature (Settings, Optional features, Add a feature, Graphics
 Tools). Add the target .exe to its list and enable the debug layer there.
 
 The layer reports through `OutputDebugString`, so its messages do NOT appear in
-a console or in `dxr11_proxy.log`. Read them with DebugView or a debugger
+a console or in `dxr-tier-11-proxy.log`. Read them with DebugView or a debugger
 attached to the process.
 
-`DXR11_DEBUGLAYER=1` turns it on in this project's own test harness, where the
+`DXR_TIER11_DEBUGLAYER=1` turns it on in this project's own test harness, where the
 messages are drained into stdout. That variable does nothing for the shim.
 
 **A warning about reading anything into its silence.** The debug layer does not
@@ -271,8 +271,8 @@ Three levels, increasing in thoroughness:
 
 | Goal | Do this |
 |---|---|
-| Report Tier 1.0 again, keep the shim loaded | `tier11 = 0` in `dxr11.ini` |
-| Forward everything, translate nothing | `nowrap = 1` in `dxr11.ini` |
+| Report Tier 1.0 again, keep the shim loaded | `tier11 = 0` in `dxr-tier-11.ini` |
+| Forward everything, translate nothing | `nowrap = 1` in `dxr-tier-11.ini` |
 | Remove the shim entirely | delete `d3d12.dll` from the .exe's directory |
 
 Deleting the DLL always restores the original behaviour exactly. The shim adds
