@@ -128,10 +128,12 @@ Version 1.
   text. `.\tools\run_rewriter_test.ps1` runs it end to end, taking ground
   truth from WARP every run rather than from a stored baseline.
 
-      pattern 1, opaque closest hit               14450 hits   MATCH
-      pattern 3, alpha-tested, generated any-hit   8117 hits   MATCH
+      pattern 1, opaque closest hit                14450 hits   MATCH
+      pattern 3, alpha-tested, generated any-hit    8117 hits   MATCH
+      resource array indexed [2], via a table      14450 hits   MATCH
+      descriptor-table root signature, no array    14450 hits   MATCH
 
-  Both bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
+  All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
                      dominators and natural loops
@@ -156,19 +158,42 @@ Version 1.
   has one triangle layer, so accept-first-hit is indistinguishable from
   closest-hit in it. The path works; first-hit semantics are not proven.
 
-  Next action: the three things most likely to break it, in order.
-  1. A shader binding through a **descriptor table**. Named below as the most
-     likely failure and never exercised here.
-  2. A second, independently written RayQuery shader, ideally not derived from
-     the Phase 2 pair, to find what has been accidentally assumed.
+  **Descriptor tables: tested, and the worry was misplaced.** This brief and
+  the docs both named them as the most likely thing to break the rewriter.
+  They are not, and the test found the right thing instead.
+  - A descriptor table alone changes NOTHING in the DXIL. Measured against the
+    root-descriptor original: byte-identical function body, identical resource
+    records. The root signature lives in the container's `RTS0` part, not in
+    the module, and a non-library shader reaches resources through
+    `createHandle(rangeId, index)` whatever the root signature says.
+  - The real hazard is resource ARRAYS, which tables enable. `outBufs[4]`
+    indexed at `[2]` gives `createHandle` with index 2 and a `[4 x T]` type,
+    and the lowering was reading the rangeId while ignoring the index. It did
+    not render wrong only by luck, and the analysis had already accepted it.
+  - Now supported, in the form DXC itself uses for a library: the global
+    carries the array type, the element comes through a constant
+    `getelementptr`, and `createHandleForLib` takes the ELEMENT type. See
+    `phase5/cases/reference/`, which exists so such questions get answered by
+    DXC rather than by reasoning.
+  - `raytest --table` binds a real four-descriptor table where only slot 2
+    points at the output and 0, 1 and 3 point at a decoy, so a dropped index
+    writes nowhere visible.
+
+  Next action, in order of how likely each is to break it.
+  1. A second, **independently written** RayQuery shader, not descended from
+     the Phase 2 pair. Everything proven so far descends from two shaders
+     written to demonstrate one lowering, so an accidental shared assumption is
+     a real risk. Descriptor tables were supposed to be the danger and were
+     not; something else will be.
+  2. **Dynamic descriptor indexing**, currently refused. Common in real engines.
   3. Wire the rewriter into the proxy at `CreateStateObject` and the compute
      pipeline path. That forces the tier question: reporting Tier 1.1 entitles
      an app to emit RayQuery, so the flip and a working rewriter have to land
      together, with anything refused failing loudly.
 
   What is NOT generic, written down so it is not rediscovered:
-  - **Root-level bindings only.** Descriptor tables and `createHandleFromHeap`
-    are untested, and are the most likely thing to break on a real shader.
+  - Resource arrays work, but only with a **constant, uniform** index. Dynamic
+    and non-uniform indexing are refused, as is `createHandleFromHeap`.
   - The payload is fixed at `{float, <2 x float>, i32}`, carrying exactly the
     three committed accessors the whitelist supports.
   - One entry point, one query.
@@ -593,10 +618,17 @@ anything.
   it. `--rtpoison` does the same but corrupts the lowered side on purpose, and
   must DIVERGE.
 
-Check sensitivity before believing a pass. Twice in this project a test passed
-for the wrong reason: the `-gfxsplit` control re-bound a PSO the test had
-abandoned, and the first `--rtpoison` corrupted BOTH sides so they still agreed
-with each other. A test that cannot fail has not been run.
+Check sensitivity before believing a pass, and check the CHECK. Three times in
+this project a test passed for the wrong reason:
+- the `-gfxsplit` control re-bound a PSO the test had abandoned;
+- the first `--rtpoison` corrupted BOTH sides, so they still agreed;
+- the descriptor-array poison substituted on `@outBufs` when the rewriter
+  synthesises `@rq_uav0`, so it never applied and the "failure" case was
+  byte-identical to the passing one.
+
+A test that cannot fail has not been run. When a sensitivity check reports the
+same result as the real run, suspect the check first: diff what it actually
+produced before concluding anything about the code.
 
 ## Working method
 
