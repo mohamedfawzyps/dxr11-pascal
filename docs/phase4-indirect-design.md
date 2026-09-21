@@ -671,3 +671,57 @@ the queue *wrapper* broke, and hooking leaves it alone.
 Remaining work for S1: the command list wrapper, then `CreateCommandSignature`
 interception for DISPATCH_RAYS, then `ExecuteIndirect` segmentation with
 binding-state replay.
+
+## Command list wrapper landed
+
+`proxy/d3d12_command_list.{h,cpp}` wraps `ID3D12GraphicsCommandList6`, 80
+methods, all straight forwards for now. The device returns wrappers from
+`CreateCommandList` and `CreateCommandList1`, and the queue hook swaps them back
+for the real lists on the way into `ExecuteCommandLists`.
+
+Two places already have to unwrap, which is a preview of the work to come:
+
+- the queue hook, for submitted lists
+- `ExecuteBundle`, because a bundle is created through `CreateCommandList` too
+  and therefore arrives wrapped
+
+Wrapping only happens when the queue hook is active. A wrapper that reached a
+real `ExecuteCommandLists` would be rejected, so if the hook ever fails its
+self-test the device hands back real lists instead of creating something that
+cannot be submitted.
+
+### The log found a hole immediately
+
+First run with the wrapper at `ID3D12GraphicsCommandList4`:
+
+    [dxr11-proxy] command list QI PASSED THROUGH UNWRAPPED: {55050859-4024-474C-87F5-6472EAEE44EA}
+
+That is `ID3D12GraphicsCommandList5`, and SimpleLighting asks for it. An
+unwrapped list there would have bypassed `ExecuteIndirect` entirely and silently.
+The wrapper now covers GraphicsCommandList5 and 6, both optional in the same way
+Device6 and Device7 are, and `ProxyIidName` learned the command list IIDs so the
+next such line reads as a name rather than a GUID.
+
+This is the second time the deliberate "pass through but log it" choice has paid
+for itself, after `ID3D12Device7` on Tier 1.0 hardware.
+
+### Regression
+
+| | result |
+|---|---|
+| raytest | ALL MATCH, both patterns bit-exact |
+| HelloWorld | **0 of 14400 pixels differ**, 2095 against 2085 fps |
+| SimpleLighting | 1375 against 1377 fps, no unwrapped QI |
+| debug build through the wrapper | 3 debug-layer lines, **0 errors, 0 refcount or live-object complaints** |
+
+The debug-layer row is the meaningful one for a new wrapper: the debug build arms
+`SetBreakOnSeverity(ERROR)`, so a refcounting or interface mistake would have
+killed the process rather than being reported. It survived.
+
+### Remaining for S1
+
+1. `CreateCommandSignature` interception for DISPATCH_RAYS on Tier 1.0.
+2. `ExecuteIndirect` segmentation: split the recording, submit, wait, read the
+   dimensions back, then replay binding state and issue a direct `DispatchRays`.
+3. Batch several indirect dispatches behind one sync, since the measurement
+   showed the damage is per split rather than one-off.

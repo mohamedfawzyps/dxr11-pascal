@@ -105,6 +105,22 @@ const char* ProxyIidName(const IID& iid) {
 #ifdef __ID3D12Device14_INTERFACE_DEFINED__
     IIDCASE(ID3D12Device14)
 #endif
+#ifdef __ID3D12GraphicsCommandList_INTERFACE_DEFINED__
+    IIDCASE(ID3D12GraphicsCommandList)
+    IIDCASE(ID3D12GraphicsCommandList1)
+    IIDCASE(ID3D12GraphicsCommandList2)
+    IIDCASE(ID3D12GraphicsCommandList3)
+    IIDCASE(ID3D12GraphicsCommandList4)
+#endif
+#ifdef __ID3D12GraphicsCommandList5_INTERFACE_DEFINED__
+    IIDCASE(ID3D12GraphicsCommandList5)
+#endif
+#ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
+    IIDCASE(ID3D12GraphicsCommandList6)
+#endif
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    IIDCASE(ID3D12GraphicsCommandList7)
+#endif
     IIDCASE(ID3D12DebugDevice)
 #ifdef __ID3D12DebugDevice1_INTERFACE_DEFINED__
     IIDCASE(ID3D12DebugDevice1)

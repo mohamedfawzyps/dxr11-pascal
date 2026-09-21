@@ -2,6 +2,7 @@
 
 #include "queue_hook.h"
 #include "proxy_log.h"
+#include "d3d12_command_list.h"
 
 #include <windows.h>
 #include <vector>
@@ -40,10 +41,23 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         ProxyLog("[dxr11-proxy] ExecuteCommandLists intercepted (first real call), n=%u\n",
                  NumCommandLists);
 
-    // Once command lists are wrapped, this is where they are swapped back for
-    // the real ones. Until then there is nothing to unwrap, so forward as-is
-    // and keep the allocation out of the hot path.
-    g_original(self, NumCommandLists, ppCommandLists);
+    // The reason this hook exists: swap our wrappers back for the real lists
+    // before the runtime sees them. Most submissions are small, so a stack
+    // buffer covers the common case without touching the heap.
+    ID3D12CommandList* stackBuf[16];
+    std::vector<ID3D12CommandList*> heapBuf;
+    ID3D12CommandList** out = stackBuf;
+    if (NumCommandLists > _countof(stackBuf)) {
+        heapBuf.resize(NumCommandLists);
+        out = heapBuf.data();
+    }
+    bool anyWrapped = false;
+    for (UINT i = 0; i < NumCommandLists; ++i) {
+        ID3D12CommandList* real = Dxr11CommandList::Unwrap(ppCommandLists[i]);
+        out[i] = real ? real : ppCommandLists[i];
+        if (real) anyWrapped = true;
+    }
+    g_original(self, NumCommandLists, anyWrapped ? out : ppCommandLists);
 }
 
 bool PatchSlot(void** vtable, size_t index, void* replacement, void** outOriginal) {

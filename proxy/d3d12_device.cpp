@@ -11,6 +11,7 @@
 #include "proxy_log.h"
 #include "state_object_cache.h"
 #include "queue_hook.h"
+#include "d3d12_command_list.h"
 
 #include <windows.h>
 #include <new>
@@ -94,6 +95,28 @@ ULONG STDMETHODCALLTYPE Dxr11Device::Release() {
     return (ULONG)n;
 }
 
+// Wrap a freshly created command list. Only meaningful once the queue hook is
+// live, because a wrapper that reached a real ExecuteCommandLists would be
+// rejected; if the hook is not active we hand back the real list unchanged
+// rather than create something that cannot be submitted.
+static HRESULT WrapList(REFIID riid, void** pp) {
+    if (!Dxr11QueueHookActive()) return S_OK;
+    ID3D12GraphicsCommandList4* real4 = nullptr;
+    if (FAILED(static_cast<IUnknown*>(*pp)->QueryInterface(
+            __uuidof(ID3D12GraphicsCommandList4), (void**)&real4)) || !real4) {
+        return S_OK;   // not a graphics list (a bundle of another type, say)
+    }
+    auto* wrapper = new (std::nothrow) Dxr11CommandList(real4);   // takes real4's ref
+    if (!wrapper) { real4->Release(); return S_OK; }
+    void* out = nullptr;
+    if (SUCCEEDED(wrapper->QueryInterface(riid, &out)) && out) {
+        static_cast<IUnknown*>(*pp)->Release();
+        *pp = out;
+    }
+    wrapper->Release();
+    return S_OK;
+}
+
 // --- ID3D12Object -----------------------------------------------------------
 
 HRESULT STDMETHODCALLTYPE Dxr11Device::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) { FWD(GetPrivateData(guid, pDataSize, pData)); }
@@ -127,20 +150,17 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandQueue(const D3D12_COMMAND_QU
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** ppCommandAllocator) { FWD(CreateCommandAllocator(type, riid, ppCommandAllocator)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateGraphicsPipelineState(pDesc, riid, ppPipelineState)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState)); }
-// Neither wrapped nor hooked, and both were tried and measured.
-//
-// Wrapping the list forces wrapping the queue, and a wrapped queue makes DXGI
-// access-violate on the first Present.
-//
-// Hooking the list vtable does not work either: a command list swaps to a
-// PER-OBJECT, heap-allocated vtable, so the shared image vtable present when
-// CreateCommandList returns is not the one in use when the app records. A hook
-// installed here self-tests cleanly and then never sees a single real call.
-// Measured with `tier11probe.exe -hooktest`; see docs/phase4-indirect-design.md.
-//
-// The queue vtable, by contrast, is an image address and is shared, which is
-// what the eventual design leans on.
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* pCommandAllocator, ID3D12PipelineState* pInitialState, REFIID riid, void** ppCommandList) { FWD(CreateCommandList(nodeMask, type, pCommandAllocator, pInitialState, riid, ppCommandList)); }
+// Wrapped, not hooked. Hooking a command list does not work: it swaps to a
+// per-object heap vtable, so the shared image vtable present here is abandoned
+// before the app records anything, and a hook installed here never fires.
+// Measured with tier11probe.exe -hooktest. Wrapping is safe because nothing
+// outside D3D12 holds a command list; the one leak point,
+// ExecuteCommandLists, is covered by the queue vtable hook.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* pCommandAllocator, ID3D12PipelineState* pInitialState, REFIID riid, void** ppCommandList) {
+    HRESULT hr = m_real->CreateCommandList(nodeMask, type, pCommandAllocator, pInitialState, riid, ppCommandList);
+    if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) WrapList(riid, ppCommandList);
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) { FWD(CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) { FWD(CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap)); }
 UINT STDMETHODCALLTYPE Dxr11Device::GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) { FWD(GetDescriptorHandleIncrementSize(DescriptorHeapType)); }
@@ -191,7 +211,11 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::EnqueueMakeResident(D3D12_RESIDENCY_FLAGS
 
 // --- ID3D12Device4 ----------------------------------------------------------
 
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList1(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void** ppCommandList) { FWD(CreateCommandList1(nodeMask, type, flags, riid, ppCommandList)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList1(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void** ppCommandList) {
+    HRESULT hr = m_real->CreateCommandList1(nodeMask, type, flags, riid, ppCommandList);
+    if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) WrapList(riid, ppCommandList);
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC* pDesc, REFIID riid, void** ppSession) { FWD(CreateProtectedResourceSession(pDesc, riid, ppSession)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource, void** ppvResource) { FWD(CreateCommittedResource1(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateHeap1(const D3D12_HEAP_DESC* pDesc, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvHeap) { FWD(CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap)); }
