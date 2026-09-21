@@ -74,6 +74,7 @@ static const uint32_t kMagic = 0x31425452; // "RTB1"
 
 enum class Adapter { Warp, Hardware };
 enum class Method  { RayQuery, TraceRay };
+enum class Pattern { Opaque, Alpha };
 
 // ---------------------------------------------------------------------------
 static void Throw(const char* what, HRESULT hr) {
@@ -142,6 +143,90 @@ void RayGen() {
 
     Result r; r.t = p.t; r.bx = p.bary.x; r.by = p.bary.y; r.hit = p.hit;
     outBuf[idx.y * width + idx.x] = r;
+}
+[shader("closesthit")]
+void ClosestHit(inout Payload p, BuiltInTriangleIntersectionAttributes attr) {
+    p.t = RayTCurrent(); p.bary = attr.barycentrics; p.hit = 1;
+}
+[shader("miss")]
+void Miss(inout Payload p) { p.hit = 0; }
+)HLSL";
+
+// Alpha-tested variants. Geometry is non-opaque; a shared alphaTest() decides
+// per-candidate accept/reject. In RayQuery this is the Proceed() loop body; in
+// TraceRay it is the generated any-hit shader. This is the core lowering check:
+// accept == fall off the end of any-hit, reject == IgnoreHit().
+static const char* kRayQueryAlphaHLSL = R"HLSL(
+cbuffer CB : register(b0) {
+    uint width; uint height; float halfExtent; float camZ;
+    float tMin; float tMax; float2 _pad;
+};
+RaytracingAccelerationStructure scene : register(t0);
+struct Result { float t; float bx; float by; uint hit; };
+RWStructuredBuffer<Result> outBuf : register(u0);
+
+bool alphaTest(float2 b) { return frac(b.x * 4.0) < 0.5; }
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= width || tid.y >= height) return;
+    float u = ((tid.x + 0.5) / width)  * 2.0 - 1.0;
+    float v = ((tid.y + 0.5) / height) * 2.0 - 1.0;
+    RayDesc ray;
+    ray.Origin    = float3(u * halfExtent, v * halfExtent, camZ);
+    ray.Direction = float3(0, 0, -1);
+    ray.TMin = tMin; ray.TMax = tMax;
+
+    RayQuery<RAY_FLAG_NONE> q;
+    q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+    while (q.Proceed()) {                       // loop body == any-hit shader
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            if (alphaTest(q.CandidateTriangleBarycentrics()))
+                q.CommitNonOpaqueTriangleHit(); // accept
+            // else: reject (do nothing)
+        }
+    }
+    Result r = (Result)0;
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        r.t = q.CommittedRayT();
+        float2 b = q.CommittedTriangleBarycentrics();
+        r.bx = b.x; r.by = b.y; r.hit = 1;
+    }
+    outBuf[tid.y * width + tid.x] = r;
+}
+)HLSL";
+
+static const char* kTraceRayAlphaHLSL = R"HLSL(
+cbuffer CB : register(b0) {
+    uint width; uint height; float halfExtent; float camZ;
+    float tMin; float tMax; float2 _pad;
+};
+RaytracingAccelerationStructure scene : register(t0);
+struct Result { float t; float bx; float by; uint hit; };
+RWStructuredBuffer<Result> outBuf : register(u0);
+struct Payload { float t; float2 bary; uint hit; };
+
+bool alphaTest(float2 b) { return frac(b.x * 4.0) < 0.5; }
+
+[shader("raygeneration")]
+void RayGen() {
+    uint2 idx = DispatchRaysIndex().xy;
+    float u = ((idx.x + 0.5) / width)  * 2.0 - 1.0;
+    float v = ((idx.y + 0.5) / height) * 2.0 - 1.0;
+    RayDesc ray;
+    ray.Origin    = float3(u * halfExtent, v * halfExtent, camZ);
+    ray.Direction = float3(0, 0, -1);
+    ray.TMin = tMin; ray.TMax = tMax;
+
+    Payload p; p.t = 0; p.bary = float2(0, 0); p.hit = 0;
+    TraceRay(scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, ray, p);
+
+    Result r; r.t = p.t; r.bx = p.bary.x; r.by = p.bary.y; r.hit = p.hit;
+    outBuf[idx.y * width + idx.x] = r;
+}
+[shader("anyhit")]
+void AnyHit(inout Payload p, BuiltInTriangleIntersectionAttributes attr) {
+    if (!alphaTest(attr.barycentrics)) IgnoreHit();  // reject; else accept
 }
 [shader("closesthit")]
 void ClosestHit(inout Payload p, BuiltInTriangleIntersectionAttributes attr) {
@@ -277,7 +362,7 @@ static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
     return result;
 }
 
-static Scene BuildScene(Gpu& g) {
+static Scene BuildScene(Gpu& g, bool opaque) {
     Scene s;
     // One triangle at z=0.
     const float verts[9] = {
@@ -294,7 +379,8 @@ static Scene BuildScene(Gpu& g) {
     // BLAS
     D3D12_RAYTRACING_GEOMETRY_DESC geo{};
     geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geo.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geo.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                       : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
     geo.Triangles.VertexBuffer.StartAddress = s.vb->GetGPUVirtualAddress();
     geo.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
     geo.Triangles.VertexCount = 3;
@@ -361,10 +447,10 @@ static void BindRoots(ID3D12GraphicsCommandList* cl, ID3D12RootSignature* rs,
 }
 
 // ---------------------------------------------------------------------------
-static ComPtr<ID3D12Resource> RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
-        ID3D12Resource* cb, ID3D12Resource* out) {
+static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
+        ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
     auto rs = MakeRootSig(g.device.Get());
-    ComPtr<IDxcBlob> cs = dxc.compile(kRayQueryHLSL, L"main", L"cs_6_5");
+    ComPtr<IDxcBlob> cs = dxc.compile(hlsl, L"main", L"cs_6_5");
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = rs.Get();
     pd.CS.pShaderBytecode = cs->GetBufferPointer();
@@ -379,7 +465,6 @@ static ComPtr<ID3D12Resource> RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     g.list->Dispatch((kWidth + 7) / 8, (kHeight + 7) / 8, 1);
     UavBarrier(g.list.Get(), out);
     g.flush();
-    return nullptr;
 }
 
 // A shader table with one record: just a 32-byte identifier, table 64-aligned.
@@ -397,9 +482,9 @@ static ComPtr<ID3D12Resource> MakeSBT(ID3D12Device* dev, const void* ident) {
 }
 
 static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
-        ID3D12Resource* cb, ID3D12Resource* out) {
+        ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl, bool anyHit) {
     auto rs = MakeRootSig(g.device.Get());
-    ComPtr<IDxcBlob> lib = dxc.compile(kTraceRayHLSL, L"", L"lib_6_3");
+    ComPtr<IDxcBlob> lib = dxc.compile(hlsl, L"", L"lib_6_3");
 
     // --- state object subobjects ---
     std::vector<D3D12_STATE_SUBOBJECT> subs;
@@ -413,6 +498,7 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     hg.HitGroupExport = L"HitGroup";
     hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
     hg.ClosestHitShaderImport = L"ClosestHit";
+    if (anyHit) hg.AnyHitShaderImport = L"AnyHit";
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg });
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
@@ -487,10 +573,11 @@ static void WriteFile(const char* path, const std::vector<Result>& data) {
 }
 
 // Run one adapter+method trial and dump the per-ray results to `outPath`.
-static void RunTrial(Adapter adapter, Method method, const char* outPath) {
+static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char* outPath) {
     const char* an = (adapter == Adapter::Warp) ? "WARP" : "hardware";
     const char* mn = (method == Method::RayQuery) ? "RayQuery(compute)" : "TraceRay(DXR1.0)";
-    std::printf("[trial] %s on %s -> %s\n", mn, an, outPath);
+    const char* pn = (pattern == Pattern::Opaque) ? "opaque" : "alpha";
+    std::printf("[trial] %s %s on %s -> %s\n", pn, mn, an, outPath);
 
     ComPtr<IDXGIFactory6> factory;
     UINT flags = 0;
@@ -525,7 +612,7 @@ static void RunTrial(Adapter adapter, Method method, const char* outPath) {
 
     Gpu g; g.init(device.Get());
     Dxc dxc; dxc.init();
-    Scene scene = BuildScene(g);
+    Scene scene = BuildScene(g, pattern == Pattern::Opaque);
 
     // Constant buffer.
     SceneCB cbData{ kWidth, kHeight, kHalfExtent, kCamZ, kTMin, kTMax, 0, 0 };
@@ -543,8 +630,13 @@ static void RunTrial(Adapter adapter, Method method, const char* outPath) {
     auto readback = CreateBuffer(device.Get(), outSize, D3D12_HEAP_TYPE_READBACK,
         D3D12_RESOURCE_STATE_COPY_DEST);
 
-    if (method == Method::RayQuery) RunRayQuery(g, dxc, scene, cb.Get(), out.Get());
-    else                            RunTraceRay(g, dxc, scene, cb.Get(), out.Get());
+    if (method == Method::RayQuery) {
+        const char* hlsl = (pattern == Pattern::Opaque) ? kRayQueryHLSL : kRayQueryAlphaHLSL;
+        RunRayQuery(g, dxc, scene, cb.Get(), out.Get(), hlsl);
+    } else {
+        const char* hlsl = (pattern == Pattern::Opaque) ? kTraceRayHLSL : kTraceRayAlphaHLSL;
+        RunTraceRay(g, dxc, scene, cb.Get(), out.Get(), hlsl, pattern == Pattern::Alpha);
+    }
 
     // Copy out -> readback.
     Transition(g.list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -615,17 +707,29 @@ int main(int argc, char** argv) {
         if (argc >= 4 && std::strcmp(argv[1], "diff") == 0)
             return Diff(argv[2], argv[3]);
 
-        if (argc >= 4) {
+        // Single trial: raytest.exe <warp|hw> <rayquery|traceray> <opaque|alpha> <out>
+        if (argc >= 5) {
             Adapter a = std::strcmp(argv[1], "warp") == 0 ? Adapter::Warp : Adapter::Hardware;
             Method  m = std::strcmp(argv[2], "rayquery") == 0 ? Method::RayQuery : Method::TraceRay;
-            RunTrial(a, m, argv[3]);
+            Pattern p = std::strcmp(argv[3], "alpha") == 0 ? Pattern::Alpha : Pattern::Opaque;
+            RunTrial(a, m, p, argv[4]);
             return 0;
         }
 
-        // Default: ground truth on WARP, lowered on hardware, then diff.
-        RunTrial(Adapter::Warp,     Method::RayQuery, "a.bin");
-        RunTrial(Adapter::Hardware, Method::TraceRay, "b.bin");
-        return Diff("a.bin", "b.bin");
+        // Default: run both patterns, each ground-truth (WARP RayQuery) vs
+        // lowered (hardware TraceRay), and diff.
+        int rc = 0;
+        for (Pattern p : { Pattern::Opaque, Pattern::Alpha }) {
+            const char* tag = (p == Pattern::Opaque) ? "opaque" : "alpha";
+            std::string fa = std::string(tag) + "_a.bin";
+            std::string fb = std::string(tag) + "_b.bin";
+            std::printf("\n### pattern: %s ###\n", tag);
+            RunTrial(Adapter::Warp,     Method::RayQuery, p, fa.c_str());
+            RunTrial(Adapter::Hardware, Method::TraceRay, p, fb.c_str());
+            rc |= Diff(fa.c_str(), fb.c_str());
+        }
+        std::printf("\n==== OVERALL: %s ====\n", rc == 0 ? "ALL MATCH" : "DIVERGENCE");
+        return rc;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[FATAL] %s\n", e.what());
         return 1;

@@ -25,10 +25,10 @@ and signed by dxil.dll.
 ## Build / run (Windows x64, Agility SDK)
 
     build_phase2.bat C:\path\to\agility     (or set AGILITY_SDK_DIR)
-    raytest.exe                             WARP RayQuery -> a.bin,
-                                            HW TraceRay  -> b.bin, then diff
-    raytest.exe warp rayquery a.bin         run one trial
-    raytest.exe hw   traceray b.bin
+    raytest.exe                             both patterns (opaque, alpha):
+                                            WARP RayQuery vs HW TraceRay, diffed
+    raytest.exe warp rayquery alpha a.bin   run one trial
+    raytest.exe hw   traceray alpha b.bin
     raytest.exe diff a.bin b.bin
 
 `D3D12Core.dll` from the Agility SDK must sit in `.\D3D12\` next to the exe (the
@@ -38,15 +38,18 @@ Exit 0 = MATCH, 4 = DIVERGE.
 
 ## Status
 
-- Host-side geometry and diff logic verified on Linux (hit/miss mix correct,
-  hits at t==camZ, diff flags value and hit-flip divergence).
-- The D3D12 / DXR plumbing was written without a Windows build to hand, so the
-  first compile on the dev machine is an iteration pass. Verified-vs-inferred:
-  the ray math and diff are verified; the D3D12 API calls are inferred and need
-  a real build+run.
+- Opaque closest-hit: PASSED on the dev machine (GTX 1070). WARP reported
+  RaytracingTier 0xb (1.1), the 1070 reported 0xa (1.0). Both produced 14450
+  hits over 65536 rays and the diff was bit-exact: 0 hit/miss mismatches, 0
+  value mismatches, max |dt| = 0, max |dbary| = 0. WARP and NVIDIA returned
+  identical t and barycentrics, better than the tolerance the plan allowed for.
+- Alpha-tested closest-hit: added (non-opaque geometry, shared alphaTest() as
+  the RayQuery Proceed() loop body and as the TraceRay any-hit shader). Expected
+  to accept ~8117 of the 14450 triangle hits, so it exercises both accept and
+  IgnoreHit(). Awaiting a run on the dev machine.
 
 ## Next
 
-- Run it, confirm MATCH on the opaque closest-hit pattern.
-- Then add the alpha-tested pattern (generated any-hit shader / `IgnoreHit`) to
-  exercise the `Proceed()` loop-body lowering, per the plan.
+- Run the alpha pattern, confirm MATCH.
+- With both patterns matching, the Phase 2 gate is passed; proceed to Phase 3
+  (proxy d3d12.dll skeleton).
