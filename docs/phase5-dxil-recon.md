@@ -273,11 +273,129 @@ Targeting `lib_6_5` rather than `lib_6_3` would keep `!dx.version` at 1.5 where
 the RayQuery input already sits; the 1070 reports shader model 6.7, so that
 costs nothing.
 
+## Pattern 1 lowered by hand, and it runs
+
+`phase5/hand/make_lib.py` turns `rayquery_opaque.ll`, a `cs_6_5` compute shader
+using `RayQuery<RAY_FLAG_FORCE_OPAQUE>`, into a `lib_6_5` DXR library. It is a
+script rather than a hand-typed file so it is reproducible and so the edits are
+individually legible, but every edit was worked out by hand against the
+validator. This is pattern 1 from the brief, the stated first target.
+
+    python phase5/hand/make_lib.py
+    phase5out\dxilrt.exe asm phase5/hand/rayquery_opaque_lib.ll out.dxil
+
+### Letting the validator specify the work
+
+The first attempt changed one thing, `!dx.shaderModel` from `cs` to `lib`, and
+asked. That is the point of having the feedback loop: the validator enumerates
+the job rather than being guessed at.
+
+    error: Opcode ThreadId not valid in shader model lib_6_5(lib).
+    error: Resource handle should returned by createHandle.
+      at '%1 = call ... @dx.op.createHandle(i32 57, i8 1, i32 0, i32 0, i1 false)'
+    error: store should be on uav resource.
+    error: buffer load/store only works on Raw/Typed/StructuredBuffer.
+
+Both root causes were predicted by the recon. The rest were knock-on effects of
+the handle one.
+
+### The edits
+
+- `!dx.shaderModel` `cs 6,5` to `lib 6,5`. Keeping 6.5 rather than dropping to
+  6.3 leaves `!dx.version` at 1.5 where the input already sits, and the 1070
+  reports shader model 6.7, so it costs nothing.
+- **Resources become globals.** A library's handles come from
+  `createHandleForLib` (160) applied to a loaded global, not `createHandle` (57)
+  applied to a binding index. So three `external constant` globals are added,
+  `!dx.resources` points at them instead of `undef`, and the three
+  `createHandle` calls become a load plus `createHandleForLib`.
+- `dx.op.threadId` (93) becomes `dx.op.dispatchRaysIndex` (145).
+- **The query collapses to one `traceRay`.** With `FORCE_OPAQUE`, `Proceed`
+  never yields a candidate, so there is no loop and no any-hit shader. The
+  `allocateRayQuery` / `TraceRayInline` / `Proceed` / `CommittedStatus` sequence
+  becomes a payload init, a `traceRay` (157), and a load of the payload.
+- `ClosestHit` and `Miss` are appended. Both are tiny.
+- `!dx.typeAnnotations` is added and `!dx.entryPoints` is rewritten from one
+  compute record into a resource-only record plus three export records.
+
+Two things did NOT need doing, both worth recording because they were expected
+to be work:
+
+- **The CFG is untouched**, phi nodes and all. `CommittedStatus` was being
+  compared against `COMMITTED_TRIANGLE_HIT` (1), and the generated `ClosestHit`
+  writes `hit = 1` while `Miss` writes `0`, so loading the payload's hit field
+  is the identical test. The branch, the three float phis and the integer phi
+  all survive as they were.
+- **Names do not need MSVC mangling.** DXC emits `\01?RayGen@@YAXXZ`, but plain
+  `@RayGen` works and `RDAT` exposes it under exactly that name, which is what
+  the state object looks up.
+
+### The constraint that bit
+
+LLVM numbers unnamed values sequentially, so every value this script introduces
+is named. The reverse also bites and was not anticipated: **deleting a numbered
+value breaks the sequence.** Removing the rayQuery values `%33` and `%34` made
+the assembler refuse:
+
+    shader: instruction expected to be numbered '%33'
+
+Fixed by having two replacement instructions take those exact numbers rather
+than renumbering the rest of the function. An automated rewriter has to do the
+same, or renumber wholesale. Cheap to hit, cheap to fix, and the assembler says
+precisely what is wrong.
+
+### Result: it validates, signs, and renders correctly
+
+    assembled ok
+    unsigned  5332 bytes, 5 parts: SFI0(8) RDAT(380) STAT(2104) HASH(20) DXIL(2728)
+    validated and signed ok
+
+And on hardware, against WARP's native Tier 1.1 RayQuery as ground truth:
+
+    WARP RayQuery (ground truth)          65536 rays, 14450 hits
+    hand-lowered library on the GTX 1070  65536 rays, 14450 hits
+
+    hit/miss mismatches: 0
+    value  mismatches  : 0 (tol 0.0010)
+    max |dt|           : 0.000000
+    max |dbary|        : 0.000000
+    RESULT: MATCH
+
+**A RayQuery shader, transformed at the DXIL text level, running correctly on
+Tier 1.0 hardware.** That is the Phase 5 premise demonstrated end to end, for
+one pattern.
+
+`raytest.exe --lib <file.dxil>` is what makes this checkable: the TraceRay side
+loads a pre-built library from disk instead of compiling HLSL, so anything the
+eventual rewriter produces can be held against the same ground truth.
+
+### Checked for sensitivity, twice
+
+A `--lib` path that was silently ignored would produce exactly the result above,
+so the test was made to fail on purpose. Flipping one constant in the
+hand-lowered library, the ray direction from -Z to +Z:
+
+    poisoned hand-lowered lib   65536 rays, 0 hits
+    hit/miss mismatches: 14450   RESULT: DIVERGE
+
+And as a control in the other direction, DXC's own `traceray_opaque.dxil` pushed
+through the same `--lib` path gives 14450 hits and MATCH. So the path is real,
+it carries the file it is given, and it notices when that file is wrong.
+
 ## Next
 
-Take `rayquery_opaque.ll`, hand-edit it into a library, and put it through
-`dxilrt asm`. That is pattern 1, the brief's stated first target, and it needs
-no any-hit shader at all. Doing it by hand first, before writing any rewriter,
-is the same move Phase 2 made: find out what breaks by hand now, not inside a
-compiler later. The validator's complaints are the specification for what the
-automated pass will have to get right.
+Pattern 1 is proven by hand. The two remaining questions, in order:
+
+1. **Pattern 3, the any-hit case.** `rayquery_alpha.ll` has the rotated
+   `Proceed` loop, so it exercises the loop-body extraction that pattern 1
+   skipped entirely. That is the part of the transform with no precedent here,
+   and doing it by hand first will expose whatever the recon missed.
+2. **Only then, automate.** The edits above are mechanical but they are keyed to
+   exact instruction text. A rewriter has to find the same sites structurally,
+   by following the query handle and matching opcodes on operand 0, which is
+   what the recon says the IR supports.
+
+Still unknown, and worth settling before automation: whether an application's
+shader that binds resources differently, uses descriptor tables rather than root
+descriptors, or declares more than one query, still fits this shape. Everything
+here is one shader with three root-level bindings.

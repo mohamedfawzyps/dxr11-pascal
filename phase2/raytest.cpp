@@ -245,6 +245,22 @@ static bool g_roundTrip = false;
 static bool g_rtPoison  = false;   // deliberate corruption, to prove the check bites
 static bool g_poisonNow = false;   // set per trial: poison only the lowered side
 
+// Phase 5. With --lib <file>, the TraceRay side loads a pre-built DXIL library
+// from disk instead of compiling HLSL, so a hand-lowered or rewriter-produced
+// library can be checked against the same WARP ground truth as everything else.
+static const char* g_libFile = nullptr;
+static std::vector<uint8_t> ReadAll(const char* path) {
+    std::vector<uint8_t> v;
+    FILE* f = std::fopen(path, "rb");
+    if (!f) Throw("open --lib file", E_FAIL);
+    std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    v.resize(n > 0 ? (size_t)n : 0);
+    size_t got = v.empty() ? 0 : std::fread(v.data(), 1, v.size(), f);
+    std::fclose(f);
+    if (got != v.size()) Throw("read --lib file", E_FAIL);
+    return v;
+}
+
 // --- DXC runtime compile ---------------------------------------------------
 struct Dxc {
     ComPtr<IDxcCompiler3> compiler;
@@ -557,14 +573,24 @@ static ComPtr<ID3D12Resource> MakeSBT(ID3D12Device* dev, const void* ident) {
 static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl, bool anyHit) {
     auto rs = MakeRootSig(g.device.Get());
-    ComPtr<IDxcBlob> lib = dxc.compile(hlsl, L"", L"lib_6_3");
 
     // --- state object subobjects ---
     std::vector<D3D12_STATE_SUBOBJECT> subs;
 
+    ComPtr<IDxcBlob> lib;
+    std::vector<uint8_t> fileLib;
     D3D12_DXIL_LIBRARY_DESC libDesc{};
-    libDesc.DXILLibrary.pShaderBytecode = lib->GetBufferPointer();
-    libDesc.DXILLibrary.BytecodeLength = lib->GetBufferSize();
+    if (g_libFile) {
+        fileLib = ReadAll(g_libFile);
+        std::printf("        library loaded from %s (%zu bytes)\n",
+                    g_libFile, fileLib.size());
+        libDesc.DXILLibrary.pShaderBytecode = fileLib.data();
+        libDesc.DXILLibrary.BytecodeLength = fileLib.size();
+    } else {
+        lib = dxc.compile(hlsl, L"", L"lib_6_3");
+        libDesc.DXILLibrary.pShaderBytecode = lib->GetBufferPointer();
+        libDesc.DXILLibrary.BytecodeLength = lib->GetBufferSize();
+    }
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc });
 
     D3D12_HIT_GROUP_DESC hg{};
@@ -785,6 +811,12 @@ int main(int argc, char** argv) {
         // Pull --roundtrip out of argv so the positional arguments below are
         // unaffected by it.
         for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
+                g_libFile = argv[i + 1];
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
+                continue;
+            }
             const bool poison = std::strcmp(argv[i], "--rtpoison") == 0;
             if (!poison && std::strcmp(argv[i], "--roundtrip") != 0) continue;
             g_roundTrip = true;
