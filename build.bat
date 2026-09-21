@@ -8,8 +8,10 @@ rem or set DXC_SDK_DIR first, then: build.bat
 
 set "DXC=%~1"
 if "%DXC%"=="" set "DXC=%DXC_SDK_DIR%"
-if "%DXC%"=="" (
-  echo Provide the DXC SDK path, e.g.:  build.bat C:\path\to\dxc
+if "%DXC%"=="" set "DXC=C:\DW\DXC"
+if not exist "%DXC%\inc\dxcapi.h" (
+  echo dxcapi.h not found under "%DXC%\inc".
+  echo Pass the DXC SDK path, e.g.:  build.bat C:\path\to\dxc
   echo (the folder that contains inc\dxcapi.h and bin\x64\dxcompiler.dll^)
   exit /b 1
 )
