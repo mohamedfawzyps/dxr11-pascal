@@ -445,10 +445,18 @@ def _append_shaders(text, module, q, exports, table, globals_):
   ret void
 }}'''.format(ms=exports['miss'], pl=PAYLOAD))
 
-    marker = re.search(r'^\}\s*$', text, re.M)
-    if not marker:
+    # Insert after the line that closes the entry function. Done on lines
+    # rather than with a multiline regex: `\s*$` there also eats the following
+    # newlines, which produced a run of blank lines by accident. It is also the
+    # one construct MSVC's std::regex cannot do, and the C++ port has to match
+    # this byte for byte.
+    lines = text.split('\n')
+    at = next((i for i, l in enumerate(lines) if re.match(r'^\}\s*$', l)), None)
+    if at is None:
         raise LowerError('cannot find the end of the entry function')
-    return text[:marker.end()] + '\n\n' + '\n\n'.join(fns) + text[marker.end():]
+    block = ('\n' + '\n\n'.join(fns)).split('\n')
+    lines[at + 1:at + 1] = block
+    return '\n'.join(lines)
 
 
 def _anyhit(module, q, exports, table, globals_):

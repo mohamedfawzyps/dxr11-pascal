@@ -64,6 +64,35 @@ foreach ($c in $cases) {
     }
     Write-Host '  assembled, validated and signed'
 
+    # The C++ port's correctness bar: byte-identical output to the Python
+    # original. Far stronger than "it renders correctly", and it is what keeps
+    # the two implementations from drifting apart.
+    if (Test-Path '.\phase5out\dxrw.exe') {
+        New-Item -ItemType Directory -Force 'phase5\outcpp' | Out-Null
+        & .\phase5out\dxrw.exe lower $c.src "phase5\outcpp\$n.ll" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  C++ PORT REFUSED what Python lowered'
+            $failed++
+        } else {
+            $a = [IO.File]::ReadAllBytes("phase5\out\$n.ll")
+            $b = [IO.File]::ReadAllBytes("phase5\outcpp\$n.ll")
+            $same = $a.Length -eq $b.Length
+            if ($same) {
+                for ($i = 0; $i -lt $a.Length; $i++) {
+                    if ($a[$i] -ne $b[$i]) { $same = $false; break }
+                }
+            }
+            if ($same) {
+                Write-Host "  C++ port: byte-identical ($($a.Length) bytes)"
+            } else {
+                Write-Host '  C++ port: DIFFERS from the Python original'
+                $failed++
+            }
+        }
+    } else {
+        Write-Host '  C++ port: phase5out\dxrw.exe missing, run build_rewriter.bat'
+    }
+
     # WARP RayQuery is the oracle; the 1070 runs what the rewriter produced.
     $gt = if ($c.ContainsKey('gt')) { $c.gt } else { @() }
     & .\raytest.exe warp rayquery $c.pat "rw_${n}_a.bin" @($gt) | Out-Null

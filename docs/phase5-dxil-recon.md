@@ -889,20 +889,89 @@ arrives; it does nothing about it. The tier flip and a working in-proxy
 transform have to land together, exactly as the brief says, because a shim that
 claims 1.1 and then fails is worse than one that claims 1.0.
 
+## The C++ port, checked by byte-identical output
+
+The fork above was decided in favour of porting. `proxy/rewriter/` is the
+analysis and the lowering in C++, 1689 lines against the Python original's
+1303, built into `phase5out/dxrw.exe` by `build_rewriter.bat`.
+
+| C++ | ports |
+|---|---|
+| `ll_model.{h,cpp}` | `dxil.py` plus `llnorm.py`: parsing, CFG, dominators, natural loops, render |
+| `rq_analyze.{h,cpp}` | `rayquery.py`: find, classify, refuse |
+| `rq_lower.{h,cpp}` | `lower.py`: the transform |
+| `phase5/dxrw.cpp` | the CLI, so the two can be compared |
+
+### The bar: byte-identical, not "it renders correctly"
+
+A port is exactly the situation where "the tests still pass" is too weak, since
+both implementations are checked against the same six cases and a shared
+misunderstanding would pass twice. So the bar is that the C++ must produce the
+**same bytes** as the Python for every case:
+
+    opaque    byte-identical (13533 bytes)
+    alpha     byte-identical (14980 bytes)
+    table     byte-identical (13675 bytes)
+    tablers   byte-identical (13533 bytes)
+    indep     byte-identical (16317 bytes)
+    ids       byte-identical (13452 bytes)
+
+The refusals agree too, message for message, including the two that matter
+most: `CommittedGeometryIndex has no lowering on Tier 1.0` and `RayQuery in a
+"ps" shader`.
+
+This check is now part of `tools/run_rewriter_test.ps1`, so the two
+implementations cannot drift apart quietly. It is demonstrably sensitive: it
+failed on the first run, which is how the next item was found.
+
+### What the byte comparison caught
+
+The first run differed on every case, by exactly two blank lines. The cause was
+in the PYTHON, not the port. `_append_shaders` located the end of the entry
+function with `re.search(r'^\}\s*$', text, re.M)`, and in multiline mode `\s*`
+also consumes the following newlines, so the insertion point drifted past them
+and produced a run of blank lines nobody intended.
+
+Both sides now do that insertion on lines instead. The generated IR is tidier,
+and the accident is gone rather than faithfully reproduced in a second
+language. Reproducing sloppiness in a port is not fidelity.
+
+### Two things MSVC forced
+
+- **`std::regex` has no multiline mode at all.** Every pattern that used one
+  here was line-oriented anyway, so they became line operations, which is
+  clearer than the regexes were. This is also what exposed the blank-line bug.
+- **A raw string ending in `)"` terminates early.** `R"( ... !"(\w+)" ... )"`
+  is not the string it looks like. Custom delimiters, `R"RX( ... )RX"`, where
+  the pattern contains a quote.
+
+### What this does NOT yet do
+
+The port is the analysis and the lowering. It is not yet wired into the proxy,
+and two pieces stand between:
+
+1. **The DXC host.** The rewriter works on text; the proxy receives bitcode. A
+   C++ path from container to text and back needs `IDxcCompiler::Disassemble`,
+   `IDxcAssembler` and `dxil.dll` for signing, loaded from the proxy. That is
+   the deployment consequence named in the fork, and it is not written yet.
+2. **The dispatch path.** Lowering a compute shader to a library is only half
+   of it. The application then calls `Dispatch`, which has to become
+   `DispatchRays` against a state object and shader table the shim builds and
+   owns. None of that exists.
+
+So the tier flip is still blocked, for the same reason as before. What has
+changed is that the transform itself is now in the language the proxy is
+written in, and is provably the same transform.
+
 ## Next
 
-Detection is in the proxy and the regression is unchanged. The transform is a
-decision, not a next step: see the three options above. Option 1, porting the
-analysis and lowering to C++ with DXC loaded for text conversion and signing,
-is the only one that meets the project's goal, and it is a piece of work the
-size of Phase 5 so far.
+1. **The DXC host in C++**: container to text and back, plus signing, loaded
+   from the proxy. Small next to the port, and it makes the rewriter callable
+   on what the proxy actually receives.
+2. **The dispatch path**: `Dispatch` on a lowered compute shader has to become
+   `DispatchRays` against a shim-owned state object and shader table. This is
+   the larger of the two and nothing is written.
+3. Only then the tier flip, with anything refused failing loudly.
 
-Smaller things that do not depend on that decision:
-
-1. **Dynamic descriptor indexing**, currently refused.
-2. More independent shaders. Both written so far found something the Phase 2
-   pair could not. Untried: non-default `RAY_FLAG` combinations, `Abort()`,
-   procedural primitives, committed object-space accessors.
-3. A check that the rewriter's output is rejected by nothing in the proxy path,
-   by feeding a lowered library through `CreateStateObject` on the proxy rather
-   than through the test harness directly.
+Independent of all that: dynamic descriptor indexing is still refused, and more
+independent shaders are still the cheapest way to find what has been assumed.

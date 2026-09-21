@@ -51,3 +51,5 @@ phase5/cases/*.dxil
 # Generated from the reference shaders on demand
 phase5/cases/reference/*.ll
 phase5/cases/reference/*.dxil
+
+phase5/outcpp/
