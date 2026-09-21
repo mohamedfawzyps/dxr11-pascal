@@ -143,12 +143,14 @@ alpha testing to exercise the any-hit path.
 Use a tolerance, not exact equality. DXR does not guarantee bit-identical
 results across implementations.
 
-**Result so far (2026-09-21):** harness in `phase2/raytest.cpp`, details in
-docs/phase2-lowering.md.
-- Opaque closest-hit: PASSED. WARP (Tier 1.1) vs GTX 1070 (Tier 1.0), 14450
-  hits / 65536 rays, bit-exact diff (identical t and barycentrics).
-- Alpha-tested closest-hit: implemented (any-hit / Proceed loop-body lowering),
-  awaiting a run.
+**Result: PASSED (2026-09-21).** harness in `phase2/raytest.cpp`, details in
+docs/phase2-lowering.md. WARP (Tier 1.1) vs GTX 1070 (Tier 1.0), 65536 rays:
+- Opaque closest-hit: 14450 hits, bit-exact diff.
+- Alpha-tested closest-hit (any-hit / Proceed loop-body lowering): 8117 hits,
+  bit-exact diff.
+
+Both t and barycentrics were identical between WARP and NVIDIA, better than the
+tolerance allowed. The lowering is sound for these patterns; proceed to Phase 3.
 
 ### Phase 3: proxy skeleton (1 week)
 

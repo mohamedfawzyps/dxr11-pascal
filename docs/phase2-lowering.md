@@ -43,13 +43,15 @@ Exit 0 = MATCH, 4 = DIVERGE.
   hits over 65536 rays and the diff was bit-exact: 0 hit/miss mismatches, 0
   value mismatches, max |dt| = 0, max |dbary| = 0. WARP and NVIDIA returned
   identical t and barycentrics, better than the tolerance the plan allowed for.
-- Alpha-tested closest-hit: added (non-opaque geometry, shared alphaTest() as
-  the RayQuery Proceed() loop body and as the TraceRay any-hit shader). Expected
-  to accept ~8117 of the 14450 triangle hits, so it exercises both accept and
-  IgnoreHit(). Awaiting a run on the dev machine.
+- Alpha-tested closest-hit: PASSED. Non-opaque geometry, shared alphaTest() as
+  the RayQuery Proceed() loop body and as the TraceRay any-hit shader. 8117 hits
+  accepted (of 14450 candidates), bit-exact diff. Exercises both accept and
+  IgnoreHit().
+
+Phase 2 gate PASSED: the RayQuery -> TraceRay lowering is sound for the opaque
+and alpha-tested closest-hit patterns.
 
 ## Next
 
-- Run the alpha pattern, confirm MATCH.
-- With both patterns matching, the Phase 2 gate is passed; proceed to Phase 3
-  (proxy d3d12.dll skeleton).
+- Phase 3: proxy d3d12.dll skeleton (forward everything, wrap the device,
+  verify a real DXR 1.0 app still runs).
