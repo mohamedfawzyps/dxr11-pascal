@@ -1,12 +1,13 @@
-# dxr11-pascal: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
+# pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
-Version 1.
+Brief version 1. Not the project's version: that lives in CHANGELOG.md and
+proxy/version.h, and is currently 0.12.0.
 
-## Current position (2026-09-21)
+## Current position (2026-09-22)
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
 GTX 1070 and produces bit-exact output against WARP. Fourteen render cases, 0
-mismatches, plus two refusal gates. Run `.\tools\run_dispatch_test.ps1`.
+mismatches, plus four gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
 was missing. Nothing in this project implements ray tracing.
@@ -41,12 +42,45 @@ APPLICATION did:
 - an application routing both geometry kinds to ONE hit group record.
 
 So the next question is not what to build but **WHAT TO RUN**: real software,
-enough of it that the refusal list is trusted, before the tier flip stops being
-opt-in.
+enough of it that the refusal list is trusted. That is what the version number
+tracks, see CHANGELOG.md: 0.x until real software has been through it, 1.0.0
+when the refusal list is trusted.
 
 See the entries below and docs/phase5-dxil-recon.md.
 
-The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
+**IT IS SHIPPED NOW**, and that changed several defaults. Repository
+`pascal-dxr-tier-1.1`, branch `main`, tagged v0.12.0, with README.md,
+CHANGELOG.md, docs/usage.md and a setup GUI. The rules below are about being a
+thing somebody downloads, and they are not the same as the rules for a thing
+only its author runs:
+
+- **Tier 1.1 is ON by default.** The install IS the opt-in: a proxy DLL only
+  sits beside an executable because somebody put it there. Requiring a second
+  opt-in through an environment variable that Steam and the Epic launcher never
+  pass on mostly produced reports that the shim does nothing. The old gate was
+  right for development, where the risk was a test run silently flipping, and
+  wrong for a release.
+- **Settings come from `dxr11.ini` beside the DLL**, because a file is the only
+  mechanism that works regardless of how an application is launched. The
+  environment still WINS over the file, deliberately, so a stray `.ini` can
+  never change what the test scripts measure. See proxy/config.h.
+- **Without DXC the shim stands aside entirely.** It neither claims Tier 1.1
+  nor wraps the device. Two reasons, and the second is the one worth
+  remembering:
+  - Claiming Tier 1.1 is a promise to translate RayQuery, and the promise
+    cannot be kept without `dxcompiler.dll` and `dxil.dll`. Copy the DLL alone,
+    forget the other two, and an application is told it may emit RayQuery, does
+    so, and the driver rejects a shader nobody could rewrite. That is the one
+    failure this project refuses to ship, and making the tier claim the default
+    had introduced it.
+  - Everything the WRAPPER still does is a Tier 1.1 feature, so a Tier 1.0
+    application never calls any of it. Wrapping would be risk with no benefit,
+    and the wrapper hooks a queue vtable and wraps every command list. The cost
+    of checking: DXC now loads at device creation rather than at the first
+    shader, so the lazy loading noted below is gone when DXC is present.
+- The log prefix is `[dxr-tier-11-proxy-log]` and it names the version and the
+  DXC it loaded, because a bug report arrives as a log file from a binary
+  nobody can identify.
 
 - Phase 1 signing test: PASSED. See below and docs/phase1-signing.md.
 - Phase 2 hand-lowering test: PASSED, bit-exact on both patterns. See
@@ -710,9 +744,62 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   the `table` case is now in the dispatch suite too, which is coverage that was
   previously IMPOSSIBLE rather than merely absent.
 
+- **Three defects found by pointing it at real engine shaders, NOT yet fixed.**
+  Investigating Falcor and RTXPT as targets turned these up in an hour, and
+  each would meet a real application before any of the interesting refusals do:
+  - **A RayQuery shader with no early-out bounds check does not lower.** The
+    entry block becomes a phi predecessor and normalization leaves a dangling
+    `%bb0`, because the entry block has no label line to rename. It fails at
+    the ASSEMBLER with `use of undefined value '%bb0'`, which names nothing
+    relevant. Reproduced minimally on a plain SM 6.5 non-bindless shader.
+    **Every shader in the suite opens with `if (tid.x >= width) return;`**, and
+    that one shared habit hid it. The probe is
+    `phase5/cases/reference/rq_bindless_probe.hlsl`.
+  - **`CreatePipelineState`, the pipeline stream form, detects RayQuery and
+    forwards it.** Only `CreateComputePipelineState` gets the substitution.
+    Engines with a unified PSO cache use the stream form.
+  - **`createHandleFromHeap` is documented as refused and is not.** The string
+    appears nowhere in the rewriter. A bindless SM 6.6 shader is accepted and
+    classified as pattern 1, then fails later for the first reason above.
+
+- **What a survey of real engines actually found**, and it reframes the
+  remaining work:
+  - **`GeometryIndex` is the standard hit-identification idiom.** Falcor
+    identifies every hit as `GeometryInstanceID(InstanceID(), GeometryIndex())`,
+    and `Committed`/`CandidateGeometryIndex` appear on nearly every inline
+    path. So the one accessor measured as impossible is the one real engines
+    use most. RTXPT's intro sample uses it too.
+  - **But it is no longer impossible.** It was written off before the shader
+    table machinery existed. Set
+    `MultiplierForGeometryContributionToShaderIndex` to 1, size the table by
+    the geometry counts `as_tracker` already records per BLAS, and give each
+    record a local root signature carrying its geometry index as a root
+    constant. The closest-hit reads that constant. Ordinary DXR 1.0 practice,
+    and every piece exists except the local root signature.
+  - **Both NVIDIA samples put RayQuery inside a RAYGEN shader**, not a compute
+    shader. Measured: `PathTracerSample.hlsl` and `IntroPathTracer.hlsl` are
+    `[shader("raygeneration")]` with a RayQuery inside, and no compute entry
+    points anywhere in RTXPT's shader set.
+  - **Our refusal for that is broader than its own stated reason.** CLAUDE.md
+    justifies refusing RayQuery inside a DXR 1.0 shader with "any-hit and
+    intersection shaders cannot call TraceRay". True of those two. **A raygen
+    CAN call TraceRay.** So raygen-hosted RayQuery is lowerable in principle,
+    and it is the single most common real shape. The obstacle is not the
+    shaders, it is SHADER TABLE OWNERSHIP: in the compute path the shim builds
+    the table, in the raygen path the application does, so generated hit groups
+    need records appended to a table we do not own.
+  - Falcor's `VBufferRT.cs.slang` IS a pure compute inline pass, 16x16, early
+    out, alpha test in the loop. It is the closest real target, and it needs
+    the `GeometryIndex` work.
+  - RTXPT's driver minimum of 595.71 is NOT the blocker it looks like: its
+    README documents dropping Agility SDK 1.619 at configure time, which drops
+    it to DXR 1.1. A DXR 1.1 requirement is the TARGET, not a cost. DXR 1.2,
+    SM 6.9, SER and OMM are the genuinely out-of-scope parts.
+
   Next action. **Not a feature: exposure.** Run real software through it, until
-  the refusal list is trusted, and only then consider making the tier flip the
-  default.
+  the refusal list is trusted. Fix the three defects above first, because the
+  entry-block one will misfire on almost anything and its message points
+  nowhere near the cause.
 
   Four accessors stay PERMANENTLY refused and must keep failing loudly:
   Candidate and `CommittedGeometryIndex`, which are Tier 1.1 on the DXR 1.0
@@ -760,7 +847,7 @@ The tier flip is therefore deliberately OPT-IN, behind `DXR11_TIER11=1`.
   behaviour.
 
 Dev machine (Windows x64), everything under `C:\DW`:
-- `C:\DW\dxr11-pascal` - this repository.
+- `C:\DW\dxr11-pascal` - this repository, published as `pascal-dxr-tier-1.1`.
 - `C:\DW\DXC` - DirectX Shader Compiler (`inc\dxcapi.h`, `bin\x64\dxcompiler.dll`,
   `dxil.dll`).
 - `C:\DW\microsoft.direct3d.d3d12.1.619.5` - Agility SDK.
@@ -768,6 +855,13 @@ Dev machine (Windows x64), everything under `C:\DW`:
   app used to validate the proxy.
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`,
   `build_sample.bat`, `build_phase4.bat`.
+  `tools\dxr-tier-11-setup.bat` is the end-user installer, a WinForms
+  PowerShell script: pick the .exe, install, toggle, read the log. It is loud
+  about missing DXC, because that is the failure that otherwise surfaces much
+  later as a shader refused for no visible reason. `Show refusals only` filters
+  the log to the REFUSED and NOTE lines, deduplicated, which is the part of a
+  long log anybody actually needs.
+  `dxr11.example.ini` is the settings file to copy and rename.
   `build_phase4.bat` builds the Tier 1.1 probe into `phase4out\`, a directory
   with no proxy in it so the probe measures the real runtime; copy `d3d12.dll`
   in to measure the shim instead. `tier11probe.exe [warp|hw]` runs the three
@@ -1060,23 +1154,18 @@ The estimate of the engineering cost was right: command list splitting was
 the bulk of it, and preserving binding state across the break was the part that
 kept being subtly wrong.
 
-**The tier flip is now possible but OPT-IN, on purpose.** `DXR11_TIER11=1`
-makes `CheckFeatureSupport` report Tier 1.1 and turns on the RayQuery rewriting
-path. Without it the shim reports Tier 1.0 and behaves exactly as before, and
-`.\tools\run_dispatch_test.ps1` tests that gate as a case of its own.
+**The tier flip was opt-in for a long time and is now the default**, once the
+rewriting path it promises actually existed and was gated on DXC being present.
+See the position section for why that changed and what it is conditional on.
 
-It stays off by default because reporting 1.1 entitles an application to emit
-RayQuery, and a shim that claims 1.1 and then fails is worse than one that
-claims 1.0. The refusal list has only been exercised against this project's own
-shaders. A shader the rewriter refuses is logged and forwarded unchanged, so
-the application gets the driver's own error rather than a silently wrong
-render.
+The principle that drove the old gate has NOT changed and still governs:
+reporting 1.1 entitles an application to emit RayQuery, and a shim that claims
+1.1 and then fails is worse than one that claims 1.0. What changed is where the
+check lives. It used to be an environment variable the user had to set; it is
+now a check on whether the shim can actually honour the claim.
 
-The proxy now DETECTS RayQuery, see the position section, but that does not
-unblock the flip. Detection says when RayQuery arrives; it does nothing about
-it. The tier flip and a working in-proxy transform have to land together.
-Everything Phase 5 has proven runs through the Python tooling, not through the
-shim, and that is the honest gap.
+A shader the rewriter refuses is still logged and forwarded unchanged, so the
+application gets the driver's own error rather than a silently wrong render.
 
 ### Phase 5: the DXIL rewriter
 
@@ -1182,6 +1271,10 @@ WARP is the oracle throughout. It implements Tier 1.1 correctly in software,
 so any RayQuery shader can be run there for ground truth and diffed against
 the lowered version on the 1070. No RTX card needed.
 
+`.\tools\run_proxy_test.ps1` copies DXC beside the proxy, and must. Without
+it the shim stands aside and the comparison is the unmodified path against
+itself, which passes and means nothing. It warns if DXC is not there.
+
 Phase 5 has its own end-to-end check, `.\tools\run_rewriter_test.ps1`:
 lower each pattern with the rewriter, assemble and sign with `dxilrt`, run on
 the 1070, diff against WARP. It also runs the refusal tests, because an
@@ -1214,9 +1307,18 @@ anything.
 - `DXR11_DEBUGLAYER=1` turns the D3D12 debug layer on in a release build AND
   drains the InfoQueue. Both halves are needed: the layer reports through
   `OutputDebugString`, so without the drain a console sees nothing and its
-  silence proves nothing.
+  silence proves nothing. **The harness reads this, the SHIM does not.** For a
+  real application use `dxcpl.exe`, the DirectX Control Panel, which forces the
+  layer on for any executable you name.
 
-Check sensitivity before believing a pass, and check the CHECK. Four times in
+The shim itself reads exactly TWO settings, and no others. `tier11` defaults ON
+and `nowrap` defaults off, each settable in `dxr11.ini` beside the DLL or as
+`DXR11_TIER11` / `DXR11_NO_WRAP` in the environment, which wins. `nowrap` is
+not a companion to `tier11`, it OVERRIDES it: everything the shim does lives on
+the device object it hands the application, the Tier 1.1 answer included, so
+declining to hand that object over switches the whole layer off.
+
+Check sensitivity before believing a pass, and check the CHECK. Five times in
 this project a test passed for the wrong reason:
 - the `-gfxsplit` control re-bound a PSO the test had abandoned;
 - the first `--rtpoison` corrupted BOTH sides, so they still agreed;
@@ -1231,8 +1333,21 @@ this project a test passed for the wrong reason:
   ALREADY KNOWN to be wrong. It stayed silent there too, so the silence meant
   nothing either way.
 
-The last one generalises: **an oracle that says nothing has to be shown capable
-of saying something**, on the same run, before its silence counts as a result.
+- **a CORRECT change to the product silently emptied a test.** Making the shim
+  stand aside when DXC is absent was right. But `run_proxy_test.ps1` exists to
+  prove the WRAPPER is transparent, and the Microsoft sample folders contain no
+  DXC, so the shim stood aside there and the comparison became the unmodified
+  path against itself. It would have passed forever while proving nothing. The
+  script now copies DXC beside the proxy and warns loudly if it cannot.
+
+The debug layer one generalises: **an oracle that says nothing has to be shown
+capable of saying something**, on the same run, before its silence counts as a
+result.
+
+The last one generalises differently, and is the harder lesson: **when you
+change what the product DOES, re-ask what each test is still measuring.** That
+test did not break, did not warn, and did not fail. It quietly changed subject.
+Nothing in a green suite tells you this happened.
 
 And one failure that was not a test at all, but the same shape of mistake. A
 CRLF `.ll` made the C++ rewriter refuse with a message about the query handle,
