@@ -7,8 +7,11 @@
 
 #include "d3d12_command_list.h"
 #include "proxy_log.h"
+#include "command_signature.h"
 
 #include <windows.h>
+#include <cstring>
+#include <cstdint>
 
 #define FWD(call) m_real->call
 
@@ -147,14 +150,76 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetMarker(UINT m, const void* d, UINT s
 void STDMETHODCALLTYPE Dxr11CommandList::BeginEvent(UINT m, const void* d, UINT s) { FWD(BeginEvent(m, d, s)); }
 void STDMETHODCALLTYPE Dxr11CommandList::EndEvent() { FWD(EndEvent()); }
 
-// The seat this whole wrapper exists to create. Still a pure forward; the
-// DISPATCH_RAYS substitution and the command list split land here.
+// The seat this whole wrapper exists to create.
+//
+// A signature the runtime built is forwarded untouched. One of our DISPATCH_RAYS
+// stand-ins has to be serviced here, because Tier 1.0 has no indirect ray
+// dispatch at all.
+//
+// PARTIAL. Only the case where the argument buffer is CPU-visible and already
+// final at record time is implemented. That is enough to prove the whole chain,
+// signature through to a real dispatch, and it is NOT the case Unreal uses:
+// Unreal builds its argument buffer on the GPU immediately before the dispatch,
+// so nothing in it is valid yet at this point. That needs the command list
+// split, which is the next piece of work. Until then the GPU-written case
+// refuses loudly rather than dispatching something wrong.
 void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature* sig, UINT maxCount, ID3D12Resource* args, UINT64 argOffset, ID3D12Resource* countBuf, UINT64 countOffset) {
-    static LONG once = 0;
-    if (InterlockedCompareExchange(&once, 1, 0) == 0)
-        ProxyLog("[dxr11-proxy] ExecuteIndirect intercepted (first real call): "
-                 "sig=%p maxCount=%u\n", (void*)sig, maxCount);
-    FWD(ExecuteIndirect(sig, maxCount, args, argOffset, countBuf, countOffset));
+    Dxr11CommandSignature* ours = Dxr11CommandSignature::From(sig);
+    if (!ours) {
+        FWD(ExecuteIndirect(sig, maxCount, args, argOffset, countBuf, countOffset));
+        return;
+    }
+
+    if (countBuf) {
+        ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): a count buffer is not "
+                 "supported yet, dispatch SKIPPED\n");
+        return;
+    }
+    if (!args) {
+        ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): null argument buffer\n");
+        return;
+    }
+
+    // Can the CPU see the arguments at all? A DEFAULT heap means they are
+    // produced on the GPU and simply do not exist yet.
+    D3D12_HEAP_PROPERTIES heap{};
+    D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+    if (FAILED(args->GetHeapProperties(&heap, &heapFlags)) ||
+        (heap.Type != D3D12_HEAP_TYPE_UPLOAD && heap.Type != D3D12_HEAP_TYPE_READBACK)) {
+        static LONG warned = 0;
+        if (InterlockedCompareExchange(&warned, 1, 0) == 0) {
+            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): argument buffer is in a "
+                     "GPU-only heap (type %d). Its contents do not exist yet at record "
+                     "time, so this needs the command list split, which is not built. "
+                     "Dispatch SKIPPED. Output will be wrong, loudly.\n", (int)heap.Type);
+        }
+        return;
+    }
+
+    const UINT stride = ours->ByteStride() ? ours->ByteStride()
+                                           : (UINT)sizeof(D3D12_DISPATCH_RAYS_DESC);
+    for (UINT i = 0; i < maxCount; ++i) {
+        D3D12_DISPATCH_RAYS_DESC desc{};
+        uint8_t* p = nullptr;
+        const UINT64 offset = argOffset + (UINT64)i * stride;
+        D3D12_RANGE readRange{ (SIZE_T)offset, (SIZE_T)(offset + sizeof(desc)) };
+        if (FAILED(args->Map(0, &readRange, (void**)&p)) || !p) {
+            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS): could not map the "
+                     "argument buffer, dispatch SKIPPED\n");
+            return;
+        }
+        std::memcpy(&desc, p + offset, sizeof(desc));
+        D3D12_RANGE noWrite{ 0, 0 };
+        args->Unmap(0, &noWrite);
+
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            ProxyLog("[dxr11-proxy] ExecuteIndirect(DISPATCH_RAYS) -> direct DispatchRays "
+                     "%ux%ux%u, read from a CPU-visible argument buffer at record time\n",
+                     desc.Width, desc.Height, desc.Depth);
+
+        if (desc.Width && desc.Height && desc.Depth) FWD(DispatchRays(&desc));
+    }
 }
 
 void STDMETHODCALLTYPE Dxr11CommandList::AtomicCopyBufferUINT(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT n, ID3D12Resource* const* dep, const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) { FWD(AtomicCopyBufferUINT(d, dof, s, sof, n, dep, ranges)); }

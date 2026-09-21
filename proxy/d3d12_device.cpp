@@ -12,6 +12,7 @@
 #include "state_object_cache.h"
 #include "queue_hook.h"
 #include "d3d12_command_list.h"
+#include "command_signature.h"
 
 #include <windows.h>
 #include <new>
@@ -189,7 +190,36 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::GetDeviceRemovedReason() { FWD(GetDeviceR
 void STDMETHODCALLTYPE Dxr11Device::GetCopyableFootprints(const D3D12_RESOURCE_DESC* pResourceDesc, UINT FirstSubresource, UINT NumSubresources, UINT64 BaseOffset, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts, UINT* pNumRows, UINT64* pRowSizeInBytes, UINT64* pTotalBytes) { FWD(GetCopyableFootprints(pResourceDesc, FirstSubresource, NumSubresources, BaseOffset, pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap) { FWD(CreateQueryHeap(pDesc, riid, ppvHeap)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::SetStablePowerState(BOOL Enable) { FWD(SetStablePowerState(Enable)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* pDesc, ID3D12RootSignature* pRootSignature, REFIID riid, void** ppvCommandSignature) { FWD(CreateCommandSignature(pDesc, pRootSignature, riid, ppvCommandSignature)); }
+// Tier 1.0 refuses a DISPATCH_RAYS signature outright, so the app can never
+// reach ExecuteIndirect. Hand back a stand-in instead, which ExecuteIndirect
+// recognises and services itself. See command_signature.h.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* pDesc, ID3D12RootSignature* pRootSignature, REFIID riid, void** ppvCommandSignature) {
+    bool dispatchRays = false;
+    if (!m_tier11 && pDesc) {
+        for (UINT i = 0; i < pDesc->NumArgumentDescs; ++i)
+            if (pDesc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS)
+                dispatchRays = true;
+    }
+    if (!dispatchRays) FWD(CreateCommandSignature(pDesc, pRootSignature, riid, ppvCommandSignature));
+
+    // D3D12 requires DISPATCH_RAYS to be the only argument in its signature.
+    // Anything else is a shape we have not seen and cannot emulate, so refuse
+    // rather than guess.
+    if (pDesc->NumArgumentDescs != 1) {
+        ProxyLog("[dxr11-proxy] CreateCommandSignature: DISPATCH_RAYS alongside %u other "
+                 "arguments is not supported\n", pDesc->NumArgumentDescs - 1);
+        return E_INVALIDARG;
+    }
+    if (!ppvCommandSignature) return E_INVALIDARG;
+
+    auto* sig = new (std::nothrow) Dxr11CommandSignature(m_real, *pDesc);
+    if (!sig) return E_OUTOFMEMORY;
+    HRESULT hr = sig->QueryInterface(riid, ppvCommandSignature);
+    sig->Release();
+    ProxyLog("[dxr11-proxy] CreateCommandSignature: DISPATCH_RAYS stand-in created "
+             "(ByteStride=%u) hr=0x%08lx\n", pDesc->ByteStride, (unsigned long)hr);
+    return hr;
+}
 void STDMETHODCALLTYPE Dxr11Device::GetResourceTiling(ID3D12Resource* pTiledResource, UINT* pNumTilesForEntireResource, D3D12_PACKED_MIP_INFO* pPackedMipDesc, D3D12_TILE_SHAPE* pStandardTileShapeForNonPackedMips, UINT* pNumSubresourceTilings, UINT FirstSubresourceTilingToGet, D3D12_SUBRESOURCE_TILING* pSubresourceTilingsForNonPackedMips) { FWD(GetResourceTiling(pTiledResource, pNumTilesForEntireResource, pPackedMipDesc, pStandardTileShapeForNonPackedMips, pNumSubresourceTilings, FirstSubresourceTilingToGet, pSubresourceTilingsForNonPackedMips)); }
 LUID STDMETHODCALLTYPE Dxr11Device::GetAdapterLuid() { FWD(GetAdapterLuid()); }
 

@@ -725,3 +725,73 @@ killed the process rather than being reported. It survived.
    dimensions back, then replay binding state and issue a direct `DispatchRays`.
 3. Batch several indirect dispatches behind one sync, since the measurement
    showed the damage is per split rather than one-off.
+
+## CreateCommandSignature interception, and the chain proven end to end
+
+`proxy/command_signature.{h,cpp}` provides a stand-in. On Tier 1.0 the driver
+refuses to build a DISPATCH_RAYS signature at all, so the app can never reach
+`ExecuteIndirect`; the shim hands back an object that carries the description and
+nothing else, and `ExecuteIndirect` recognises it.
+
+It is deliberately **not** a real signature built from a substitute argument
+type. That was the obvious alternative and it fails badly: a DISPATCH signature
+with the DISPATCH_RAYS stride would read a shader table GPU address as a thread
+group count, so anything that escaped our interception would hang the GPU. An
+object the runtime does not recognise fails instead, which is the better
+failure. `ID3D12CommandSignature` adds no methods of its own, so the stand-in is
+only the eight inherited ones.
+
+### All three Phase 4 features now pass on the GTX 1070
+
+`tier11probe.exe hw` through the proxy:
+
+    -- indirect DispatchRays --
+       direct DispatchRays      : 14450 tri + 2312 proc hits, 0 unwritten
+       CreateCommandSignature   : OK  (ByteStride=104)
+       ExecuteIndirect          : 14450 tri + 2312 proc hits, 0 unwritten
+       RESULT                   : MATCH
+    -- AddToStateObject --       RESULT : added shader ran
+    -- Tier 1.1 ray flags --     correct on all three rows
+
+Matching the WARP ground truth exactly. The log shows the whole chain:
+
+    CreateCommandSignature: DISPATCH_RAYS stand-in created (ByteStride=104)
+    ExecuteIndirect(DISPATCH_RAYS) -> direct DispatchRays 256x256x1,
+        read from a CPU-visible argument buffer at record time
+
+### What this does NOT yet do, and it is the important half
+
+Read that last log line carefully. Only the case where the argument buffer is
+**CPU-visible and already final at record time** is implemented. The probe uses
+an upload-heap buffer written before recording, which is why it passes.
+
+**Unreal does not do that.** It builds its argument buffer on the GPU with
+`CopyBufferRegion` immediately before the dispatch, in a DEFAULT heap, so at the
+moment `ExecuteIndirect` is recorded nothing in that buffer is valid yet. That
+case is detected by checking the heap type and **refuses loudly**, skipping the
+dispatch rather than issuing one with garbage:
+
+    ExecuteIndirect(DISPATCH_RAYS): argument buffer is in a GPU-only heap (type 1).
+    Its contents do not exist yet at record time, so this needs the command list
+    split, which is not built. Dispatch SKIPPED. Output will be wrong, loudly.
+
+A count buffer is refused the same way. So the feature is genuinely working for
+one shape and honestly broken for the other, rather than quietly wrong for both.
+
+Even the implemented path carries a caveat worth stating: reading at record time
+is correct only if the application does not rewrite the buffer between recording
+and submission. It logs what it did, so the assumption is visible rather than
+hidden.
+
+### Regression
+
+raytest ALL MATCH, HelloWorld 0 of 14400 pixels differ at 2129 against 2146 fps,
+SimpleLighting 1380 against 1391 fps, and WARP still forwards everything
+untouched because it is Tier 1.1.
+
+### Remaining for S1
+
+The command list split: segment the recording at the `ExecuteIndirect`, submit,
+wait, read the dimensions back, replay the binding state, and issue the direct
+`DispatchRays`. Then batch several dispatches behind one sync, since the
+measurement showed the damage is per split rather than one-off.
