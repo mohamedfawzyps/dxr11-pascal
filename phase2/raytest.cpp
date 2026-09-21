@@ -271,6 +271,10 @@ static const UINT kMaskCount = 8;
 // vary. Against the default one-triangle, one-instance scene every correct
 // answer is 0, so a lowering that returned a constant 0 would pass.
 static bool g_multi = false;
+// With --contrib the two instances get different hit group contributions,
+// which no single-record shader table can serve. Used to show the shim
+// refuses that scene instead of drawing it wrong.
+static bool g_contrib = false;
 
 // --proc builds a scene of PROCEDURAL geometry, one AABB, and switches the hit
 // group to D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE with the generated
@@ -568,6 +572,7 @@ static Scene BuildSceneMulti(Gpu& g, bool opaque) {
         inst[i].Transform[0][0] = inst[i].Transform[1][1] = inst[i].Transform[2][2] = 1.0f;
         inst[i].Transform[0][3] = (i == 0) ? -0.6f : 0.6f;   // side by side
         inst[i].InstanceMask = 0xFF;
+        if (g_contrib) inst[i].InstanceContributionToHitGroupIndex = (UINT)i;
         inst[i].AccelerationStructure = s.blas->GetGPUVirtualAddress();
     }
     auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
@@ -1073,6 +1078,10 @@ int main(int argc, char** argv) {
                 g_proc = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--contrib") == 0) {
+                g_contrib = true;
                 continue;
             }
             if (std::strcmp(argv[i], "--multi") == 0) {

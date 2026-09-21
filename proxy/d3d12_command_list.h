@@ -285,6 +285,11 @@ private:
     // closing the segment. The close is deferred so that a run of dispatches
     // with no work between them lands in one segment behind one sync.
     bool QueueSplit(ID3D12Resource* args, UINT64 argOffset);
+    // Gets the instance descriptions of a top-level build to the CPU, so the
+    // shader table can know the contributions and the geometry types they
+    // reach. Reads them outright when they are in CPU-visible memory;
+    // otherwise records a copy that the queue hook picks up later.
+    void CaptureInstances(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc);
     // Closes the segment if any dispatches are queued, and opens a continuation
     // with the bindings replayed. Called before recording anything that must be
     // ordered after those dispatches.

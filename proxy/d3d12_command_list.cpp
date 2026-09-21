@@ -10,9 +10,11 @@
 #include "command_signature.h"
 #include "rq_pipeline.h"
 #include "as_tracker.h"
+#include "res_tracker.h"
 
 #include <windows.h>
 #include <cstring>
+#include <string>
 #include <cstdint>
 
 #define FWD(call) m_real->call
@@ -219,6 +221,18 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
     // Dispatch becomes DispatchRays. Its root bindings need no translation:
     // DXR's global root signature IS the compute root signature.
     if (m_rqPso) {
+        // The instance data now says whether the table the shim built can be
+        // right for this scene. If it cannot, refuse rather than draw a wrong
+        // image: a silently wrong result is the one failure mode this project
+        // will not ship.
+        std::string why;
+        if (astrack::TableWouldBeWrong(&why)) {
+            static LONG once = 0;
+            if (InterlockedCompareExchange(&once, 1, 0) == 0)
+                ProxyLog("[dxr11-proxy] lowered RayQuery dispatch REFUSED: %s. "
+                         "Nothing is drawn for it.\n", why.c_str());
+            return;
+        }
         m_rqPso->DispatchAsRays(m_real, x, y, z);
         return;
     }
@@ -507,6 +521,8 @@ void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(co
     // type of every structure can be learned here for nothing. The shader
     // table needs it: a record has to match the geometry that resolves to it.
     astrack::NoteBuild(d);
+    if (d && d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
+        CaptureInstances(d);
     FWD(BuildRaytracingAccelerationStructure(d, n, p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
@@ -542,6 +558,104 @@ ID3D12Device5* Dxr11CommandList::RealDevice() {
         m_real->GetDevice(__uuidof(ID3D12Device5), (void**)m_device.GetAddressOf());
     }
     return m_device.Get();
+}
+
+void Dxr11CommandList::CaptureInstances(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
+    const auto& in = desc->Inputs;
+    if (!in.NumDescs || !in.InstanceDescs) return;
+
+    // Once per destination address. An engine rebuilds its top-level structure
+    // every frame into the same memory, and re-reading it every frame would be
+    // a copy per frame for an answer that does not change. The cost of that
+    // choice: an application that CHANGES its contributions in place keeps the
+    // first answer. Nothing tested does, and it would be visible here.
+    if (astrack::LookupTlas(desc->DestAccelerationStructureData).valid) return;
+
+    if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            ProxyLog("[dxr11-proxy] top-level AS: ARRAY_OF_POINTERS instance "
+                     "descriptions are not read (each pointer is itself a GPU "
+                     "address, needing a second dependent copy).\n");
+        return;
+    }
+
+    const restrack::Found src = restrack::Find(in.InstanceDescs);
+    if (!src.resource) {
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            ProxyLog("[dxr11-proxy] top-level AS: instance buffer at 0x%llX is not "
+                     "a tracked resource, so its descriptions cannot be read.\n",
+                     static_cast<unsigned long long>(in.InstanceDescs));
+        return;
+    }
+
+    const UINT64 bytes =
+        static_cast<UINT64>(in.NumDescs) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+
+    // The cheap case, and the common one: the application wrote the descriptions
+    // from the CPU into an upload buffer, so they can simply be read. No copy,
+    // no fence, no cost at all.
+    D3D12_HEAP_PROPERTIES heap{};
+    D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+    if (SUCCEEDED(src.resource->GetHeapProperties(&heap, &heapFlags)) &&
+        (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK)) {
+        uint8_t* p = nullptr;
+        D3D12_RANGE readRange{ static_cast<SIZE_T>(src.offset),
+                               static_cast<SIZE_T>(src.offset + bytes) };
+        if (SUCCEEDED(src.resource->Map(0, &readRange, (void**)&p)) && p) {
+            astrack::NoteInstances(
+                desc->DestAccelerationStructureData,
+                reinterpret_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p + src.offset),
+                in.NumDescs);
+            D3D12_RANGE noWrite{ 0, 0 };
+            src.resource->Unmap(0, &noWrite);
+        }
+        return;
+    }
+
+    // The expensive case: the descriptions were produced on the GPU, so they do
+    // not exist yet. Copy them out and let the queue hook read them once the
+    // submission has run. Same shape as the indirect dispatch readback, minus
+    // the stall: nothing needs this answer the instant it is recorded.
+    ID3D12Device5* dev = RealDevice();
+    if (!dev) return;
+
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = bytes;
+    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
+        ProxyLog("[dxr11-proxy] top-level AS: could not create the instance "
+                 "readback buffer.\n");
+        return;
+    }
+
+    // DXR requires the instance buffer to be in NON_PIXEL_SHADER_RESOURCE at the
+    // build, so that is the state it is in here and the state to put it back to.
+    D3D12_RESOURCE_BARRIER toCopy{};
+    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toCopy.Transition.pResource = src.resource;
+    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    m_real->ResourceBarrier(1, &toCopy);
+
+    m_real->CopyBufferRegion(readback.Get(), 0, src.resource, src.offset, bytes);
+
+    D3D12_RESOURCE_BARRIER back = toCopy;
+    back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    back.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    m_real->ResourceBarrier(1, &back);
+
+    astrack::NotePendingInstances(desc->DestAccelerationStructureData,
+                                  readback.Get(), in.NumDescs);
 }
 
 bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {

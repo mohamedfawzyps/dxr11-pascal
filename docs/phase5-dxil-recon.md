@@ -1438,46 +1438,116 @@ and it distinguishes correctly rather than always saying the same thing:
     raytest triangle scene     1 geometry, triangles
     raytest --proc scene       1 geometry, procedural AABBs
 
-### TLAS instance data is NOT free, and that is the whole problem
+### TLAS instance data is NOT free, and getting it was the work
 
-`InstanceDescs` is a **GPU virtual address**. The contributions are in GPU
-memory, so reading them means a copy and a sync per top-level build, in engines
-that rebuild their TLAS every frame. The machinery exists, it is what the Phase
-4 indirect `DispatchRays` split does, but it is a real per-frame cost and a
-substantial piece of work.
+`InstanceDescs` is a **GPU virtual address**, and a copy needs an
+`ID3D12Resource`. **D3D12 has no API that turns an address back into a
+resource.** That is the whole obstacle, and it is why this half cost what the
+other did not.
 
-Nothing is guessed in the meantime. A top-level build logs, once, exactly what
-is not known:
+The way through: every resource the application creates goes through the
+wrapped device, so the shim can remember the mapping itself.
+`proxy/res_tracker.{h,cpp}` keeps buffers in a map keyed by start address, and
+`Find` answers with the resource and the offset within it. Two decisions there,
+both about lifetime and both deliberate:
 
-    top-level AS build seen, N instances. Their
-    InstanceContributionToHitGroupIndex values live in GPU memory and are NOT
-    read; the shader table still assumes they are all zero.
+- **No reference is held.** An `AddRef` would change when the application's
+  resources die, which a transparent shim must not do, and would leak for every
+  buffer an application ever creates. Entries can go stale; that is safe for the
+  one use there is, because a lookup only happens while the application is
+  passing that buffer to a build, so it must still own it.
+- **An entry is replaced** when a new resource reports the same start address,
+  which is how address reuse after a free is handled.
 
-So the limitation is now **visible at runtime** rather than only written down,
-which is the point of doing this half first.
+Measured on the Phase 4 probe, which is the first thing to check because if the
+lookup fails the whole approach is dead:
 
-### Where that leaves the two open problems
+    top-level AS build seen, 2 instances. Instance buffer at 0x9184000
+    RESOLVED to resource 000002465ECD9650 + 0x0, out of 7 tracked buffers
 
-Both still need the expensive half.
+### Two paths to the data, and only one of them costs anything
 
-- **Nonzero `InstanceContributionToHitGroupIndex`**, which already constrains
-  triangle-only scenes, needs the maximum contribution so the table can be
-  sized. One number, but it is in GPU memory.
-- **Mixed triangle and procedural** needs the full instance-to-BLAS map, so a
-  record of the right TYPE can be placed at every index. That is the geometry
-  types this half now has, joined to the instance data it does not.
+Once the resource is named, reading it splits the same way the indirect
+`DispatchRays` arguments did.
 
-Note also that lists are only wrapped on Tier 1.0 devices, so nothing is
-tracked on WARP. That is correct, since the shim does nothing there, but it
-does mean the tracking cannot be observed on the ground-truth path.
+**CPU-visible (upload heap): free.** The application wrote the descriptions
+from the CPU, so they are simply mapped and read at record time. No copy, no
+fence, no stall. This is what both Microsoft samples and every test scene do.
+
+**GPU-only (default heap): a copy and a fence, but no stall.** A
+`CopyBufferRegion` into a readback buffer is recorded into the application's own
+list, wrapped in `NON_PIXEL_SHADER_RESOURCE` to `COPY_SOURCE` and back, which is
+the state DXR requires that buffer to be in at a build. The queue hook then
+signals a fence after the submission and parses the result on a **later**
+submission, whenever the GPU has passed it. Nothing ever waits. The answer
+arrives a submission late, which is acceptable because nothing needs it the
+instant it is recorded.
+
+The reading is done **once per destination address**. An engine rebuilds its
+top-level structure every frame into the same memory, and a copy per frame for
+an answer that does not change is not worth paying. The cost of that choice: an
+application that changes its contributions in place keeps the first answer.
+
+Not read: `ARRAY_OF_POINTERS` instance descriptions, where each pointer is
+itself a GPU address needing a second dependent copy. Logged, not guessed at.
+
+`-gpuinst` on the Phase 4 probe puts the descriptions in GPU-only memory
+specifically so the expensive path is exercised rather than hypothetical. Both
+paths produce the same answer, with the debug layer on and silent.
+
+### What it found, and it is exactly what was predicted
+
+The probe scene, read through the shim on the 1070:
+
+    top-level AS at 0x9437000 READ: 2 instances, max
+    InstanceContributionToHitGroupIndex 1, geometry reached: triangles and
+    procedural, 0 instance(s) pointing at an unseen bottom-level structure
+
+which matches `phase4/tier11probe.cpp` exactly: two instances with
+contributions 0 and 1, instance 0 on the triangle BLAS and instance 1 on the
+procedural one. Both open problems in one scene, now measured rather than
+assumed.
+
+The Microsoft samples read as 1 instance, max contribution 0, triangles only,
+which is the case the shim's single-record table is already right for.
+
+### The refusal this bought
+
+The point of knowing is not to log it. A lowered RayQuery dispatch builds ONE
+hit group record of ONE geometry type, and until now it would have run anyway
+on a scene where that is wrong, producing a quietly incorrect image. It now
+refuses:
+
+    lowered RayQuery dispatch REFUSED: the scene uses nonzero
+    InstanceContributionToHitGroupIndex, so a single hit group record would not
+    be the one the ray resolves to. Nothing is drawn for it.
+
+Shown to be real rather than unreachable with `raytest --multi --contrib`,
+which gives the two instances different contributions: WARP finds 18496 hits,
+and the shim declines to answer instead of inventing a number.
+
+Two limits of that check, stated because they are real:
+
+- It is judged over **every** top-level structure read, not the one the shader
+  is about to trace against, because which structure that is is not knowable at
+  the dispatch when it arrives through a descriptor table. So it can refuse a
+  dispatch that would have been fine. Refusing is the safe direction.
+- It can only see what has been **read**. On the GPU-only path the answer
+  arrives a submission late, so the first dispatch of a run is not covered.
+
+### Regression
+
+Unchanged by all of this: 7 of 7 end-to-end dispatch cases MATCH against WARP,
+the probe on hardware still gives 14450 + 2312 + 48774 = 65536 on both
+argument-buffer shapes, `D3D12RaytracingHelloWorld` is 0 of 14400 pixels
+different, `D3D12RaytracingSimpleLighting` runs at baseline fps, and the debug
+layer is silent through the new barriers and copies.
 
 ## Next
 
-1. **The TLAS half.** Copy the instance descriptions and read them back, the
-   same machinery as the Phase 4 indirect DispatchRays split. It unblocks both
-   open problems at once, and it is the last structural piece of the shim. The
-   cost is a copy and a sync per top-level build, which for an engine that
-   rebuilds every frame is not nothing.
+1. **Use the instance data.** Size the shader table by the maximum contribution
+   and place a record of the right type at each index. That turns both refusals
+   into working scenes, and it is the last structural piece of the shim.
 2. **Dynamic descriptor indexing**, still refused.
 3. **Only then consider making the tier flip the default**, once enough real
    software has run through it that the refusal list is trusted.

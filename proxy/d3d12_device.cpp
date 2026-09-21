@@ -15,6 +15,7 @@
 #include "command_signature.h"
 #include "dxil_scan.h"
 #include "rq_pipeline.h"
+#include "res_tracker.h"
 
 #include <windows.h>
 #include <new>
@@ -301,10 +302,40 @@ void STDMETHODCALLTYPE Dxr11Device::CopyDescriptors(UINT NumDestDescriptorRanges
 void STDMETHODCALLTYPE Dxr11Device::CopyDescriptorsSimple(UINT NumDescriptors, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart, D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) { FWD(CopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart, DescriptorHeapsType)); }
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Dxr11Device::GetResourceAllocationInfo(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) { FWD(GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs)); }
 D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE Dxr11Device::GetCustomHeapProperties(UINT nodeMask, D3D12_HEAP_TYPE heapType) { FWD(GetCustomHeapProperties(nodeMask, heapType)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) { FWD(CreateCommittedResource(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, riidResource, ppvResource)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) {
+    const HRESULT hr = m_real->CreateCommittedResource(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, riidResource, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        ID3D12Resource* res = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
+            restrack::Note(res);
+            res->Release();   // the tracker holds no reference
+        }
+    }
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateHeap(const D3D12_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap) { FWD(CreateHeap(pDesc, riid, ppvHeap)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePlacedResource(ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) { FWD(CreatePlacedResource(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) { FWD(CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePlacedResource(ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) {
+    const HRESULT hr = m_real->CreatePlacedResource(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        ID3D12Resource* res = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
+            restrack::Note(res);
+            res->Release();   // the tracker holds no reference
+        }
+    }
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) {
+    const HRESULT hr = m_real->CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        ID3D12Resource* res = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
+            restrack::Note(res);
+            res->Release();   // the tracker holds no reference
+        }
+    }
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateSharedHandle(ID3D12DeviceChild* pObject, const SECURITY_ATTRIBUTES* pAttributes, DWORD Access, LPCWSTR Name, HANDLE* pHandle) { FWD(CreateSharedHandle(pObject, pAttributes, Access, Name, pHandle)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::OpenSharedHandle(HANDLE NTHandle, REFIID riid, void** ppvObj) { FWD(OpenSharedHandle(NTHandle, riid, ppvObj)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::OpenSharedHandleByName(LPCWSTR Name, DWORD Access, HANDLE* pNTHandle) { FWD(OpenSharedHandleByName(Name, Access, pNTHandle)); }
@@ -375,9 +406,29 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList1(UINT nodeMask, D3D12_C
     return hr;
 }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC* pDesc, REFIID riid, void** ppSession) { FWD(CreateProtectedResourceSession(pDesc, riid, ppSession)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource, void** ppvResource) { FWD(CreateCommittedResource1(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource, void** ppvResource) {
+    const HRESULT hr = m_real->CreateCommittedResource1(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        ID3D12Resource* res = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
+            restrack::Note(res);
+            res->Release();   // the tracker holds no reference
+        }
+    }
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateHeap1(const D3D12_HEAP_DESC* pDesc, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvHeap) { FWD(CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource1(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvResource) { FWD(CreateReservedResource1(pDesc, InitialState, pOptimizedClearValue, pProtectedSession, riid, ppvResource)); }
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource1(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvResource) {
+    const HRESULT hr = m_real->CreateReservedResource1(pDesc, InitialState, pOptimizedClearValue, pProtectedSession, riid, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        ID3D12Resource* res = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
+            restrack::Note(res);
+            res->Release();   // the tracker holds no reference
+        }
+    }
+    return hr;
+}
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Dxr11Device::GetResourceAllocationInfo1(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs, D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) { FWD(GetResourceAllocationInfo1(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1)); }
 
 // --- ID3D12Device5 ----------------------------------------------------------

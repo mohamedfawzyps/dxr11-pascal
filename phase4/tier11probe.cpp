@@ -86,6 +86,10 @@ static bool g_hookTest = false;
 static bool g_queueVTable = false;
 static bool g_gfxSplit = false;
 static bool g_batchSplit = false;
+// Put the instance descriptions in GPU-only memory, as an engine that
+// builds them in a compute pass would. The shim can then no longer just
+// map them, and has to copy them out and read them after a submission.
+static bool g_gpuInst = false;
 static int g_filler = 4;
 static int g_frames = 60;
 static uint32_t g_rayCount = 1u << 20;   // 1M rays, enough that Pascal does real work
@@ -471,10 +475,30 @@ static Scene BuildScene(Gpu& g) {
     inst[0].AccelerationStructure = s.blasTri->GetGPUVirtualAddress();
     inst[1].AccelerationStructure = s.blasAabb->GetGPUVirtualAddress();
 
-    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+    auto instUpload = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
-    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, inst, sizeof(inst));
-    instBuf->Unmap(0, nullptr);
+    HR(instUpload->Map(0, &none, &p), "map inst"); std::memcpy(p, inst, sizeof(inst));
+    instUpload->Unmap(0, nullptr);
+
+    // By default the descriptions stay in the upload buffer, which is what
+    // every sample does and what the CPU can read directly. With -gpuinst they
+    // are moved to a DEFAULT heap first, so the only way to see them is a copy
+    // out after the GPU has run. DXR wants the buffer in
+    // NON_PIXEL_SHADER_RESOURCE at the build, so it is left in that state.
+    ComPtr<ID3D12Resource> instBuf = instUpload;
+    if (g_gpuInst) {
+        instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyBufferRegion(instBuf.Get(), 0, instUpload.Get(), 0, sizeof(inst));
+        D3D12_RESOURCE_BARRIER tb{};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = instBuf.Get();
+        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        g.list->ResourceBarrier(1, &tb);
+        std::printf("   instance descriptions placed in GPU-only memory (-gpuinst)\n");
+    }
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
     ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -2220,6 +2244,7 @@ int main(int argc, char** argv) {
             else if (std::strcmp(argv[i], "-queuevtable") == 0) g_queueVTable = true;
             else if (std::strcmp(argv[i], "-gfxsplit") == 0) g_gfxSplit = true;
             else if (std::strcmp(argv[i], "-batchsplit") == 0) g_batchSplit = true;
+            else if (std::strcmp(argv[i], "-gpuinst") == 0) g_gpuInst = true;
             else if (std::strcmp(argv[i], "-filler") == 0 && i + 1 < argc) g_filler = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-frames") == 0 && i + 1 < argc) g_frames = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-rays") == 0 && i + 1 < argc) g_rayCount = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
