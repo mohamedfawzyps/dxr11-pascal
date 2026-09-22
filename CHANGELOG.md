@@ -17,6 +17,21 @@ build.
 
 ---
 
+## 0.36.5
+
+- Video memory is logged immediately before a RayQuery state object is built,
+  from `IDXGIAdapter3::QueryVideoMemoryInfo`, local and system segments. The
+  one library that kills the device inside `CreateStateObject` in a shipping
+  game builds perfectly on the same card offline: alone, sixty times over, and
+  with 261 other state objects already held. Every input is therefore
+  exonerated and the difference is what else the device has been asked to do.
+  Memory is the first thing about a loaded game an empty probe cannot
+  reproduce. A measurement, not an argument: if usage is nowhere near budget
+  the idea dies in one run.
+- `sotest`'s directory walk capped at 64 libraries, so a 261-library test
+  silently became a 64-library one and still reported "device still alive".
+  Raised to 1024.
+
 ## 0.36.4
 
 - The D3D12 debug layer is relayed into the proxy log as it speaks, through

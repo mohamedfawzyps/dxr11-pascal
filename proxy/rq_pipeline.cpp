@@ -1,6 +1,8 @@
 #include "rq_pipeline.h"
 
 #include "config.h"
+
+#include <dxgi1_4.h>
 #include "proxy_log.h"
 #include "rq_stub_cs.h"
 #include "shader_dump.h"
@@ -178,6 +180,62 @@ void Dxr11RayQueryPhaseNote(const char* what, const char* detail) {
     ProxyLog("[dxr-tier-11-proxy-log] rqphase: RayQuery shader %ld %s%s%s\n",
              static_cast<long>(i), what,
              (detail && *detail) ? ": " : "", (detail && *detail) ? detail : "");
+}
+
+// What the GPU's memory looks like at the moment of a state object build.
+//
+// One generated library kills the device inside CreateStateObject in a
+// shipping game and builds perfectly on the same card offline: alone, sixty
+// times over, and with 261 other state objects already held. Everything about
+// the inputs is therefore exonerated and the difference is what else the
+// device has been asked to do. Memory is the first thing about a loaded game
+// that an empty probe cannot reproduce, and a driver that cannot allocate for
+// a shader it is compiling is a plausible source of
+// DXGI_ERROR_DRIVER_INTERNAL_ERROR, which carries no detail of its own.
+//
+// This measures rather than argues. If usage is nowhere near budget the idea
+// is dead in one run, which is worth more than the idea being right.
+//
+// dxgi.dll is loaded by NAME on purpose here, unlike DXC. The point is to
+// reach whatever DXGI this process is already using, and if that is this
+// project's own dxgi proxy then it forwards and the answer is the same.
+static void LogVideoMemory(ID3D12Device5* dev, const char* when) {
+    if (!dev) return;
+    IDXGIAdapter3* ad = nullptr;
+    HMODULE m = LoadLibraryW(L"dxgi.dll");
+    if (m) {
+        typedef HRESULT(WINAPI * PFN_CF1)(REFIID, void**);
+        auto cf1 = reinterpret_cast<PFN_CF1>(
+            reinterpret_cast<void*>(GetProcAddress(m, "CreateDXGIFactory1")));
+        IDXGIFactory4* f = nullptr;
+        if (cf1 && SUCCEEDED(cf1(__uuidof(IDXGIFactory4), (void**)&f)) && f) {
+            f->EnumAdapterByLuid(dev->GetAdapterLuid(),
+                                 __uuidof(IDXGIAdapter3), (void**)&ad);
+            f->Release();
+        }
+    }
+    if (!ad) {
+        ProxyLog("[dxr-tier-11-proxy-log] video memory %s: could not reach "
+                 "IDXGIAdapter3, so this run has no memory figure\n", when);
+        return;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO loc{}, non{};
+    const HRESULT h1 = ad->QueryVideoMemoryInfo(
+        0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &loc);
+    const HRESULT h2 = ad->QueryVideoMemoryInfo(
+        0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non);
+    ad->Release();
+    const double MB = 1024.0 * 1024.0;
+    if (SUCCEEDED(h1))
+        ProxyLog("[dxr-tier-11-proxy-log] video memory %s: LOCAL usage %.0f MB "
+                 "of budget %.0f MB (%.0f%%), reserved %.0f MB\n",
+                 when, loc.CurrentUsage / MB, loc.Budget / MB,
+                 loc.Budget ? (100.0 * loc.CurrentUsage / loc.Budget) : 0.0,
+                 loc.CurrentReservation / MB);
+    if (SUCCEEDED(h2))
+        ProxyLog("[dxr-tier-11-proxy-log] video memory %s: SYSTEM usage %.0f MB "
+                 "of budget %.0f MB\n",
+                 when, non.CurrentUsage / MB, non.Budget / MB);
 }
 
 // rqlimit and rqonly: cap or single out which shaders actually get BUILT.
@@ -430,6 +488,7 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     // call never returns and never logs a result. Without a line in front of
     // it the log ends on whatever came before and the call has to be inferred
     // from an absence. Now the last line in a dead log NAMES the call.
+    LogVideoMemory(dev, "before CreateStateObject");
     ProxyLog("[dxr-tier-11-proxy-log] about to call CreateStateObject: %zu byte "
              "library, %u subobjects, global root signature %p. If this is the "
              "last line in the log, that call is where the device went.\n",

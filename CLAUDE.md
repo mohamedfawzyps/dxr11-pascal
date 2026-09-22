@@ -1339,11 +1339,48 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   the raygen. 13132 bytes in, 28984 out, more than twice the largest of the
   six that are harmless.
 
+  **THE DEBUG LAYER SAYS NOTHING ABOUT THE CALL, AND THAT IS ITSELF THE
+  RESULT.** 0.36.4 relays the layer into this log through
+  `ID3D12InfoQueue1::RegisterMessageCallback`, which delivers messages
+  synchronously and is therefore the only way to read one produced inside a
+  call that never returns. The end of the log:
+
+      23:48:12.810  about to call CreateStateObject: 28984 byte library, 9 subobjects
+      23:48:12.847  device QI {9727A022-...}            ID3D12DeviceRemovedExtendedData1
+      23:48:12.847  D3D12 WARNING #233: RemoveDevice ... DXGI_ERROR_DRIVER_INTERNAL_ERROR
+
+  The layer's entire vocabulary that run was 24 `native 16bit ops` errors of
+  Unreal's own, 31 pixel-shader RTV warnings, 4 resource-state warnings and
+  that one removal. **Zero validation complaints about our state object.** So
+  D3D12 is happy with the description and the fault is inside the driver,
+  compiling a library the runtime accepts, 37 ms in.
+
+  **THREE MORE OFFLINE CONTROLS, ALL NEGATIVE, ALL WORTH NOT REPEATING.** On
+  the same 1070, device alive every time:
+
+      the suspect alone                            builds
+      the suspect x60, all held at once            builds
+      260 other state objects, then the suspect    builds
+
+  **The 261 one nearly did not count.** `sotest`'s directory walk capped at
+  64 files, so the first attempt silently built 64 and reported "device still
+  alive". A cap that turns a test into a weaker test without saying so is the
+  same failure as a knob that does not move what it names, which this
+  investigation has now been caught by twice. Raised to 1024.
+
   **So every input is exonerated and the process is the whole difference.**
   Same library bytes, same root signature, same `D3D12Core.dll 1.618.5.0`,
   same GPU, same driver: offline it builds and the device lives, in Escher it
   removes the device. Nothing left to vary except what that device has
   already been asked to do.
+
+  **261 of Unreal's own DXR state objects are alive when the call is made**,
+  counted from the log. Memory is the first thing about a loaded game that an
+  empty probe cannot reproduce, and a driver that cannot allocate while
+  compiling a shader is a plausible source of an error code that carries no
+  detail. 0.36.5 logs `QueryVideoMemoryInfo` immediately before the call. If
+  usage is nowhere near budget the idea dies in one run, which is worth more
+  than it being right.
 
   **What is left to separate, and `rqonly` is the instrument.** 0.36.3 adds
   `rqonly = N`: build ONLY the N-th shader that lowers, counting from 0,

@@ -310,6 +310,14 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     return out;
 }
 
+// How many lowered_NNN sets a folder may hold. It was 64, which silently
+// truncated a 261-library test into a 64-library one that then reported
+// "device still alive": a cap that turns a test into a weaker test without
+// saying so is the same failure mode as a knob that does not move what it
+// names. Raised, and the loop still skips missing indices.
+static const int kMaxLibs = 1024;
+
+
 // Every shader dumped from one run, created in sequence and kept ALIVE.
 // Unreal creates compute PSOs on WORKER THREADS: FD3D12PipelineState::CreateAsync
 // starts an FAsyncTask<FD3D12PipelineStateWorker>. So this shim's
@@ -330,7 +338,7 @@ int RunThreaded(ID3D12Device5* dev, const std::string& dir, int repeat, int thre
     for (int t = 0; t < threads; ++t) {
         pool.emplace_back([&, t] {
             for (int pass = 0; pass < repeat; ++pass) {
-                for (int i = 0; i < 64; ++i) {
+                for (int i = 0; i < kMaxLibs; ++i) {
                     char stem[64];
                     sprintf_s(stem, "lowered_%03d", i);
                     const std::string lib = dir + "\\" + stem + ".out.dxil";
@@ -366,7 +374,7 @@ int RunDir(ID3D12Device5* dev, const std::string& dir, int repeat) {
     std::vector<Built> held;
     int failed = 0;
   for (int pass = 0; pass < repeat; ++pass)
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < kMaxLibs; ++i) {
         char stem[64];
         sprintf_s(stem, "lowered_%03d", i);
         const std::string lib = dir + "\\" + stem + ".out.dxil";
