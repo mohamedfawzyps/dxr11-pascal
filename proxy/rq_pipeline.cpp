@@ -103,6 +103,70 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::From(ID3D12PipelineState* p) {
     return it == g_carriers.end() ? nullptr : it->second;
 }
 
+// The carrier, built once and used by every exit from TryCreate. `attach`
+// false means a stopped phase: everything stays alive, but nothing registers,
+// so no dispatch is ever substituted.
+static ID3D12PipelineState* MakeCarrier(ID3D12Device5* dev,
+                                        const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                        Dxr11RayQueryPso* self, bool attach,
+                                        std::string* why) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+    cd.pRootSignature = desc->pRootSignature;
+    cd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
+    cd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
+    cd.NodeMask = desc->NodeMask;
+    cd.Flags = desc->Flags;
+    ID3D12PipelineState* carrier = nullptr;
+    const HRESULT chr = dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&carrier));
+    if (FAILED(chr) || !carrier) {
+        char cbuf[96];
+        std::snprintf(cbuf, sizeof(cbuf),
+                      "cannot create the carrier pipeline state (hr=0x%08X)",
+                      static_cast<unsigned>(chr));
+        if (why) *why = cbuf;
+        if (self) self->Release();
+        return nullptr;
+    }
+    if (self) {
+        if (attach) Dxr11RayQueryPso::RegisterCarrier(carrier, self);
+        carrier->SetPrivateDataInterface(IID_Dxr11RayQueryPso, self);
+        self->Release();
+    }
+    return carrier;
+}
+// rqphase: stop part-way through and hand back a do-nothing pipeline.
+//
+// rqstub = 1 runs the game and full lowering crashes the driver, so the cause
+// is somewhere between those two points. Everything in between has now been
+// replayed offline and none of it reproduces: the libraries build one at a
+// time, 210 at once, and on eight threads at once, with the device alive
+// afterwards. DRED says the GPU was executing nothing when it died.
+//
+// So bisect the middle instead of guessing at it. Each phase does one more
+// step than the last and then stops:
+//
+//   rqphase = 0   nothing (same as rqstub)
+//   rqphase = 1   rewrite the DXIL, throw it away
+//   rqphase = 2   rewrite, then create the state object
+//   rqphase = 3   rewrite, state object, then build the shader table
+//   absent        all of it, the normal behaviour
+//
+// A stopped phase still keeps everything it built alive, attached to the
+// carrier, so memory and driver objects match the real run. What it does not
+// do is register the carrier, so no dispatch is ever substituted and the
+// pipeline does nothing. Rendering will be wrong, exactly as under rqstub.
+static int RayQueryPhase() {
+    static int s = -2;
+    if (s == -2) {
+        const cfg::Text t = cfg::GetText("DXR_TIER11_RQPHASE", "rqphase");
+        s = t.value.empty() ? -1 : _wtoi(t.value.c_str());
+        if (s >= 0)
+            ProxyLog("[dxr-tier-11-proxy-log] rqphase = %d (from %s): lowering stops "
+                     "after that step and the application gets a pipeline that does "
+                     "nothing. This is a bisect, not a setting.\n", s, t.source);
+    }
+    return s;
+}
 ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
         std::string* why) {
@@ -159,6 +223,8 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         *why = err;
         return nullptr;
     }
+
+    if (RayQueryPhase() == 1) return MakeCarrier(dev, desc, nullptr, false, why);
 
     // Before CreateStateObject, deliberately. A library that lowers cleanly
     // and then kills the driver is exactly the case worth having on disk, and
@@ -362,6 +428,8 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     if (idHitProc) std::memcpy(self->m_idHitProc, idHitProc, kIdSize);
     props->Release();
 
+    if (RayQueryPhase() == 2) return MakeCarrier(dev, desc, self, false, why);
+
     // One record of the real hit group to begin with. The acceleration
     // structures have usually not been built yet at pipeline creation, so what
     // the scene needs is not knowable here; the first dispatch rebuilds the
@@ -371,6 +439,8 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         self->Release();
         return nullptr;
     }
+
+    if (RayQueryPhase() == 3) return MakeCarrier(dev, desc, self, false, why);
 
     static LONG onceVer = 0;
     if (InterlockedCompareExchange(&onceVer, 1, 0) == 0)
@@ -389,36 +459,11 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
                  : x.hasIntersection ? ", with a generated intersection shader"
                  : (x.hasAnyHit ? ", with a generated any-hit shader" : ""));
     // The object the application holds is a REAL pipeline state: its own root
-    // signature, and a compute shader that does nothing. It is never executed.
-    // Dispatch is intercepted and replaced by SetPipelineState1 plus
-    // DispatchRays, so what the carrier's shader contains has never mattered.
-    // What matters is that D3D12 made it, so every call the application makes
-    // on it is handled by D3D12 rather than by guesswork here.
-    D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
-    cd.pRootSignature = desc->pRootSignature;
-    cd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
-    cd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
-    cd.NodeMask = desc->NodeMask;
-    cd.Flags = desc->Flags;
-    ID3D12PipelineState* carrier = nullptr;
-    const HRESULT chr = dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&carrier));
-    if (FAILED(chr) || !carrier) {
-        char cbuf[96];
-        std::snprintf(cbuf, sizeof(cbuf),
-                      "cannot create the carrier pipeline state (hr=0x%08X)",
-                      static_cast<unsigned>(chr));
-        if (why) *why = cbuf;
-        self->Release();
-        return nullptr;
-    }
-
-    // The carrier OWNS us. When the application releases its last reference
-    // D3D12 releases the private data interface, our destructor runs, and the
-    // registry entry goes with it.
-    RegisterCarrier(carrier, self);
-    carrier->SetPrivateDataInterface(IID_Dxr11RayQueryPso, self);
-    self->Release();
-    return carrier;
+    // signature, and a compute shader that does nothing. It is never executed,
+    // because Dispatch is intercepted and replaced by SetPipelineState1 plus
+    // DispatchRays. What matters is that D3D12 made it, so every call the
+    // application makes on it is handled by D3D12 rather than by guesswork.
+    return MakeCarrier(dev, desc, self, true, why);
 }
 
 bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,

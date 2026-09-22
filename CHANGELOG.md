@@ -17,6 +17,58 @@ build.
 
 ---
 
+## 0.35.0 (2026-09-22)
+
+### DRED says the GPU was executing nothing
+
+`-gpucrashdebugging` reached the game, `RHI.DRED` is `true`, and the report has
+**no breadcrumbs and no page fault data**. Aftermath was on and wrote no dump.
+
+That is a result, not a blank. DRED breadcrumbs record command list progress;
+none means the GPU was not running tracked work when the device went. No page
+fault means nothing touched bad memory. `DXGI_ERROR_DRIVER_INTERNAL_ERROR` with
+neither is a **CPU-side driver failure**.
+
+Found by reading the engine source, which had been sitting on this machine
+unread for a day: `UE::RHI::ShouldEnableGPUCrashFeature` makes one command line
+switch force every GPU crash feature on. Every earlier report said
+`RHI.DRED false`, which is why eight runs said the GPU died and none said what
+it was doing.
+
+### Also from the source, and tested because of it
+
+`FD3D12PipelineState::CreateAsync` starts an
+`FAsyncTask<FD3D12PipelineStateWorker>`, so Unreal creates compute PSOs on
+worker threads and this shim's `CreateStateObject` calls are concurrent. Every
+test here was single-threaded.
+
+`sotest --threads 8 --repeat 3`: **168 state objects created concurrently on
+the 1070, none failed, device alive.** Together with 210 created in sequence,
+that rules out one bad library, cumulative creation, resource limits and
+concurrency. None of it is worth testing again.
+
+### rqphase, bisecting the middle instead of guessing at it
+
+`rqstub = 1` runs and full lowering crashes, so the cause is between them.
+Everything in between has been replayed offline and none of it reproduces. So
+stop part-way through instead:
+
+    rqphase = 0   nothing (the same as rqstub)
+    rqphase = 1   rewrite the DXIL, throw it away
+    rqphase = 2   rewrite, then create the state object
+    rqphase = 3   rewrite, state object, then build the shader table
+    absent        all of it
+
+A stopped phase keeps everything it built alive and attached to the carrier, so
+driver objects and memory match a real run. It simply never registers the
+carrier, so no dispatch is substituted and the pipeline does nothing.
+
+Two runs locate it. Measured both ways: `rqphase = 2` gives DIVERGE on every
+case in the dispatch suite, which is what "built but never run" looks like, and
+unset all 23 pass.
+
+---
+
 ## 0.34.0 (2026-09-22)
 
 ### Stop handing the application an object D3D12 never made

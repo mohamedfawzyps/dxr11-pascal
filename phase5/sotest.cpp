@@ -37,6 +37,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "d3d12.lib")
@@ -295,6 +298,57 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
 }
 
 // Every shader dumped from one run, created in sequence and kept ALIVE.
+// Unreal creates compute PSOs on WORKER THREADS: FD3D12PipelineState::CreateAsync
+// starts an FAsyncTask<FD3D12PipelineStateWorker>. So this shim's
+// CreateStateObject calls are concurrent in the game, and were single-threaded
+// in every test here.
+//
+// That is the one axis the offline probe never varied, and DRED now says the
+// GPU was not executing anything when the device died: no breadcrumbs, no page
+// fault. A driver internal error with neither is a CPU-side failure, and
+// creating a DXR state object is the heaviest CPU-side thing this shim asks the
+// driver to do.
+int RunThreaded(ID3D12Device5* dev, const std::string& dir, int repeat, int threads) {
+    std::printf("creating on %d threads, %d passes each\n\n", threads, repeat);
+    std::vector<std::thread> pool;
+    std::atomic<int> failed{0};
+    std::mutex holdLock;
+    std::vector<Built> held;
+    for (int t = 0; t < threads; ++t) {
+        pool.emplace_back([&, t] {
+            for (int pass = 0; pass < repeat; ++pass) {
+                for (int i = 0; i < 64; ++i) {
+                    char stem[64];
+                    sprintf_s(stem, "lowered_%03d", i);
+                    const std::string lib = dir + "\\" + stem + ".out.dxil";
+                    FILE* probe = nullptr;
+                    if (fopen_s(&probe, lib.c_str(), "rb") != 0 || !probe) continue;
+                    fclose(probe);
+                    Built b = BuildOne(dev, lib, dir + "\\" + stem + ".rs.bin", true);
+                    if (FAILED(b.hr)) {
+                        std::printf("  thread %d %s hr=0x%08X %s\n", t, stem,
+                                    static_cast<unsigned>(b.hr), HrName(b.hr));
+                        b.Release();
+                        ++failed;
+                    } else {
+                        std::lock_guard<std::mutex> g(holdLock);
+                        held.push_back(b);
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+    const HRESULT rem = dev->GetDeviceRemovedReason();
+    std::printf("\nheld %zu state objects, %d failed\n", held.size(), failed.load());
+    if (rem != S_OK)
+        std::printf("  DEVICE REMOVED: 0x%08X %s\n",
+                    static_cast<unsigned>(rem), HrName(rem));
+    else
+        std::printf("  device still alive\n");
+    for (auto& b : held) b.Release();
+    return (failed.load() || rem != S_OK) ? 1 : 0;
+}
 int RunDir(ID3D12Device5* dev, const std::string& dir, int repeat) {
     std::vector<Built> held;
     int failed = 0;
@@ -344,6 +398,7 @@ int main(int argc, char** argv) {
 
     bool warp = false;
     int repeat = 1;
+    int threads = 1;
     std::string dir, libPath, rsPath;
     for (int i = 1; i < argc; ++i) {
         if (_stricmp(argv[i], "warp") == 0) warp = true;
@@ -352,6 +407,7 @@ int main(int argc, char** argv) {
         // The game creates ours alongside a couple of hundred of its own.
         // Seven at a time is not the same test.
         else if (_stricmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
+        else if (_stricmp(argv[i], "--threads") == 0 && i + 1 < argc) threads = atoi(argv[++i]);
         else if (libPath.empty()) libPath = argv[i];
         else rsPath = argv[i];
     }
@@ -383,7 +439,8 @@ int main(int argc, char** argv) {
 
     int rc;
     if (!dir.empty()) {
-        rc = RunDir(dev, dir, repeat);
+        rc = threads > 1 ? RunThreaded(dev, dir, repeat, threads)
+                         : RunDir(dev, dir, repeat);
     } else {
         Built b = BuildOne(dev, libPath, rsPath, false);
         const HRESULT removed = dev->GetDeviceRemovedReason();
