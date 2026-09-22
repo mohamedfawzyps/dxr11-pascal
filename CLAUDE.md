@@ -1269,8 +1269,12 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       WITH_RHI_BREADCRUMBS = (UE_BUILD_DEBUG || UE_BUILD_DEVELOPMENT ||
                               WITH_PROFILEGPU || (HAS_GPU_STATS && RHI_NEW_GPU_PROFILER))
       WITH_PROFILEGPU      = !(UE_BUILD_SHIPPING || UE_BUILD_TEST) || ...
+      HAS_GPU_STATS        = ((STATS || CSV_PROFILER_STATS ||
+                               GPUPROFILERTRACE_ENABLED) && (!UE_BUILD_SHIPPING))
 
-  so Unreal writes no breadcrumbs at all in Shipping. DRED had nothing to
+  Every term is off in Shipping, and `HAS_GPU_STATS` carries its own
+  `!UE_BUILD_SHIPPING`, so this is not a matter of which profiling options the
+  packager happened to enable. Unreal writes no breadcrumbs at all in Shipping. DRED had nothing to
   report because nothing was recorded, not because the GPU was idle. The
   inference "nothing was executing, so this is a CPU-side failure" does not
   follow and is withdrawn.
