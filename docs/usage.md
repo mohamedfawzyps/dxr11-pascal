@@ -283,7 +283,9 @@ tools\run_dispatch_test.ps1     RayQuery shaders end to end through the proxy
 tools\run_rewriter_test.ps1     the rewriter, and Python/C++ agreement
 ```
 
-Both should end with every case passing and both refusal gates behaving.
+Both should end with every case passing and every gate behaving: 23 render
+cases and 4 gates in the first, 13 render cases and 15 analysis and lowering
+checks in the second.
 
 ## 7. When something goes wrong
 
@@ -305,9 +307,14 @@ is, and the log says what was being translated when it happened.
 for `NOTE:`. The shim refuses what it cannot serve, and it also warns about
 scene layouts it can only partly serve.
 
-**A shader is refused.** The reason is in the log, in full. The permanent ones
-are in the README; those will not change, because DXR 1.0 has nothing to lower
-them onto.
+**A shader is refused.** The reason is in the log, in full. The README splits
+them into two lists, and the difference matters when you are deciding whether
+to report it: refusals that are facts about DXR 1.0 will not change, and
+refusals that are gaps in the rewriter will. "More than one RayQuery object"
+is the second kind and is the most common one a real game hits.
+
+Turn `dump` on and the refused shader is written out as a `.dxil` container
+with a `.txt` saying why, which is what makes a useful bug report.
 
 **Turn the D3D12 debug layer on.** The shim does not switch this itself, and
 it does not need to: `dxcpl.exe`, the DirectX Control Panel, forces the debug
@@ -349,8 +356,13 @@ in a subdirectory. That works with this shim: the proxy exports the three
 undocumented `D3D12Core*` entry points that `d3d12SDKLayers.dll` imports, so
 the Agility runtime and the debug layer both still load.
 
-Coverage against Unreal is a **source survey, not an execution test**. Epic's
-RayQuery use is all in compute shaders, which is the shape this shim handles,
-and 21 of the 25 accessors Epic uses are supported. The other four cannot be
-lowered, and Epic does use them, so expect some shaders to be refused. The log
-will name them.
+Epic's RayQuery use is all in compute shaders, which is the shape this shim
+handles, and **all 25 of the accessors Epic uses are now supported**. Four of
+them were listed as impossible for a long time and are not.
+
+This is no longer only a source survey. Shaders dumped out of a running UE
+5.8.2 game have been through the whole path, and one of them lowers, validates
+and signs. Expect some shaders to still be refused, most of them for having
+more than one RayQuery object in an entry point, and the log will name each
+one. `dump = refused-shaders` writes them out so a refusal can be reproduced
+offline with `dxrw rewrite`.

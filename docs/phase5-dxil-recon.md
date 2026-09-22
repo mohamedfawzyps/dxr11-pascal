@@ -1323,6 +1323,12 @@ Twenty of Unreal's 25 accessors. What remains is
 `CommitProceduralPrimitiveHit`, needing the generated intersection shader, and
 the four that are permanently refused.
 
+> Left as it stood, because it was accurate when written and the correction is
+> the interesting part. All 25 are supported now. The four called permanently
+> refused stopped being so the moment this shim started building the shader
+> table itself, which had not happened yet here. See "The shader table answers
+> what the shader model cannot" below.
+
     eight shaders lowered, C++ and Python BYTE-IDENTICAL on every one
     six shaders end to end through the proxy on the 1070, all MATCH
     12 of 12 refusals behaved
@@ -1821,21 +1827,146 @@ with 14 analysis and lowering checks behaving. The probe on hardware still gives
 `D3D12RaytracingSimpleLighting` runs at baseline fps, and the debug layer is
 silent.
 
+## The shader table answers what the shader model cannot
+
+`GeometryIndex()` in a DXR 1.0 hit shader is itself Tier 1.1, measured, and
+HLSL exposes no hit-shader intrinsic for `InstanceContributionToHitGroupIndex`
+at all. Both were written down here as having nothing to lower onto, and both
+were wrong, for one reason: the objection assumed the APPLICATION owns the
+shader table. In the compute dispatch path this shim builds it.
+
+With `MultiplierForGeometryContributionToShaderIndex = 1`, a hit lands on
+record `InstanceContribution + GeometryIndex`, and the shim knows both numbers
+for every record it writes. So each record carries them as local root signature
+root constants and the hit shader reads them back with the machinery the
+rewriter already had: a global of a named type, `createHandleForLib` (160) on
+it, then `cbufferLoadLegacy` (59).
+
+The gate was a measurement, not an argument.
+`phase5/cases/reference/lib_localroot_ref.hlsl` reads both values from
+`cbuffer ... : register(b0, space1)` in an any-hit and a closest-hit, and the
+container carries **SFI0 = 0x0**. That is the entire difference from
+`GeometryIndex()`, which sets 0x2000000 and makes `CreateStateObject` return
+`E_INVALIDARG` on the 1070. Checking was not optional: this project had already
+been caught once by an intrinsic that looked ordinary and was Tier 1.1.
+
+The local root signature is associated with the HIT GROUPS only, through a
+`SUBOBJECT_TO_EXPORTS_ASSOCIATION`, so raygen and miss records stay 32 bytes
+and only hit records grow to 64.
+
+Four accessors, one mechanism, and 120 of the 157 refusals a real Unreal
+session produced.
+
+The test had to exist before the feature could be believed. Every scene in this
+project had ONE geometry per structure, so every correct answer was 0 and a
+lowering that dropped the index entirely would have passed. `raytest --geom`
+builds one bottom-level structure with four geometries, and the candidate
+values GATE THE COMMIT rather than escaping the loop. `geometry +
+contribution != 3` commits, so the missing quadrant is geometry 3 without
+`--contrib` and geometry 1 with it: **the gap moves**, so neither accessor can
+be a constant and pass.
+
+## Shader Model 6.6 binds resources differently, and that was 124 refusals
+
+The rewriter was built against `cs_6_5`. Unreal compiles its RayQuery shaders
+at `cs_6_6`, and 6.6 does not reach a resource the way 6.5 does:
+
+    cs_6_5   createHandle (57, class, rangeId, index)
+    cs_6_6   createHandleFromBinding (217, ResBind, index) -> annotateHandle (216)
+
+Neither 217 nor 216 was on the recomputable list, so every handle made that way
+was invisible to the loop isolation check and looked like caller state the
+any-hit shader could not see. One dumped Unreal container, `refused_010.dxil`,
+is `!{!"cs", i32 6, i32 6}` with seven uses of 217 and zero of either 57 or
+160, and every resource chain reads
+
+    createHandleFromBinding -> annotateHandle -> cbufferLoadLegacy ->
+    extractvalue -> icmp
+
+which is exactly the recomputable shape already supported, written in newer
+opcodes.
+
+The conversion is 217 to `createHandleForLib` (160), the same target the 6.5
+path already uses, and the `annotateHandle` after it is left untouched: it is
+legal in a library and carries the resource properties. What could NOT be
+guessed from the 6.5 path is the global, so it was read off DXC
+(`phase5/cases/reference/lib_sm66_binding_ref.hlsl`):
+
+    %CB = type { float, i32 }
+    @CB = external constant %dx.types.Handle        ; HANDLE type, not %CB
+    !6 = !{i32 0, %CB* bitcast (%dx.types.Handle* @CB to %CB*), !"CB", ...}
+
+    %1 = load %dx.types.Handle, %dx.types.Handle* @CB, align 4
+    %2 = call %dx.types.Handle @dx.op.createHandleForLib.dx.types.Handle(i32 160, %dx.types.Handle %1)
+
+Three differences from the 6.5 form, and all three matter: the global holds a
+**handle** rather than the resource, so one overload serves every resource; the
+`!dx.resources` record **bitcasts** that global back to the resource type; and
+the `createHandleFromBinding` declare has to go, because an unused declare is
+itself a validation error.
+
+`createHandleFromHeap` (218) needed nothing. A heap handle used only in the
+raygen stays where it is and is correct; one used inside the Proceed loop is
+refused, because 218 is not recomputable and the isolation check catches it.
+`RayTracingDebugMainCS` uses sixteen of them and keeps all sixteen in the
+raygen.
+
+## The module shader flags were hardcoded, and happened to be right
+
+The lowering wrote `i64 16` for the entry point's shader flags. Every shader
+this project had ever seen declared `0x2000010`, and the only bit the lowering
+removes is the tier 1.1 flag `0x2000000`, so 16 was correct by coincidence for
+years.
+
+Unreal's shader declares `0x42000010`, because it uses descriptor heap
+indexing. The validator said:
+
+    error: Flags must match usage.
+    note: Flags declared=16, actual=1073741840
+
+which names the symptom and nothing about the cause. The flags now come from
+the entry point's properties with the tier 1.1 bit cleared, which reproduces
+`16` exactly for every existing case, so no other output moved by a byte.
+
+**A real Unreal shader now goes container in and signed container out**, and
+the Python and the C++ produce byte-identical text for it.
+
+## An independent case found what a real engine could not
+
+`phase5/cases/rayquery_sm66.hlsl` is the `indep` shader at `cs_6_6`, so it
+converts a handle in the raygen AND recreates one in the generated any-hit. It
+failed on its first run, in a way no Unreal shader could have: LLVM prints an
+all-zero `ResBind` as `zeroinitializer` rather than writing the fields out, and
+nothing Unreal bound sat at SRV t0 space0.
+
+That is the fourth time in this project a case written independently of the
+feature found something the feature's own tests could not.
+
 ## Next
 
-**Nothing on the rewriter's own list.** Every remaining refusal is a fact about
-DXR 1.0 or about what the application did, not a shape this rewriter has yet to
-learn:
+Two of the remaining refusals are the rewriter's own, and one of them is false.
 
-- `Candidate`/`CommittedGeometryIndex`, Tier 1.1 on the DXR 1.0 side too;
-- `*InstanceContributionToHitGroupIndex`, which HLSL does not expose at all;
-- RayQuery in a pixel, vertex, mesh or amplification shader;
-- RayQuery inside an existing DXR 1.0 shader;
-- groupshared memory or wave intrinsics around the query;
-- multiple concurrent RayQuery objects;
-- a loop body reading caller locals that do not fit the payload;
-- an application routing both geometry kinds to one hit group record.
+1. **Multiple RayQuery objects in one entry point**, 33 of Unreal's shaders.
+   The check refuses on `FindOp(kAllocate).size() != 1`, which counts
+   ALLOCATIONS rather than liveness, and the message says "concurrent" about
+   something it never measured. In `NiagaraCollisionRayTraceCS` the first query
+   is finished three hundred lines before the second is allocated. Lowering
+   them is real work, one TraceRay and one generated hit shader set per query,
+   but "no lowering exists" was never true. This is the next build.
+2. **One assembler failure** left in a real Unreal session, cause not yet
+   identified. `dump` writes the container out, and `dxrw rewrite` reproduces
+   the refusal offline, which is the way in.
+3. **A 6.6 binding into a resource array at a dynamic index.** The 6.5 form of
+   exactly that works. One reference compile settles the shape of an array
+   global in the binding form, and guessing it is how a lowering goes silently
+   wrong.
+4. **RayQuery hosted in a raygen shader**, which is what both NVIDIA samples
+   do and which this document's refusal list justified with "any-hit and
+   intersection shaders cannot call TraceRay". True of those two. A raygen
+   can. The obstacle is shader table OWNERSHIP: in the compute path this shim
+   builds the table, in the raygen path the application does, so generated hit
+   groups would need records appended to a table we do not own.
 
-So the next question is not what to build but **what to run**: real software,
-enough of it that the refusal list is trusted, before the tier flip stops being
-opt-in.
+Everything else refused is a fact about DXR 1.0 or about what the application
+did. So the question is still **what to run**, not what to build: real
+software, enough of it that the refusal list is trusted.

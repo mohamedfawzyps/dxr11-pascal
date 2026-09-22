@@ -24,6 +24,25 @@ $verLine = Select-String -Path (Join-Path $root 'proxy\version.h') -Pattern '#de
 if (-not $verLine) { throw 'Cannot read the version from proxy/version.h' }
 $version = $verLine.Matches[0].Groups[1].Value
 
+# A release that is not a tagged commit cannot be got back. v0.15.0 through
+# v0.24.0 do not exist as tags because eleven versions were allowed to pile up
+# uncommitted, and there is no way to recover the intermediate points now.
+#
+# So this refuses rather than warns. A warning at the end of a long script is
+# a warning nobody reads, and the whole reason this script exists is that a
+# release assembled from memory goes subtly wrong the second time.
+$tag = "v$version"
+$dirty = (& git -C $root status --porcelain) -join ''
+$atTag = (& git -C $root tag --points-at HEAD) -split "`n" | ForEach-Object { $_.Trim() }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  not a git repository, skipping the tag check" -ForegroundColor DarkGray
+} elseif ($dirty) {
+    throw "The working tree has uncommitted changes. Commit them, then tag $tag, then run this."
+} elseif ($atTag -notcontains $tag) {
+    $at = if ($atTag -and $atTag[0]) { "HEAD carries " + ($atTag -join ', ') } else { 'HEAD carries no tag' }
+    throw "proxy/version.h says $version but $at. Tag this commit first:`n    git tag -a $tag -m ""$tag""`n    git push origin $tag"
+}
+
 $name = "pascal-dxr-tier-1.1-v$version"
 $stage = Join-Path $root "release\$name"
 $zip = Join-Path $root "release\$name.zip"

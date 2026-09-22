@@ -1,20 +1,28 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.24.0.
+proxy/version.h, and is currently 0.25.0.
 
 ## Current position (2026-09-22)
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
-GTX 1070 and produces bit-exact output against WARP. Fourteen render cases, 0
+GTX 1070 and produces bit-exact output against WARP. 23 render cases, 0
 mismatches, plus four gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
 was missing. Nothing in this project implements ray tracing.
 
-**ALL THE LOWERING IS DONE.** Unreal uses 25 distinct RayQuery accessors and
-**everything with a DXR 1.0 equivalent is now supported: 21 of 25.** The other
-four are permanently refused because DXR 1.0 offers nothing to lower them onto.
+**ALL THE LOWERING IS DONE, AND ALL 25 ACCESSORS NOW WORK.** The four that
+were called permanently impossible are not. `Candidate`/`CommittedGeometryIndex`
+and `*InstanceContributionToHitGroupIndex` were written off while the
+APPLICATION owned the shader table; the shim builds it, so each record carries
+those numbers as local root signature constants and the hit shader reads them
+back. Measured SFI0 = 0x0, which was the gate.
+
+**A REAL UNREAL SHADER NOW LOWERS, VALIDATES AND SIGNS.**
+`RayTracingDebugMainCS`, dumped from a running UE 5.8.2 game, goes DXIL
+container in and signed container out. That is the first time anything not
+written for this project has been through the whole path.
 
 **The shader table is now built from the application's own geometry layout.**
 Acceleration structure interception is complete and the instance data is USED.
@@ -27,21 +35,33 @@ primitives works rather than being refused.
 a query that commits BOTH triangle and procedural hits, which lowers to an
 any-hit AND an intersection shader from one Proceed loop.
 
-**NOTHING IS LEFT ON THE REWRITER'S OWN LIST.** Dynamic descriptor indexing
-was the last shape it had simply not been taught, and it now works, uniform and
-non-uniform. Every remaining refusal is a fact about DXR 1.0 or about what the
-APPLICATION did:
+**WHAT IS LEFT IS A SHORT LIST, AND TWO OF THEM ARE THE REWRITER'S OWN.**
+Ordered by what a real engine actually hits:
 
-- `Candidate`/`CommittedGeometryIndex`, Tier 1.1 on the DXR 1.0 side too;
-- `*InstanceContributionToHitGroupIndex`, which HLSL does not expose at all;
+1. **Multiple RayQuery objects in one entry point.** 33 of Unreal's shaders,
+   and **the refusal is FALSE**: the check counts ALLOCATIONS, not liveness,
+   and the two queries in NiagaraCollisionRayTraceCS are three hundred lines
+   apart. Lowering them is real work, one TraceRay and one hit shader set per
+   query, but "no lowering exists" was never true. THIS IS THE NEXT BUILD.
+2. **One assembler failure** left in Unreal's log, cause not yet identified.
+   The dump is the way in, not more reasoning.
+3. **A 6.6 binding into a resource ARRAY at a dynamic index.** The 6.5 path
+   supports exactly this. One reference compile settles the shape.
+4. **RayQuery hosted in a raygen shader**, which is what both NVIDIA samples
+   do. Lowerable in principle, because a raygen CAN call TraceRay; the
+   obstacle is shader table OWNERSHIP, not the shaders.
+
+Genuinely refused, and each is a fact about DXR 1.0 or about what the
+APPLICATION did, not a gap:
+
 - RayQuery in a pixel, vertex, mesh or amplification shader;
-- RayQuery inside an existing DXR 1.0 shader;
+- RayQuery inside an any-hit or intersection shader, which cannot call
+  TraceRay (a raygen is a different case, see 4 above);
 - groupshared memory or wave intrinsics around the query;
-- multiple concurrent RayQuery objects;
-- a loop body reading caller locals that do not fit the payload;
+- a loop body reading genuine caller locals that do not fit the payload;
 - an application routing both geometry kinds to ONE hit group record.
 
-So the next question is not what to build but **WHAT TO RUN**: real software,
+So the question is still **WHAT TO RUN**, not what to build: real software,
 enough of it that the refusal list is trusted. That is what the version number
 tracks, see CHANGELOG.md: 0.x until real software has been through it, 1.0.0
 when the refusal list is trusted.
@@ -295,9 +315,10 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       the same through NonUniformResourceIndex     14450 hits   MATCH
 
   All bit-exact, 0 mismatches, max |dt| and max |dbary| 0.000000.
-  Twelve render cases, each also checked byte-identical between the Python and
-  the C++ on both the `.ll` path and the container path, and fourteen analysis
-  and lowering checks, run by `.\tools\run_rewriter_test.ps1`.
+  Those twelve were the suite at the time. It now runs THIRTEEN render cases,
+  each also checked byte-identical between the Python and the C++ on both the
+  `.ll` path and the container path, and fifteen analysis and lowering checks,
+  by `.\tools\run_rewriter_test.ps1`.
 
       dxil.py        small .ll model: blocks, instructions, dx.op decoding,
                      dominators and natural loops
@@ -1226,24 +1247,32 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
     SM 6.9, SER and OMM are the genuinely out-of-scope parts.
 
   Next action. **Not a feature: exposure.** Run real software through it, until
-  the refusal list is trusted. Fix the three defects above first, because the
-  entry-block one will misfire on almost anything and its message points
-  nowhere near the cause.
+  the refusal list is trusted. All three defects named above are now fixed, and
+  the ordered list of what remains is at the top of this brief.
 
-  Four accessors stay PERMANENTLY refused and must keep failing loudly:
-  Candidate and `CommittedGeometryIndex`, which are Tier 1.1 on the DXR 1.0
-  side too, and `*InstanceContributionToHitGroupIndex`, which HLSL does not
-  expose to a hit shader at all.
+  **No accessor is permanently refused any more.** The four that were,
+  Candidate and `CommittedGeometryIndex` and the two
+  `*InstanceContributionToHitGroupIndex` forms, all work through local root
+  signature constants in the shader table records. The paragraph that used to
+  stand here said they must keep failing loudly, and it was right for as long
+  as the application owned the table.
 
   What is NOT generic, written down so it is not rediscovered:
   - Resource arrays work with a constant index, a dynamic one, and a
-    non-uniform one. `createHandleFromHeap` is still refused. A dynamically
-    indexed handle used INSIDE the Proceed loop is refused too, because the
+    non-uniform one, in the Shader Model 6.5 binding form. The 6.6 form of a
+    DYNAMIC array index is refused, because the shape of an array global in
+    the binding form has not been measured off DXC. A dynamically indexed
+    handle used INSIDE the Proceed loop is refused in either form, because the
     index is raygen state the any-hit cannot see.
-  - The payload layout is FIXED, now 88 bytes, and carries exactly the
+  - `createHandleFromHeap` (218) needs no special handling and has none. A heap
+    handle used only in the raygen passes through correctly; one used inside
+    the Proceed loop is refused, because 218 is not on the recomputable list
+    and the isolation check catches it.
+  - The payload layout is FIXED, now 92 bytes, and carries exactly the
     committed accessors the whitelist supports. It is a state object contract:
     `PAYLOAD_BYTES` and `MaxPayloadSizeInBytes` move together or
-    `CreateStateObject` fails.
+    `CreateStateObject` fails. It lives in FOUR places, `lower.py`,
+    `rq_lower.cpp`, `rq_pipeline.cpp` and the harness.
   - One entry point, one query.
   - Procedural primitives lower, via a generated intersection shader, and so
     does a query committing BOTH kinds, via an any-hit and an intersection
@@ -1449,20 +1478,30 @@ Detect these and fail loudly rather than producing wrong output:
 | RayQuery in a pixel, vertex, mesh or amplification shader | `DispatchRays` only launches raygen; there is no promotion path |
 | RayQuery inside an existing DXR 1.0 shader | Any-hit and intersection shaders cannot call `TraceRay` |
 | RayQuery alongside `groupshared` or group barriers | Raygen shaders have no thread group |
-| Multiple concurrent RayQuery objects | `TraceRay` has one payload and one in-flight trace |
 | Loop body reading caller locals that do not fit the payload | The any-hit shader is a separate invocation; the payload is the only shared state |
 | Wave intrinsics around the query | Promotion to raygen changes lane occupancy |
-| **`CommittedGeometryIndex`** | MEASURED: `GeometryIndex()` in a DXR 1.0 hit shader is ITSELF Tier 1.1. It sets shader flag 0x2000000 and `CreateStateObject` returns `E_INVALIDARG` on the 1070, so there is nothing to lower onto |
 
-`CommittedGeometryIndex` was not in the original list and was found by testing.
-It is the first Tier 1.1 feature this approach cannot emulate at all, which is
-a fact about the project's scope rather than a limitation of the rewriter. A
-route exists in principle, encoding the geometry index in the shader table with
-one hit group record per geometry, but that means the shim rebuilding the
-application's SBT. Not attempted.
+Two rows have LEFT this table, and both are worth understanding, because each
+was written down as impossible and neither was.
 
-The pixel-shader case is the most consequential, since it is legal in DXR 1.1
-and some engines use it.
+**`CommittedGeometryIndex`.** MEASURED and true: `GeometryIndex()` in a DXR 1.0
+hit shader is ITSELF Tier 1.1, sets shader flag 0x2000000, and
+`CreateStateObject` returns `E_INVALIDARG` on the 1070. The note here said a
+route existed in principle, encoding the index in the shader table, "but that
+means the shim rebuilding the application's SBT. Not attempted." The shim now
+BUILDS the table rather than rebuilding one, so the objection dissolved. The
+same mechanism took `*InstanceContributionToHitGroupIndex` with it.
+
+**Multiple concurrent RayQuery objects.** Still refused, but the reason given
+here, one payload and one in-flight trace, only applies to queries that are
+genuinely LIVE at once. The check counts allocations, and Unreal's are
+sequential. See the entry below.
+
+The lesson both share: an impossibility claim is only as durable as the
+assumption under it, and neither assumption was written down beside the claim.
+
+The pixel-shader case is the most consequential of what remains, since it is
+legal in DXR 1.1 and some engines use it.
 
 ## Build order
 

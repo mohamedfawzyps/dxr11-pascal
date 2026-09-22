@@ -40,6 +40,13 @@ rejected.
 | Indirect `DispatchRays` | The command list is split at the dispatch, the argument buffer is read back, real `DispatchRays` calls are issued |
 | Inline ray tracing (`RayQuery`) | The DXIL is rewritten into a DXR 1.0 library, with generated any-hit, intersection, closest-hit and miss shaders |
 
+There is a second, separate proxy, `dxgi.dll`, which is not a Tier 1.1 feature
+at all. Unreal Engine refuses ray tracing on Pascal by PCI **device id**, after
+it has already accepted the tier, with no setting that overrides it. So
+`dxgi.dll` reports the card under a Turing device id and changes nothing else:
+not the vendor id, not the adapter description, and no capability answer. It is
+a separate file so it can be left out, but for Unreal it is not optional.
+
 The fourth is the real work. A `RayQuery` compute shader is lowered so that the
 `Proceed()` loop body becomes an any-hit shader, or an intersection shader, or
 both, and the committed accessors travel in the ray payload.
@@ -48,11 +55,15 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 14 end-to-end render cases, all bit-exact, plus 2 refusal gates
-- 12 rewriter cases, each byte-identical between the Python reference and the
-  C++ port, on both the `.ll` path and the DXIL container path
+- 23 end-to-end render cases, all bit-exact, plus 4 refusal gates
+- 13 rewriter cases, each byte-identical between the Python reference and the
+  C++ port, on both the `.ll` path and the DXIL container path, plus 15
+  analysis and lowering checks
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
   pixel-identical to its no-proxy baseline
+
+A shader taken from a shipping Unreal Engine 5.8.2 game, which nobody here
+wrote, goes DXIL container in and signed container out.
 
 Tier 1.1 is reported by default. A proxy DLL only sits beside an executable
 because somebody put it there, so the install is the opt-in, and asking for a
@@ -65,13 +76,18 @@ leaves the shim loaded and forwarding, the second leaves no trace at all.
 
 ## Using it
 
-Build the proxy, then put the resulting `d3d12.dll` next to the target
-executable. That is the whole installation:
+Build the proxies, then put the resulting DLLs next to the target executable.
+That is the whole installation:
 
 ```
 build_proxy.bat
+build_dxgi.bat
 copy d3d12.dll <target directory>
+copy dxgi.dll <target directory>
 ```
+
+`dxgi.dll` is only needed for an application that refuses Pascal by device id,
+which in practice means Unreal. It does nothing unless it is copied in.
 
 For a `RayQuery` shader to be rewritten, `dxcompiler.dll` and `dxil.dll` have
 to be in that directory too. They load lazily, so a plain DXR 1.0 application
@@ -97,23 +113,31 @@ Nothing here is guessed at: each refusal is provoked by a test.
 
 Refused because DXR 1.0 offers nothing to lower onto:
 
-- `CommittedGeometryIndex` and `CandidateGeometryIndex`. Measured:
-  `GeometryIndex()` inside a DXR 1.0 hit shader is *itself* Tier 1.1, and the
-  driver rejects the state object
-- `*InstanceContributionToHitGroupIndex`, which HLSL does not expose to a hit
-  shader at all
-- `RayQuery` in a pixel, vertex, mesh or amplification shader
-- `RayQuery` inside an existing DXR 1.0 shader
+- `RayQuery` in a pixel, vertex, mesh or amplification shader. `DispatchRays`
+  only launches a raygen, and there is no promotion path
+- `RayQuery` inside an any-hit or intersection shader, neither of which can
+  call `TraceRay`
 - `groupshared` memory, group barriers or wave intrinsics in the same entry
   point as the query
-- more than one `RayQuery` object per entry point
 - a loop body reading caller locals that do not fit the payload
 - an application routing both triangle and procedural geometry to the same hit
   group record, which no shader table can serve
 
-Unreal Engine 5.7 uses 25 distinct `RayQuery` accessors. Everything with a DXR
-1.0 equivalent is supported, which is 21 of them; the other four are in the
-list above.
+Refused because the rewriter has not been taught them yet, which is a different
+thing and is said differently in the log:
+
+- more than one `RayQuery` object per entry point. The check counts
+  allocations rather than overlap, so two queries used one after the other are
+  refused as well, which is the largest remaining gap against Unreal
+- a Shader Model 6.6 binding into a resource array at a dynamic index. The 6.5
+  form of exactly that works
+
+**All 25 of the `RayQuery` accessors Unreal uses are now supported.** Four of
+them, `Candidate`/`CommittedGeometryIndex` and the two
+`*InstanceContributionToHitGroupIndex` forms, were listed here as permanently
+impossible, and they were, for as long as the application owned the shader
+table. This shim builds it, so each record carries those numbers as local root
+signature constants and the hit shader reads them back.
 
 ## Requirements
 
