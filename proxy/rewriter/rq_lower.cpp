@@ -830,6 +830,76 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     }
         }
 
+        // A Proceed loop body that WRITES is not transplantable.
+        //
+        // The check above guards what the body READS. Nothing guarded what it
+        // writes, and the two are not the same question. The any-hit shader
+        // runs a different number of times than the loop body does, by design:
+        // with RAY_FLAG_FORCE_OPAQUE no candidate is ever yielded so it never
+        // runs at all, and with FORCE_NON_OPAQUE it runs once per candidate in
+        // an implementation-defined order. So a store, an append or an atomic
+        // in that body means something different after lowering, silently.
+        //
+        // Found on RayTracingDebugMainCS, a real Unreal shader that appends a
+        // debug record per candidate. It lowered, validated, signed, and then
+        // killed the device inside CreateStateObject. Whether the write is
+        // also what the driver choked on is NOT established, and this refusal
+        // does not rest on it.
+        //
+        // DXC marks every dx.op declaration with one of three attribute
+        // groups and the module says which is which: readnone is pure,
+        // readonly loads, a bare nounwind WRITES. Reading that beats a
+        // hand-kept list of store opcodes, which would be incomplete the day
+        // DXIL grows another one. The numbering is resolved per module rather
+        // than assumed, see the attribute group bug in 0.26.0.
+        //
+        // LIMIT, stated rather than hidden: this reads dx.op calls. A plain
+        // `store` reaches only an alloca or groupshared in practice, and
+        // groupshared around a query is already refused.
+        {
+            std::map<std::string, std::string> groupText;
+            static const std::regex kAttrLine(
+                R"(^attributes\s+#(\d+)\s*=\s*\{(.*)\}\s*$)");
+            static const std::regex kDeclLine(
+                R"(^declare\s+.*@([\w.$]+)\s*\(.*\)\s*#(\d+)\s*$)");
+            std::map<std::string, std::string> byNum;
+            std::smatch mm;
+            for (const auto& line : m.lines)
+                if (std::regex_match(line, mm, kAttrLine))
+                    byNum[mm[1].str()] = mm[2].str();
+            for (const auto& line : m.lines)
+                if (std::regex_match(line, mm, kDeclLine)) {
+                    auto it = byNum.find(mm[2].str());
+                    groupText[mm[1].str()] = it == byNum.end() ? "" : it->second;
+                }
+            for (const auto& b : fn.blocks) {
+                if (!q.loop.body.count(b.label)) continue;
+                for (const auto& i : b.instrs) {
+                    if (i.callee.compare(0, 6, "dx.op.") != 0) continue;
+                    // The RayQuery ops are mutators too and are all declared
+                    // nounwind. They are not transplanted, they are REWRITTEN,
+                    // and the analysis already refuses an opcode it does not
+                    // know.
+                    if (i.callee.compare(0, 15, "dx.op.rayQuery_") == 0 ||
+                        i.callee == "dx.op.allocateRayQuery")
+                        continue;
+                    auto g = groupText.find(i.callee);
+                    if (g != groupText.end() &&
+                        (g->second.find("readnone") != std::string::npos ||
+                         g->second.find("readonly") != std::string::npos))
+                        continue;
+                    const int op = i.DxOp();
+                    r.error = "Proceed loop body has a side effect (" + i.callee +
+                              ", opcode " + (op >= 0 ? std::to_string(op) : "?") +
+                              "); the any-hit shader it becomes runs a different "
+                              "number of times than the loop body does, and in an "
+                              "implementation-defined order, so the write would not "
+                              "be the same write";
+                    return r;
+                }
+            }
+        }
+
         // The block the guard branches through to reach the loop, if any.
         for (const auto& p : q.proceeds) {
             if (p.first->label == q.loop.latch) continue;

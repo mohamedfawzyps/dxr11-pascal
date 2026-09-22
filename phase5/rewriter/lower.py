@@ -550,6 +550,7 @@ def _edit_query(module, q, edits, exports):
         header, latch, body = q.loop
         exit_label = _loop_exit(fn, header, latch, body)
         _check_loop_isolated(fn, q, header, latch, body, _type_names(module.text))
+        _check_loop_side_effects(module, fn, body)
 
     edits[q.trace.index] = _trace_block(q, ra, exit_label)
 
@@ -781,6 +782,76 @@ def _needed_chain(fn, recomputable, wanted, types, skip=()):
         need.add(r)
         frontier.extend(_operands(recomputable[r], types))
     return [i for _, i in fn.instrs() if i.result in need]
+
+
+def _attr_groups(module):
+    """callee name -> the attribute group TEXT its declaration carries.
+
+    DXC marks every dx.op declaration with one of three groups, and the module
+    says which is which: `readnone` is pure, `readonly` loads, and a bare
+    `nounwind` WRITES MEMORY. Reading it from the module beats a hand-kept list
+    of store opcodes, which would be incomplete the day DXIL grows another one.
+    The numbering is not fixed either, see the attribute group bug in 0.26.0,
+    so the groups are resolved per module rather than assumed."""
+    attrs = {}
+    for line in module.lines:
+        m = re.match(r'^attributes\s+#(\d+)\s*=\s*\{(.*)\}\s*$', line)
+        if m:
+            attrs[m.group(1)] = m.group(2)
+    out = {}
+    for line in module.lines:
+        m = re.match(r'^declare\s+.*@([\w.$]+)\s*\(.*\)\s*#(\d+)\s*$', line)
+        if m:
+            out[m.group(1)] = attrs.get(m.group(2), '')
+    return out
+
+
+def _check_loop_side_effects(module, fn, body):
+    """A Proceed loop body that WRITES is not transplantable.
+
+    The isolation check above guards what the body READS. Nothing guarded what
+    it writes, and the two are not the same question. The any-hit shader runs a
+    different number of times than the loop body does, by design:
+
+      - with RAY_FLAG_FORCE_OPAQUE no candidate is ever yielded, so the any-hit
+        never runs and the writes simply do not happen;
+      - with FORCE_NON_OPAQUE it runs once per candidate in an
+        implementation-defined order, so both the count and the order move.
+
+    So a store, an append or an atomic in that body means something different
+    after lowering, silently. Found on RayTracingDebugMainCS, a real Unreal
+    shader that appends a debug record per candidate: it lowered, validated,
+    signed, and then killed the device inside CreateStateObject. Whether the
+    write is also what the driver choked on is NOT established, and this
+    refusal does not rest on it.
+
+    Every shader in this suite has a pure loop body, which is why nothing here
+    could expose it. Fourth time a suite of cases written to demonstrate a
+    lowering has shared its author's blind spot.
+
+    LIMIT, stated rather than hidden: this reads dx.op calls. A plain `store`
+    reaches only an alloca or groupshared in practice, and groupshared around a
+    query is already refused."""
+    groups = _attr_groups(module)
+    for label in body:
+        for i in fn.block(label).instrs:
+            if not i.callee or not i.callee.startswith('dx.op.'):
+                continue
+            # The RayQuery ops themselves are mutators and are all declared
+            # nounwind. They are not transplanted, they are REWRITTEN, and the
+            # analysis already refuses any rayQuery opcode it does not know.
+            if (i.callee.startswith('dx.op.rayQuery_')
+                    or i.callee == 'dx.op.allocateRayQuery'):
+                continue
+            attr = groups.get(i.callee)
+            if attr is not None and ('readnone' in attr or 'readonly' in attr):
+                continue
+            raise rq.Unsupported(
+                'Proceed loop body has a side effect (%s, opcode %s); the '
+                'any-hit shader it becomes runs a different number of times '
+                'than the loop body does, and in an implementation-defined '
+                'order, so the write would not be the same write'
+                % (i.callee, i.dxop if i.dxop is not None else '?'))
 
 
 def _check_loop_isolated(fn, q, header, latch, body, types):

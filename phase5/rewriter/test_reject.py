@@ -264,6 +264,40 @@ def main():
         ok.append(expect_lower_reject('UAV read used inside the loop', load(UAV),
                                       'reads values defined outside it'))
 
+    # A Proceed loop body that WRITES.
+    #
+    # The check above guards what the body READS. This is the other half, and
+    # it went missing for the whole of Phase 5 because every case in this suite
+    # has a pure loop body. A real Unreal shader, RayTracingDebugMainCS, does
+    # not: it appends a debug record per candidate, and the lowering
+    # transplanted the append into the any-hit shader, where it runs a
+    # different number of times and in a different order.
+    #
+    # The mutation adds a counter increment on %v2, the handle the loop body
+    # ALREADY reads its alpha mask through, so the isolation check exempts it
+    # and this provokes the new refusal rather than the old one. Pointing it at
+    # a UAV handle instead makes refuse_uav_in_loop fire first, which the first
+    # version of this test did, and which is how the two were told apart.
+    # The attribute group number is looked up rather than written as #1, which
+    # is the mistake 0.26.0 had to fix once already.
+    SFX = os.path.join('phase5', 'cases', 'rayquery_indep.ll')
+    if os.path.isfile(SFX):
+        sfx = load(SFX)
+        g = re.search(r'^attributes #(\d+) = \{ nounwind \}\s*$', sfx, re.M)
+        assert g, 'no bare nounwind attribute group to hang a writing op on'
+        commit = re.search(r'^.*rayQuery_CommitNonOpaqueTriangleHit.*$', sfx, re.M)
+        assert commit, 'the independent case no longer commits inside the loop'
+        sfx = sfx.replace(
+            commit.group(0),
+            '  %sidefx = call i32 @dx.op.bufferUpdateCounter'
+            '(i32 70, %dx.types.Handle %v2, i8 1)\n' + commit.group(0))
+        sfx = sfx.replace(
+            g.group(0),
+            'declare i32 @dx.op.bufferUpdateCounter(i32, %%dx.types.Handle, i8) #%s\n\n%s'
+            % (g.group(1), g.group(0)))
+        ok.append(expect_lower_reject('UAV counter updated inside the loop', sfx,
+                                      'has a side effect'))
+
     # Committing BOTH kinds is no longer refused: the loop body lowers twice,
     # into an any-hit and an intersection shader, with two closest-hits because
     # the committed status differs. So this case flips from a refusal to an

@@ -1456,11 +1456,31 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   which is the fourth time a suite of cases written to demonstrate a lowering
   shared its author's blind spot.
 
-  **The fix is a refusal with a reason**: a Proceed loop body that stores to a
-  UAV, updates a counter or does an atomic cannot become an any-hit shader.
+  **THE REFUSAL IS IN, 0.36.6**: a Proceed loop body that stores to a UAV,
+  updates a counter or does an atomic cannot become an any-hit shader.
   That is correct on its own terms, and it also stops this shim ever building
   the library that kills the device, which is a symptom fix arriving for an
   unrelated and better reason.
+
+  **The rule is read from the module, not from a list.** DXC marks every
+  `dx.op` declaration with an attribute group and the module says which is
+  which: `readnone` is pure, `readonly` loads, a bare `nounwind` WRITES. A
+  hand-kept list of store opcodes would be incomplete the day DXIL grows
+  another one. The numbering is resolved per module rather than assumed, which
+  is the attribute group bug 0.26.0 already had to fix. `rayQuery_*` ops are
+  exempt because they are rewritten rather than transplanted, and the analysis
+  already refuses an opcode it does not know.
+
+  Both implementations, byte-identical, and all thirteen render cases produce
+  identical output, so nothing existing moved. The suspect now refuses, word
+  for word the same in the Python and the C++, and the other six still lower.
+
+  **The test took two goes and the first one was the useful one.** Adding the
+  counter update on a UAV handle made `refuse_uav_in_loop` fire instead, so
+  the case proved the OLD refusal. It had to go on the handle the loop already
+  reads through, which the isolation check exempts, before the new refusal was
+  the one being provoked. A refusal test that fires the wrong refusal passes
+  and measures nothing.
 
   **STATED HONESTLY: this is a correlation, not a demonstrated cause.** The
   same library still builds offline, so the counter alone is not sufficient.

@@ -17,6 +17,38 @@ build.
 
 ---
 
+## 0.36.6
+
+- **A Proceed loop body that WRITES is now refused.** The loop isolation check
+  guards what the body READS, and nothing guarded what it writes. The two are
+  not the same question: the any-hit shader the body becomes runs a different
+  number of times than the loop does, by design. With
+  `RAY_FLAG_FORCE_OPAQUE` no candidate is yielded so it never runs at all, and
+  with `FORCE_NON_OPAQUE` it runs once per candidate in an
+  implementation-defined order. A store, an append or an atomic there means
+  something different after lowering, silently.
+- Found on `RayTracingDebugMainCS`, a real UE 5.8.2 shader that appends a
+  debug record per candidate. It lowered, validated, signed, and then killed
+  the device inside `CreateStateObject`. **Whether the write is also what the
+  driver choked on is NOT established and this refusal does not rest on it.**
+- The rule comes from the module rather than a hand-kept list of store
+  opcodes, which would be incomplete the day DXIL grows another one: DXC marks
+  every `dx.op` declaration with an attribute group, and a bare `nounwind`
+  writes memory where `readnone` and `readonly` do not. The group numbering is
+  resolved per module, not assumed, which is the bug 0.26.0 had to fix once
+  already. The `rayQuery_*` ops are exempt because they are rewritten rather
+  than transplanted, and the analysis already refuses one it does not know.
+- Both implementations, byte-identical, and all thirteen render cases still
+  produce identical output, so nothing existing moved.
+- `test_reject.py` provokes it by adding a counter update to a known-good
+  loop, on the handle that loop already reads through, so the isolation check
+  exempts it and the new refusal is what fires. Pointing it at a UAV handle
+  instead makes `refuse_uav_in_loop` fire first, which is how the two were
+  told apart.
+- LIMIT: the check reads `dx.op` calls. A plain `store` reaches only an alloca
+  or groupshared in practice, and groupshared around a query is already
+  refused.
+
 ## 0.36.5
 
 - Video memory is logged immediately before a RayQuery state object is built,
