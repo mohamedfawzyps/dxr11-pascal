@@ -1,28 +1,33 @@
-// Replay a lowered library through CreateStateObject, outside the game.
+// Replay lowered libraries through CreateStateObject, outside the game.
 //
-// Three runs of a real Unreal game ended with the GPU dying
+// Runs of a real Unreal game kept ending with the GPU dying
 // (DXGI_ERROR_DRIVER_INTERNAL_ERROR) while the shim was creating state objects
-// from its generated libraries. The dump has all seven of them, but there was
-// no way to try one without launching the game again, which takes minutes and
-// answers one question.
+// from its generated libraries. The dump has them all, but there was no way to
+// try one without launching the game again, which takes minutes and answers
+// one question.
 //
-// This takes the pair the shim writes:
+// This takes what the shim writes:
 //
-//     lowered_NNN.out.dxil   the library handed to the driver
-//     lowered_NNN.rs.bin     the application's root signature blob
+//     lowered_NNN.out.dxil     the library handed to the driver
+//     lowered_NNN.rs.bin       the root signature it was built against
+//     lowered_NNN.shape.txt    the state object shape the shim chose
 //
-// and builds the SAME state object rq_pipeline.cpp builds. If the driver falls
-// over, it falls over here, on one shader, in a second, with nothing else
-// running.
+// and builds the SAME state object rq_pipeline.cpp builds.
 //
 //     sotest <lib.dxil> [rs.bin] [warp|hw]
+//     sotest --dir <folder> [warp|hw]
 //
-// WARP is worth trying first for a library that kills the hardware driver: if
-// WARP accepts it the library is probably valid and the fault is NVIDIA's, and
-// if WARP refuses it the message says what is wrong with it.
+// --dir is the one that matters. One at a time proved every library compiles
+// on a GTX 1070; the game does not do them one at a time. It creates several,
+// HOLDS them all, and Unreal compiles pipelines on a worker pool while the
+// renderer submits work. A fault that is cumulative rather than in any single
+// library only shows when they are built together.
 //
-// Exit code is 0 when the state object was created, 1 otherwise. A driver that
-// takes the process down with it produces neither, which is itself the answer.
+// WARP first is the useful order: if WARP accepts a library the fault is
+// likely NVIDIA's, and if WARP refuses it the message says what is wrong.
+//
+// Exit code is 0 when everything was created. A driver that takes the process
+// down with it produces no exit code at all, which is itself the answer.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -30,6 +35,7 @@
 #include <dxgi1_4.h>
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -44,9 +50,9 @@ namespace {
 const UINT kPayloadBytes = 92;
 const UINT kAttrBytes = 8;
 
-bool ReadFileBytes(const char* path, std::vector<unsigned char>* out) {
+bool ReadFileBytes(const std::string& path, std::vector<unsigned char>* out) {
     FILE* f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || !f) return false;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
     fseek(f, 0, SEEK_END);
     const long n = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -72,11 +78,9 @@ struct Shape {
 
 Shape ReadShape(const std::string& libPath) {
     Shape s;
-    std::string p = libPath;
-    const size_t dot = p.rfind(".out.dxil");
+    const size_t dot = libPath.rfind(".out.dxil");
     if (dot == std::string::npos) return s;
-    p = p.substr(0, dot) + ".shape.txt";
-    std::vector<unsigned char> raw;
+    const std::string p = libPath.substr(0, dot) + ".shape.txt";
     FILE* f = nullptr;
     if (fopen_s(&f, p.c_str(), "rb") != 0 || !f) return s;
     char line[256] = {};
@@ -102,6 +106,7 @@ const char* HrName(HRESULT hr) {
         case 0x80004005: return "E_FAIL";
         case 0x887A0005: return "DXGI_ERROR_DEVICE_REMOVED";
         case 0x887A0006: return "DXGI_ERROR_DEVICE_HUNG";
+        case 0x887A0007: return "DXGI_ERROR_DEVICE_RESET";
         case 0x887A0020: return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
         case 0x887A0001: return "DXGI_ERROR_INVALID_CALL";
         default: return "";
@@ -112,81 +117,54 @@ void Report(const char* what, HRESULT hr) {
     std::printf("  %-28s hr=0x%08X %s\n", what, static_cast<unsigned>(hr), HrName(hr));
 }
 
-}  // namespace
+struct Built {
+    ID3D12StateObject* so = nullptr;
+    ID3D12RootSignature* globalRs = nullptr;
+    ID3D12RootSignature* localRs = nullptr;
+    HRESULT hr = E_FAIL;
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::printf("usage: sotest <lib.dxil> [rs.bin] [warp|hw]\n");
-        return 2;
+    void Release() {
+        if (so) so->Release();
+        if (localRs) localRs->Release();
+        if (globalRs) globalRs->Release();
+        so = nullptr; localRs = nullptr; globalRs = nullptr;
     }
-    const char* libPath = argv[1];
-    const char* rsPath = nullptr;
-    bool warp = false;
-    for (int i = 2; i < argc; ++i) {
-        if (_stricmp(argv[i], "warp") == 0) warp = true;
-        else if (_stricmp(argv[i], "hw") == 0) warp = false;
-        else rsPath = argv[i];
-    }
+};
+
+// The same subobjects rq_pipeline.cpp assembles, from the dumped files.
+Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
+               const std::string& rsPath, bool quiet) {
+    Built out;
 
     std::vector<unsigned char> lib, rsBlob;
     if (!ReadFileBytes(libPath, &lib) || lib.empty()) {
-        std::printf("cannot read %s\n", libPath);
-        return 2;
+        if (!quiet) std::printf("cannot read %s\n", libPath.c_str());
+        return out;
     }
-    if (rsPath && !ReadFileBytes(rsPath, &rsBlob)) {
-        std::printf("cannot read %s\n", rsPath);
-        return 2;
-    }
-    std::printf("library %s, %zu bytes%s\n", libPath, lib.size(),
-                rsBlob.empty() ? ", NO root signature blob" : "");
+    ReadFileBytes(rsPath, &rsBlob);   // optional, but almost always needed
 
-    IDXGIFactory4* factory = nullptr;
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
-        std::printf("CreateDXGIFactory2 failed\n");
-        return 2;
-    }
-    IDXGIAdapter1* adapter = nullptr;
-    if (warp) factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
-    else factory->EnumAdapters1(0, &adapter);
-
-    ID3D12Device5* dev = nullptr;
-    HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));
-    if (FAILED(hr) || !dev) {
-        Report("D3D12CreateDevice", hr);
-        return 2;
-    }
-    {
-        DXGI_ADAPTER_DESC1 ad{};
-        if (adapter) adapter->GetDesc1(&ad);
-        std::wprintf(L"adapter %s\n", ad.Description);
-    }
-
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
-    dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
-    std::printf("raytracing tier %u\n",
-                static_cast<unsigned>(o5.RaytracingTier) / 10);
-
-    ID3D12RootSignature* globalRs = nullptr;
-    if (!rsBlob.empty()) {
-        hr = dev->CreateRootSignature(0, rsBlob.data(), rsBlob.size(),
-                                      IID_PPV_ARGS(&globalRs));
-        Report("CreateRootSignature", hr);
-        if (FAILED(hr)) return 1;
-    }
-
-    // --- the same subobjects rq_pipeline.cpp builds -------------------------
     const Shape shape = ReadShape(libPath);
     if (!shape.known) {
-        std::printf("no .shape.txt beside the library; it is written by the shim "
-                    "from 0.30.0 on and this cannot build the right state object "
-                    "without it\n");
-        return 2;
+        if (!quiet)
+            std::printf("no .shape.txt beside the library; it is written by the shim "
+                        "from 0.30.0 on and this cannot build the right state object "
+                        "without it\n");
+        return out;
     }
-    const bool hasAnyHit = shape.anyhit;
-    const bool hasIsect = shape.intersection;
-    const bool needsBoth = shape.both;
-    std::printf("shape: anyhit=%d intersection=%d both=%d recordconstants=%d\n",
-                hasAnyHit, hasIsect, needsBoth, shape.recordConstants);
+    if (!quiet) {
+        std::printf("library %s, %zu bytes%s\n", libPath.c_str(), lib.size(),
+                    rsBlob.empty() ? ", NO root signature blob" : "");
+        std::printf("shape: anyhit=%d intersection=%d both=%d recordconstants=%d\n",
+                    shape.anyhit, shape.intersection, shape.both,
+                    shape.recordConstants);
+    }
+
+    if (!rsBlob.empty()) {
+        out.hr = dev->CreateRootSignature(0, rsBlob.data(), rsBlob.size(),
+                                          IID_PPV_ARGS(&out.globalRs));
+        if (!quiet) Report("CreateRootSignature", out.hr);
+        if (FAILED(out.hr)) return out;
+    }
 
     D3D12_DXIL_LIBRARY_DESC libDesc{};
     libDesc.DXILLibrary.pShaderBytecode = lib.data();
@@ -195,15 +173,15 @@ int main(int argc, char** argv) {
     D3D12_HIT_GROUP_DESC hg{};
     hg.HitGroupExport = L"HitGroup";
     hg.ClosestHitShaderImport = L"ClosestHit";
-    if (needsBoth) {
+    if (shape.both) {
         hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
         hg.AnyHitShaderImport = L"AnyHit";
-    } else if (hasIsect && !hasAnyHit) {
+    } else if (shape.intersection) {
         hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
         hg.IntersectionShaderImport = L"Isect";
     } else {
         hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-        if (hasAnyHit) hg.AnyHitShaderImport = L"AnyHit";
+        if (shape.anyhit) hg.AnyHitShaderImport = L"AnyHit";
     }
 
     D3D12_HIT_GROUP_DESC hgProc{};
@@ -230,23 +208,20 @@ int main(int argc, char** argv) {
     pc.MaxTraceRecursionDepth = 1;
 
     D3D12_GLOBAL_ROOT_SIGNATURE grs{};
-    grs.pGlobalRootSignature = globalRs;
+    grs.pGlobalRootSignature = out.globalRs;
 
     D3D12_STATE_SUBOBJECT subs[11]{};
     UINT n = 0;
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
-    if (needsBoth) subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
+    if (shape.both) subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc };
-    if (globalRs)
+    if (out.globalRs)
         subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs };
 
-    // The local root signature carrying the geometry index, added exactly when
-    // the shim added it.
-    ID3D12RootSignature* localRs = nullptr;
     D3D12_LOCAL_ROOT_SIGNATURE lrs{};
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc{};
     const wchar_t* hitExports[4] = {};
@@ -271,22 +246,25 @@ int main(int argc, char** argv) {
         if (SUCCEEDED(rhr))
             rhr = dev->CreateRootSignature(0, blob->GetBufferPointer(),
                                            blob->GetBufferSize(),
-                                           IID_PPV_ARGS(&localRs));
+                                           IID_PPV_ARGS(&out.localRs));
         if (blob) blob->Release();
         if (err) err->Release();
-        if (SUCCEEDED(rhr) && localRs) {
-            lrs.pLocalRootSignature = localRs;
-            subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lrs };
-            hitExports[hitExportCount++] = L"HitGroup";
-            if (needsBoth) hitExports[hitExportCount++] = L"HitGroupProc";
-            hitExports[hitExportCount++] = L"HitGroupNullTri";
-            hitExports[hitExportCount++] = L"HitGroupNullProc";
-            assoc.NumExports = hitExportCount;
-            assoc.pExports = hitExports;
-            assoc.pSubobjectToAssociate = &subs[n - 1];
-            subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
-                          &assoc };
+        if (FAILED(rhr) || !out.localRs) {
+            if (!quiet) Report("local CreateRootSignature", rhr);
+            out.hr = rhr;
+            return out;
         }
+        lrs.pLocalRootSignature = out.localRs;
+        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lrs };
+        hitExports[hitExportCount++] = L"HitGroup";
+        if (shape.both) hitExports[hitExportCount++] = L"HitGroupProc";
+        hitExports[hitExportCount++] = L"HitGroupNullTri";
+        hitExports[hitExportCount++] = L"HitGroupNullProc";
+        assoc.NumExports = hitExportCount;
+        assoc.pExports = hitExports;
+        assoc.pSubobjectToAssociate = &subs[n - 1];
+        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
+                      &assoc };
     }
 
     D3D12_STATE_OBJECT_DESC sod{};
@@ -294,35 +272,123 @@ int main(int argc, char** argv) {
     sod.NumSubobjects = n;
     sod.pSubobjects = subs;
 
-    std::printf("calling CreateStateObject with %u subobjects...\n", n);
-    std::fflush(stdout);
+    if (!quiet) {
+        std::printf("calling CreateStateObject with %u subobjects...\n", n);
+        std::fflush(stdout);
+    }
+    out.hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&out.so));
+    if (!quiet) Report("CreateStateObject", out.hr);
 
-    ID3D12StateObject* so = nullptr;
-    hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&so));
-    Report("CreateStateObject", hr);
-
-    if (SUCCEEDED(hr)) {
+    if (SUCCEEDED(out.hr) && out.so) {
         // Getting an identifier forces the driver past mere acceptance, which
         // is where a lazy compile would actually happen.
         ID3D12StateObjectProperties* props = nullptr;
-        if (SUCCEEDED(so->QueryInterface(IID_PPV_ARGS(&props)))) {
+        if (SUCCEEDED(out.so->QueryInterface(IID_PPV_ARGS(&props)))) {
             const void* id = props->GetShaderIdentifier(L"RayGen");
-            std::printf("  %-28s %s\n", "GetShaderIdentifier(RayGen)",
-                        id ? "returned an identifier" : "returned NULL");
+            if (!quiet)
+                std::printf("  %-28s %s\n", "GetShaderIdentifier(RayGen)",
+                            id ? "returned an identifier" : "returned NULL");
             props->Release();
         }
-        so->Release();
+    }
+    return out;
+}
+
+// Every shader dumped from one run, created in sequence and kept ALIVE.
+int RunDir(ID3D12Device5* dev, const std::string& dir) {
+    std::vector<Built> held;
+    int failed = 0;
+    for (int i = 0; i < 64; ++i) {
+        char stem[64];
+        sprintf_s(stem, "lowered_%03d", i);
+        const std::string lib = dir + "\\" + stem + ".out.dxil";
+        FILE* probe = nullptr;
+        if (fopen_s(&probe, lib.c_str(), "rb") != 0 || !probe) continue;
+        fclose(probe);
+
+        std::printf("%s ... ", stem);
+        std::fflush(stdout);
+        Built b = BuildOne(dev, lib, dir + "\\" + stem + ".rs.bin", true);
+        if (SUCCEEDED(b.hr)) {
+            std::printf("ok\n");
+            held.push_back(b);
+        } else {
+            std::printf("hr=0x%08X %s\n", static_cast<unsigned>(b.hr), HrName(b.hr));
+            b.Release();
+            ++failed;
+        }
+        std::fflush(stdout);
+
+        const HRESULT rem = dev->GetDeviceRemovedReason();
+        if (rem != S_OK) {
+            std::printf("\n  DEVICE REMOVED after %s: 0x%08X %s\n", stem,
+                        static_cast<unsigned>(rem), HrName(rem));
+            return 1;
+        }
+    }
+    std::printf("\nheld %zu state objects at once, %d failed, device still alive\n",
+                held.size(), failed);
+    for (auto& b : held) b.Release();
+    return failed ? 1 : 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::printf("usage: sotest <lib.dxil> [rs.bin] [warp|hw]\n"
+                    "       sotest --dir <folder> [warp|hw]\n");
+        return 2;
     }
 
-    // Ask why, if the device went away. This is the answer the game's crash
-    // report gives, reached here in one second instead of a whole launch.
-    const HRESULT removed = dev->GetDeviceRemovedReason();
-    if (removed != S_OK) Report("GetDeviceRemovedReason", removed);
+    bool warp = false;
+    std::string dir, libPath, rsPath;
+    for (int i = 1; i < argc; ++i) {
+        if (_stricmp(argv[i], "warp") == 0) warp = true;
+        else if (_stricmp(argv[i], "hw") == 0) warp = false;
+        else if (_stricmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
+        else if (libPath.empty()) libPath = argv[i];
+        else rsPath = argv[i];
+    }
 
-    if (localRs) localRs->Release();
-    if (globalRs) globalRs->Release();
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        std::printf("CreateDXGIFactory2 failed\n");
+        return 2;
+    }
+    IDXGIAdapter1* adapter = nullptr;
+    if (warp) factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
+    else factory->EnumAdapters1(0, &adapter);
+
+    ID3D12Device5* dev = nullptr;
+    HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));
+    if (FAILED(hr) || !dev) {
+        Report("D3D12CreateDevice", hr);
+        return 2;
+    }
+    {
+        DXGI_ADAPTER_DESC1 ad{};
+        if (adapter) adapter->GetDesc1(&ad);
+        std::wprintf(L"adapter %s\n", ad.Description);
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
+    dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+    std::printf("raytracing tier %u\n\n",
+                static_cast<unsigned>(o5.RaytracingTier) / 10);
+
+    int rc;
+    if (!dir.empty()) {
+        rc = RunDir(dev, dir);
+    } else {
+        Built b = BuildOne(dev, libPath, rsPath, false);
+        const HRESULT removed = dev->GetDeviceRemovedReason();
+        if (removed != S_OK) Report("GetDeviceRemovedReason", removed);
+        rc = SUCCEEDED(b.hr) ? 0 : 1;
+        b.Release();
+    }
+
     dev->Release();
     if (adapter) adapter->Release();
     factory->Release();
-    return SUCCEEDED(hr) ? 0 : 1;
+    return rc;
 }

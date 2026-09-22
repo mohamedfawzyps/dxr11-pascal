@@ -321,6 +321,14 @@ private:
     // Dispatch calls for any pipeline state, ours included.
     Dxr11RayQueryPso* m_rqPso = nullptr;
 
+public:
+    // Set the stand-in on a freshly wrapped list, for the case where the
+    // application named it as CreateCommandList's initial state and never
+    // calls SetPipelineState afterwards.
+    static void AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq);
+
+private:
+
     ID3D12GraphicsCommandList6* m_real6;
     ID3D12GraphicsCommandList7* m_real7;
     ID3D12GraphicsCommandList8* m_real8;

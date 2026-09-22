@@ -377,8 +377,19 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
 // outside D3D12 holds a command list; the one leak point,
 // ExecuteCommandLists, is covered by the queue vtable hook.
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* pCommandAllocator, ID3D12PipelineState* pInitialState, REFIID riid, void** ppCommandList) {
-    HRESULT hr = m_real->CreateCommandList(nodeMask, type, pCommandAllocator, pInitialState, riid, ppCommandList);
-    if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) WrapList(riid, ppCommandList);
+    // pInitialState is a PIPELINE STATE and may be one of our stand-ins, which
+    // is not a real D3D12 object. Handing it to the real device means the
+    // driver dereferences something it did not make. See Dxr11CommandList::Reset.
+    Dxr11RayQueryPso* rq = Dxr11RayQueryPso::From(pInitialState);
+    HRESULT hr = m_real->CreateCommandList(nodeMask, type, pCommandAllocator,
+                                           rq ? nullptr : pInitialState,
+                                           riid, ppCommandList);
+    if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) {
+        WrapList(riid, ppCommandList);
+        // Carry the stand-in onto the wrapper, so a list created with one and
+        // dispatched without a further SetPipelineState still works.
+        if (rq) Dxr11CommandList::AdoptRayQueryPso(*ppCommandList, rq);
+    }
     return hr;
 }
 // The tier flip, OPT-IN. Reporting Tier 1.1 entitles an application to emit

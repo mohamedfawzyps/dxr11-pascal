@@ -1011,6 +1011,16 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     ComPtr<ID3D12Resource> decoy;
     if (g_table) heap = MakeTableHeap(g.device.Get(), out, decoy);
 
+    // Reset the list WITH the pipeline state, not with null.
+    //
+    // This is how Unreal reuses a command list and it is not what this harness
+    // used to do, so the shim's stand-in PSO reached the real driver through
+    // Reset, through ClearState and through CreateCommandList while every test
+    // here passed. A GPU crash in a real game, and nothing here could see it.
+    // SetPipelineState is still called after, exactly as an engine would.
+    HR(g.list->Close(), "cmdlist Close before PSO reset");
+    HR(g.list->Reset(g.alloc.Get(), pso.Get()), "cmdlist Reset with the PSO");
+
     g.list->SetPipelineState(pso.Get());
     if (g_table) {
         ID3D12DescriptorHeap* heaps[] = { heap.Get() };

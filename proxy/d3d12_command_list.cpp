@@ -227,9 +227,32 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i)
         m_bindings.roots[i] = Dxr11RootParam{};
     m_allocator = a;
+    // Reset takes an INITIAL PIPELINE STATE, and our stand-in is not a real
+    // pipeline state. SetPipelineState has always trapped it; this did not,
+    // and neither did ClearState or CreateCommandList, so the driver was being
+    // handed an object that is not a D3D12 object at all.
+    //
+    // Unreal resets command lists with a PSO as a matter of course, which is
+    // the ordinary way to reuse one, so this was reached on a real engine
+    // immediately and never on anything in this project's own tests.
+    if (auto* rq = Dxr11RayQueryPso::From(p)) {
+        m_rqPso = rq;
+        return FWD(Reset(a, nullptr));
+    }
+    m_rqPso = nullptr;
     return FWD(Reset(a, p));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) { WorkBarrier(); FWD(ClearState(p)); }
+void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) {
+    WorkBarrier();
+    // Same reason as Reset above.
+    if (auto* rq = Dxr11RayQueryPso::From(p)) {
+        m_rqPso = rq;
+        FWD(ClearState(nullptr));
+        return;
+    }
+    m_rqPso = nullptr;
+    FWD(ClearState(p));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawIndexedInstanced(UINT a, UINT b, UINT c, INT d, UINT e) { WorkBarrier(); FWD(DrawIndexedInstanced(a, b, c, d, e)); }
 void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
@@ -922,4 +945,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetProgram(const D3D12_SET_PROGRAM_DESC
 void STDMETHODCALLTYPE Dxr11CommandList::DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC* pDesc) {
     WorkBarrier();
     if (m_real10) m_real10->DispatchGraph(pDesc);
+}
+
+// See the declaration. The pointer handed back by WrapList is our wrapper, so
+// this is a static rather than a friend reaching into another object.
+void Dxr11CommandList::AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq) {
+    if (!wrappedList || !rq) return;
+    static_cast<Dxr11CommandList*>(
+        static_cast<ID3D12GraphicsCommandList*>(wrappedList))->m_rqPso = rq;
 }

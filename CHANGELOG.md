@@ -17,6 +17,64 @@ build.
 
 ---
 
+## 0.31.0 (2026-09-22)
+
+### The stand-in PSO was reaching the driver through three other doors
+
+`Dxr11RayQueryPso` is an `ID3D12PipelineState` the application holds and never
+inspects. It is not a real D3D12 object, and the driver must never see it.
+`SetPipelineState` has always trapped it. **Three other calls take a pipeline
+state and none of them did:**
+
+    Dxr11CommandList::Reset(allocator, pInitialState)
+    Dxr11CommandList::ClearState(pPipelineState)
+    Dxr11Device::CreateCommandList(..., pInitialState, ...)
+
+All three forwarded the pointer straight through, so the driver was handed an
+object it did not make and asked to treat it as a pipeline state.
+
+**Resetting a command list with a PSO is the ordinary way to reuse one**, and
+it is what Unreal does. This project's harness has always reset with `nullptr`,
+which is why every test passed while a real engine hit it on the first frame.
+
+All three now recognise the stand-in, pass `nullptr` to the real call, and
+remember it, so a list created or reset with one still dispatches correctly.
+
+### The harness now resets the way an engine does
+
+`raytest` closes and re-resets its list WITH the pipeline state before
+dispatching. Put the bug back and the first case fails with
+`cmdlist Close (hr=0x80070057)`: the runtime rejecting a list reset with an
+object that is not a pipeline state. Without that change the suite passes
+either way, which is exactly what it did through five versions of chasing this.
+
+### What this does NOT claim
+
+It is not established that this was the GPU crash. What is established:
+
+- **The generated libraries are fine.** All seven dumped from a crashing run
+  build on the 1070 individually, and all seven build and are held at once in
+  one process, with the device still alive afterwards. `sotest --dir` does it
+  in about a second.
+- **They are fine on WARP too**, so they are valid DXR 1.0 rather than merely
+  tolerated.
+- So the driver dying is not "this library cannot be compiled", which is where
+  0.30.0 left it.
+
+Handing the driver a bogus pipeline state is a real defect with a real
+mechanism for `DXGI_ERROR_DRIVER_INTERNAL_ERROR`, found by looking at what else
+the shim gives the driver rather than at the shaders. Whether it is THE cause
+is a question for the next run.
+
+### A measurement that was not clean
+
+The first `sotest` results were taken with a stale 0.16.0 proxy sitting in
+`phase5out`, so the probe ran against a wrapped device claiming Tier 1.1
+instead of the real driver. The numbers did not change when it was moved aside,
+but they were not evidence until they were taken again without it.
+
+---
+
 ## 0.30.0 (2026-09-22)
 
 ### rqdispatch answered nothing, and the reason IS the answer
