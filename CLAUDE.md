@@ -1197,6 +1197,39 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   driver cannot survive what Unreal asks of it, no amount of correct RayQuery
   lowering will help, and that is a different project from this one.
 
+- **READING THE ENGINE SOURCE, AFTER A DAY OF GUESSING.** `C:\DW\UnrealEngine`
+  is a full UE source tree and it sat there through eight versions of chasing
+  the GPU crash by inspection. Two things came straight out of it:
+  - **`-gpucrashdebugging` turns DRED on.**
+    `UE::RHI::ShouldEnableGPUCrashFeature` in `RHI/Private/RHI.cpp` makes that
+    one switch force every GPU crash feature on, over any cvar. **Every crash
+    report collected so far says `RHI.DRED false` and
+    `RHI.DREDHasBreadcrumbData false`**, which is why eight runs produced "the
+    GPU died" and not one of them said what it was doing. The engine has had
+    the answer available the whole time.
+  - **Compute PSOs are created on WORKER THREADS.**
+    `FD3D12PipelineState::CreateAsync` starts an
+    `FAsyncTask<FD3D12PipelineStateWorker>`, so `TryCreate` runs concurrently
+    on several threads. Checked in consequence: the DXC host creates its
+    `IDxcUtils`, `IDxcCompiler`, `IDxcAssembler` and `IDxcValidator` per call
+    rather than sharing them, and its one-time load is behind a
+    `std::once_flag`, so that path is sound. The carrier registry has its own
+    mutex.
+
+  **What the offline probe has ruled out**, so none of it is worth re-testing:
+  every generated library builds on the 1070 individually, all seven build and
+  are held at once, and **210 held at once leaves the device alive**. It is not
+  one bad library, not cumulative creation, not a resource limit.
+
+  **What the bisect established**: `rqstub = 1` runs the game with ray tracing
+  enabled and Unreal's own DXR work intact, so the cause is on this side.
+  `nowrap = 1` runs it too but proves less, because Unreal switches ray tracing
+  off entirely at Tier 1.0.
+
+  **The lesson, and it is the same one as the entry-block phi and the stream
+  form**: the answer was in something already on this machine, and it went
+  unread because guessing felt faster. Eight versions, four real defects, none
+  of them the cause.
 - **THE 33 "CONCURRENT" QUERIES ARE SEQUENTIAL. The refusal is false.**
   Confirmed from `refused_002.dxil`, NiagaraCollisionRayTraceCS:
 
