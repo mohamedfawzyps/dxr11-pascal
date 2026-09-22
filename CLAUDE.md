@@ -1237,16 +1237,55 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       nowrap = 1        translate nothing, device unwrapped      RUNS
       rqstub = 1        real do-nothing PSO, nothing lowered     RUNS
       rqphase = 1       + rewrite the DXIL, throw it away        RUNS
-      rqphase = 2       + shader dump + CreateStateObject        CRASHES
+      rqphase = 2       + CreateStateObject                      CRASHES x2
+      rqphase = 2, rqlimit = 1   only the FIRST shader lowered   RUNS, see below
       (unset)           + shader table + dispatch                CRASHES
 
-  So the cause is one of exactly two things, and the next run separates them by
-  turning the dump off at `rqphase = 2`.
+  **THE `rqlimit = 1` ROW PROVES NOTHING YET, AND THE SHIM IS WHY.** Under any
+  phase, 0.36.0 gave a REFUSED shader a do-nothing pipeline by returning BEFORE
+  the log line and before `shdump::Refused`. So both outcomes were silent and
+  the run could not say whether its one allowed shader lowered and built a
+  state object or was simply refused. The dump never initialised either, which
+  is the tell: `shdump::Lowered` runs before `CreateStateObject` and would have
+  logged, so the shader was probably refused and **no state object was ever
+  built**. Probably is not good enough, so 0.36.1 logs and dumps every outcome
+  under a phase and the run is being repeated.
 
-  **`shdump::Lowered()` was called in precisely the runs that crashed and in
-  none that ran.** A perfect correlation across four configurations, which
-  would mean the diagnostic added to investigate this was causing it. The code
-  is memory-safe on inspection, so treat that as a lead and not a conclusion.
+  **Same mistake as the last two, in a new place.** 0.36.0 made the phases
+  comparable and in doing so removed the instrument that made them readable.
+  The brief already says: when you change what the product DOES, re-ask what
+  each test is still measuring.
+
+  **THE SHADER DUMP HAS NOTHING TO DO WITH IT, AND THE "PERFECT CORRELATION"
+  WAS AN ARTEFACT OF NOT READING THE LOG.** `shader dumping is ON` appears
+  ZERO times across every run in the log. Dumping was never enabled in any of
+  them, so `shdump::Lowered` took a mutex, saw an empty directory and returned,
+  in the runs that crashed and the runs that did not, alike. It wrote nothing
+  and it is not a variable. The row above used to read "+ shader dump +
+  CreateStateObject" and that description was simply false.
+
+  **So the variable between phase 1 and phase 2 is `CreateStateObject` on a
+  generated library, in the game's process, and nothing else.** Two runs at
+  `rqphase = 2` (pids 5396 and 1880) died with no end marker. Three runs at
+  `rqstub = 1` and one at `rqphase = 1` ended cleanly. The rewrite is
+  innocent, the shader table and the dispatch are never reached, and the call
+  that does it is the one call this project had already ruled out offline.
+
+  **That is the contradiction to work on, and it is now sharp.** The same
+  libraries build on the 1070 one at a time, 210 in sequence, 168 across eight
+  threads, on the game's own `D3D12Core.dll`, and on WARP, with the device
+  alive afterwards. In Escher's process the first ones kill it. So the defect
+  is not in the library and not in the call, it is in the CONTEXT: what else
+  this device has been asked to do by the time the call is made. An offline
+  probe cannot reach that by construction, which is why the next instrument is
+  a Development build with `WITH_RHI_BREADCRUMBS` rather than another replay.
+
+  **Method note, third time in this investigation and the most expensive.**
+  The conclusion "the dump is the cause" was written into this brief and then
+  withdrawn within the hour, because a run was assumed to have used the
+  configuration it was asked to use. The shim logs its own configuration on
+  every run, in one line, precisely so that never has to be assumed. **Read
+  the log line that names the configuration before interpreting the run.**
 
   **What is ruled out, by measurement, and is not worth testing again:**
   - the generated libraries: each builds on the 1070, all seven at once, 210 in
@@ -1328,11 +1367,30 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   Pascal with `RuntimeDependent` it should already decline. Which means these
   24 are probably something else, and guessing which is how the last day went.
 
-  **The control before anything is concluded**: the same run with `rqstub = 1`,
-  which SURVIVES, and the debug layer still on. If the 24 errors appear there
-  too then they are not the cause, because that configuration lives through
-  them. If they do not appear, then what this shim lowers is what leads Unreal
-  into shaders Pascal cannot create.
+  **THE CONTROL RAN, AND THE 24 ERRORS ARE NOT THE CAUSE.** Same game, same
+  forced debug layer, `rqstub = 1`: all 24 `CreateComputeShader` errors appear,
+  one after another, and the run CARRIES ON. No `Removing Device` anywhere.
+  After them it builds 8 bottom-level structures, reads a top-level one,
+  emulates two AddToStateObject calls and exits through the shim's own end
+  marker. A configuration that lives through those errors cannot be killed by
+  them.
+
+  So D3D12 rejecting those 24 shaders is something Unreal does on this card
+  whatever the shim is doing, and the device removal in the full run has a
+  different cause. That is the third theory retired by a control rather than by
+  argument, and the control cost one run.
+
+  **What `rqstub` looks like on screen, and it is the diagnostic working.** The
+  frontend renders at wild brightness with the hue shifted, slow and stuttery.
+  Expected: every RayQuery shader is a do-nothing PSO, so Lumen and MegaLights
+  read whatever was in their targets, and the forced debug layer costs the rest.
+  It does say one useful thing, that Unreal genuinely CONSUMES those outputs
+  rather than having a fallback, so a correct lowering has somewhere to show.
+
+  Toggling ray tracing and MegaLights in the menu ended that run. Under
+  `rqstub`, where nothing is lowered, so it is not the translation. Noted and
+  not chased: the toggle tears down and rebuilds the whole ray tracing
+  pipeline, and the STARTUP crash is the one being bisected.
 
   **The tool worked because it is in the runtime.** A Shipping build strips
   Unreal's own instrumentation, which is why DRED had nothing; `dxcpl` forces a
@@ -1405,6 +1463,16 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   subobjects.** The DXR 1.0 path works at engine scale, not just on this
   project's own harness. What stopped it there was the stream-form PSO gap
   below, not anything in the lowering.
+
+  **The AS tracking has now read a real scene, and the numbers are the first
+  hard requirement a game has placed on the shader table.** The `rqstub` run
+  resolved the instance buffer out of 306 tracked buffers and reported **6
+  instances, max `InstanceContributionToHitGroupIndex` 26, triangles only, 0
+  instances pointing at an unseen bottom-level structure**, so a lowered
+  dispatch on that scene needs **27 hit group records** rather than one. The
+  growth path exists and is tested; this is the first measurement of how far it
+  has to grow in something nobody wrote for this project. The upload-heap read
+  path served it, so nothing waited.
 
 - **Two defects found by pointing it at real engine shaders, NOT yet fixed.**
   Investigating Falcor and RTXPT as targets turned these up in an hour, and

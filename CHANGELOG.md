@@ -17,6 +17,41 @@ build.
 
 ---
 
+## 0.36.1 (2026-09-22)
+
+### A phase made every outcome silent, and it cost a run
+
+0.36.0 gave a REFUSED shader a do-nothing pipeline so the phases would be
+comparable. It did that by returning before the log line and before
+`shdump::Refused`, so under any `rqphase` the log said nothing per shader at
+all. A run with `rqlimit = 1` then could not answer the only question it was
+asked: did that one shader lower and build a state object, or was it refused.
+The crash/no-crash bit is worthless without it.
+
+Every outcome under a phase is now counted and logged, and a refusal is dumped
+as it would be normally:
+
+    rqphase: RayQuery shader N lowered, state object BUILT
+    rqphase: RayQuery shader N REFUSED, do-nothing pipeline substituted: <why>
+
+**The rule this breaks is one the brief already states.** When you change what
+the product does, re-ask what each test is still measuring. Making the phases
+comparable quietly removed the instrument that made them readable.
+
+### The pipeline library wrapper was guarded the wrong way round
+
+`CreatePipelineLibrary` wrapped only when `m_tier11`, which is true when the
+REAL hardware already reports Tier 1.1. On such hardware this shim never
+produces a stand-in pipeline, so there is nothing to decline; on Pascal, where
+stand-ins exist, the library was never wrapped. The whole of
+`d3d12_pipeline_library.cpp` was dead code on the only cards it was written
+for. Every other guard in that file reads `!m_tier11`.
+
+Found by reading the call site while chasing something else, not by a test,
+because no test covers a PSO cache.
+
+---
+
 ## 0.36.0 (2026-09-22)
 
 ### rqphase = 1 did not exonerate anything, and the experiment was at fault

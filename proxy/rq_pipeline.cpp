@@ -171,6 +171,15 @@ static int RayQueryPhase() {
 }
 int Dxr11RayQueryPhase() { return RayQueryPhase(); }
 
+void Dxr11RayQueryPhaseNote(const char* what, const char* detail) {
+    if (RayQueryPhase() < 0) return;
+    static LONG s_n = 0;
+    const LONG i = InterlockedIncrement(&s_n);
+    ProxyLog("[dxr-tier-11-proxy-log] rqphase: RayQuery shader %ld %s%s%s\n",
+             static_cast<long>(i), what,
+             (detail && *detail) ? ": " : "", (detail && *detail) ? detail : "");
+}
+
 ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
         std::string* why) {
@@ -228,7 +237,10 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         return nullptr;
     }
 
-    if (RayQueryPhase() == 1) return MakeCarrier(dev, desc, nullptr, false, why);
+    if (RayQueryPhase() == 1) {
+        Dxr11RayQueryPhaseNote("rewritten, nothing built", nullptr);
+        return MakeCarrier(dev, desc, nullptr, false, why);
+    }
 
     // Before CreateStateObject, deliberately. A library that lowers cleanly
     // and then kills the driver is exactly the case worth having on disk, and
@@ -432,7 +444,10 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     if (idHitProc) std::memcpy(self->m_idHitProc, idHitProc, kIdSize);
     props->Release();
 
-    if (RayQueryPhase() == 2) return MakeCarrier(dev, desc, self, false, why);
+    if (RayQueryPhase() == 2) {
+        Dxr11RayQueryPhaseNote("lowered, state object BUILT", nullptr);
+        return MakeCarrier(dev, desc, self, false, why);
+    }
 
     // One record of the real hit group to begin with. The acceleration
     // structures have usually not been built yet at pipeline creation, so what
@@ -444,7 +459,10 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         return nullptr;
     }
 
-    if (RayQueryPhase() == 3) return MakeCarrier(dev, desc, self, false, why);
+    if (RayQueryPhase() == 3) {
+        Dxr11RayQueryPhaseNote("lowered, state object and shader table BUILT", nullptr);
+        return MakeCarrier(dev, desc, self, false, why);
+    }
 
     static LONG onceVer = 0;
     if (InterlockedCompareExchange(&onceVer, 1, 0) == 0)

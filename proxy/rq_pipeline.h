@@ -42,6 +42,14 @@ extern const GUID IID_Dxr11RayQueryPso;
 // -1 when unset.
 int Dxr11RayQueryPhase();
 
+// Say what happened to one shader, but only while a phase is set.
+//
+// A phase substitutes a do-nothing pipeline for BOTH outcomes, so the log went
+// silent per shader and a whole run became uninterpretable: it could not say
+// whether the single RayQuery shader in it had lowered and built a state
+// object, or been refused. The crash/no-crash bit is worthless without that.
+void Dxr11RayQueryPhaseNote(const char* what, const char* detail);
+
 class Dxr11RayQueryPso : public ID3D12PipelineState {
 public:
     // Build everything a lowered RayQuery compute shader needs to run, or

@@ -410,6 +410,13 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
         // RayQuery shader into a fatal error, so a run ends early for a reason
         // that has nothing to do with the crash being bisected.
         if (Dxr11RayQueryPhase() >= 0) {
+            // Say so, and keep the shader. Substituting silently made a whole
+            // run uninterpretable: the log could not distinguish a shader that
+            // lowered and built a state object from one that was refused.
+            Dxr11RayQueryPhaseNote("REFUSED, do-nothing pipeline substituted",
+                                   why.c_str());
+            shdump::Refused(pDesc->CS.pShaderBytecode,
+                            (size_t)pDesc->CS.BytecodeLength, why.c_str());
             D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *pDesc;
             sd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
             sd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
@@ -617,7 +624,12 @@ LUID STDMETHODCALLTYPE Dxr11Device::GetAdapterLuid() { FWD(GetAdapterLuid()); }
 // d3d12_pipeline_library.h for why that call is the dangerous one.
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineLibrary(const void* pLibraryBlob, SIZE_T BlobLength, REFIID riid, void** ppPipelineLibrary) {
     const HRESULT hr = m_real->CreatePipelineLibrary(pLibraryBlob, BlobLength, riid, ppPipelineLibrary);
-    if (m_tier11 && SUCCEEDED(hr) && ppPipelineLibrary)
+    // !m_tier11, not m_tier11. This read the wrong way round and so wrapped
+    // the library only on hardware that already has Tier 1.1, where this shim
+    // never produces a stand-in in the first place. On the cards the project
+    // targets it never wrapped anything, which made the whole file dead code.
+    // Every other guard here is !m_tier11 for the same reason.
+    if (!m_tier11 && SUCCEEDED(hr) && ppPipelineLibrary)
         Dxr11WrapPipelineLibrary(riid, ppPipelineLibrary);
     return hr;
 }
@@ -672,6 +684,12 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_
         // RayQuery shader into a fatal error, so a run ends early for a reason
         // that has nothing to do with the crash being bisected.
         if (Dxr11RayQueryPhase() >= 0) {
+            // See the struct form above: a silent substitution makes the whole
+            // bisect unreadable.
+            Dxr11RayQueryPhaseNote("REFUSED, do-nothing pipeline substituted",
+                                   why.c_str());
+            shdump::Refused(ps.cs.pShaderBytecode,
+                            (size_t)ps.cs.BytecodeLength, why.c_str());
             D3D12_COMPUTE_PIPELINE_STATE_DESC sd = cd;
             sd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
             sd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
