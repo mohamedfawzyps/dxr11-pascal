@@ -1268,6 +1268,41 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - Standing aside is still the right behaviour. The failure was in reading
     the result, not in the shim.
 
+- **THE DRIVER CRASH REPRODUCES OFFLINE. ONE SECOND, NO GAME.**
+  `phase5/cases/driver-crash/` holds it. `crash.out.dxil` is a library this
+  project generated from `VolumeHardwareRayTraceLightSamplesCS`, a real UE
+  5.8.2 compute shader. Built with its own root signature on the 1070, on a
+  fresh device, in a process that does nothing else:
+
+      phase5out\sotest.exe crash.out.dxil crash.rs.bin hw
+      calling CreateStateObject with 9 subobjects...
+      Segmentation fault
+
+  The driver access-violates INSIDE `CreateStateObject`. No Unreal, no other
+  state objects, no memory pressure, no concurrency, 28036 bytes of library.
+  This is what eleven versions of bisecting could not reach.
+
+  **AND IT EXPLAINS WHY EVERY EARLIER OFFLINE REPLAY SUCCEEDED.** This brief
+  built a whole conclusion on those: "every input is exonerated and the
+  process is the whole difference", with four controls behind it, the suspect
+  alone, sixty copies, 261 other state objects first, eight threads. Every one
+  of them replayed the SAME SHADER, `RayTracingDebugMainCS`, because it was
+  the only one the bisect had isolated. **The offline control was a sample of
+  one, and that shader happens to be survivable on a quiet device.** The
+  moment 0.36.7 let more shaders lower, a different one reproduced instantly.
+  The conclusion is withdrawn: the fault is in something the LIBRARY contains,
+  and the process context was never the variable.
+
+  The method error is the familiar one in a new place. Four controls agreeing
+  felt like four measurements and was one measurement repeated, because the
+  input never varied. **A control has to vary the thing it is controlling
+  for.**
+
+  **What it buys is ITERATION.** Cutting the library down and asking which
+  construct the driver cannot compile is now a one second experiment instead
+  of a game launch. That is the whole difference between this being tractable
+  and not.
+
 - **THE BIGGEST REFUSAL IN A REAL GAME IS TWO SMALL THINGS, MEASURED FROM THE
   DUMP RATHER THAN GUESSED.** 64 refused shaders were on disk from one Escher
   run. Every one of the 58 "Proceed loop body reads values defined outside it"
