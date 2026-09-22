@@ -92,4 +92,4 @@ Get-ChildItem $stage | ForEach-Object {
 }
 Write-Host ''
 Write-Host "Version $version, from proxy\version.h."
-Write-Host 'Check it matches the tag you are releasing.'
+Write-Host 'Tagged , so the zip, the header and the tag agree.'
