@@ -1162,6 +1162,41 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - The device id spoof is confirmed working from the engine's side:
     `RHI.DeviceId 1F08`.
 
+- **THE GPU CRASH IS STILL UNEXPLAINED AFTER FIVE VERSIONS, AND THE CONTROL WAS
+  NEVER RUN.** 0.26.0 through 0.31.0 each fixed a real defect found while
+  chasing it, and none of them was the cause. What IS established, by
+  measurement rather than argument:
+  - **The generated libraries are fine.** All seven dumped from a crashing run
+    build on the 1070 one at a time, and all seven build and are HELD at once
+    in one process with the device alive afterwards. All seven build on WARP
+    too, so they are valid DXR 1.0 rather than merely tolerated.
+    `phase5out\sotest.exe --dir <folder> hw` does it in about a second.
+  - **No lowered dispatch has ever executed.** The `rqdispatch` line never
+    appeared in the log, and that setting is read inside the dispatch path.
+  - **No acceleration structure build was ever intercepted**, and no
+    `ExecuteIndirect` on the DISPATCH_RAYS stand-in. So the AS tracking and the
+    indirect split, the two most complex things here, never ran either.
+  - `SecondsSinceStart = 0`: it dies during startup, before anything renders.
+  - The failure is `CrashType GPUCrash`, `D3DDeviceRemovedReason 0x887A0020`,
+    `DXGI_ERROR_DRIVER_INTERNAL_ERROR`. Not a hang, not a page fault.
+
+  **The mistake in method, worth more than any of the fixes**: every experiment
+  so far varied something INSIDE the translation and asked whether the crash
+  moved. None asked whether the translation is involved at all. `nowrap = 1`
+  is documented in this brief as precisely that diagnostic, "if the symptom
+  survives nowrap = 1, the translation is not the cause", and it went unrun for
+  five versions while four bugs were found and fixed around it.
+
+  `rqlimit = 0` looked like that control and was not: Unreal turns the first
+  forwarded shader into a fatal error, so the run ended long before the point
+  where the driver had been dying.
+
+  **The live hypothesis it tests.** The dxgi spoof stops Unreal refusing Pascal
+  by device id, so Unreal enables ray tracing and drives DXR 1.0 paths on a GTX
+  1070. Epic disabled that for a reason nobody here has established. If the
+  driver cannot survive what Unreal asks of it, no amount of correct RayQuery
+  lowering will help, and that is a different project from this one.
+
 - **THE 33 "CONCURRENT" QUERIES ARE SEQUENTIAL. The refusal is false.**
   Confirmed from `refused_002.dxil`, NiagaraCollisionRayTraceCS:
 
