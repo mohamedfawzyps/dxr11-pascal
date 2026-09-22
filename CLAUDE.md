@@ -1363,8 +1363,35 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       Segmentation fault
 
   The driver access-violates INSIDE `CreateStateObject`. No Unreal, no other
-  state objects, no memory pressure, no concurrency, 28036 bytes of library.
-  This is what eleven versions of bisecting could not reach.
+  state objects, no memory pressure, no concurrency. This is what eleven
+  versions of bisecting could not reach.
+
+  **IT IS INTERMITTENT AND IT WEARS OFF, WHICH IS THE MOST IMPORTANT PROPERTY
+  IT HAS.** The first version of this entry named `lowered_008` and said it
+  crashed reliably. It does not. Measured across nineteen generated libraries
+  from one run, each built alone in its own process:
+
+      first time each was ever compiled    5 of 19 crashed
+      sweep again                          1 of 19, the same one
+      sweep again                          1 of 19
+      sweep again                          none
+      sweep again                          none
+
+  The library that crashed twice then ran ten times without complaint. **So one
+  clean run proves nothing, and a bisect that trusts one is worthless.** Take
+  the result over several fresh sweeps. The vendored case is now
+  `HardwareRayTraceLightSamplesCS`, which survived longest, and the README says
+  this in its first paragraph.
+
+  INFERRED, not established: the driver's shader disk cache. The crash looks
+  like it happens while the driver actually COMPILES the library, on a cache
+  miss, and stops once an entry exists. The test is to clear NVIDIA's DXCache
+  under %LOCALAPPDATA% and sweep again, which has not been run.
+  **Against that inference**: the game crashed on the same shader across many
+  separate runs, and a warm disk cache should have prevented that. The story is
+  not complete.
+
+  It is also not size. 53852 bytes builds fine and 16764 crashed.
 
   **AND IT EXPLAINS WHY EVERY EARLIER OFFLINE REPLAY SUCCEEDED.** This brief
   built a whole conclusion on those: "every input is exonerated and the
