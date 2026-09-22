@@ -53,3 +53,6 @@ phase5/cases/reference/*.ll
 phase5/cases/reference/*.dxil
 
 phase5/outcpp/
+
+# Release staging, built by tools/make-release.ps1
+release/
