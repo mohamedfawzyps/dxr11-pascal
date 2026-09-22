@@ -1417,6 +1417,42 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   family that is the largest refusal source overall. Whatever is special about
   these shaders is worth finding once.
 
+  **WHAT THE CRASHING FAMILY CONTAINS THAT THE SAFE ONES DO NOT.** The
+  generated libraries were disassembled and their dx.op use compared. Four
+  things separate the MegaLights family from every library that has never
+  crashed, including the two Lumen reflection ones that are nearly twice the
+  size:
+
+      op                    Lumen 000/001   MegaLights 008..016   LumenDL 018
+      Sin                        0                6                   0
+      Cos                        0                6                   0
+      LegacyF16ToF32             0                5 to 6              0
+      LegacyF32ToF16             0                1 to 2              0
+      Sqrt                       4 to 6          26 to 28             3
+      Rsqrt                      5 to 6          28 to 30             2
+
+  Sin, Cos and the half-float conversions are ABSENT from everything that has
+  never crashed and present in everything that has. Sqrt and Rsqrt are five
+  times denser. Going the other way, `Dot4` and `WorldToObject` appear only in
+  the safe Lumen pair, so this is not simply "more of everything".
+
+  Note `LegacyF32ToF16` is the packing conversion, NOT a native 16-bit op, so
+  it is not the thing the debug layer complains about in Unreal's own compute
+  shaders. Pascal supports it. It is a correlation, not an accusation.
+
+  CAVEAT, and it is the reason this is a lead and not a finding: 016 carries
+  the same signature and survived the cold sweep, having crashed in an earlier
+  one. With a failure that is probabilistic per compile, family-level
+  correlation is exactly what a per-compile race would look like too, so this
+  does not yet distinguish "the driver cannot compile this construct" from
+  "these libraries take a path where the race is reachable".
+
+  **The bisect that settles it is now cheap, and one thing makes it cheaper
+  than it looks: ANY EDIT IS AUTOMATICALLY A CACHE MISS.** Changing the
+  library changes its bytes and therefore its cache key, so a variant gets a
+  cold compile without clearing anything. What still needs the cache cleared
+  is re-testing the SAME variant, because a compile that survives is cached.
+
   **There is now a repeatable experiment**, which there was not this morning:
   clear DXCache, sweep, count. That is the procedure any bisect of the library
   has to use, because a single clean run means nothing.
