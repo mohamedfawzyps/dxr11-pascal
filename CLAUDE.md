@@ -1230,6 +1230,41 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   form**: the answer was in something already on this machine, and it went
   unread because guessing felt faster. Eight versions, four real defects, none
   of them the cause.
+- **ESCHER'S RAY TRACING WORKS ON PASCAL THROUGH PLAIN DXR 1.0, AND THAT WAS
+  FOUND BY ACCIDENT.** A run where `d3d12.dll` STOOD ASIDE, because
+  `dxcompiler.dll` had gone missing from the game folder, left only the dxgi
+  device id spoof in play. Unreal therefore saw a Turing id and the REAL Tier
+  1.0, enabled ray tracing, drove its own DXR 1.0 paths, and the game rendered
+  with **correct colours and lighting** and exited cleanly.
+  - So Epic's `IsRayTracingEmulated` refusal really is the only thing standing
+    between this card and a working ray-traced frame in this game, exactly as
+    the device id work assumed, and the driver survives everything Unreal's
+    DXR 1.0 path asks of it for a whole run.
+  - It also settles what the brightness and hue shift always were: the
+    do-nothing substitution, as designed, and nothing else. Every earlier run
+    that looked broken was broken on purpose.
+  - And it narrows the remaining problem to RayQuery alone.
+
+- **A RUN THAT LOOKED LIKE A TRIUMPH WAS THE SHIM DOING NOTHING, IN THE
+  FIELD.** The same run as above. The picture was right for the first time all
+  day, and the log's fourth line said:
+
+      DXC: NOT AVAILABLE, dxcompiler.dll is not next to the shim
+      standing aside entirely ... the application gets the real device untouched
+
+  This brief ALREADY warns about exactly this, for `run_proxy_test.ps1`: "the
+  Microsoft sample folders contain no DXC, so the shim stood aside there and
+  the comparison became the unmodified path against itself. It would have
+  passed forever while proving nothing." The warning was written for a test
+  script and the same thing then happened to a real run, where the reward for
+  believing it would have been declaring the RayQuery translation fixed.
+  - **Read the DXC line before interpreting any run**, alongside the rule
+    about reading the configuration line. Both are one line and both decide
+    whether the run means anything.
+  - What removed the two DLLs is NOT known. Saying so beats inventing a cause.
+  - Standing aside is still the right behaviour. The failure was in reading
+    the result, not in the shim.
+
 - **THE GPU CRASH BISECT, as far as it has got.** Each row is a real run of a
   shipping UE 5.8.2 game on the GTX 1070. `rqstub` and `rqphase` are in
   proxy/rq_pipeline.cpp and the example ini.
