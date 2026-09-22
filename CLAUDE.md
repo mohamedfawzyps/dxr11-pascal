@@ -1305,13 +1305,52 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   implementation-defined for RayQuery traversal anyway and therefore already
   not guaranteed for a counter-append buffer.
 
-  So the refusal can probably be narrowed to: refuse when the query uses
-  `Abort()`, or when the store is not append-style, meaning not indexed by the
-  counter result. TO VERIFY BEFORE BUILDING IT, and this is the part that
-  decides it: whether DXR guarantees one any-hit invocation per candidate, or
-  permits an implementation to invoke it more than once for the same
-  intersection. If it permits re-invocation, an append cannot be transplanted
-  at all and the refusal stands as written.
+  **THE SPEC WAS CHECKED AND IT SAYS THE REFUSAL IS RIGHT AS WRITTEN, TODAY.**
+  From the D3D12 raytracing spec, on
+  `D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION`:
+
+      "With this flag, the any hit shader must only execute once for a given
+       intersection on a given ray."
+
+  The flag existing is the proof: **without it an implementation MAY invoke the
+  any-hit more than once for the same intersection**, and the spec separately
+  says "there is no defined order of execution of any hit shaders for the
+  intersections along a ray path", and warns apps to "be careful about
+  authoring side effects... such as doing UAV writes from them". So an append
+  transplanted into an any-hit can fire twice for one candidate. `Proceed()`
+  yields each candidate once. The two are not equivalent and the refusal
+  stands.
+
+  **BUT THE FLAG IS ALSO THE WAY THROUGH, AND THE SHIM IS IN A POSITION TO SET
+  IT.** Geometry flags live in `D3D12_RAYTRACING_GEOMETRY_DESC`, which arrives
+  as CPU MEMORY in `BuildRaytracingAccelerationStructure`, which this shim
+  already intercepts and already reads for free. Adding the flag means copying
+  the array and pointing the build at the copy.
+
+  The argument for doing it is not about appends, it is about faithfulness:
+  **RayQuery semantics already imply the flag.** `Proceed()` yields each
+  candidate exactly once, so any lowering that turns a Proceed loop into an
+  any-hit shader is only correct when that shader runs exactly once per
+  candidate. Today that happens to be harmless because every loop body the
+  rewriter accepts is idempotent. It stops being harmless the moment one is
+  not, which is precisely this case.
+
+  Costs and open questions, none of them settled:
+  - the flag applies to the application's own DXR 1.0 hit groups too, where it
+    forces de-duplication that was not asked for. Slower, not wrong;
+  - it changes an acceleration structure the application built, which no other
+    part of this shim does;
+  - ORDER is still undefined even with the flag, so a write whose result
+    depends on the order of candidates is still not transplantable. A counter
+    append is order-independent by construction, which is why this family
+    would be served;
+  - `Abort()` still differs, because this shim's lowering lets traversal
+    continue, so it would append records RayQuery would not. That one stays a
+    refusal.
+
+  So the narrowed rule, if this is built: set the flag, then refuse a side
+  effect only when the query uses `Abort()` or the store is not indexed by the
+  counter result.
 
 - **THE DRIVER CRASH REPRODUCES OFFLINE. ONE SECOND, NO GAME.**
   `phase5/cases/driver-crash/` holds it. `crash.out.dxil` is a library this
