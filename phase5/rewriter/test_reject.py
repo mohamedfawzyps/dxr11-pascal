@@ -57,6 +57,52 @@ def expect_reject(name, text, must_mention):
         return True
 
 
+def expect_attrs(name, text):
+    """The generated shaders must carry the module's OWN attribute numbers.
+
+    Every shader this project wrote is numbered #0 readnone, #1 nounwind,
+    #2 nounwind readonly by DXC, and the lowering hardcoded those. A real
+    Unreal module numbers #1 and #2 the other way round and has no #3 at all,
+    so AnyHitNull came out marked #3 with no such group, IgnoreHit was
+    therefore not noreturn, and the `unreachable` after it was rejected by the
+    validator. The message named the instruction, not the attribute.
+
+    Nothing in the suite could catch that, because every input here agrees
+    with the hardcoded numbers. This rewrites them the other way round first.
+    """
+    swapped = (text.replace('attributes #1 = { nounwind }',
+                            'attributes #1 = { nounwind readonly }')
+                   .replace('attributes #2 = { nounwind readonly }',
+                            'attributes #2 = { nounwind }'))
+    if swapped == text:
+        print('  FAILED   %-34s the input did not have the numbering this '
+              'rewrites; the check applied to nothing' % name)
+        return False
+    m = Module(swapped)
+    q = rayquery.analyze(m)
+    out = lower.lower(m, q)
+
+    groups = dict((b.strip(), int(n))
+                  for n, b in re.findall(
+                      r'(?m)^attributes #(\d+) = \{ (.*) \}$', out))
+    want = {'AnyHitNull': 'noreturn nounwind',
+            'AnyHit': 'nounwind',
+            'ClosestHit': 'nounwind'}
+    for fn, body in want.items():
+        if body not in groups:
+            print('  FAILED   %-34s no attribute group for %r' % (name, body))
+            return False
+        mm = re.search(r'(?m)^define void @%s\(.*\) #(\d+) \{$' % fn, out)
+        if not mm:
+            continue
+        if int(mm.group(1)) != groups[body]:
+            print('  FAILED   %-34s %s is #%s, but %r is #%d'
+                  % (name, fn, mm.group(1), body, groups[body]))
+            return False
+    print('  ok       %-34s attribute groups resolved, not assumed' % name)
+    return True
+
+
 def expect_pattern(name, text, want):
     """Accepted AND classified as `want`.
 
@@ -198,6 +244,9 @@ def main():
             '@dx.op.rayQuery_StateScalar.i32(i32 207',
             '@dx.op.rayQuery_StateScalar.i32(i32 209')
         ok.append(expect_ok('CommittedGeometryIndex now lowers', geom))
+
+    # Attribute group numbers are the module's, not a constant.
+    ok.append(expect_attrs('attribute numbering differs', alpha))
 
     # The BOUNDARY of the recomputable exemption.
     #

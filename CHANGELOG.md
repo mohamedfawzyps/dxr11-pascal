@@ -17,6 +17,75 @@ build.
 
 ---
 
+## 0.26.0 (2026-09-22)
+
+### Attribute group numbers are the module's, not a constant
+
+The lowering wrote `#1` for nounwind, `#2` for nounwind readonly and `#3` for
+noreturn nounwind, because that is how DXC numbered every shader this project
+had written. A real Unreal module numbers them differently:
+
+    ours     #0 readnone  #1 nounwind           #2 nounwind readonly  #3 added
+    Unreal   #0 readnone  #1 nounwind readonly  #2 nounwind           #3 ABSENT
+
+`#3` was appended by replacing the literal line
+`attributes #2 = { nounwind readonly }`, which that module does not contain, so
+it was never added. `AnyHitNull` was then marked `#3`, which resolved to
+nothing, so `IgnoreHit` was not noreturn and the `unreachable` after it was
+illegal:
+
+    error: Instructions must be of an allowed type.
+    note: at 'unreachable' in block '#0' of function 'AnyHitNull'.
+
+The message names the instruction and not the attribute that made it illegal,
+which is a long way from the cause. Three of six refusals in one real session.
+
+The generated text now writes placeholders that are resolved against the input
+module, reusing a group that exists and appending one that does not. Ours still
+resolve to 1, 2 and 3, so every existing output is byte-identical.
+
+### An unused declare is a validation error, including ours
+
+`dx.op.dispatchRaysIndex` was declared unconditionally. It only replaces
+`threadId`, so a shader that never read `SV_DispatchThreadID` never calls it.
+**Every shader in this suite reads it**, which is exactly why this was
+unconditional and why nothing here could find it.
+
+### The test that would have caught it did not exist
+
+Every input in the suite agrees with the hardcoded numbering, so no case could
+expose it. `test_reject.py` now rewrites a known-good module to the other
+numbering before lowering it, and checks that each generated function carries
+the id its module actually uses. Put the bug back and that check fails, which
+is the only evidence that it is a check at all.
+
+### Measured, on the six shaders a real Unreal session refused
+
+    refused_000  assembler, use of undefined value          still refused
+    refused_001  2 RayQuery objects (they are sequential)    still refused
+    refused_002  attribute numbering                         NOW LOWERS
+    refused_003  loop body reads a caller local              still refused
+    refused_004  attribute numbering + unused declare        NOW LOWERS
+    refused_005  attribute numbering                         NOW LOWERS
+
+### Not fixed, and not yet explained: the GPU crash
+
+That session ended in a **GPU crash**, not a shader compile failure.
+`CrashType GPUCrash`, and `D3DDeviceRemovedReason` is `0x887A0020`,
+`DXGI_ERROR_DRIVER_INTERNAL_ERROR`. Four shaders had lowered and built state
+objects successfully before it.
+
+Two candidates and no evidence separating them: the refused shaders, which are
+forwarded unchanged so a RayQuery DXIL reaches a Tier 1.0 driver, or the
+libraries this shim generated. Fewer refusals means less of the first, so this
+release reduces exposure without establishing a cause.
+
+The next build is the diagnostic, not a guess: dumping the shaders that LOWER
+as well as the ones that do not, so the four can be replayed through
+`CreateStateObject` offline on the 1070 without the game.
+
+---
+
 ## 0.25.0 (2026-09-22)
 
 ### Shader Model 6.6 resource binding

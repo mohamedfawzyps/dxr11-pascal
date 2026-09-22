@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.25.0.
+proxy/version.h, and is currently 0.26.0.
 
 ## Current position (2026-09-22)
 
@@ -1112,6 +1112,56 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
     reading the record before the index fields rather than after. Neither
     changed behaviour. **That is what byte-identity is for: it catches drift
     while it is still cosmetic.**
+- **HARDCODED ATTRIBUTE GROUP NUMBERS: FIXED (0.26.0), and the message pointed
+  nowhere near the cause.** Three of the six shaders a real Unreal session
+  refused were this one bug.
+
+      ours     #0 readnone  #1 nounwind           #2 nounwind readonly  #3 added
+      Unreal   #0 readnone  #1 nounwind readonly  #2 nounwind           #3 ABSENT
+
+  `#3` was appended by replacing the literal line
+  `attributes #2 = { nounwind readonly }`, which that module does not contain,
+  so it never appeared. `AnyHitNull` was marked `#3`, which resolved to
+  nothing, so `IgnoreHit` was not noreturn, so the `unreachable` after it was
+  rejected: "Instructions must be of an allowed type". **The validator names
+  the instruction, not the attribute that made it illegal.**
+  - Generated text now writes placeholders resolved against the input module,
+    the same technique already used for the non-uniform metadata node. Ours
+    still resolve to 1, 2 and 3, so every existing output is byte-identical.
+  - **`#0` was hardcoded too and happened to be right**, readnone in both. It
+    is resolved now as well rather than left to keep being lucky.
+  - **`dx.op.dispatchRaysIndex` was declared unconditionally**, and an unused
+    declare is itself a validation error. It only replaces `threadId`, and
+    EVERY shader in this suite reads `SV_DispatchThreadID`, which is exactly
+    why it was unconditional and why nothing here could find it. Same shape as
+    the entry-block phi bug, which every shader hid by opening with a bounds
+    check.
+  - **The test could not have existed before the bug did.** Every input in the
+    suite agrees with the hardcoded numbering, so no case could expose it.
+    `test_reject.py` now rewrites a known-good module to the other numbering
+    before lowering and checks each generated function carries the id its
+    module actually uses. Put the bug back and the check fails.
+
+- **A REAL UNREAL SESSION ENDED IN A GPU CRASH, NOT A COMPILE FAILURE, AND IT
+  IS NOT EXPLAINED.** `CrashType GPUCrash`, `D3DDeviceRemovedReason` =
+  `0x887A0020` = `DXGI_ERROR_DRIVER_INTERNAL_ERROR`, read from Unreal's own
+  crash context. Not a hang, not a page fault. The shim saw it as
+  `CreateStateObject failed (hr=0x887A0005)`, which is the symptom.
+  - **Four Unreal shaders had lowered and built state objects successfully
+    first.** That is the first time real engine shaders got that far.
+  - Two candidates and nothing yet separating them: the REFUSED shaders, which
+    are forwarded unchanged so a RayQuery DXIL reaches a Tier 1.0 driver, or
+    the libraries this shim GENERATED. 0.26.0 reduces the first without
+    establishing a cause.
+  - **The next move is a diagnostic, not a guess.** `dump` writes refusals
+    only, so the four that lowered are gone and cannot be replayed. Dumping
+    lowered output too puts them back on disk, where `CreateStateObject` can
+    be tried offline on the 1070 without the game.
+  - DRED was off in that run (`RHI.DRED false`), so there are no breadcrumbs.
+    Aftermath was on, which may be worth reading next time.
+  - The device id spoof is confirmed working from the engine's side:
+    `RHI.DeviceId 1F08`.
+
 - **THE 33 "CONCURRENT" QUERIES ARE SEQUENTIAL. The refusal is false.**
   Confirmed from `refused_002.dxil`, NiagaraCollisionRayTraceCS:
 

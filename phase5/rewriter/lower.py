@@ -223,14 +223,14 @@ def lower(module, q, exports=None):
     _edit_query(module, q, edits, exports)
 
     fn = q.fn
-    edits[fn.index] = 'define void @%s() #1 {' % exports['raygen']
+    edits[fn.index] = 'define void @%s() #RQNW {' % exports['raygen']
 
     out = render(module, edits)
     out = _add_types_and_globals(out, globals_, q.needs_record_constants, binding)
     out = _swap_declarations(out, q, globals_, binding)
     out = _append_shaders(out, module, q, exports, table, globals_, binds)
     out = _rewrite_metadata(out, md, table, globals_, q, exports, binding)
-    return out
+    return _resolve_attrs(out)
 
 
 # Shader Model 6.6 reaches a resource by BINDING, not by a range index.
@@ -268,6 +268,72 @@ HANDLE_TYPE = '%dx.types.Handle'
 # which sets it and makes CreateStateObject refuse the library on a GTX 1070.
 # Every RayQuery op is gone after lowering, so the flag must go with them.
 RT11_SHADER_FLAG = 0x2000000
+
+
+# Attribute group NUMBERS are a fact about the input module, not a constant.
+#
+# The lowering used to write #1 for nounwind, #2 for nounwind readonly and #3
+# for noreturn nounwind, because that is how DXC numbered every shader this
+# project had written. A real Unreal module numbers them differently:
+#
+#     ours     #0 readnone  #1 nounwind           #2 nounwind readonly  #3 added
+#     Unreal   #0 readnone  #1 nounwind readonly  #2 nounwind           #3 ABSENT
+#
+# So AnyHit came out marked readonly, the declares came out marked nounwind,
+# and #3 was never appended at all, because it was added by replacing the
+# literal line `attributes #2 = { nounwind readonly }`, which that module does
+# not contain. AnyHitNull was then marked #3, which resolved to nothing, so
+# IgnoreHit was not noreturn and the `unreachable` after it was illegal:
+#
+#     error: Instructions must be of an allowed type.
+#     note: at 'unreachable' in block '#0' of function 'AnyHitNull'.
+#
+# Three of six refusals in one real Unreal session, and the message points at
+# the instruction rather than at the attribute that made it illegal.
+#
+# The generated text now writes placeholders and this resolves them against the
+# module, reusing a group that already exists and appending one that does not.
+# Ours still resolve to 1, 2 and 3, so no existing output moves by a byte.
+ATTR_PLACEHOLDERS = [('#RQNONE', 'nounwind readnone'),
+                     ('#RQNW', 'nounwind'),
+                     ('#RQRO', 'nounwind readonly'),
+                     ('#RQNR', 'noreturn nounwind')]
+
+
+def _resolve_attrs(text):
+    lines = text.split('\n')
+    have = {}
+    used = set()
+    last = -1
+    for n, line in enumerate(lines):
+        m = re.match(r'attributes #(\d+) = \{ (.*) \}\s*$', line)
+        if not m:
+            continue
+        used.add(int(m.group(1)))
+        # First wins. A module with two groups of the same body is not
+        # something DXC emits, but picking the same one twice is the safe
+        # answer if it ever does.
+        have.setdefault(m.group(2).strip(), int(m.group(1)))
+        last = n
+    wanted = [(ph, body) for ph, body in ATTR_PLACEHOLDERS if ph in text]
+    added = []
+    for ph, body in wanted:
+        if body in have:
+            continue
+        nid = 0
+        while nid in used:
+            nid += 1
+        used.add(nid)
+        have[body] = nid
+        added.append('attributes #%d = { %s }' % (nid, body))
+    if added:
+        if last < 0:
+            raise LowerError('module declares no attribute groups')
+        lines[last + 1:last + 1] = added
+        text = '\n'.join(lines)
+    for ph, body in wanted:
+        text = text.replace(ph, '#%d' % have[body])
+    return text
 
 
 def _module_flags(text, md):
@@ -866,22 +932,29 @@ def _swap_declarations(text, q, globals_, binding=False):
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandleFromBinding[^\n]*\n']:
         text = re.sub(pat, '\n', text)
 
-    new = ['', '; Function Attrs: nounwind readnone',
-           'declare i32 @dx.op.dispatchRaysIndex.i32(i32, i8) #0',
-           '', '; Function Attrs: nounwind',
+    # DispatchRaysIndex replaces threadId, so a shader that never read
+    # SV_DispatchThreadID never calls it, and an unused declare is itself a
+    # validation error. Every shader in this suite reads it, which is exactly
+    # why this was unconditional; a real Unreal shader that gets its index from
+    # somewhere else is what found it.
+    new = []
+    if any(i.dxop == 93 for _, i in q.fn.instrs()):
+        new += ['', '; Function Attrs: nounwind readnone',
+                'declare i32 @dx.op.dispatchRaysIndex.i32(i32, i8) #RQNONE']
+    new += ['', '; Function Attrs: nounwind',
            'declare void @dx.op.traceRay.%s(i32, %%dx.types.Handle, i32, i32, i32, '
-           'i32, i32, float, float, float, float, float, float, float, float, %s*) #1'
+           'i32, i32, float, float, float, float, float, float, float, float, %s*) #RQNW'
            % (PAYLOAD[1:], PAYLOAD),
            '', '; Function Attrs: nounwind readonly',
-           'declare float @dx.op.rayTCurrent.f32(i32) #2',
+           'declare float @dx.op.rayTCurrent.f32(i32) #RQRO',
            '', '; Function Attrs: nounwind readnone',
-           'declare i32 @dx.op.instanceIndex.i32(i32) #0',
+           'declare i32 @dx.op.instanceIndex.i32(i32) #RQNONE',
            '', '; Function Attrs: nounwind readnone',
-           'declare i32 @dx.op.primitiveIndex.i32(i32) #0',
+           'declare i32 @dx.op.primitiveIndex.i32(i32) #RQNONE',
            '', '; Function Attrs: nounwind readnone',
-           'declare i32 @dx.op.instanceID.i32(i32) #0',
+           'declare i32 @dx.op.instanceID.i32(i32) #RQNONE',
            '', '; Function Attrs: nounwind readnone',
-           'declare i32 @dx.op.hitKind.i32(i32) #0',
+           'declare i32 @dx.op.hitKind.i32(i32) #RQNONE',
            ]
     # An UNUSED declare is itself a validation error, so these three are
     # emitted only when something actually calls them. The rest above are
@@ -889,49 +962,49 @@ def _swap_declarations(text, q, globals_, binding=False):
     used_ops = {i.dxop for _, i in q.candidate_ops} | {i.dxop for _, i in q.committed_ops}
     conditional = [
         ({rq.CANDIDATE_WORLD_TO_OBJECT, rq.COMMITTED_WORLD_TO_OBJECT},
-         'declare float @dx.op.worldToObject.f32(i32, i32, i8) #0'),
+         'declare float @dx.op.worldToObject.f32(i32, i32, i8) #RQNONE'),
         ({rq.CANDIDATE_OBJECT_RAY_ORIGIN},
-         'declare float @dx.op.objectRayOrigin.f32(i32, i8) #0'),
+         'declare float @dx.op.objectRayOrigin.f32(i32, i8) #RQNONE'),
         ({rq.CANDIDATE_OBJECT_RAY_DIRECTION},
-         'declare float @dx.op.objectRayDirection.f32(i32, i8) #0'),
+         'declare float @dx.op.objectRayDirection.f32(i32, i8) #RQNONE'),
     ]
     # Only reached from a generated hit shader. A raygen read of RayFlags
     # became a constant, so a shader reading it only there declares nothing,
     # and an unused declare is itself a validation error.
     if q.rayflags_in_loop:
         new += ['', '; Function Attrs: nounwind readnone',
-                'declare i32 @dx.op.rayFlags.i32(i32) #0']
+                'declare i32 @dx.op.rayFlags.i32(i32) #RQNONE']
     for ops, decl in conditional:
         if used_ops & ops:
             new += ['', '; Function Attrs: nounwind readnone', decl]
 
-    # The record read. Both are #2, nounwind readonly, copied from DXC output.
+    # The record read. Both are nounwind readonly, copied from DXC output.
     #
     # cbufferLoadLegacy may ALREADY be declared, because the application's own
     # shader very likely has a cbuffer of its own; declaring it twice is as much
     # an error as declaring it unused.
     if q.needs_record_constants:
         new += ['', '; Function Attrs: nounwind readonly',
-                'declare %%dx.types.Handle @%s(i32, %s) #2'
+                'declare %%dx.types.Handle @%s(i32, %s) #RQRO'
                 % (RECORD_HANDLE_FN, RECORD_TYPE)]
         if '@dx.op.cbufferLoadLegacy.i32(' not in text:
             new += ['', '; Function Attrs: nounwind readonly',
                     'declare %s @dx.op.cbufferLoadLegacy.i32'
-                    '(i32, %%dx.types.Handle, i32) #2' % CBRET]
+                    '(i32, %%dx.types.Handle, i32) #RQRO' % CBRET]
     if q.needs_intersection:
         new += ['', '; Function Attrs: nounwind',
-                'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #1'
+                'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #RQNW'
                 % (ATTRS[1:], ATTRS)]
     # Unconditional now: the generated any-hit may or may not exist, but
     # AnyHitNull always does and it is nothing but an IgnoreHit.
     new += ['', '; Function Attrs: noreturn nounwind',
-            'declare void @dx.op.ignoreHit(i32) #3']
+            'declare void @dx.op.ignoreHit(i32) #RQNR']
     if binding:
         # One overload serves every resource in the 6.6 form, because the
         # global is a handle whatever the resource is.
         new += ['', '; Function Attrs: nounwind readonly',
                 'declare %s @dx.op.createHandleForLib.dx.types.Handle'
-                '(i32, %s) #2' % (HANDLE_TYPE, HANDLE_TYPE)]
+                '(i32, %s) #RQRO' % (HANDLE_TYPE, HANDLE_TYPE)]
     else:
         seen = set()
         for sym, gty, elem, _ in globals_.values():
@@ -940,14 +1013,11 @@ def _swap_declarations(text, q, globals_, binding=False):
                 continue
             seen.add(fnname)
             new += ['', '; Function Attrs: nounwind readonly',
-                    'declare %%dx.types.Handle @%s(i32, %s) #2' % (fnname, elem)]
+                    'declare %%dx.types.Handle @%s(i32, %s) #RQRO' % (fnname, elem)]
 
     anchor = text.index('\nattributes #0 =')
     text = text[:anchor] + '\n' + '\n'.join(new) + text[anchor:]
-    if 'attributes #3' not in text:
-        text = text.replace('attributes #2 = { nounwind readonly }',
-                            'attributes #2 = { nounwind readonly }\n'
-                            'attributes #3 = { noreturn nounwind }')
+
     return text
 
 
@@ -959,7 +1029,7 @@ def _closesthit(name, status, q):
     COMMITTED_PROCEDURAL_PRIMITIVE_HIT, and one shader cannot say both,
     because it does not know which hit group resolved to it.
     """
-    ch = ['define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #1 {{'
+    ch = ['define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #RQNW {{'
           .format(ch=name, pl=PAYLOAD, at=ATTRS),
           '  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
           '  %ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
@@ -1037,7 +1107,7 @@ def _append_shaders(text, module, q, exports, table, globals_, binds=None):
     else:
         fns.append(_closesthit(exports['closesthit'],
                                2 if q.needs_intersection else 1, q))
-    fns.append('''define void @{ms}({pl}* noalias nocapture %p) #1 {{
+    fns.append('''define void @{ms}({pl}* noalias nocapture %p) #RQNW {{
   %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2
   store i32 0, i32* %ph, align 4
   ret void
@@ -1050,14 +1120,14 @@ def _append_shaders(text, module, q, exports, table, globals_, binds=None):
     # Rejecting every candidate is how a TRIANGLES hit group produces no hit:
     # traversal carries on past that geometry as if the shader had never seen
     # it. #3 is noreturn nounwind, as DXC marks its own.
-    fns.append('''define void @{ah}({pl}* noalias nocapture %p, {at}* nocapture readnone %attr) #3 {{
+    fns.append('''define void @{ah}({pl}* noalias nocapture %p, {at}* nocapture readnone %attr) #RQNR {{
   call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()
   unreachable
 }}'''.format(ah=exports['anyhitnull'], pl=PAYLOAD, at=ATTRS))
 
     # And reporting nothing is how a PROCEDURAL hit group produces no hit: an
     # intersection shader that returns has found nothing.
-    fns.append('''define void @{is}() #1 {{
+    fns.append('''define void @{is}() #RQNW {{
   ret void
 }}'''.format(**{'is': exports['isectnull']}))
 
@@ -1119,7 +1189,7 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                 subst[i.result] = 'false'
 
     order = [header] + sorted(l for l in body if l not in (header, latch))
-    out = ['define void @%s() #1 {' % exports['intersection'],
+    out = ['define void @%s() #RQNW {' % exports['intersection'],
            '  %%rq.at = alloca %s, align 8' % ATTRS]
 
     used, inBody = set(), set()
@@ -1246,7 +1316,7 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
     aborts = bool(q.aborts)
 
     order = [header] + sorted(l for l in body if l not in (header, latch))
-    out = ['define void @%s(%s* noalias nocapture %%p, %s* nocapture readonly %%attr) #1 {'
+    out = ['define void @%s(%s* noalias nocapture %%p, %s* nocapture readonly %%attr) #RQNW {'
            % (exports['anyhit'], PAYLOAD, ATTRS),
            '  %rq.ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
            '  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4']

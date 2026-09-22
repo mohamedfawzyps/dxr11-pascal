@@ -426,6 +426,67 @@ std::map<Bind, int> BindingMap(const std::string& text,
 // bit the lowering removes is the tier 1.1 flag. An Unreal shader declares
 // 0x42000010, so 16 was wrong by exactly the bit it did not know about and the
 // validator said "Flags must match usage".
+// Attribute group NUMBERS are a fact about the input module, not a constant.
+// See lower.py for what Unreal's numbering did to AnyHitNull and why the
+// message pointed at the `unreachable` rather than at the missing noreturn.
+struct AttrPlaceholder { const char* tag; const char* body; };
+const AttrPlaceholder kAttrPlaceholders[] = {
+    { "#RQNONE", "nounwind readnone" },
+    { "#RQNW",   "nounwind" },
+    { "#RQRO",   "nounwind readonly" },
+    { "#RQNR",   "noreturn nounwind" },
+};
+
+std::string ResolveAttrs(const std::string& in, std::string* err) {
+    auto lines = llm::SplitLines(in);
+    static const std::regex kAttr(R"(attributes #(\d+) = \{ (.*) \}\s*)");
+    std::map<std::string, int> have;
+    std::set<int> used;
+    int last = -1;
+    for (size_t n = 0; n < lines.size(); ++n) {
+        std::smatch m;
+        if (!std::regex_match(lines[n], m, kAttr)) continue;
+        const int id = std::stoi(m[1].str());
+        used.insert(id);
+        // First wins, matching the Python.
+        have.emplace(Trim(m[2].str()), id);
+        last = static_cast<int>(n);
+    }
+    std::vector<AttrPlaceholder> wanted;
+    for (const auto& a : kAttrPlaceholders)
+        if (in.find(a.tag) != std::string::npos) wanted.push_back(a);
+
+    std::vector<std::string> added;
+    for (const auto& a : wanted) {
+        if (have.count(a.body)) continue;
+        int id = 0;
+        while (used.count(id)) ++id;
+        used.insert(id);
+        have[a.body] = id;
+        added.push_back("attributes #" + std::to_string(id) + " = { " + a.body + " }");
+    }
+    std::string out = in;
+    if (!added.empty()) {
+        if (last < 0) {
+            *err = "module declares no attribute groups";
+            return in;
+        }
+        lines.insert(lines.begin() + last + 1, added.begin(), added.end());
+        out = llm::JoinLines(lines);
+    }
+    // Replace ALL of them. The Replace helper here does the first occurrence
+    // only, where Python's str.replace does every one, and a placeholder
+    // appears once per generated function.
+    for (const auto& a : wanted) {
+        const std::string tag = a.tag;
+        const std::string num = "#" + std::to_string(have[a.body]);
+        for (size_t p = out.find(tag); p != std::string::npos;
+             p = out.find(tag, p + num.size()))
+            out.replace(p, tag.size(), num);
+    }
+    return out;
+}
+
 unsigned long long ModuleFlags(const std::string& text,
                                const std::map<int, std::string>& md) {
     static const std::regex kEp(R"(!dx\.entryPoints\s*=\s*!\{!(\d+)\})");
@@ -922,7 +983,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         }
     }
 
-    edits[fn.index] = "define void @" + e.raygen + "() #1 {";
+    edits[fn.index] = "define void @" + e.raygen + "() #RQNW {";
 
     std::string out = llm::Render(m, edits);
 
@@ -982,24 +1043,37 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         };
         for (const char* k : kill) out = std::regex_replace(out, std::regex(k), "\n");
 
-        std::vector<std::string> add = {
-            "", "; Function Attrs: nounwind readnone",
-            "declare i32 @dx.op.dispatchRaysIndex.i32(i32, i8) #0",
+        // DispatchRaysIndex replaces threadId, so a shader that never read
+        // SV_DispatchThreadID never calls it, and an unused declare is itself
+        // a validation error. See lower.py.
+        bool usesThreadId = false;
+        for (const auto& b : q.fn->blocks)
+            for (const auto& i : b.instrs)
+                if (i.DxOp() == kThreadId) usesThreadId = true;
+
+        std::vector<std::string> add;
+        if (usesThreadId) {
+            add.push_back("");
+            add.push_back("; Function Attrs: nounwind readnone");
+            add.push_back("declare i32 @dx.op.dispatchRaysIndex.i32(i32, i8) #RQNONE");
+        }
+        const std::vector<std::string> rest = {
             "", "; Function Attrs: nounwind",
             "declare void @dx.op.traceRay." + std::string(kPayload).substr(1) +
                 "(i32, %dx.types.Handle, i32, i32, i32, i32, i32, float, float, float, "
-                "float, float, float, float, float, " + kPayload + "*) #1",
+                "float, float, float, float, float, " + kPayload + "*) #RQNW",
             "", "; Function Attrs: nounwind readonly",
-            "declare float @dx.op.rayTCurrent.f32(i32) #2",
+            "declare float @dx.op.rayTCurrent.f32(i32) #RQRO",
             "", "; Function Attrs: nounwind readnone",
-            "declare i32 @dx.op.instanceIndex.i32(i32) #0",
+            "declare i32 @dx.op.instanceIndex.i32(i32) #RQNONE",
             "", "; Function Attrs: nounwind readnone",
-            "declare i32 @dx.op.primitiveIndex.i32(i32) #0",
+            "declare i32 @dx.op.primitiveIndex.i32(i32) #RQNONE",
             "", "; Function Attrs: nounwind readnone",
-            "declare i32 @dx.op.instanceID.i32(i32) #0",
+            "declare i32 @dx.op.instanceID.i32(i32) #RQNONE",
             "", "; Function Attrs: nounwind readnone",
-            "declare i32 @dx.op.hitKind.i32(i32) #0",
+            "declare i32 @dx.op.hitKind.i32(i32) #RQNONE",
         };
+        add.insert(add.end(), rest.begin(), rest.end());
         // An UNUSED declare is itself a validation error, so these three are
         // emitted only when something calls them. The rest are always used,
         // because the generated closest-hit reads them every time.
@@ -1015,26 +1089,26 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // Only reached from a generated hit shader. A raygen read of RayFlags
         // became a constant, so a shader reading it only there declares
         // nothing, and an unused declare is itself a validation error.
-        addDecl(q.rayFlagsInLoop, "declare i32 @dx.op.rayFlags.i32(i32) #0");
+        addDecl(q.rayFlagsInLoop, "declare i32 @dx.op.rayFlags.i32(i32) #RQNONE");
         addDecl(usedOps.count(kCandidateWorldToObject) ||
                 usedOps.count(kCommittedWorldToObject),
-                "declare float @dx.op.worldToObject.f32(i32, i32, i8) #0");
+                "declare float @dx.op.worldToObject.f32(i32, i32, i8) #RQNONE");
         addDecl(usedOps.count(kCandidateObjectRayOrigin) != 0,
-                "declare float @dx.op.objectRayOrigin.f32(i32, i8) #0");
+                "declare float @dx.op.objectRayOrigin.f32(i32, i8) #RQNONE");
         addDecl(usedOps.count(kCandidateObjectRayDirection) != 0,
-                "declare float @dx.op.objectRayDirection.f32(i32, i8) #0");
+                "declare float @dx.op.objectRayDirection.f32(i32, i8) #RQNONE");
 
         if (q.needsRecordConstants) {
             add.push_back("");
             add.push_back("; Function Attrs: nounwind readonly");
             add.push_back(std::string("declare %dx.types.Handle @") + kRecordHandleFn +
-                          "(i32, " + kRecordType + ") #2");
+                          "(i32, " + kRecordType + ") #RQRO");
             if (out.find("@dx.op.cbufferLoadLegacy.i32(") == std::string::npos) {
                 add.push_back("");
                 add.push_back("; Function Attrs: nounwind readonly");
                 add.push_back(std::string("declare ") + kCbRet +
                               " @dx.op.cbufferLoadLegacy.i32"
-                              "(i32, %dx.types.Handle, i32) #2");
+                              "(i32, %dx.types.Handle, i32) #RQRO");
             }
         }
         if (q.NeedsIntersection()) {
@@ -1042,13 +1116,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             add.push_back("; Function Attrs: nounwind");
             add.push_back("declare i1 @dx.op.reportHit." +
                           std::string(kAttrs).substr(1) + "(i32, float, i32, " +
-                          kAttrs + "*) #1");
+                          kAttrs + "*) #RQNW");
         }
         // Unconditional now: the generated any-hit may or may not exist, but
         // AnyHitNull always does and it is nothing but an IgnoreHit.
         add.push_back("");
         add.push_back("; Function Attrs: noreturn nounwind");
-        add.push_back("declare void @dx.op.ignoreHit(i32) #3");
+        add.push_back("declare void @dx.op.ignoreHit(i32) #RQNR");
         if (binding) {
             // One overload serves every resource in the 6.6 form, because the
             // global is a handle whatever the resource is.
@@ -1056,7 +1130,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             add.push_back("; Function Attrs: nounwind readonly");
             add.push_back(std::string("declare ") + kHandleType +
                           " @dx.op.createHandleForLib.dx.types.Handle(i32, " +
-                          kHandleType + ") #2");
+                          kHandleType + ") #RQRO");
         } else {
             std::set<std::string> seenFn;
             for (const auto& g : globals) {
@@ -1064,7 +1138,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (!seenFn.insert(f).second) continue;
                 add.push_back("");
                 add.push_back("; Function Attrs: nounwind readonly");
-                add.push_back("declare %dx.types.Handle @" + f + "(i32, " + g.elem + ") #2");
+                add.push_back("declare %dx.types.Handle @" + f + "(i32, " + g.elem + ") #RQRO");
             }
         }
         const size_t anchor = out.find("\nattributes #0 =");
@@ -1074,10 +1148,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             joined += add[i];
         }
         out = out.substr(0, anchor) + "\n" + joined + out.substr(anchor);
-        if (out.find("attributes #3") == std::string::npos)
-            out = Replace(out, "attributes #2 = { nounwind readonly }",
-                          "attributes #2 = { nounwind readonly }\n"
-                          "attributes #3 = { noreturn nounwind }");
+
     }
 
     // --- generated shaders ---------------------------------------------------
@@ -1133,7 +1204,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 for (const auto& l : rest) order.push_back(l);
             }
             std::vector<std::string> is;
-            is.push_back("define void @" + e.intersection + "() #1 {");
+            is.push_back("define void @" + e.intersection + "() #RQNW {");
             is.push_back(std::string("  %rq.at = alloca ") + kAttrs + ", align 8");
 
             const std::set<std::string> types = TypeNames(m.text);
@@ -1299,7 +1370,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::vector<std::string> ah;
             ah.push_back("define void @" + e.anyhit + "(" + kPayload +
                          "* noalias nocapture %p, " + kAttrs +
-                         "* nocapture readonly %attr) #1 {");
+                         "* nocapture readonly %attr) #RQNW {");
             ah.push_back(std::string("  %rq.ap = getelementptr inbounds ") + kAttrs +
                          ", " + kAttrs + "* %attr, i32 0, i32 0");
             ah.push_back("  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4");
@@ -1458,7 +1529,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::vector<std::string> ch;
             ch.push_back("define void @" + name + "(" + kPayload +
                          "* noalias nocapture %p, " + kAttrs +
-                         "* nocapture readonly %attr) #1 {");
+                         "* nocapture readonly %attr) #RQNW {");
             ch.push_back("  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()");
             ch.push_back(std::string("  %ap = getelementptr inbounds ") + kAttrs + ", " +
                          kAttrs + "* %attr, i32 0, i32 0");
@@ -1541,7 +1612,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         // Miss
         fns.push_back("define void @" + e.miss + "(" + std::string(kPayload) +
-                      "* noalias nocapture %p) #1 {\n"
+                      "* noalias nocapture %p) #RQNW {\n"
                       "  %ph = getelementptr inbounds " + kPayload + ", " + kPayload +
                       "* %p, i32 0, i32 2\n"
                       "  store i32 0, i32* %ph, align 4\n"
@@ -1556,13 +1627,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // never seen it. #3 is noreturn nounwind, as DXC marks its own.
         fns.push_back("define void @" + e.anyhitnull + "(" + std::string(kPayload) +
                       "* noalias nocapture %p, " + kAttrs +
-                      "* nocapture readnone %attr) #3 {\n"
+                      "* nocapture readnone %attr) #RQNR {\n"
                       "  call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()\n"
                       "  unreachable\n}");
 
         // And reporting nothing is how a PROCEDURAL hit group produces no hit:
         // an intersection shader that returns has found nothing.
-        fns.push_back("define void @" + e.isectnull + "() #1 {\n"
+        fns.push_back("define void @" + e.isectnull + "() #RQNW {\n"
                       "  ret void\n}");
 
         static const std::regex kEnd(R"(\}\s*)");
@@ -1793,6 +1864,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             nodeJoined += nodes[i];
         }
         out += "\n" + nodeJoined + "\n";
+    }
+
+    {
+        std::string attrErr;
+        out = ResolveAttrs(out, &attrErr);
+        if (!attrErr.empty()) { r.error = attrErr; return r; }
     }
 
     r.ok = true;
