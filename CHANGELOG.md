@@ -17,6 +17,38 @@ build.
 
 ---
 
+## 0.36.7
+
+- **`createHandleFromHeap` (218) joins the recomputable list**, which closes the
+  single largest refusal a real game produces. The 0.25.0 note said a heap
+  handle used inside the Proceed loop is refused because 218 is not on that
+  list, and filed it as correct. It was measured on a shader that kept all 16
+  of its heap handles in the raygen, so nothing ever counted the in-loop case.
+  Counted from one Escher run: 58 of 157 refusals are exactly this.
+- It is recomputable for the reason the other handles are, one step further
+  out. The descriptor heap is set on the command list and is the same heap in
+  the any-hit as in the raygen, and the index reaches it from a cbuffer, which
+  holds the same bytes for the whole dispatch. The fixpoint enforces the "from
+  a cbuffer" half by itself: 218 is admitted only when its index is ALREADY
+  recomputable, so an index built from a UAV read or a phi still refuses. It
+  needs no conversion, unlike 57 and 217, because a heap handle means the same
+  thing in a library, so it is emitted verbatim.
+- **Measured on the real corpus, not on the suite.** Replaying the 58 dumped
+  Unreal shaders: 18 now lower and go container in to signed container out; 16
+  turn out to do a UAV append inside the loop as well and hit the side-effect
+  refusal from 0.36.6 instead; 24 still refuse because their chain runs
+  through a `rawBufferLoad` or a `textureLoad`. All 18 are byte-identical
+  between the Python and the C++, and the two agree on every one of the 58
+  outcomes.
+- All thirteen render cases are byte-identical to before, 23 dispatch cases
+  and four gates pass, 17 of 17 refusal checks.
+- **GAP, stated rather than hidden: no RENDER test covers a heap handle inside
+  the Proceed loop.** The suite has no case that indexes
+  `ResourceDescriptorHeap` there, so what is proven is that 18 real engine
+  shaders lower, validate, sign and agree across two implementations, not that
+  the result draws the right pixels. A case for that is the next thing to
+  build.
+
 ## 0.36.6
 
 - **A Proceed loop body that WRITES is now refused.** The loop isolation check

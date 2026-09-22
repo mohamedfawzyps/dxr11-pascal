@@ -247,6 +247,7 @@ def lower(module, q, exports=None):
 # untouched. Read off DXC, see phase5/cases/reference/lib_sm66_binding_ref.hlsl.
 BIND_HANDLE = 217
 ANNOTATE_HANDLE = 216
+HEAP_HANDLE = 218
 # The library form's global is a HANDLE, not the resource type, and the
 # overload is named after the handle type too. That is the part that cannot be
 # guessed from the 6.5 path, where both are the resource type.
@@ -686,7 +687,27 @@ _PURE = {
 # 216 and 217 being absent is what refused 118 of Unreal's shaders: every one of
 # them reaches its cbuffer through the 6.6 binding form, so no handle was ever
 # exempt and every value built on one looked like caller state.
-_PURE_DXOP = {57, 59, 93, ANNOTATE_HANDLE, BIND_HANDLE}
+#
+# 218 is createHandleFromHeap, the bindless form, and it was left off
+# DELIBERATELY and wrongly. The 0.25.0 note said a heap handle used inside the
+# Proceed loop is refused because 218 is not on this list, and recorded that as
+# correct. It was measured on a shader that kept all 16 of its heap handles in
+# the raygen, so nothing counted the in-loop case. Counting it: 58 of the 157
+# shaders one Escher run refused are exactly this, which makes it the single
+# largest refusal a real game produces.
+#
+# It is recomputable for the reason the other handles are, one step further
+# out. The descriptor heap is set on the command list and is the same heap in
+# the any-hit as in the raygen, and the index reaches it from a cbuffer, which
+# holds the same bytes for the whole dispatch. So the hit shader can rebuild
+# the handle rather than be handed it. The fixpoint below is what enforces
+# "from a cbuffer": 218 is admitted only when its index is ALREADY
+# recomputable, so an index computed from a UAV read or a phi still refuses.
+#
+# It needs no conversion either, unlike 57 and 217. A heap handle means the
+# same thing in a library as in a compute shader, which the 0.25.0 measurement
+# established, so it is emitted verbatim.
+_PURE_DXOP = {57, 59, 93, ANNOTATE_HANDLE, BIND_HANDLE, HEAP_HANDLE}
 
 
 # Every %name an instruction READS, not just its call arguments.

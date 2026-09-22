@@ -125,6 +125,7 @@ const CandMap* FindCand(int op) {
 // untouched. Read off DXC, see phase5/cases/reference/lib_sm66_binding_ref.hlsl.
 const int kBindHandle = 217;
 const int kAnnotateHandle = 216;
+const int kHeapHandle = 218;
 // The library form's global is a HANDLE, not the resource type, and the
 // overload is named after the handle type too. That is the part that cannot be
 // guessed from the 6.5 path, where both are the resource type.
@@ -282,11 +283,26 @@ bool PureInstruction(const llm::Instr& i) {
 }
 
 // 57 createHandle, 59 cbufferLoadLegacy, 93 threadId, plus the Shader Model
-// 6.6 handle pair 216/217. See lower.py for what is deliberately absent:
-// loads, phis, integer division, any other dx.op.
+// 6.6 handle pair 216/217 and the bindless form 218. See lower.py for what is
+// deliberately absent: loads, phis, integer division, any other dx.op.
+//
+// 218 was left off deliberately and wrongly. The 0.25.0 note said a heap
+// handle used inside the Proceed loop is refused because 218 is not on this
+// list, and filed that as correct; it was measured on a shader that kept all
+// 16 of its heap handles in the raygen, so nothing counted the in-loop case.
+// Counted: 58 of the 157 refusals from one Escher run are exactly this.
+//
+// It is recomputable for the reason the other handles are, one step further
+// out. The descriptor heap is set on the command list and is the same heap in
+// the any-hit as in the raygen, and the index reaches it from a cbuffer, which
+// holds the same bytes for the whole dispatch. The fixpoint is what enforces
+// "from a cbuffer": 218 is admitted only when its index is ALREADY
+// recomputable, so an index built from a UAV read or a phi still refuses. It
+// needs no conversion either, unlike 57 and 217, because a heap handle means
+// the same thing in a library, so it is emitted verbatim.
 bool PureDxOp(int op) {
     return op == 57 || op == 59 || op == 93 ||
-           op == kAnnotateHandle || op == kBindHandle;
+           op == kAnnotateHandle || op == kBindHandle || op == kHeapHandle;
 }
 
 std::map<std::string, const llm::Instr*> Recomputable(

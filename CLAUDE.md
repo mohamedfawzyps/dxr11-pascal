@@ -1286,6 +1286,23 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   index out of a packed field. Nothing else. No UAV reads, no phis, no genuine
   caller locals.
 
+  **DONE IN 0.36.7, AND THE REPLAY SAYS 18 RATHER THAN 58.** Exempting 218
+  and replaying the same 58 shaders offline:
+
+      18  now LOWER, container in and signed container out, and byte-identical
+          between the Python and the C++
+      16  were ALSO doing a UAV append inside the loop, so they now hit the
+          side-effect refusal from 0.36.6 instead
+      24  still refuse: the chain runs through a rawBufferLoad or a textureLoad
+
+  So the earlier reading of "two additions close all 58" was wrong in two
+  ways, and both are worth keeping. `lshr` was already on the pure list, so it
+  was never the missing piece; what those 24 actually need is a LOAD
+  recomputed, which is a different and more delicate question because an SRV
+  is safe to re-read and a UAV the raygen wrote is not, and recomputing
+  hoists. And closing one refusal exposed the next for the fifth version
+  running: 16 shaders were doing the same thing the debug shader does.
+
   **All of it is recomputable, by the argument this brief already makes twice.**
   A cbuffer holds the same bytes for the whole dispatch and the descriptor heap
   is the same heap in the any-hit as in the raygen, so the hit shader can
