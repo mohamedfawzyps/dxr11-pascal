@@ -1,0 +1,42 @@
+// Version resource for the proxy d3d12.dll.
+//
+// Without this the shim is the ONE file in the game folder with no version at
+// all, sitting next to four Microsoft DLLs that all have one. That is exactly
+// backwards: the others are stable releases, and this is the part likely to be
+// an old copy someone forgot they installed.
+//
+// The strings deliberately do NOT imitate Microsoft's d3d12.dll. A file
+// claiming to be the real runtime would be the wrong thing to find in an
+// anti-cheat report or in a support thread. It says what it is.
+
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    DXR_TIER11_VERSION_COMMA
+PRODUCTVERSION DXR_TIER11_VERSION_COMMA
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_DLL
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"   // US English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "pascal-dxr-tier-1.1 project"
+            VALUE "FileDescription",  "DXR Tier 1.1 compatibility shim for NVIDIA Pascal"
+            VALUE "FileVersion",      DXR_TIER11_VERSION
+            VALUE "InternalName",     "pascal-dxr-tier-1.1"
+            VALUE "OriginalFilename", "d3d12.dll"
+            VALUE "ProductName",      "GTX Pascal DXR Tier 1.1"
+            VALUE "ProductVersion",   DXR_TIER11_VERSION
+            VALUE "Comments",         "Not Microsoft's d3d12.dll. A proxy that forwards to it."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END

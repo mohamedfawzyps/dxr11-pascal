@@ -20,7 +20,7 @@ $root = Split-Path -Parent $PSScriptRoot
 
 # The version comes from the header the DLL was built from, so the zip cannot
 # disagree with what the binary logs about itself.
-$verLine = Select-String -Path (Join-Path $root 'proxy\version.h') -Pattern '#define DXR_TIER11_VERSION "([^"]+)"'
+$verLine = Select-String -Path (Join-Path $root 'proxy\version.h') -Pattern '#define\s+DXR_TIER11_VERSION\s+"([^"]+)"'
 if (-not $verLine) { throw 'Cannot read the version from proxy/version.h' }
 $version = $verLine.Matches[0].Groups[1].Value
 
@@ -35,6 +35,14 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $dll = Join-Path $root 'd3d12.dll'
 if (-not (Test-Path $dll)) { throw 'd3d12.dll not found. Run build_proxy.bat first.' }
 Copy-Item $dll $stage
+
+# dxgi.dll ships with it. It is a separate file so it can be removed on its
+# own, but it is not optional in practice: Unreal refuses ray tracing on Pascal
+# by device id, after accepting the tier, so without it the shim has nothing to
+# do in an Unreal game.
+$dxgi = Join-Path $root 'dxgi.dll'
+if (-not (Test-Path $dxgi)) { throw 'dxgi.dll not found. Run build_dxgi.bat first.' }
+Copy-Item $dxgi $stage
 
 Copy-Item (Join-Path $root 'dxr-tier-11.example.ini') $stage
 Copy-Item (Join-Path $root 'tools\dxr-tier-11-setup.ps1') $stage

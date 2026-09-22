@@ -145,16 +145,42 @@ set DXR_TIER11=0
 
 ### The whole switch list
 
-The shim reads exactly two environment variables. There are no others.
+The shim reads exactly six settings. There are no others.
 
-| Setting | Default | What it does |
-|---|---|---|
-| `tier11` / `DXR_TIER11` | **on** | report Tier 1.1 and rewrite RayQuery shaders |
-| `nowrap` / `DXR_TIER11_NOWRAP` | off | hand the application the real device and translate nothing |
+| Setting | Default | Read by | What it does |
+|---|---|---|---|
+| `tier11` / `DXR_TIER11` | **on** | d3d12.dll | report Tier 1.1 and rewrite RayQuery shaders |
+| `nowrap` / `DXR_TIER11_NOWRAP` | off | d3d12.dll | hand the application the real device and translate nothing |
+| `log` / `DXR_TIER11_LOG` | `%TEMP%` | both | where to put the log file |
+| `dump` / `DXR_TIER11_DUMP` | off | d3d12.dll | write refused shaders to a folder, for diagnosis |
+| `spoof` / `DXR_TIER11_SPOOF` | **on** | dxgi.dll | report a Pascal card under a Turing device id |
+| `spoofid` / `DXR_TIER11_SPOOFID` | `0x1F08` | dxgi.dll | which device id to report |
 
 Each can be set in `dxr-tier-11.ini` beside the DLL, or as an environment variable of
 the upper-case name. The environment wins, so a stray `.ini` can never change
-what the test scripts measure. Values are `1/true/on/yes` or `0/false/off/no`.
+what the test scripts measure. The first two take `1/true/on/yes` or
+`0/false/off/no`; the third is a path.
+
+**The device id spoof** is what makes this work in Unreal at all, and it is
+the one thing here that changes an answer rather than translating a shape.
+
+Unreal refuses ray tracing on Pascal by PCI device id, and it does that AFTER
+accepting the Tier 1.1 answer. Five lines of stock engine code, no cvar and no
+command line flag to turn it off. So without `dxgi.dll` in the folder, the
+whole shim reports the tier correctly and then nothing happens.
+
+Only the device id changes, and only on the cards Unreal itself lists. The
+card's name, its vendor and every capability answer stay exactly as they are:
+Unreal asks NVAPI what the hardware can DO, and every one of those questions
+still goes to the real 1070 and gets the real answer. Shader execution
+reordering, for instance, correctly reports unsupported.
+
+**The log location** accepts a folder as well as a file name, and puts the
+usual name inside a folder. A relative path is relative to the game folder, not
+to whatever directory the game happened to start in, which for a Steam or Epic
+launch is not something you can predict. If the path cannot be opened the log
+goes to `%TEMP%` and says so on its first line, rather than disappearing. The
+setup tool has a box for it, and its `Open the log` button follows it.
 
 `NO_WRAP` is not a companion to the first one, it overrides it. Everything the
 shim does lives on the device object it hands the application, including the
@@ -182,16 +208,53 @@ type %TEMP%\dxr-tier-11-proxy.log
 A healthy start looks like this:
 
 ```
-[dxr-tier-11-proxy-log] attached to process, version 0.14.0
-[dxr-tier-11-proxy-log] device wrapping enabled
-[dxr-tier-11-proxy-log] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
-[dxr-tier-11-proxy-log] DXR_TIER11=1: reporting Tier 1.1 to the application.
-[dxr-tier-11-proxy-log] queue hook installed: vtable ... slot 10, self-test passed
+10:20:00.499 [dxr-tier-11-proxy-log] ======== start: MyGame.exe (pid 4872), shim 0.15.0 ========
+10:20:00.840 [dxr-tier-11-proxy-log] DXC:     dxcompiler 1.10.2605.37, dxil 1.10.2605.37
+10:20:00.840 [dxr-tier-11-proxy-log] runtime: D3D12Core.dll 1.619.5.0 (C:\MyGame\D3D12\D3D12Core.dll)
+10:20:00.840 [dxr-tier-11-proxy-log] runtime: d3d12SDKLayers.dll not loaded, so the debug layer is off, which is normal
+10:20:00.840 [dxr-tier-11-proxy-log] runtime: the real d3d12.dll 6.2.26100.9278 (C:\WINDOWS\system32\d3d12.dll)
+10:20:01.128 [dxr-tier-11-proxy-log] device wrapping enabled
+10:20:01.128 [dxr-tier-11-proxy-log] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
+10:20:01.128 [dxr-tier-11-proxy-log] highest device interface available: ID3D12Device15 (this shim implements up to 15)
+10:20:01.128 [dxr-tier-11-proxy-log] reporting Tier 1.1 to the application (tier11 on, from default).
+10:20:01.497 [dxr-tier-11-proxy-log] queue hook installed: vtable ... slot 10, self-test passed
 ```
 
-The first line proves the shim loaded at all, and says which build. If the
-file does not exist, the DLL is in the wrong directory and nothing else in
-this guide matters.
+(the date is on each line too, dropped here for width)
+
+The `start` line proves the shim loaded at all, and says which build and which
+executable. If the file does not exist, the DLL is in the wrong directory and
+nothing else in this guide matters.
+
+**The log is appended to, not replaced**, so a crash leaves its evidence behind
+rather than being overwritten by the next launch. Find the last `start` marker
+and read from there. Every run ends with a matching one:
+
+```
+10:24:31.002 [dxr-tier-11-proxy-log] ========= end: MyGame.exe (pid 4872) =========
+```
+
+**A missing `end` marker is a finding, not a gap.** It means the process never
+unloaded the shim, which is what a crash looks like from in here. The last line
+before it is where to look.
+
+### The four DLLs that are not ours
+
+The `DXC:` and `runtime:` lines report what the PROCESS actually loaded, which
+is not always what you think you installed. Two things decide whether a run
+works and neither is this project's code:
+
+- **`dxcompiler.dll` and `dxil.dll`** convert the shader and sign it. Without
+  them nothing is rewritten and the shim stands aside entirely.
+- **`D3D12Core.dll`** is the application's own Agility SDK runtime, if it ships
+  one. Unreal does. It is usually in a `D3D12` subfolder rather than beside the
+  exe, which is why the full path is logged: the same file name arrives from
+  System32, from beside the exe, or from that subfolder, and which one it was
+  is exactly the question a differing result raises.
+
+The setup tool shows the same five files, read off disk, before anything is
+launched. The two answer different questions: the panel says what is installed,
+the log says what was loaded.
 
 Then, when a RayQuery shader arrives:
 
@@ -230,8 +293,8 @@ Work down this list in order. Each step rules out a layer.
 loads D3D12 from somewhere else. Confirm the .exe path, and confirm you copied
 to that directory and not to the project root.
 
-**The log exists but stops after "attached to process".** The application
-never created a D3D12 device. Something failed earlier, unrelated to the shim.
+**The log exists but stops after the `start` marker.** The application never
+created a D3D12 device. Something failed earlier, unrelated to the shim.
 
 **Is the shim the problem at all?** Set `DXR_TIER11_NOWRAP=1`. That disables
 device wrapping and restores plain forwarding while leaving the DLL in place.

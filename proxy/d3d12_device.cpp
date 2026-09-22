@@ -8,6 +8,8 @@
 // it diverges.
 
 #include "d3d12_device.h"
+#include "pso_stream.h"
+#include "shader_dump.h"
 #include "proxy_log.h"
 #include "state_object_cache.h"
 #include "queue_hook.h"
@@ -57,40 +59,24 @@ static void NoteRayQuery(bool tier11, const char* where, const void* code, SIZE_
 // followed by its payload, with every entry aligned to a pointer. Walk it far
 // enough to find a compute shader; anything unrecognised ends the walk, since
 // the size of an unknown payload is unknowable.
-static void NoteRayQueryInStream(bool tier11, const D3D12_PIPELINE_STATE_STREAM_DESC* d) {
-    if (!d || !d->pPipelineStateSubobjectStream) return;
-    const BYTE* p = static_cast<const BYTE*>(d->pPipelineStateSubobjectStream);
-    SIZE_T left = d->SizeInBytes;
-    const SIZE_T align = sizeof(void*);
-    while (left >= sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
-        memcpy(&type, p, sizeof(type));
-        const SIZE_T head = (sizeof(type) + align - 1) & ~(align - 1);
-        if (left < head) return;
+// Every shader a pipeline stream carries, reported. See proxy/pso_stream.h
+// for why the previous version of this saw none of them.
+static psostream::Parsed NoteRayQueryInStream(bool tier11,
+                                              const D3D12_PIPELINE_STATE_STREAM_DESC* d) {
+    const psostream::Parsed ps = psostream::Walk(d);
+    for (int i = 0; i < ps.shaderCount; ++i)
+        NoteRayQuery(tier11, "CreatePipelineState",
+                     ps.shaders[i].pShaderBytecode,
+                     (SIZE_T)ps.shaders[i].BytecodeLength);
 
-        SIZE_T payload = 0;
-        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
-            payload = sizeof(D3D12_SHADER_BYTECODE);
-            if (left < head + payload) return;
-            D3D12_SHADER_BYTECODE bc{};
-            memcpy(&bc, p + head, sizeof(bc));
-            NoteRayQuery(tier11, "CreatePipelineState", bc.pShaderBytecode,
-                         (SIZE_T)bc.BytecodeLength);
-        } else {
-            // Not a shader, and its size is not knowable from here.
-            return;
-        }
-        const SIZE_T step = (head + payload + align - 1) & ~(align - 1);
-        if (step > left) return;
-        p += step; left -= step;
-    }
+    // A stream shape we cannot walk is worth a line, because the consequence
+    // of walking it wrong is a RayQuery shader slipping past unseen, and that
+    // surfaces much later as the driver rejecting a shader nobody logged.
+    if (!ps.complete)
+        ProxyLog("[dxr-tier-11-proxy-log] CreatePipelineState: stopped reading the stream at "
+                 "%s (%u). Any shader after that point was not examined.\n",
+                 psostream::TypeName(ps.stoppedAt), ps.stoppedAt);
+    return ps;
 }
 
 // Does the real device offer ID3D12Device<n>? One place, so the startup log
@@ -145,6 +131,79 @@ Dxr11Device::Dxr11Device(ID3D12Device5* real)
     for (int n = 6; n <= 15; ++n) if (Highest(n)) top = n;
     ProxyLog("[dxr-tier-11-proxy-log] highest device interface available: ID3D12Device%d "
              "(this shim implements up to 15)\n", top);
+    LogCapabilities();
+}
+
+// What the real device can do, on the axes that decide whether an engine will
+// USE ray tracing once we have told it the tier is 1.1.
+//
+// This exists because of a real dead end. A run produced a clean log, the tier
+// was reported, and nothing happened: no acceleration structure, no state
+// object, no RayQuery shader, for sixteen minutes. The tier is necessary and
+// it is not sufficient, and from outside there was no way to tell which of the
+// OTHER gates had closed.
+//
+// The gates are Unreal Engine 5's, read out of
+// Engine/Source/Runtime/D3D12RHI/Private/Windows/WindowsD3D12Device.cpp
+// (FindMaxRHIFeatureLevel) and D3D12Adapter.cpp (the ray tracing block). They
+// are not ours to satisfy, and that is the point: when this line says PASSES
+// and ray tracing still does not happen, the cause is in the application or
+// its content, not in the shim. Other engines gate differently, so this is
+// reported as facts plus one engine's verdict, not as a pass or fail.
+void Dxr11Device::LogCapabilities() {
+    if (!m_real) return;
+
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1,
+                                   D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
+                                   D3D_FEATURE_LEVEL_11_0 };
+    D3D12_FEATURE_DATA_FEATURE_LEVELS fl = { _countof(levels), levels, D3D_FEATURE_LEVEL_11_0 };
+    m_real->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
+
+    // Probed downwards, because asking for a model the device does not have
+    // returns E_INVALIDARG rather than a lower answer. This is how the runtime
+    // documents it and how Unreal does it.
+    D3D_SHADER_MODEL want[] = { D3D_SHADER_MODEL(0x69), D3D_SHADER_MODEL(0x68),
+                                D3D_SHADER_MODEL(0x67), D3D_SHADER_MODEL(0x66),
+                                D3D_SHADER_MODEL(0x65), D3D_SHADER_MODEL(0x60) };
+    D3D_SHADER_MODEL sm = D3D_SHADER_MODEL(0);
+    for (D3D_SHADER_MODEL s : want) {
+        D3D12_FEATURE_DATA_SHADER_MODEL q = { s };
+        if (SUCCEEDED(m_real->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &q, sizeof(q)))) {
+            sm = q.HighestShaderModel;
+            break;
+        }
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {};
+    m_real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0));
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
+    m_real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1));
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
+    const bool have9 = SUCCEEDED(
+        m_real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9)));
+    const bool atomic64 = have9 && o9.AtomicInt64OnTypedResourceSupported;
+
+    ProxyLog("[dxr-tier-11-proxy-log]   caps: feature level %x, shader model %d.%d, "
+             "resource binding tier %d, wave ops %s, 64-bit typed atomics %s\n",
+             (unsigned)fl.MaxSupportedFeatureLevel, (sm >> 4) & 0xf, sm & 0xf,
+             (int)o0.ResourceBindingTier, o1.WaveOps ? "yes" : "NO",
+             have9 ? (atomic64 ? "yes" : "NO") : "not reported");
+
+    // Unreal needs ALL of these for the SM6 shader platform, and ray tracing is
+    // refused outright on SM5 whatever the tier says.
+    const bool sm6 = fl.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_0 &&
+                     sm >= D3D_SHADER_MODEL(0x66) &&
+                     o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 &&
+                     o1.WaveOps && atomic64;
+    if (sm6)
+        ProxyLog("[dxr-tier-11-proxy-log]   caps: this device meets Unreal's SM6 bar, so a "
+                 "Tier 1.1 answer is enough for it to enable ray tracing. If it still does "
+                 "not, the reason is in the application or its settings, not here.\n");
+    else
+        ProxyLog("[dxr-tier-11-proxy-log]   caps: this device does NOT meet Unreal's SM6 bar, "
+                 "which needs feature level 12_0, shader model 6.6, resource binding tier 3, "
+                 "wave ops and 64-bit typed atomics. Unreal refuses ray tracing on SM5 "
+                 "whatever tier it is told, and no shim can change that.\n");
 }
 
 Dxr11Device::~Dxr11Device() {
@@ -306,6 +365,8 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
         ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader NOT lowered: %s\n"
                  "[dxr-tier-11-proxy-log]   forwarding unchanged; the driver will reject it\n",
                  why.c_str());
+        shdump::Refused(pDesc->CS.pShaderBytecode,
+                        (size_t)pDesc->CS.BytecodeLength, why.c_str());
     }
     FWD(CreateComputePipelineState(pDesc, riid, ppPipelineState));
 }
@@ -481,8 +542,38 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::SetResidencyPriority(UINT NumObjects, ID3
 
 // --- ID3D12Device2 ----------------------------------------------------------
 
+// The stream form of the same thing CreateComputePipelineState does, and it
+// needs the same substitution. An engine with a unified PSO cache creates
+// EVERYTHING here, compute included; Unreal does, which is why this path being
+// detection-only was not a gap in coverage but the whole of it.
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) {
-    NoteRayQueryInStream(m_tier11, pDesc);
+    const psostream::Parsed ps = NoteRayQueryInStream(m_tier11, pDesc);
+
+    // Compute only, never a stream that also carries a graphics or mesh stage.
+    // RayQuery in a pixel shader has no lowering, and substituting a stand-in
+    // for a graphics pipeline would be far worse than forwarding it.
+    if (!m_tier11 && ps.complete && ps.IsComputeOnly() &&
+        Dxr11ContainerUsesRayQuery(ps.cs.pShaderBytecode, (SIZE_T)ps.cs.BytecodeLength) &&
+        ppPipelineState && riid == __uuidof(ID3D12PipelineState)) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+        cd.pRootSignature = ps.rootSignature;
+        cd.CS = ps.cs;
+        cd.NodeMask = ps.nodeMask;
+        cd.Flags = ps.flags;
+        // The cached blob is deliberately NOT carried over. It was produced for
+        // the original compute shader, and what gets created here is a state
+        // object built from a rewritten library.
+        std::string why;
+        if (auto* pso = Dxr11RayQueryPso::TryCreate(m_real, &cd, &why)) {
+            *ppPipelineState = pso;
+            return S_OK;
+        }
+        ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader NOT lowered: %s\n"
+                 "[dxr-tier-11-proxy-log]   forwarding unchanged; the driver will reject it\n",
+                 why.c_str());
+        shdump::Refused(ps.cs.pShaderBytecode, (size_t)ps.cs.BytecodeLength,
+                        why.c_str());
+    }
     FWD(CreatePipelineState(pDesc, riid, ppPipelineState));
 }
 

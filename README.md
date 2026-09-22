@@ -144,10 +144,17 @@ what it took to notice.
 ## Versions
 
 [CHANGELOG.md](CHANGELOG.md) carries the releases and the versioning policy.
-The version is compiled into the DLL and logged on attach, so a log file
-identifies its own build:
+The version is compiled into the DLL, put in its version resource, and logged
+at the start of every run, so both the file and any log identify their own
+build:
 
-    [dxr-tier-11-proxy-log] attached to process, version 0.14.0
+    2026-09-22 10:20:00.499 [dxr-tier-11-proxy-log] ======== start: MyGame.exe (pid 4872), shim 0.15.0 ========
+
+The log also reports the versions of the four DLLs that are not ours and that
+decide whether a run works: `dxcompiler.dll` and `dxil.dll`, which convert and
+sign the rewritten shader, and the application's own `D3D12Core.dll` and
+`d3d12SDKLayers.dll`. Full paths, because the same file name arrives from
+System32, from beside the exe, or from an Agility subdirectory.
 
 ## Documentation
 

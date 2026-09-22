@@ -49,14 +49,45 @@ void LoadIni() {
     std::ifstream f(dir + L"dxr-tier-11.ini");
     if (!f) return;
     std::string line;
+    bool first = true;
     while (std::getline(f, line)) {
+        // A UTF-8 BOM would otherwise end up glued to the first key, and the
+        // setting would be silently ignored rather than reported as wrong.
+        if (first && line.size() >= 3 && line.compare(0, 3, "\xEF\xBB\xBF") == 0)
+            line.erase(0, 3);
+        first = false;
         line = Trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[')
             continue;
         const size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
-        g_ini[Lower(Trim(line.substr(0, eq)))] = Lower(Trim(line.substr(eq + 1)));
+        // The KEY is lowered, the VALUE is not: a switch is a keyword and a
+        // path is not. Truthy() lowers what it is given.
+        g_ini[Lower(Trim(line.substr(0, eq)))] = Trim(line.substr(eq + 1));
     }
+}
+
+std::wstring Decode(const std::string& s, UINT codepage, DWORD flags) {
+    if (s.empty()) return L"";
+    const int n = MultiByteToWideChar(codepage, flags, s.c_str(),
+                                      static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring out(n, L'\0');
+    MultiByteToWideChar(codepage, flags, s.c_str(), static_cast<int>(s.size()),
+                        &out[0], n);
+    return out;
+}
+
+std::wstring Widen(const char* ascii) { return Decode(ascii, CP_ACP, 0); }
+
+// An .ini value to a path. Written as UTF-8 by the setup tool, but somebody
+// editing it by hand in Notepad may well have saved it as ANSI, so a strict
+// UTF-8 decode that fails falls back rather than producing nothing. Getting
+// this wrong shows up as a log that silently goes to the wrong place.
+std::wstring FromIniBytes(const std::string& s) {
+    std::wstring w = Decode(s, CP_UTF8, MB_ERR_INVALID_CHARS);
+    if (w.empty() && !s.empty()) w = Decode(s, CP_ACP, 0);
+    return w;
 }
 
 bool Truthy(const std::string& v, bool* out) {
@@ -77,10 +108,35 @@ Flag Get(const char* envName, const char* iniKey, bool fallback) {
         return Flag{ parsed, "environment" };
 
     auto it = g_ini.find(Lower(iniKey));
-    if (it != g_ini.end() && Truthy(it->second, &parsed))
+    if (it != g_ini.end() && Truthy(Lower(it->second), &parsed))
         return Flag{ parsed, "dxr-tier-11.ini" };
 
     return Flag{ fallback, "default" };
 }
+
+Text GetText(const char* envName, const char* iniKey) {
+    std::call_once(g_once, LoadIni);
+
+    // A path can be long and can hold anything a user name can, so this is
+    // wide from the environment onwards. GetEnvironmentVariableW returns the
+    // required size when the buffer is too small, which is how the length is
+    // discovered rather than guessed.
+    const std::wstring wideEnv = Widen(envName);
+    DWORD n = GetEnvironmentVariableW(wideEnv.c_str(), nullptr, 0);
+    if (n > 1) {
+        std::wstring buf(n, L'\0');
+        n = GetEnvironmentVariableW(wideEnv.c_str(), &buf[0], n);
+        buf.resize(n);
+        if (!buf.empty()) return Text{ buf, "environment" };
+    }
+
+    auto it = g_ini.find(Lower(iniKey));
+    if (it != g_ini.end() && !it->second.empty())
+        return Text{ FromIniBytes(it->second), "dxr-tier-11.ini" };
+
+    return Text{ std::wstring(), "default" };
+}
+
+std::wstring ShimDirectory() { return OwnDirectory(); }
 
 }  // namespace cfg

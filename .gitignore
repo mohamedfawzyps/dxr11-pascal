@@ -9,6 +9,9 @@ raytest.exe
 D3D12/
 
 d3d12.dll
+dxgi.dll
+dxgi.lib
+dxgi.exp
 *.lib
 *.exp
 *.ilk

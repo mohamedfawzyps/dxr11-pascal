@@ -179,17 +179,41 @@ def main():
     ok.append(expect_reject('no loop, not FORCE_OPAQUE', noflag,
                             'no lowering is defined'))
 
-    # CommittedGeometryIndex is recognised and still has no lowering, because
-    # GeometryIndex() in a DXR 1.0 hit shader is ITSELF a Tier 1.1 feature.
-    # Measured: such a library sets shader flag 0x2000000 and
-    # CreateStateObject on the GTX 1070 returns E_INVALIDARG. Refusing is the
-    # only correct answer, so it must not quietly start being accepted.
+    # CommittedGeometryIndex FLIPS from a refusal to an acceptance, and the
+    # case is kept rather than deleted so the refusal cannot creep back.
+    #
+    # It was refused for most of this project's life, and the measurement
+    # behind that is still true: GeometryIndex() in a DXR 1.0 hit shader is
+    # ITSELF a Tier 1.1 feature, such a library sets shader flag 0x2000000, and
+    # CreateStateObject on the GTX 1070 returns E_INVALIDARG. What changed is
+    # that the answer no longer comes from an intrinsic. The shim builds the
+    # shader table, so the geometry index rides in the record as a local root
+    # signature constant and the hit shader reads it back. Measured at
+    # SFI0 = 0x0: phase5/cases/reference/lib_localroot_ref.hlsl.
+    #
+    # This is the third time here that a test's premise was a fact about the
+    # world and the fact moved. The suite caught it, which is the point.
     if os.path.isfile(IDS):
         geom = load(IDS).replace(
             '@dx.op.rayQuery_StateScalar.i32(i32 207',
             '@dx.op.rayQuery_StateScalar.i32(i32 209')
-        ok.append(expect_reject('CommittedGeometryIndex', geom,
-                                'itself a Tier 1.1 feature'))
+        ok.append(expect_ok('CommittedGeometryIndex now lowers', geom))
+
+    # The BOUNDARY of the recomputable exemption.
+    #
+    # A cbuffer read or a ray-index value read inside the Proceed loop is
+    # rebuilt by the generated hit shader rather than refused, because neither
+    # is caller state. A UAV read is: the raygen may have written that buffer,
+    # so running the load again in a different invocation is not the same as
+    # carrying the value. `param` in the dispatch suite proves the exemption
+    # works; this proves it stops.
+    UAV = os.path.join('phase5', 'cases', 'refuse_uav_in_loop.ll')
+    if os.path.isfile(UAV):
+        # expect_lower_reject, not expect_reject: this lives in the LOWERING,
+        # because it is about whether the loop body can be transplanted rather
+        # than about what the query does. The analysis accepts it happily.
+        ok.append(expect_lower_reject('UAV read used inside the loop', load(UAV),
+                                      'reads values defined outside it'))
 
     # Committing BOTH kinds is no longer refused: the loop body lowers twice,
     # into an any-hit and an intersection shader, with two closest-hits because

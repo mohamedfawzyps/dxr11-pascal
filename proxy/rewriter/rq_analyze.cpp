@@ -35,6 +35,12 @@ const std::map<int, const char*>& KnownTable() {
         { kCandidateObjectRayOrigin, "CandidateObjectRayOrigin" },
         { kCandidateObjectRayDirection, "CandidateObjectRayDirection" },
         { kCommittedInstanceID, "CommittedInstanceID" },
+        { kRayFlags, "RayFlags" },
+        { kCandidateGeometryIndex, "CandidateGeometryIndex" },
+        { kCandidateInstanceContrib,
+          "CandidateInstanceContributionToHitGroupIndex" },
+        { kCommittedInstanceContrib,
+          "CommittedInstanceContributionToHitGroupIndex" },
     };
     return t;
 }
@@ -58,27 +64,28 @@ const char* OpcodeName(int op) {
     return it == KnownTable().end() ? "?" : it->second;
 }
 
-std::string NoLoweringReason(int op) {
-    // CommittedGeometryIndex is recognised so the refusal can explain itself,
-    // but it has NO lowering on this hardware. Its DXR 1.0 equivalent,
-    // GeometryIndex() in a hit shader, is ITSELF a Tier 1.1 feature: measured,
-    // such a library sets shader flag 0x2000000 and CreateStateObject on the
-    // GTX 1070 fails with E_INVALIDARG. Encoding the index in the shader table
-    // would work but means the shim rebuilding the application's SBT.
-    if (op == kCommittedGeometryIndex)
-        return "CommittedGeometryIndex has no lowering on Tier 1.0. Its DXR 1.0 "
-               "equivalent, GeometryIndex() in a hit shader, is itself a Tier 1.1 "
-               "feature and CreateStateObject rejects it on this hardware. "
-               "Encoding the index in the shader table would work but is not "
-               "implemented.";
-    return "";
-}
+// Empty, and that is the interesting part.
+//
+// CommittedGeometryIndex lived here for most of this project's life, because
+// GeometryIndex() in a DXR 1.0 hit shader is ITSELF Tier 1.1: a library using
+// it sets shader flag 0x2000000 and CreateStateObject on the GTX 1070 returns
+// E_INVALIDARG. That measurement is still true. What changed is that the
+// answer no longer has to come from an intrinsic: the shim builds the shader
+// table, so it puts the geometry index in the record.
+//
+// A real Unreal 5.8 run refused 120 shaders on the four record opcodes, more
+// than everything else together, which is what made it worth doing.
+//
+// Kept as a function rather than deleted, because the next opcode with no
+// lowering will want somewhere to say so.
+std::string NoLoweringReason(int) { return ""; }
 
 bool IsCommittedOp(int op) {
     return op == kCommittedStatus || op == kCommittedBary || op == kCommittedRayT ||
            op == kCommittedInstanceIndex || op == kCommittedGeometryIndex ||
            op == kCommittedPrimitiveIndex || op == kCommittedInstanceID ||
-           op == kCommittedFrontFace || op == kCommittedWorldToObject;
+           op == kCommittedFrontFace || op == kCommittedWorldToObject ||
+           op == kCommittedInstanceContrib;
 }
 
 bool IsCandidateOp(int op) {
@@ -87,7 +94,9 @@ bool IsCandidateOp(int op) {
            op == kCandidateWorldToObject || op == kCandidateFrontFace ||
            op == kCandidateRayT || op == kCandidateInstanceIndex ||
            op == kCandidateInstanceID || op == kCandidatePrimitiveIndex ||
-           op == kCandidateObjectRayOrigin || op == kCandidateObjectRayDirection;
+           op == kCandidateObjectRayOrigin || op == kCandidateObjectRayDirection ||
+           op == kCandidateGeometryIndex || op == kCandidateInstanceContrib ||
+           op == kRayFlags;
 }
 
 std::string FlagNames(int value) {
@@ -109,6 +118,19 @@ std::string FlagNames(int value) {
 
 int Query::DynFlags() const { return trace ? Imm(trace->args[3]) : 0; }
 int Query::RayFlags() const { return constFlags | DynFlags(); }
+
+bool Query::StaticFlags() const {
+    static const std::regex kImm(R"(^\s*i32\s+(-?\d+)\s*$)");
+    return trace && std::regex_match(trace->args[3], kImm);
+}
+
+std::pair<std::string, std::string> Query::FlagsOperand() const {
+    if (StaticFlags())
+        return { "", "i32 " + std::to_string(RayFlags()) };
+    const std::string dyn = llm::OperandName(trace->args[3]);
+    return { "  %rq.flags = or i32 " + dyn + ", " + std::to_string(constFlags),
+             "i32 %rq.flags" };
+}
 
 std::string Query::AsHandle() const {
     return trace ? llm::OperandName(trace->args[2]) : "";
@@ -179,13 +201,22 @@ std::string Collect(const llm::Function& fn, Query& q) {
             } else if (op == kCommitProcedural) {
                 q.procCommits.emplace_back(&b, &i);
             } else if (IsCandidateOp(op)) {
+                if (RecordWord(op) >= 0) q.needsRecordConstants = true;
                 q.candidateOps.emplace_back(&b, &i);
             } else if (IsCommittedOp(op)) {
+                if (RecordWord(op) >= 0) q.needsRecordConstants = true;
                 q.committedOps.emplace_back(&b, &i);
             }
         }
     }
     if (!q.trace) return "query is allocated but never traced";
+
+    // Ray flags computed at runtime are FINE: dx.op.traceRay takes RayFlags
+    // as an ordinary i32 operand, not an immediate. Measured, see
+    // phase5/cases/reference/lib_dynflags_ref.hlsl. They were refused for one
+    // version because Imm() had been silently folding an unknown value to 0
+    // and tracing with the wrong flags; passing the value through is the right
+    // answer. Unreal computes them at runtime in 118 shaders.
     return "";
 }
 

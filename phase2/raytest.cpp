@@ -289,6 +289,19 @@ static bool g_mixed = false;
 static bool g_both = false;
 
 static bool g_table = false;
+// Create the compute PSO through CreatePipelineState, the pipeline STREAM
+// form, instead of CreateComputePipelineState. Unreal uses the stream form
+// for everything, and the shim's substitution used to cover only the struct
+// form, so every RayQuery shader in a real engine went straight to the
+// driver unexamined. Same shader, same scene, different D3D12 entry point.
+static bool g_stream = false;
+// One bottom-level structure holding FOUR geometries, so GeometryIndex varies
+// across the image instead of being 0 everywhere.
+//
+// Every other scene here has one geometry per structure, which means every
+// correct answer for GeometryIndex is 0 and a lowering that returned a
+// constant would pass. That is the whole reason this scene exists.
+static bool g_geom = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
@@ -629,6 +642,81 @@ static Scene BuildSceneMixed(Gpu& g, bool opaque) {
     return s;
 }
 
+// One BLAS, four geometries, one quad each, one per quadrant of the view.
+//
+// GeometryIndex is then a function of where the ray lands: 0 bottom-left,
+// 1 bottom-right, 2 top-left, 3 top-right. A shader reading it produces a
+// four-way pattern, and any lowering that loses the index produces a flat one.
+//
+// The quads stop short of the axes so no ray lands exactly on a shared edge,
+// where which geometry is hit would be a tie and the oracle could legitimately
+// disagree with the hardware.
+static Scene BuildSceneGeom(Gpu& g, bool opaque) {
+    Scene s;
+    const float lo = 0.1f, hi = 0.9f;
+    struct Quad { float x0, y0, x1, y1; };
+    const Quad quads[4] = {
+        { -hi, -hi, -lo, -lo },   // geometry 0
+        {  lo, -hi,  hi, -lo },   // geometry 1
+        { -hi,  lo, -lo,  hi },   // geometry 2
+        {  lo,  lo,  hi,  hi },   // geometry 3
+    };
+    float verts[4 * 6 * 3];
+    for (int q = 0; q < 4; ++q) {
+        const Quad& r = quads[q];
+        const float tri[18] = {
+            r.x0, r.y0, 0.0f,  r.x1, r.y0, 0.0f,  r.x0, r.y1, 0.0f,
+            r.x1, r.y0, 0.0f,  r.x1, r.y1, 0.0f,  r.x0, r.y1, 0.0f,
+        };
+        std::memcpy(verts + q * 18, tri, sizeof(tri));
+    }
+    s.vb = CreateBuffer(g.device.Get(), sizeof(verts), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(s.vb->Map(0, &none, &p), "map vb"); std::memcpy(p, verts, sizeof(verts));
+    s.vb->Unmap(0, nullptr);
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geo[4]{};
+    for (int q = 0; q < 4; ++q) {
+        geo[q].Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        geo[q].Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                              : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        geo[q].Triangles.VertexBuffer.StartAddress =
+            s.vb->GetGPUVirtualAddress() + q * 6 * sizeof(float) * 3;
+        geo[q].Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+        geo[q].Triangles.VertexCount = 6;
+        geo[q].Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        geo[q].Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+    }
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
+    bi.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    bi.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    bi.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    bi.NumDescs = 4; bi.pGeometryDescs = geo;
+    s.blas = BuildAS(g, bi);
+
+    // One instance. With --contrib it carries a nonzero contribution as well,
+    // so the record index becomes contribution + geometry index and BOTH
+    // numbers have to be right rather than just one of them.
+    D3D12_RAYTRACING_INSTANCE_DESC inst{};
+    inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
+    inst.InstanceMask = 0xFF;
+    if (g_contrib) inst.InstanceContributionToHitGroupIndex = 2;
+    inst.AccelerationStructure = s.blas->GetGPUVirtualAddress();
+    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, &inst, sizeof(inst));
+    instBuf->Unmap(0, nullptr);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    s.tlas = BuildAS(g, ti);
+    return s;
+}
+
 static Scene BuildSceneMulti(Gpu& g, bool opaque) {
     Scene s;
     const float qx = 0.4f, qy = 0.8f;
@@ -871,8 +959,52 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     pd.CS.pShaderBytecode = cs->GetBufferPointer();
     pd.CS.BytecodeLength = cs->GetBufferSize();
     ComPtr<ID3D12PipelineState> pso;
-    HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)),
-       "CreateComputePipelineState");
+    if (g_stream) {
+        // Laid out the way an engine lays it out, which is the point: the root
+        // signature comes FIRST, so a walker that stops at the first
+        // non-shader subobject never reaches the CS at all.
+        struct alignas(void*) SubRootSig {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+            ID3D12RootSignature* value;
+        };
+        struct alignas(void*) SubCS {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+            D3D12_SHADER_BYTECODE value;
+        };
+        struct alignas(void*) SubNodeMask {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK;
+            UINT value;
+        };
+        struct alignas(void*) SubFlags {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type =
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS;
+            D3D12_PIPELINE_STATE_FLAGS value;
+        };
+        struct alignas(void*) Stream {
+            SubRootSig rootSig;
+            SubNodeMask nodeMask;
+            SubCS cs;
+            SubFlags flags;
+        } stream{};
+        stream.rootSig.value = rs.Get();
+        stream.nodeMask.value = 0;
+        stream.cs.value = pd.CS;
+        stream.flags.value = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+        ComPtr<ID3D12Device2> dev2;
+        HR(g.device.As(&dev2), "ID3D12Device2 for CreatePipelineState");
+        D3D12_PIPELINE_STATE_STREAM_DESC sd{};
+        sd.SizeInBytes = sizeof(stream);
+        sd.pPipelineStateSubobjectStream = &stream;
+        HR(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)), "CreatePipelineState (stream)");
+        std::printf("        compute PSO created through CreatePipelineState (stream form)\n");
+    } else {
+        HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)),
+           "CreateComputePipelineState");
+    }
 
     auto mask = MakeAlphaMask(g.device.Get());
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -1004,7 +1136,7 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
     // shows up as CreateStateObject returning E_INVALIDARG, which is a real
     // coupling: the payload size is part of the state object contract, not a
     // free choice for whatever generates the shaders.
-    sc.MaxPayloadSizeInBytes = 88;
+    sc.MaxPayloadSizeInBytes = 92;   // must match kPayloadBytes in rq_lower.cpp
     sc.MaxAttributeSizeInBytes = 8;     // float2 barycentrics
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
 
@@ -1177,6 +1309,7 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
     Dxc dxc; dxc.init();
     Scene scene = g_mixed ? BuildSceneMixed(g, pattern == Pattern::Opaque)
                 : g_proc  ? BuildSceneProc(g, pattern == Pattern::Opaque)
+                : g_geom  ? BuildSceneGeom(g, pattern == Pattern::Opaque)
                 : g_multi ? BuildSceneMulti(g, pattern == Pattern::Opaque)
                           : BuildScene(g, pattern == Pattern::Opaque);
 
@@ -1302,6 +1435,18 @@ int main(int argc, char** argv) {
                 g_csFile = argv[i + 1];
                 for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
                 argc -= 2; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--geom") == 0) {
+                g_geom = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--stream") == 0) {
+                g_stream = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
                 continue;
             }
             if (std::strcmp(argv[i], "--table") == 0) {

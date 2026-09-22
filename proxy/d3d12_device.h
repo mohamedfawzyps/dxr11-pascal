@@ -194,6 +194,11 @@ private:
     // Whether the real device offers ID3D12Device<n>, for n in 6..15.
     bool Highest(int n) const;
 
+    // The caps that decide whether an engine will USE ray tracing once it has
+    // been told the tier is 1.1. Logged once per device; see the definition
+    // for why a shim reports somebody else's gates.
+    void LogCapabilities();
+
     ID3D12Device5* m_real;
     bool           m_tier11;
     // Null when the underlying device does not offer these. QueryInterface

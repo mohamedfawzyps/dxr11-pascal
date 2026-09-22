@@ -24,12 +24,43 @@ const char* kAttrs = "%struct.BuiltInTriangleIntersectionAttributes";
 // offsets across two implementations is a good way to get one of them subtly
 // wrong. The per-invocation COST is what is made conditional instead.
 const char* kPayloadType =
-    "{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float], i32 }";
-const int kPayloadBytes = 88;
+    "{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float], i32, i32 }";
+const int kPayloadBytes = 92;
+
+// The record's own two numbers, and how the generated shaders reach them.
+//
+// Not a dx.op call like everything in kChSource: there is no intrinsic for
+// either, which is exactly why they were refused. They come out of a cbuffer
+// bound by a LOCAL root signature, so the value is per hit-group-record and
+// the shim chose it when it built the table.
+const char* kRecordType = "%rq_record";
+const char* kRecordGlobal = "@rq_record";
+const char* kRecordHandleFn = "dx.op.createHandleForLib.rq_record";
+const char* kCbRet = "%dx.types.CBufRet.i32";
 // HitKind() is an integer; the RayQuery form is a bool.
 const int kHitKindFront = 254;
 
 struct Field { int idx; const char* ty; int align; };
+
+// Emitted per use rather than hoisted. The handle and the load are pure and
+// the driver folds the duplicates; hoisting them by hand would mean finding a
+// place that dominates every use, which is a CFG question this pass has no
+// reason to ask.
+std::vector<std::string> RecordRead(const std::string& tag, int word,
+                                    const std::string& result) {
+    const std::string t = std::string(kRecordType);
+    return {
+        "  %rq.cbv" + tag + " = load " + t + ", " + t + "* " + kRecordGlobal +
+            ", align 4",
+        "  %rq.cbh" + tag + " = call %dx.types.Handle @" + kRecordHandleFn +
+            "(i32 160, " + t + " %rq.cbv" + tag + ")  ; CreateHandleForLib(Resource)",
+        "  %rq.cbr" + tag + " = call " + kCbRet +
+            " @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %rq.cbh" + tag +
+            ", i32 0)  ; CBufferLoadLegacy(handle,regIndex)",
+        "  " + result + " = extractvalue " + kCbRet + " %rq.cbr" + tag + ", " +
+            std::to_string(word),
+    };
+}
 
 std::optional<Field> PayloadField(int op) {
     switch (op) {
@@ -41,6 +72,11 @@ std::optional<Field> PayloadField(int op) {
         case kCommittedInstanceID:      return Field{ 6, "i32", 4 };
         case kCommittedFrontFace:       return Field{ 7, "i32", 4 };
         case kCommittedWorldToObject:   return Field{ 8, "[12 x float]", 4 };
+        // 9 is the abort flag. 10 came with the record constants; the geometry
+        // index needed no new field because slot 5 had been reserved for it all
+        // along and left unused while the accessor was refused.
+        case kCommittedGeometryIndex:   return Field{ 5, "i32", 4 };
+        case kCommittedInstanceContrib: return Field{ 10, "i32", 4 };
         default:                        return std::nullopt;
     }
 }
@@ -67,11 +103,37 @@ const CandMap kCandidateMap[] = {
     { kCandidateObjectRayOrigin,    "float", "dx.op.objectRayOrigin.f32",    149, 1 },
     { kCandidateObjectRayDirection, "float", "dx.op.objectRayDirection.f32", 150, 1 },
     { kCandidateWorldToObject,      "float", "dx.op.worldToObject.f32",      152, 2 },
+    // Legal in an any-hit and an intersection shader, NOT in a raygen.
+    // A raygen read is folded to a constant instead, see EditRayFlags.
+    { kRayFlags,                    "i32",   "dx.op.rayFlags.i32",           144, 0 },
 };
 const CandMap* FindCand(int op) {
     for (const auto& c : kCandidateMap) if (c.op == op) return &c;
     return nullptr;
 }
+
+// Shader Model 6.6 reaches a resource by BINDING, not by a range index.
+//
+// Unreal's RayQuery shaders are cs_6_6 and every one of them does this. The
+// rewriter was built against 6.5, and that single difference caused 124 of the
+// 157 refusals a real Unreal run produced.
+//
+//   cs_6_6   createHandleFromBinding (217) -> annotateHandle (216)
+//   lib_6_6  createHandleForLib      (160) -> annotateHandle (216)
+//
+// So the conversion is 217 -> 160, and the annotateHandle after it is kept
+// untouched. Read off DXC, see phase5/cases/reference/lib_sm66_binding_ref.hlsl.
+const int kBindHandle = 217;
+const int kAnnotateHandle = 216;
+// The library form's global is a HANDLE, not the resource type, and the
+// overload is named after the handle type too. That is the part that cannot be
+// guessed from the 6.5 path, where both are the resource type.
+const char kHandleType[] = "%dx.types.Handle";
+
+// 0x2000000 is the raytracing tier 1.1 shader flag: measured on GeometryIndex,
+// which sets it and makes CreateStateObject refuse the library on a GTX 1070.
+// Every RayQuery op is gone after lowering, so the flag must go with them.
+const unsigned long long kRt11ShaderFlag = 0x2000000ull;
 
 struct ResRec {
     int nid = 0;
@@ -100,7 +162,13 @@ std::string Trim(const std::string& s) {
 std::vector<std::string> SplitTop(const std::string& s) { return llm::SplitArgs(s); }
 
 std::map<int, std::string> Metadata(const std::string& text) {
-    static const std::regex re(R"(!(\d+) = !\{(.*)\}\s*)");
+    // `distinct` counts. A [branch] or [loop] hint makes DXC emit
+    // `!16 = distinct !{!16, !"dx.controlflow.hints", i32 1}`, and a
+    // pattern that misses it leaves that id invisible. The fresh-id
+    // counter starts at max+1, so it then hands out an id the module
+    // already uses and the assembler says "Metadata id is already used".
+    // Unreal uses those hints constantly.
+    static const std::regex re(R"(!(\d+) = (?:distinct )?!\{(.*)\}\s*)");
     std::map<int, std::string> out;
     for (const auto& line : llm::SplitLines(text)) {
         std::smatch m;
@@ -138,9 +206,249 @@ std::string Replace(std::string s, const std::string& from, const std::string& t
     return s;
 }
 
+
+// --- what a generated hit shader can rebuild for itself ---------------------
+//
+// Mirrors _type_names / _operands / _recomputable / _needed_chain in lower.py,
+// which is the reference. See there for why each list is what it is.
+
+// Every %name an instruction READS, not just its call arguments.
+//
+// Instr::Uses() decodes call arguments and phi incomings, which is what the
+// rest of this pass needs. It is not enough for the isolation check: a value
+// can reach the loop body through ordinary arithmetic, `fcmp float %bary,
+// %thresh`, and Uses() cannot see it. The check then let it through, the
+// generated hit shader referenced a value it never defined, and the ASSEMBLER
+// reported it, as "use of undefined value". Loud, but nowhere near the cause.
+std::set<std::string> TypeNames(const std::string& text) {
+    // A name is a TYPE exactly when the module declares it one. Guessing from
+    // the shape of the name does not work: %rq.pl and %dx.types.Handle look
+    // alike.
+    static const std::regex kTypedef(R"RX(^(%"[^"]*"|%[\w.$-]+)\s*=\s*type\s)RX");
+    std::set<std::string> out;
+    for (const auto& line : llm::SplitLines(text)) {
+        std::smatch m;
+        if (std::regex_search(line, m, kTypedef)) out.insert(m[1].str());
+    }
+    return out;
+}
+
+std::vector<std::string> Operands(const llm::Instr& i,
+                                  const std::set<std::string>& types) {
+    // A phi writes its predecessors as `[ %val, %bb12 ]`, with no `label`
+    // keyword to mark them, so the general scan below counts %bb12 as a value
+    // read. Unreal's loop bodies are full of phis, and the check then refused
+    // 118 shaders for "reading" their own predecessor blocks.
+    //
+    // Uses() already decodes a phi correctly: incoming VALUES, which do count,
+    // and not the blocks, which do not.
+    if (i.isPhi) return i.Uses();
+
+    std::string body = i.body;
+    const size_t cut = body.find(';');
+    if (cut != std::string::npos) body = body.substr(0, cut);
+
+    // A quoted name first, because %"class.RWStructuredBuffer<Result>" holds
+    // characters an unquoted one cannot and would be cut at the quote.
+    static const std::regex kName(R"RX(%"[^"]*"|%[\w.$-]+)RX");
+    std::vector<std::string> out;
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), kName);
+         it != std::sregex_iterator(); ++it) {
+        const std::string n = it->str();
+        if (types.count(n) || n == i.result) continue;
+        // `label %bb42` is a branch target, not a value.
+        std::string before = body.substr(0, it->position());
+        while (!before.empty() && std::isspace((unsigned char)before.back()))
+            before.pop_back();
+        if (before.size() >= 5 && before.compare(before.size() - 5, 5, "label") == 0)
+            continue;
+        out.push_back(n);
+    }
+    return out;
+}
+
+bool PureInstruction(const llm::Instr& i) {
+    static const std::set<std::string> kPure = {
+        "add", "sub", "mul", "and", "or", "xor", "shl", "lshr", "ashr",
+        "fadd", "fsub", "fmul", "fdiv", "fneg",
+        "icmp", "fcmp", "select", "extractvalue", "extractelement",
+        "zext", "sext", "trunc", "bitcast", "sitofp", "uitofp", "fptosi",
+        "fptoui", "fpext", "fptrunc", "getelementptr",
+    };
+    static const std::regex kOp(R"(^\s*(\w+))");
+    std::smatch m;
+    if (!std::regex_search(i.body, m, kOp)) return false;
+    return kPure.count(m[1].str()) != 0;
+}
+
+// 57 createHandle, 59 cbufferLoadLegacy, 93 threadId, plus the Shader Model
+// 6.6 handle pair 216/217. See lower.py for what is deliberately absent:
+// loads, phis, integer division, any other dx.op.
+bool PureDxOp(int op) {
+    return op == 57 || op == 59 || op == 93 ||
+           op == kAnnotateHandle || op == kBindHandle;
+}
+
+std::map<std::string, const llm::Instr*> Recomputable(
+        const llm::Function& fn, const std::set<std::string>& types) {
+    std::map<std::string, const llm::Instr*> ok;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& b : fn.blocks) {
+            for (const auto& i : b.instrs) {
+                if (i.result.empty() || ok.count(i.result)) continue;
+                const int op = i.DxOp();
+                if (op >= 0) { if (!PureDxOp(op)) continue; }
+                else if (!PureInstruction(i)) continue;
+                bool all = true;
+                for (const auto& u : Operands(i, types))
+                    if (!ok.count(u) && u != i.result) { all = false; break; }
+                if (!all) continue;
+                ok[i.result] = &i;
+                changed = true;
+            }
+        }
+    }
+    return ok;
+}
+
+// `skip` is what the loop body defines for itself. Without it the closure walks
+// straight back into the body and rebuilds its instructions in the prologue as
+// well, which is a duplicate definition.
+std::vector<const llm::Instr*> NeededChain(
+        const llm::Function& fn,
+        const std::map<std::string, const llm::Instr*>& rec,
+        const std::set<std::string>& wanted,
+        const std::set<std::string>& types,
+        const std::set<std::string>& skip) {
+    std::set<std::string> need;
+    std::vector<std::string> frontier;
+    for (const auto& w : wanted) if (!skip.count(w)) frontier.push_back(w);
+    while (!frontier.empty()) {
+        const std::string r = frontier.back();
+        frontier.pop_back();
+        if (need.count(r) || skip.count(r)) continue;
+        auto it = rec.find(r);
+        if (it == rec.end()) continue;
+        need.insert(r);
+        for (const auto& u : Operands(*it->second, types)) frontier.push_back(u);
+    }
+    std::vector<const llm::Instr*> out;
+    for (const auto& b : fn.blocks)
+        for (const auto& i : b.instrs)
+            if (need.count(i.result)) out.push_back(&i);
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
+
+bool UsesBinding(const llm::Module& m) {
+    if (m.functions.empty()) return false;
+    for (const auto& b : m.functions[0].blocks)
+        for (const auto& i : b.instrs)
+            if (i.DxOp() == kBindHandle) return true;
+    return false;
+}
+
+struct Bind {
+    int cls = 0;
+    int space = 0;
+    int lower = 0;
+    bool operator<(const Bind& o) const {
+        if (cls != o.cls) return cls < o.cls;
+        if (space != o.space) return space < o.space;
+        return lower < o.lower;
+    }
+};
+
+// `%dx.types.ResBind { i32 lower, i32 upper, i32 space, i8 class }`, read off
+// real DXC output: `{ i32 4, i32 4, i32 0, i8 2 }` is cbuffer b4, space 0.
+bool ResBind(const llm::Instr& i, Bind* out) {
+    static const std::regex re(
+        R"(\{\s*i32\s+(-?\d+),\s*i32\s+(-?\d+),\s*i32\s+(-?\d+),\s*i8\s+(-?\d+)\s*\})");
+    if (i.args.size() < 2) return false;
+    // SRV t0 space0 is all zeroes, and LLVM prints an all-zero struct as
+    // `zeroinitializer` rather than writing the fields out. Nothing in the
+    // Unreal shaders was bound there, so only an independently written case
+    // reached this.
+    if (i.args[1].find("zeroinitializer") != std::string::npos) {
+        out->cls = 0; out->space = 0; out->lower = 0;
+        return true;
+    }
+    std::smatch m;
+    if (!std::regex_search(i.args[1], m, re)) return false;
+    out->lower = std::stoi(m[1].str());
+    out->space = std::stoi(m[3].str());
+    out->cls = std::stoi(m[4].str());
+    return true;
+}
+
+// {class, space, lowerBound} -> record node id. A record is
+// `{id, global, name, space, lowerBound, rangeSize, ...}`, so the binding in
+// the call is matched by space and lower bound rather than by the range index
+// the 6.5 form carries.
+std::map<Bind, int> BindingMap(const std::string& text,
+                               const std::map<int, std::string>& md) {
+    std::map<Bind, int> out;
+    static const std::regex kRes(R"(!dx\.resources\s*=\s*!\{!(\d+)\})");
+    std::smatch rm;
+    if (!std::regex_search(text, rm, kRes)) return out;
+    auto groups = SplitTop(md.at(std::stoi(rm[1].str())));
+    static const std::regex kI32(R"(i32\s+(-?\d+))");
+    for (size_t cls = 0; cls < groups.size(); ++cls) {
+        const std::string g = Trim(groups[cls]);
+        if (g == "null") continue;
+        for (const auto& idTok : SplitTop(md.at(std::stoi(g.substr(1))))) {
+            const int nid = std::stoi(Trim(idTok).substr(1));
+            auto f = SplitTop(md.at(nid));
+            if (f.size() < 5) continue;
+            std::smatch sm, lm;
+            const std::string sp = Trim(f[3]), lo = Trim(f[4]);
+            if (!std::regex_search(sp, sm, kI32)) continue;
+            if (!std::regex_search(lo, lm, kI32)) continue;
+            Bind b;
+            b.cls = static_cast<int>(cls);
+            b.space = std::stoi(sm[1].str());
+            b.lower = std::stoi(lm[1].str());
+            out[b] = nid;
+        }
+    }
+    return out;
+}
+
+// The module-level shader flags, tag 0 of the entry point's properties.
+//
+// The lowering used to hardcode 16 here, which happened to be right for every
+// shader this project had ever seen: they all declared 0x2000010, and the only
+// bit the lowering removes is the tier 1.1 flag. An Unreal shader declares
+// 0x42000010, so 16 was wrong by exactly the bit it did not know about and the
+// validator said "Flags must match usage".
+unsigned long long ModuleFlags(const std::string& text,
+                               const std::map<int, std::string>& md) {
+    static const std::regex kEp(R"(!dx\.entryPoints\s*=\s*!\{!(\d+)\})");
+    std::smatch m;
+    if (!std::regex_search(text, m, kEp)) return 0;
+    auto it = md.find(std::stoi(m[1].str()));
+    if (it == md.end()) return 0;
+    auto fields = SplitTop(it->second);
+    if (fields.size() < 5) return 0;
+    const std::string p4 = Trim(fields[4]);
+    if (p4.empty() || p4[0] != '!') return 0;
+    auto pit = md.find(std::stoi(p4.substr(1)));
+    if (pit == md.end()) return 0;
+    auto props = SplitTop(pit->second);
+    static const std::regex kI64(R"(^i64\s+(\d+))");
+    for (size_t i = 0; i + 1 < props.size(); i += 2) {
+        if (Trim(props[i]) != "i32 0") continue;
+        std::smatch vm;
+        const std::string v = Trim(props[i + 1]);
+        if (std::regex_search(v, vm, kI64)) return std::stoull(vm[1].str());
+    }
+    return 0;
+}
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     LowerResult r;
@@ -192,6 +500,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         }
     }
 
+    const bool binding = UsesBinding(m);
+    const std::map<Bind, int> binds = binding ? BindingMap(text0, md)
+                                              : std::map<Bind, int>();
+
     // --- one global per resource, in the same order Python builds them -----
     std::vector<GlobalInfo> globals;
     {
@@ -232,6 +544,55 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         static const std::regex kI32(R"(i32\s+(\d+))");
         static const std::regex kI32End(R"(^i32\s+(\d+)$)");
         std::smatch mm;
+
+        if (instr.DxOp() == kBindHandle) {
+            // Shader Model 6.6. The binding names the resource directly, so
+            // the record is found by space and lower bound rather than by a
+            // range index. The annotateHandle that follows is left exactly as
+            // it was: it is legal in a library and carries the properties.
+            Bind b;
+            if (!ResBind(instr, &b)) {
+                handleErr = "cannot read the ResBind of " + instr.body.substr(0, 60);
+                return "";
+            }
+            auto bit = binds.find(b);
+            if (bit == binds.end()) {
+                handleErr = "createHandleFromBinding names class " +
+                            std::to_string(b.cls) + " space " +
+                            std::to_string(b.space) + " register " +
+                            std::to_string(b.lower) +
+                            ", which !dx.resources does not describe";
+                return "";
+            }
+            const GlobalInfo* gb = findGlobal(b.cls, bit->second);
+            if (!gb) {
+                handleErr = "createHandleFromBinding names a resource with no global";
+                return "";
+            }
+            const std::string a2b = instr.args.size() > 2 ? Trim(instr.args[2])
+                                                          : std::string();
+            if (!std::regex_match(a2b, kI32End)) {
+                // The 6.5 path DOES support this, through a getelementptr on
+                // the array global. The 6.6 form is refused only because the
+                // shape of an ARRAY global in the binding form has not been
+                // measured off DXC, and guessing it is how a lowering goes
+                // silently wrong. phase5/cases/reference/ is where that
+                // question gets answered.
+                handleErr = "resource handle " + instr.result +
+                            " comes from an array binding indexed dynamically (" +
+                            a2b + "); the Shader Model 6.6 form of that has not "
+                            "been measured, and the 6.5 form is what this lowers";
+                return "";
+            }
+            const std::string rawb = "%rq.raw." + instr.result.substr(1);
+            const std::string h = kHandleType;
+            return "  " + rawb + " = load " + h + ", " + h + "* @" + gb->sym +
+                   ", align 4\n"
+                   "  " + instr.result + " = call " + h +
+                   " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " + h +
+                   " " + rawb + ")  ; CreateHandleForLib(Resource)";
+        }
+
         std::string a1 = Trim(instr.args[1]), a2 = Trim(instr.args[2]);
         std::regex_search(a1, mm, kI8);
         const int cls = std::stoi(mm[1].str());
@@ -295,7 +656,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     // --- resources ---------------------------------------------------------
     for (const auto& b : fn.blocks)
         for (const auto& i : b.instrs)
-            if (i.DxOp() == kCreateHandle) {
+            if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
                 const std::string t = handleText(i);
                 if (!handleErr.empty()) { r.error = handleErr; return r; }
                 edits[i.index] = t;
@@ -347,19 +708,20 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // for shared state, so the loop body must not read caller locals or
         // leak values back out. A resource HANDLE is exempt: it names a
         // resource the any-hit shader can reach for itself.
+        const std::set<std::string> types = TypeNames(m.text);
         std::set<std::string> defined, used, handles;
         for (const auto& lbl : q.loop.body) {
             const llm::Block* b = fn.FindBlock(lbl);
             if (!b) continue;
             for (const auto& i : b->instrs) {
                 if (!i.result.empty()) defined.insert(i.result);
-                for (const auto& u : i.Uses()) used.insert(u);
+                for (const auto& u : Operands(i, types)) used.insert(u);
             }
         }
-        for (const auto& b : fn.blocks)
-            for (const auto& i : b.instrs)
-                if (i.DxOp() == kCreateHandle && !i.result.empty())
-                    handles.insert(i.result);
+        // A resource handle is not caller state, and neither is anything
+        // else the hit shader can work out for itself: a cbuffer read, the ray
+        // index, arithmetic on those. See Recomputable above.
+        for (const auto& kv : Recomputable(fn, types)) handles.insert(kv.first);
 
         // But that exemption holds only for a handle the MODULE fully
         // determines. A dynamically indexed one depends on a value computed in
@@ -399,7 +761,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         for (const auto& b : fn.blocks) {
             if (q.loop.body.count(b.label)) continue;
             for (const auto& i : b.instrs)
-                for (const auto& u : i.Uses())
+                for (const auto& u : Operands(i, types))
                     if (defined.count(u)) {
                         r.error = "value " + u + " defined in the Proceed loop is used "
                                   "after it; the any-hit shader cannot return it";
@@ -429,7 +791,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             { 0, "float", 8 }, { 1, "<2 x float>", 4 }, { 2, "i32", 4 },
             { 3, "i32", 4 }, { 4, "i32", 4 }, { 5, "i32", 4 },
             { 6, "i32", 4 }, { 7, "i32", 4 }, { 8, "[12 x float]", 4 },
-            { 9, "i32", 4 },
+            { 9, "i32", 4 }, { 10, "i32", 4 },
         };
         for (const auto& f : init) {
             const std::string zero =
@@ -443,10 +805,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             std::to_string(f.align));
         }
         const auto ra = q.RayArgs();
+        // The RayFlags operand, which may be a runtime value. The OR that
+        // combines it with the template's flags has to land before the call.
+        const auto flags = q.FlagsOperand();
+        if (!flags.first.empty()) lines.push_back(flags.first);
         std::ostringstream tr;
         tr << "  call void @dx.op.traceRay." << std::string(kPayload).substr(1)
-           << "(i32 157, %dx.types.Handle " << q.AsHandle() << ", i32 " << q.RayFlags()
-           << ", " << ra[0] << ", i32 0, i32 0, i32 0, " << ra[1] << ", " << ra[2]
+           << "(i32 157, %dx.types.Handle " << q.AsHandle() << ", " << flags.second
+           << ", " << ra[0] << ", i32 0, i32 "
+           << (q.needsRecordConstants ? 1 : 0)
+           << ", i32 0, " << ra[1] << ", " << ra[2]
            << ", " << ra[3] << ", " << ra[4] << ", " << ra[5] << ", " << ra[6]
            << ", " << ra[7] << ", " << ra[8] << ", " << kPayload
            << "* nonnull %rq.pl)  ; TraceRay(...)";
@@ -482,6 +850,36 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (!b) continue;
             if (b->index >= 0) edits[b->index] = std::nullopt;
             for (const auto& i : b->instrs) edits[i.index] = std::nullopt;
+        }
+    }
+
+    // --- RayFlags read in the RAYGEN becomes the constant it must be --------
+    //
+    // dx.op.rayFlags is legal in a hit or miss shader, not in a raygen, so the
+    // loop-body uses go through kCandidateMap and these do not. The value is
+    // the same one the lowering hands TraceRay, and the analysis refuses a
+    // query whose flags are not a compile-time constant, so there is nothing to
+    // look up at runtime.
+    //
+    // An SSA name needs an instruction to define it, hence `add N, 0`, which
+    // the assembler folds away.
+    for (const auto& c : q.candidateOps) {
+        const llm::Instr& i = *c.second;
+        if (i.DxOp() != kRayFlags) continue;
+        // A read inside the loop already has an edit: the whole block is marked
+        // for deletion and the body is re-emitted into the any-hit, where the
+        // intrinsic IS legal. Overwriting that would resurrect it in the raygen
+        // as well.
+        if (edits.count(i.index)) { q.rayFlagsInLoop = true; continue; }
+        if (q.StaticFlags()) {
+            edits[i.index] = "  " + i.result + " = add i32 " +
+                             std::to_string(q.RayFlags()) + ", 0";
+        } else {
+            // RayFlags() can only be called after TraceRayInline, so the
+            // runtime operand dominates this point.
+            edits[i.index] = "  " + i.result + " = or i32 " +
+                             llm::OperandName(q.trace->args[3]) + ", " +
+                             std::to_string(q.constFlags);
         }
     }
 
@@ -533,11 +931,27 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         std::vector<std::string> decls;
         decls.push_back(std::string(kPayload) + " = type " + kPayloadType);
         decls.push_back(std::string(kAttrs) + " = type { <2 x float> }");
+        if (q.needsRecordConstants) {
+            // Two words, matching the two root constants the shim puts in every
+            // hit group record. Declared here even when the original shader had
+            // no cbuffer of its own, which is why CBufRet is conditional too.
+            decls.push_back(std::string(kRecordType) + " = type { i32, i32 }");
+            if (out.find(std::string(kCbRet) + " = type") == std::string::npos)
+                decls.push_back(std::string(kCbRet) + " = type { i32, i32, i32, i32 }");
+        }
         decls.push_back("");
+        if (q.needsRecordConstants)
+            decls.push_back(std::string(kRecordGlobal) + " = external constant " +
+                            kRecordType + ", align 4");
         std::set<std::string> seen;
         for (const auto& g : globals) {
             if (!seen.insert(g.sym).second) continue;
-            decls.push_back("@" + g.sym + " = external constant " + g.gty + ", align 4");
+            // In the binding form the global holds a HANDLE whatever the
+            // resource is; the RECORD bitcasts it back to the resource type.
+            // Copied from DXC: `@CB = external constant %dx.types.Handle`.
+            decls.push_back("@" + g.sym + " = external constant " +
+                            (binding ? std::string(kHandleType) : g.gty) +
+                            ", align 4");
         }
         static const std::regex kAnchor(R"(%dx\.types\.Handle = type .*)");
         auto lines = llm::SplitLines(out);
@@ -562,6 +976,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.allocateRayQuery[^\n]*\n)",
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandle\(i32, i8[^\n]*\n)",
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.threadId[^\n]*\n)",
+            // The 6.6 handle creation is converted away, so its declare goes
+            // too: an unused declare is itself a validation error.
+            R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandleFromBinding[^\n]*\n)",
         };
         for (const char* k : kill) out = std::regex_replace(out, std::regex(k), "\n");
 
@@ -595,6 +1012,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             add.push_back("; Function Attrs: nounwind readnone");
             add.push_back(d);
         };
+        // Only reached from a generated hit shader. A raygen read of RayFlags
+        // became a constant, so a shader reading it only there declares
+        // nothing, and an unused declare is itself a validation error.
+        addDecl(q.rayFlagsInLoop, "declare i32 @dx.op.rayFlags.i32(i32) #0");
         addDecl(usedOps.count(kCandidateWorldToObject) ||
                 usedOps.count(kCommittedWorldToObject),
                 "declare float @dx.op.worldToObject.f32(i32, i32, i8) #0");
@@ -602,6 +1023,20 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 "declare float @dx.op.objectRayOrigin.f32(i32, i8) #0");
         addDecl(usedOps.count(kCandidateObjectRayDirection) != 0,
                 "declare float @dx.op.objectRayDirection.f32(i32, i8) #0");
+
+        if (q.needsRecordConstants) {
+            add.push_back("");
+            add.push_back("; Function Attrs: nounwind readonly");
+            add.push_back(std::string("declare %dx.types.Handle @") + kRecordHandleFn +
+                          "(i32, " + kRecordType + ") #2");
+            if (out.find("@dx.op.cbufferLoadLegacy.i32(") == std::string::npos) {
+                add.push_back("");
+                add.push_back("; Function Attrs: nounwind readonly");
+                add.push_back(std::string("declare ") + kCbRet +
+                              " @dx.op.cbufferLoadLegacy.i32"
+                              "(i32, %dx.types.Handle, i32) #2");
+            }
+        }
         if (q.NeedsIntersection()) {
             add.push_back("");
             add.push_back("; Function Attrs: nounwind");
@@ -614,13 +1049,23 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         add.push_back("");
         add.push_back("; Function Attrs: noreturn nounwind");
         add.push_back("declare void @dx.op.ignoreHit(i32) #3");
-        std::set<std::string> seenFn;
-        for (const auto& g : globals) {
-            const std::string f = HandleFn(g.elem);
-            if (!seenFn.insert(f).second) continue;
+        if (binding) {
+            // One overload serves every resource in the 6.6 form, because the
+            // global is a handle whatever the resource is.
             add.push_back("");
             add.push_back("; Function Attrs: nounwind readonly");
-            add.push_back("declare %dx.types.Handle @" + f + "(i32, " + g.elem + ") #2");
+            add.push_back(std::string("declare ") + kHandleType +
+                          " @dx.op.createHandleForLib.dx.types.Handle(i32, " +
+                          kHandleType + ") #2");
+        } else {
+            std::set<std::string> seenFn;
+            for (const auto& g : globals) {
+                const std::string f = HandleFn(g.elem);
+                if (!seenFn.insert(f).second) continue;
+                add.push_back("");
+                add.push_back("; Function Attrs: nounwind readonly");
+                add.push_back("declare %dx.types.Handle @" + f + "(i32, " + g.elem + ") #2");
+            }
         }
         const size_t anchor = out.find("\nattributes #0 =");
         std::string joined;
@@ -691,21 +1136,42 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             is.push_back("define void @" + e.intersection + "() #1 {");
             is.push_back(std::string("  %rq.at = alloca ") + kAttrs + ", align 8");
 
-            std::set<std::string> usedNames;
+            const std::set<std::string> types = TypeNames(m.text);
+            std::set<std::string> usedNames, inBody;
             for (const auto& lbl : q.loop.body) {
                 if (lbl == q.loop.latch) continue;
                 const llm::Block* b = fn.FindBlock(lbl);
                 if (!b) continue;
-                for (const auto& i : b->instrs)
-                    for (const auto& u : i.Uses()) usedNames.insert(u);
+                for (const auto& i : b->instrs) {
+                    for (const auto& u : Operands(i, types)) usedNames.insert(u);
+                    if (!i.result.empty()) inBody.insert(i.result);
+                }
             }
-            for (const auto& b : fn.blocks)
-                for (const auto& i : b.instrs)
-                    if (i.DxOp() == kCreateHandle && usedNames.count(i.result)) {
-                        const std::string txt = handleText(i);
-                        if (!handleErr.empty()) { r.error = handleErr; return r; }
-                        is.push_back(txt);
-                    }
+            // Everything the body reads from outside itself, rebuilt here in
+            // source order. A resource handle becomes its library form; a
+            // thread id becomes DispatchRaysIndex, which is the SAME ray so the
+            // same value; everything else is pure and is emitted as it stood.
+            // The isolation check has already refused anything not on the list.
+            for (const llm::Instr* pi :
+                 NeededChain(fn, Recomputable(fn, types), usedNames, types, inBody)) {
+                const llm::Instr& i = *pi;
+                if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
+                    const std::string ht = handleText(i);
+                    if (!handleErr.empty()) { r.error = handleErr; return r; }
+                    is.push_back(ht);
+                } else if (i.DxOp() == kThreadId) {
+                    static const std::regex kCol(R"RX(i32\s+(\d+))RX");
+                    std::smatch cm;
+                    const std::string a1 = i.args.size() > 1 ? i.args[1] : std::string();
+                    const std::string col =
+                        std::regex_search(a1, cm, kCol) ? cm[1].str() : "0";
+                    is.push_back("  " + i.result +
+                                  " = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 " +
+                                  col + ")  ; DispatchRaysIndex(col)");
+                } else {
+                    is.push_back(i.line);
+                }
+            }
 
             for (const auto& lbl : order) {
                 const llm::Block* b = fn.FindBlock(lbl);
@@ -735,6 +1201,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     // Nothing to do for Abort: returning has reported nothing,
                     // and there is no later invocation to gate.
                     if (op == kAbort) continue;
+                    if (RecordWord(op) >= 0) {
+                        // The record answers, because nothing in the shader
+                        // can. The local root signature bound this record's own
+                        // constants.
+                        for (const auto& l :
+                             RecordRead(i.result.substr(1), RecordWord(op), i.result))
+                            is.push_back(l);
+                        continue;
+                    }
                     if (const CandMap* cmap = FindCand(op)) {
                         std::string cargs = "i32 " + std::to_string(cmap->dxop);
                         for (int k = 0; k < cmap->extra; ++k)
@@ -832,21 +1307,42 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // Recreate every resource handle the body uses, under the SAME SSA
             // name it had in the raygen, so the transplanted instructions need
             // no rewriting.
-            std::set<std::string> usedNames;
+            const std::set<std::string> types = TypeNames(m.text);
+            std::set<std::string> usedNames, inBody;
             for (const auto& lbl : q.loop.body) {
                 if (lbl == q.loop.latch) continue;
                 const llm::Block* b = fn.FindBlock(lbl);
                 if (!b) continue;
-                for (const auto& i : b->instrs)
-                    for (const auto& u : i.Uses()) usedNames.insert(u);
+                for (const auto& i : b->instrs) {
+                    for (const auto& u : Operands(i, types)) usedNames.insert(u);
+                    if (!i.result.empty()) inBody.insert(i.result);
+                }
             }
-            for (const auto& b : fn.blocks)
-                for (const auto& i : b.instrs)
-                    if (i.DxOp() == kCreateHandle && usedNames.count(i.result)) {
-                        const std::string t = handleText(i);
-                        if (!handleErr.empty()) { r.error = handleErr; return r; }
-                        ah.push_back(t);
-                    }
+            // Everything the body reads from outside itself, rebuilt here in
+            // source order. A resource handle becomes its library form; a
+            // thread id becomes DispatchRaysIndex, which is the SAME ray so the
+            // same value; everything else is pure and is emitted as it stood.
+            // The isolation check has already refused anything not on the list.
+            for (const llm::Instr* pi :
+                 NeededChain(fn, Recomputable(fn, types), usedNames, types, inBody)) {
+                const llm::Instr& i = *pi;
+                if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
+                    const std::string ht = handleText(i);
+                    if (!handleErr.empty()) { r.error = handleErr; return r; }
+                    ah.push_back(ht);
+                } else if (i.DxOp() == kThreadId) {
+                    static const std::regex kCol(R"RX(i32\s+(\d+))RX");
+                    std::smatch cm;
+                    const std::string a1 = i.args.size() > 1 ? i.args[1] : std::string();
+                    const std::string col =
+                        std::regex_search(a1, cm, kCol) ? cm[1].str() : "0";
+                    ah.push_back("  " + i.result +
+                                  " = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 " +
+                                  col + ")  ; DispatchRaysIndex(col)");
+                } else {
+                    ah.push_back(i.line);
+                }
+            }
 
             if (aborts) {
                 ah.push_back(std::string("  %rq.pab = getelementptr inbounds ") +
@@ -885,6 +1381,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                      "  ; HitKind()");
                         ah.push_back("  " + i.result + " = icmp eq i32 " + hk + ", " +
                                      std::to_string(kHitKindFront));
+                        continue;
+                    }
+                    if (RecordWord(op) >= 0) {
+                        // The record answers, because nothing in the shader
+                        // can. The local root signature bound this record's own
+                        // constants.
+                        for (const auto& l :
+                             RecordRead(i.result.substr(1), RecordWord(op), i.result))
+                            ah.push_back(l);
                         continue;
                     }
                     if (const CandMap* cmap = FindCand(op)) {
@@ -976,6 +1481,21 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 ch.push_back("  store i32 %id" + std::to_string(s.first) + ", i32* %pi" +
                              std::to_string(s.first) + ", align 4");
             }
+
+            // The record's two numbers, when the shader asked for either.
+            // Both are stored whenever either is read: one cbuffer load answers
+            // both, so splitting them would cost a branch and save nothing.
+            if (q.needsRecordConstants) {
+                for (const auto& l : RecordRead("g", 0, "%rq.geo")) ch.push_back(l);
+                ch.push_back(std::string("  %rq.gp = getelementptr inbounds ") +
+                             kPayload + ", " + kPayload + "* %p, i32 0, i32 5");
+                ch.push_back("  store i32 %rq.geo, i32* %rq.gp, align 4");
+                ch.push_back(std::string("  %rq.con = extractvalue ") + kCbRet +
+                             " %rq.cbrg, 1");
+                ch.push_back(std::string("  %rq.cp = getelementptr inbounds ") +
+                             kPayload + ", " + kPayload + "* %p, i32 0, i32 10");
+                ch.push_back("  store i32 %rq.con, i32* %rq.cp, align 4");
+            }
             // Twelve fetches and twelve stores, so they are emitted ONLY when
             // the shader actually reads the matrix. The payload field exists
             // either way, because a layout that changes shape is a layout that
@@ -1065,8 +1585,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     {
         for (const auto& g : globals) {
             auto fields = SplitTop(md.at(g.nid));
-            fields[1] = std::regex_replace(fields[1], std::regex(R"(\*\s+\S+$)"),
-                                           "* @" + g.sym);
+            if (binding) {
+                // `%CB* bitcast (%dx.types.Handle* @CB to %CB*)`, copied from
+                // DXC. The global holds a handle; the record still has to name
+                // the resource type, so it casts.
+                fields[1] = g.gty + "* bitcast (" + kHandleType + "* @" + g.sym +
+                            " to " + g.gty + "*)";
+            } else {
+                fields[1] = std::regex_replace(fields[1], std::regex(R"(\*\s+\S+$)"),
+                                               "* @" + g.sym);
+            }
             fields[2] = "!\"" + g.name + "\"";
             std::string body;
             for (size_t i = 0; i < fields.size(); ++i) {
@@ -1110,6 +1638,43 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             nodes.push_back("!" + std::to_string(id) + " = !{" + body + "}");
             return id;
         };
+
+        // The record cbuffer, added to whatever the application already had.
+        //
+        // Shape copied from DXC, not invented: a cbuffer record is
+        // {id, global, name, space, lowerBound, rangeSize, sizeInBytes, extra}.
+        // space 1 keeps it clear of anything the application's own global root
+        // signature binds, which the shim must not disturb. See
+        // phase5/cases/reference/lib_localroot_ref.hlsl.
+        if (q.needsRecordConstants) {
+            std::vector<std::string> groups;
+            for (const auto& g : SplitTop(md.at(std::stoi(resId))))
+                groups.push_back(Trim(g));
+            while (groups.size() < 4) groups.push_back("null");
+            std::vector<std::string> have;
+            if (groups[2] != "null")
+                for (const auto& x : SplitTop(md.at(std::stoi(groups[2].substr(1)))))
+                    have.push_back(Trim(x));
+            const int rec = node("i32 " + std::to_string(have.size()) + ", " +
+                                 kRecordType + "* " + kRecordGlobal +
+                                 ", !\"rq_record\", i32 1, i32 0, i32 1, i32 8, null");
+            std::string grp;
+            for (const auto& h : have) grp += h + ", ";
+            grp += "!" + std::to_string(rec);
+            groups[2] = "!" + std::to_string(node(grp));
+            std::string all;
+            for (size_t i = 0; i < groups.size(); ++i) {
+                if (i) all += ", ";
+                all += groups[i];
+            }
+            // Rewritten in place, so !dx.resources keeps pointing at the same
+            // node and nothing else has to learn a new id.
+            auto lines = llm::SplitLines(out);
+            const int at = llm::FindLine(
+                lines, std::regex("^!" + resId + R"( = !\{.*\}\s*$)"));
+            if (at >= 0) lines[at] = "!" + resId + " = !{" + all + "}";
+            out = llm::JoinLines(lines);
+        }
 
         const std::string sigH = "(" + std::string(kPayload) + "*, " + kAttrs + "*)";
         const std::string sigP = "(" + std::string(kPayload) + "*)";
@@ -1160,7 +1725,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         const int annId = node(annJoined);
 
         const int zero = node("i32 0");
-        const int flags = node("i32 0, i64 16");
+        const int flags = node(
+            "i32 0, i64 " +
+            std::to_string(ModuleFlags(text0, md) & ~kRt11ShaderFlag));
         std::vector<int> eps{ node("null, !\"\", null, !" + resId + ", !" +
                                    std::to_string(flags)) };
 

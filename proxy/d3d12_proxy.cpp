@@ -30,7 +30,7 @@
 #include "proxy_log.h"
 #include "version.h"
 #include "config.h"
-#include "rewriter/dxc_host.h"
+#include "dllinfo.h"
 #include "rewriter/dxc_host.h"
 #include "d3d12_device.h"
 
@@ -52,23 +52,10 @@ static T RealProc(const char* name) {
     return h ? reinterpret_cast<T>(GetProcAddress(h, name)) : nullptr;
 }
 
-// --- logging ---------------------------------------------------------------
-void ProxyLog(const char* fmt, ...) {
-    char buf[512];
-    va_list a; va_start(a, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, a);
-    va_end(a);
-    OutputDebugStringA(buf);
-    static FILE* f = [] {
-        char p[MAX_PATH];
-        DWORD n = GetTempPathA(MAX_PATH, p);
-        if (n == 0 || n >= MAX_PATH) return (FILE*)nullptr;
-        strcat_s(p, MAX_PATH, "dxr-tier-11-proxy.log");
-        FILE* fp = nullptr; fopen_s(&fp, p, "a");
-        return fp;
-    }();
-    if (f) { std::fputs(buf, f); std::fflush(f); }
-}
+// --- logging -------------------------------------------------------------
+//
+// ProxyLog, the log destination and the exe name moved to proxy_log.cpp so
+// that dxgi.dll can use them too. Only ProxyIidName is D3D12's and stays.
 
 const char* ProxyIidName(const IID& iid) {
 #define IIDCASE(T) if (iid == __uuidof(T)) return #T;
@@ -190,6 +177,48 @@ static bool WrapEnabled() {
     return on;
 }
 
+// --- what is actually loaded ------------------------------------------------
+//
+// Four DLLs that are not ours decide whether a run works, and the versions
+// matter: DXC is what converts and signs the rewritten shader, and the
+// application's own Agility SDK is what interprets the result. Reported once,
+// from the first device creation, because that is the earliest point at which
+// all four have had their chance to load. DllMain is too early: the runtime
+// loads D3D12Core.dll during D3D12CreateDevice.
+static void ReportEnvironmentOnce() {
+    static bool done = [] {
+        // Probing DXC here rather than waiting for the first shader, so the
+        // log answers "is the rewriter usable at all" on every run rather than
+        // only on runs that got as far as a RayQuery shader. Idempotent: the
+        // wrap decision below consults the same cached result.
+        std::string why;
+        if (!dxch::Available(&why))
+            ProxyLog("[dxr-tier-11-proxy-log] DXC:     NOT AVAILABLE, %s\n", why.c_str());
+        else
+            ProxyLog("[dxr-tier-11-proxy-log] DXC:     %s\n", dxch::Versions());
+
+        // The Agility SDK the APPLICATION ships, if it ships one. Unreal does,
+        // and it is a common enough cause of a shim behaving differently in
+        // two games that it belongs in every log rather than in a follow-up
+        // question.
+        const std::string core = dllinfo::OfLoadedModule(L"D3D12Core.dll");
+        ProxyLog("[dxr-tier-11-proxy-log] runtime: D3D12Core.dll %s%s\n", core.c_str(),
+                 core == "not loaded"
+                     ? ", so this application uses the operating system's own D3D12"
+                     : "");
+
+        const std::string layers = dllinfo::OfLoadedModule(L"d3d12SDKLayers.dll");
+        ProxyLog("[dxr-tier-11-proxy-log] runtime: d3d12SDKLayers.dll %s%s\n", layers.c_str(),
+                 layers == "not loaded" ? ", so the debug layer is off, which is normal" : "");
+        // By HANDLE, not by name: GetModuleHandleW(L"d3d12.dll") inside a proxy
+        // called d3d12.dll answers with the proxy.
+        ProxyLog("[dxr-tier-11-proxy-log] runtime: the real d3d12.dll %s\n",
+                 dllinfo::OfModule(RealD3D12()).c_str());
+        return true;
+    }();
+    (void)done;
+}
+
 // --- undocumented exports, forwarded by tail-jump thunk ---------------------
 //
 // d3d12SDKLayers.dll imports these three from "d3d12.dll" by name. Since our
@@ -234,6 +263,9 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
     if (!real) return E_FAIL;
 
     HRESULT hr = real(pAdapter, fl, riid, ppDevice);
+
+    // After the real call, so D3D12Core.dll has had its chance to load.
+    ReportEnvironmentOnce();
 
     // ppDevice == nullptr is the documented capability-probe form: it answers
     // "could this adapter make this device" and returns S_FALSE without
@@ -326,7 +358,20 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
         // loaded here: the host loads lazily, so an application that never
         // uses RayQuery pays nothing for this.
         dxch::SetHostModule(self);
-        ProxyLog("[dxr-tier-11-proxy-log] attached to process, version " DXR_TIER11_VERSION "\n");
+        ProxyLog("[dxr-tier-11-proxy-log] ======================== start: %s (pid %lu), "
+                 "shim " DXR_TIER11_VERSION " ========================\n",
+                 ProxyHostExeName(), (unsigned long)GetCurrentProcessId());
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // A MISSING end marker is itself the finding: it means the process did
+        // not unload us, which is what a crash looks like from in here. So the
+        // marker is worth having even though it cannot be relied on to appear.
+        //
+        // Nothing else happens on detach. During process teardown the loader
+        // lock is held and other DLLs may already be gone, so this stays to one
+        // formatted line and no cleanup.
+        ProxyLog("[dxr-tier-11-proxy-log] ========================= end: %s (pid %lu) "
+                 "=========================\n",
+                 ProxyHostExeName(), (unsigned long)GetCurrentProcessId());
     }
     return TRUE;
 }

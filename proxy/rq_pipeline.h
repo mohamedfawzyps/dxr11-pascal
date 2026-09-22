@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "as_tracker.h"
+
 // Private IID, so a pipeline state can be recognised as ours through
 // QueryInterface without ever being confused for a real one.
 // {7E3B1C42-9A54-4D18-8F60-2C71B0A4E9D3}
@@ -94,11 +96,17 @@ private:
     // group serves gets the real group; a slot reached only by the other kind
     // gets the rejecting group OF THAT KIND, so the geometry is traversed with
     // a record of the correct type and simply produces no hit.
-    bool BuildTable(const std::vector<uint8_t>& kinds, std::string* why);
+    bool BuildTable(const std::vector<uint8_t>& kinds,
+                    const std::vector<astrack::RecordConstants>& consts,
+                    std::string* why);
 
     ID3D12Device5* m_dev = nullptr;
     ID3D12StateObject* m_so = nullptr;
     ID3D12RootSignature* m_rootSig = nullptr;   // the app's, kept alive
+    // Ours: two root constants carrying the geometry index and the
+    // instance contribution into every hit group record.
+    ID3D12RootSignature* m_localRootSig = nullptr;
+    bool m_recordConstants = false;
     ID3D12Resource* m_sbt = nullptr;            // raygen, miss, hit, one buffer
     // Tables replaced by a growth. A dispatch recorded against the old one may
     // still be in flight, and nothing here knows when it lands, so they are

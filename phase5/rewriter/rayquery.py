@@ -58,6 +58,26 @@ CANDIDATE_OBJECT_RAY_ORIGIN = 205
 CANDIDATE_OBJECT_RAY_DIRECTION = 206
 COMMITTED_INSTANCE_ID = 208
 
+# The four the SHADER TABLE answers, because nothing in the shader can.
+#
+# GeometryIndex() in a DXR 1.0 hit shader is itself Tier 1.1, and HLSL exposes
+# no hit-shader intrinsic for the contribution at all. Both were written off as
+# impossible for reasons that only hold while the APPLICATION owns the table.
+# The shim builds it, so each record carries these two numbers as local root
+# signature constants and the hit shader reads them back. Measured at
+# SFI0 = 0x0: phase5/cases/reference/lib_localroot_ref.hlsl.
+#
+# Numbers read off DXC, not inferred from the gaps around them:
+# phase5/cases/reference/rq_opcodes_ref.hlsl.
+CANDIDATE_GEOMETRY_INDEX = 203
+CANDIDATE_INSTANCE_CONTRIB = 214
+COMMITTED_INSTANCE_CONTRIB = 215
+
+# Query-wide, neither candidate nor committed: the flags the query is tracing
+# with. 59 of Unreal's shaders refused on this once GeometryIndex stopped
+# blocking them first, which made it the largest single remaining bucket.
+RAY_FLAGS = 195
+
 # Opcode -> short name, for messages. Membership in this table is what makes
 # an opcode supported; the numbers NOT here are deliberately absent because
 # this project has not observed them and will not guess.
@@ -88,7 +108,17 @@ KNOWN = {
     CANDIDATE_OBJECT_RAY_ORIGIN: 'CandidateObjectRayOrigin',
     CANDIDATE_OBJECT_RAY_DIRECTION: 'CandidateObjectRayDirection',
     COMMITTED_INSTANCE_ID: 'CommittedInstanceID',
+    RAY_FLAGS: 'RayFlags',
+    CANDIDATE_GEOMETRY_INDEX: 'CandidateGeometryIndex',
+    CANDIDATE_INSTANCE_CONTRIB: 'CandidateInstanceContributionToHitGroupIndex',
+    COMMITTED_INSTANCE_CONTRIB: 'CommittedInstanceContributionToHitGroupIndex',
 }
+
+# The two read in the any-hit or intersection shader straight out of the
+# record, and the two that travel home in the payload from the closest-hit.
+RECORD_CANDIDATE_OPS = (CANDIDATE_GEOMETRY_INDEX, CANDIDATE_INSTANCE_CONTRIB)
+RECORD_COMMITTED_OPS = (COMMITTED_GEOMETRY_INDEX, COMMITTED_INSTANCE_CONTRIB)
+RECORD_OPS = RECORD_CANDIDATE_OPS + RECORD_COMMITTED_OPS
 
 # Read in the any-hit shader, where they need no payload at all: the candidate
 # under test IS what a DXR 1.0 hit-shader intrinsic reports.
@@ -96,7 +126,9 @@ CANDIDATE_OPS = (CANDIDATE_PROC_NON_OPAQUE,
                  CANDIDATE_TYPE, CANDIDATE_BARY, CANDIDATE_WORLD_TO_OBJECT,
                  CANDIDATE_FRONT_FACE, CANDIDATE_RAY_T, CANDIDATE_INSTANCE_INDEX,
                  CANDIDATE_INSTANCE_ID, CANDIDATE_PRIMITIVE_INDEX,
-                 CANDIDATE_OBJECT_RAY_ORIGIN, CANDIDATE_OBJECT_RAY_DIRECTION)
+                 CANDIDATE_OBJECT_RAY_ORIGIN, CANDIDATE_OBJECT_RAY_DIRECTION,
+                 CANDIDATE_GEOMETRY_INDEX, CANDIDATE_INSTANCE_CONTRIB,
+                 RAY_FLAGS)
 
 # Everything the generated closest-hit can put in the payload. Used by both the
 # analysis, to decide what is a committed read, and the lowering, to lay the
@@ -104,22 +136,24 @@ CANDIDATE_OPS = (CANDIDATE_PROC_NON_OPAQUE,
 COMMITTED_OPS = (COMMITTED_STATUS, COMMITTED_BARY, COMMITTED_RAY_T,
                  COMMITTED_INSTANCE_INDEX, COMMITTED_GEOMETRY_INDEX,
                  COMMITTED_PRIMITIVE_INDEX, COMMITTED_INSTANCE_ID,
-                 COMMITTED_FRONT_FACE, COMMITTED_WORLD_TO_OBJECT)
+                 COMMITTED_FRONT_FACE, COMMITTED_WORLD_TO_OBJECT,
+                 COMMITTED_INSTANCE_CONTRIB)
 
-# CommittedGeometryIndex is recognised so the refusal can explain itself, but
-# it has NO lowering on this hardware. Its DXR 1.0 equivalent, GeometryIndex()
-# in a hit shader, is itself a Tier 1.1 feature: measured, a library using it
-# sets shader flag 0x2000000 and CreateStateObject on the GTX 1070 fails with
-# E_INVALIDARG. The known route would be to encode the geometry index in the
-# shader table with one hit group record per geometry, which means the shim
-# rebuilding the application's SBT. Not attempted.
-NO_LOWERING = {
-    COMMITTED_GEOMETRY_INDEX:
-        'CommittedGeometryIndex has no lowering on Tier 1.0. Its DXR 1.0 '
-        'equivalent, GeometryIndex() in a hit shader, is itself a Tier 1.1 '
-        'feature and CreateStateObject rejects it on this hardware. Encoding '
-        'the index in the shader table would work but is not implemented.',
-}
+# Empty, and that is the interesting part.
+#
+# CommittedGeometryIndex lived here for most of this project's life, because
+# GeometryIndex() in a DXR 1.0 hit shader is ITSELF Tier 1.1: a library using
+# it sets shader flag 0x2000000 and CreateStateObject on the GTX 1070 returns
+# E_INVALIDARG. That measurement is still true. What changed is that the answer
+# no longer has to come from an intrinsic: the shim builds the shader table, so
+# it puts the geometry index in the record.
+#
+# A real Unreal 5.8 run refused 120 shaders on the four record opcodes, more
+# than everything else together, which is what made it worth doing.
+#
+# Kept as a table rather than deleted, because the next opcode with no lowering
+# will want somewhere to say so.
+NO_LOWERING = {}
 
 RAY_FLAG = [
     (0x001, 'FORCE_OPAQUE'),
@@ -166,6 +200,16 @@ class Query(object):
         self.candidate_ops = []
         self.committed_ops = []
         self.loop = None            # (header, latch, body) or None
+        # Does any accessor need the answer that only the shader TABLE has?
+        # Set by the collect pass; drives the local root signature and the
+        # wider hit records, both of which cost something and are therefore
+        # only added for a shader that asks.
+        self.needs_record_constants = False
+        # Set by the lowering: is RayFlags read INSIDE the Proceed loop?
+        # Only then does a generated hit shader call dx.op.rayFlags, and
+        # only then may it be declared, since an unused declare is itself a
+        # validation error.
+        self.rayflags_in_loop = False
 
     # --- derived ---------------------------------------------------------
 
@@ -176,7 +220,29 @@ class Query(object):
 
     @property
     def ray_flags(self):
+        """The flags KNOWN AT COMPILE TIME. Used for classification only.
+
+        When TraceRayInline is given a runtime value, dyn_flags is None and
+        this is just the template's flags. That is the honest answer for
+        deciding whether traversal is provably fixed-function: it is not, so a
+        query with no Proceed loop and no FORCE_OPAQUE template is still
+        refused. What must NOT use this is the traceRay call itself, which
+        needs flags_operand."""
         return (self.const_flags or 0) | (self.dyn_flags or 0)
+
+    @property
+    def flags_operand(self):
+        """The RayFlags operand text for traceRay, and any setup it needs.
+
+        (setup_lines, operand_text). Static flags are a literal; a runtime
+        value is OR'd with the template's flags, because RayQuery<FLAGS> means
+        both apply and TraceRay takes only one operand."""
+        if self.dyn_flags is not None:
+            return [], 'i32 %d' % self.ray_flags
+        from dxil import operand_name
+        dyn = operand_name(self.trace.args[3])
+        return (['  %%rq.flags = or i32 %s, %d' % (dyn, self.const_flags or 0)],
+                'i32 %rq.flags')
 
     @property
     def as_handle(self):
@@ -304,13 +370,31 @@ def _collect(fn, q):
             q.proc_commits.append((block, instr))
         elif op in CANDIDATE_OPS:
             q.candidate_ops.append((block, instr))
+            if op in RECORD_OPS:
+                q.needs_record_constants = True
         elif op in COMMITTED_OPS:
             if op in NO_LOWERING:
                 raise Unsupported(NO_LOWERING[op])
             q.committed_ops.append((block, instr))
+            # The state object then needs a local root signature and every hit
+            # record two more words. Both cost something, so they are added
+            # only for a shader that actually asks.
+            if op in RECORD_OPS:
+                q.needs_record_constants = True
 
     if q.trace is None:
         raise Unsupported('query is allocated but never traced')
+
+    # Ray flags computed at runtime are FINE. dx.op.traceRay takes its
+    # RayFlags as an ordinary i32 operand, not an immediate: measured, see
+    # phase5/cases/reference/lib_dynflags_ref.hlsl, where DXC emits `i32 %7`
+    # and the container signs.
+    #
+    # They were refused for one version, because `(dyn_flags or 0)` had been
+    # silently folding an unknown value to 0 and tracing with the wrong flags.
+    # Refusing was the right answer to THAT; passing the value through is the
+    # right answer to the question. Unreal computes its ray flags at runtime in
+    # 118 shaders, so folding was never going to be enough.
 
 
 def _find_loop(fn, q):

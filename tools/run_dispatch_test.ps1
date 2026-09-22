@@ -37,6 +37,8 @@ $cases = @(
        desc = 'built-in alpha-tested RayQuery, generated any-hit' },
     @{ name = 'indep';   pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
        desc = 'independent shader, resource read in the Proceed loop, numthreads(16,16,1)' },
+    @{ name = 'sm66';    pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_sm66.hlsl');
+       desc = 'Shader Model 6.6 binding, which is what Unreal compiles its RayQuery shaders at' },
     @{ name = 'proc';    pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--proc');
        desc = 'procedural primitives, generated intersection shader' },
     @{ name = 'abort';   pat = 'alpha';  extra = @('--cs', 'phase5\cases\rayquery_abort.hlsl', '--multi');
@@ -91,7 +93,88 @@ $cases = @(
     # with !dx.nonuniform. The value is wave-uniform so the RESULT is the same;
     # what this checks is that the metadata survives the whole path.
     @{ name = 'dynnu'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynnu.hlsl', '--table');
-       desc = 'dynamic index through NonUniformResourceIndex' }
+       desc = 'dynamic index through NonUniformResourceIndex' },
+    # The SAME shader, created through CreatePipelineState, the pipeline STREAM
+    # form, instead of CreateComputePipelineState.
+    #
+    # This is not a variation on the lowering, it is a different D3D12 entry
+    # point, and it is the one a real engine uses. Unreal creates every PSO
+    # through the stream form, and until this case existed the shim's
+    # substitution covered only the struct form, so every RayQuery shader in a
+    # real game reached the driver unexamined. The driver rejected them, and
+    # Unreal treats a failed compute PSO as fatal.
+    #
+    # The stream the harness builds puts the ROOT SIGNATURE FIRST, deliberately,
+    # because that is what an engine does and it is exactly what the first
+    # version of the walker could not get past.
+    @{ name = 'stream'; pat = 'opaque'; extra = @('--stream');
+       desc = 'the stream form of CreatePipelineState, which is what Unreal uses' },
+    # GeometryIndex, the accessor this project called impossible for longest,
+    # and the one a real Unreal 5.8 run refused 108 shaders on.
+    #
+    # --geom is one bottom-level structure holding FOUR geometries, a quad per
+    # quadrant. Every other scene here has one geometry per structure, so the
+    # right answer is 0 everywhere and a lowering that dropped the index would
+    # pass. Here the candidate values GATE THE COMMIT: geometry + contribution
+    # == 3 is skipped, so without --contrib the missing quadrant is geometry 3
+    # and with it geometry 1. The gap MOVES, so neither accessor can be a
+    # constant and both have to be right.
+    @{ name = 'geom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom');
+       desc = 'GeometryIndex, from a local root signature constant in the record' },
+    # RayFlags (195), read BOTH inside the Proceed loop and outside it, which
+    # take different routes: dx.op.rayFlags in the generated any-hit, where it
+    # is legal, and a folded constant in the raygen, where it is not. A
+    # lowering using the constant in both places passes a test that reads it in
+    # only one.
+    #
+    # The flags are a UNION of the template argument and the TraceRayInline
+    # argument, 0x002 | 0x200 = 0x202, so dropping either half is visible. The
+    # loop read gates the commit, so a wrong value there empties the image.
+    @{ name = 'flags'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_flags.hlsl');
+       desc = 'RayFlags, folded in the raygen and intrinsic in the any-hit' },
+    # Values computed BEFORE the Proceed loop and read INSIDE it: a cbuffer
+    # threshold and a value derived from the thread id. The ordinary shape of a
+    # real alpha test, and what Unreal refused 59 shaders on.
+    #
+    # Neither is caller state: a cbuffer is bound by the GLOBAL root signature
+    # and the ray index is the same ray, so the generated hit shader rebuilds
+    # the chain rather than being refused. The two arrive differently, a
+    # cbuffer load and a DispatchRaysIndex, so both are exercised.
+    # The same shader with the TraceRayInline flags computed at RUNTIME.
+    #
+    # Unreal does this in 118 shaders. The lowering used to fold the flags into
+    # the TraceRay call, so it could only accept a constant; dx.op.traceRay
+    # takes RayFlags as an ordinary i32 operand, so it does not have to.
+    # Expected answer identical to the static case, 0x202, which is the point:
+    # same result, different route. Dropping the operand loses the runtime half
+    # and RayFlags() reports 0x002.
+    @{ name = 'dynflags'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_dynflags.hlsl');
+       desc = 'ray flags computed at runtime, passed through rather than folded' },
+    # A loop body with real CONTROL FLOW, so DXC emits a phi inside the loop,
+    # and a [branch] hint, so it emits a distinct metadata node.
+    #
+    # Both were bugs. A phi writes its predecessors as [ %val, %bb12 ] with
+    # no label keyword, so the operand scan counted the predecessor BLOCKS as
+    # values and refused 118 of Unreal's shaders for reading them. And the
+    # metadata scan did not match distinct, so that id stayed invisible and
+    # the fresh-id counter handed it out again.
+    @{ name = 'phi'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_phi.hlsl');
+       desc = 'a phi in the loop body, and a distinct metadata node beside it' },
+    # A phi whose predecessor is the ENTRY BLOCK, which DXC gives no label
+    # because nothing can branch to it. Normalisation had nothing to rename, so
+    # the phi referenced a block that was never defined and the assembler said
+    # "use of undefined value '%bb0'".
+    #
+    # It survived the whole of Phase 5 because EVERY other case here opens with
+    # `if (tid.x >= width) return;`, and that guard puts a block between the
+    # entry and everything else. One shared habit across every test, hiding one
+    # bug.
+    @{ name = 'entryphi'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_entryphi.hlsl');
+       desc = 'a phi whose predecessor is the entry block, which has no label' },
+    @{ name = 'param'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_param.hlsl');
+       desc = 'loop body reads a cbuffer threshold and a ray-index value from outside' },
+    @{ name = 'geomcontrib'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib');
+       desc = 'the same, with a nonzero contribution, so the record index is contribution + geometry' }
 )
 
 $failed = 0

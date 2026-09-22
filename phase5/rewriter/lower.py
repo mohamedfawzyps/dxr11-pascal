@@ -31,8 +31,8 @@ ATTRS = '%struct.BuiltInTriangleIntersectionAttributes'
 # wrong. The per-invocation COST is what is made conditional instead, since the
 # closest-hit only fetches the matrix when the shader actually reads it.
 PAYLOAD_TYPE = ('{ float, <2 x float>, i32, i32, i32, i32, i32, i32, '
-                '[12 x float], i32 }')
-PAYLOAD_BYTES = 88
+                '[12 x float], i32, i32 }')
+PAYLOAD_BYTES = 92
 PAYLOAD_FIELD = {
     rq.COMMITTED_RAY_T: (0, 'float', 8),
     rq.COMMITTED_BARY: (1, '<2 x float>', 4),
@@ -43,7 +43,48 @@ PAYLOAD_FIELD = {
     rq.COMMITTED_INSTANCE_ID: (6, 'i32', 4),
     rq.COMMITTED_FRONT_FACE: (7, 'i32', 4),
     rq.COMMITTED_WORLD_TO_OBJECT: (8, '[12 x float]', 4),
+    # 9 is the abort flag. 10 was added with the record constants; the geometry
+    # index needed no new field because slot 5 had been reserved for it all
+    # along and left unused while the accessor was refused.
+    rq.COMMITTED_INSTANCE_CONTRIB: (10, 'i32', 4),
 }
+
+# The record's own two numbers, and how the generated shaders reach them.
+#
+# Not a dx.op call like everything else in CH_SOURCE: there is no intrinsic for
+# either, which is exactly why they were refused. They come out of a cbuffer
+# bound by a LOCAL root signature, so the value is per hit-group-record and the
+# shim chose it when it built the table.
+RECORD_TYPE = '%rq_record'
+RECORD_GLOBAL = '@rq_record'
+RECORD_HANDLE_FN = 'dx.op.createHandleForLib.rq_record'
+CBRET = '%dx.types.CBufRet.i32'
+# Which word of the record each accessor reads.
+RECORD_WORD = {
+    rq.CANDIDATE_GEOMETRY_INDEX: 0,
+    rq.COMMITTED_GEOMETRY_INDEX: 0,
+    rq.CANDIDATE_INSTANCE_CONTRIB: 1,
+    rq.COMMITTED_INSTANCE_CONTRIB: 1,
+}
+
+
+def _record_read(tag, word, result):
+    """The four lines that pull one word out of the hit group record.
+
+    Emitted per use rather than hoisted. The handle and the load are pure and
+    the driver folds the duplicates; hoisting them by hand would mean finding a
+    place to put them that dominates every use, which is a CFG question this
+    pass has no reason to ask."""
+    return [
+        '  %%rq.cbv%s = load %s, %s* %s, align 4'
+        % (tag, RECORD_TYPE, RECORD_TYPE, RECORD_GLOBAL),
+        '  %%rq.cbh%s = call %%dx.types.Handle @%s(i32 160, %s %%rq.cbv%s)'
+        '  ; CreateHandleForLib(Resource)' % (tag, RECORD_HANDLE_FN, RECORD_TYPE, tag),
+        '  %%rq.cbr%s = call %s @dx.op.cbufferLoadLegacy.i32(i32 59, '
+        '%%dx.types.Handle %%rq.cbh%s, i32 0)  ; CBufferLoadLegacy(handle,regIndex)'
+        % (tag, CBRET, tag),
+        '  %s = extractvalue %s %%rq.cbr%s, %d' % (result, CBRET, tag, word),
+    ]
 
 # RayQuery -> DXR 1.0, for accessors read in the ANY-HIT shader. Measured from
 # DXC output on both sides. The operand shape is identical apart from the query
@@ -56,6 +97,7 @@ CANDIDATE_MAP = {
     rq.CANDIDATE_OBJECT_RAY_ORIGIN:    ('float', 'dx.op.objectRayOrigin.f32', 149, 1),
     rq.CANDIDATE_OBJECT_RAY_DIRECTION: ('float', 'dx.op.objectRayDirection.f32', 150, 1),
     rq.CANDIDATE_WORLD_TO_OBJECT:      ('float', 'dx.op.worldToObject.f32', 152, 2),
+    rq.RAY_FLAGS:                      ('i32', 'dx.op.rayFlags.i32', 144, 0),
 }
 # HitKind() is an integer; the RayQuery form is a bool. 254 is
 # HIT_KIND_TRIANGLE_FRONT_FACE.
@@ -78,7 +120,13 @@ class LowerError(Exception):
 
 # --- resources -------------------------------------------------------------
 
-_MD = re.compile(r'^!(\d+) = !\{(.*)\}\s*$', re.M)
+# `distinct` counts. A [branch] or [loop] hint makes DXC emit
+# `!16 = distinct !{!16, !"dx.controlflow.hints", i32 1}`, and a pattern
+# that misses it leaves that id invisible. The fresh-id counter starts at
+# max(md)+1, so it then hands out an id the module already uses and the
+# assembler says "Metadata id is already used". Unreal uses those hints
+# constantly.
+_MD = re.compile(r'^!(\d+) = (?:distinct )?!\{(.*)\}\s*$', re.M)
 _CLASS_NAMES = {0: 'srv', 1: 'uav', 2: 'cbv', 3: 'smp'}
 
 
@@ -167,8 +215,10 @@ def lower(module, q, exports=None):
     table = _resource_table(text, md)
     edits = {}
 
+    binding = _uses_binding(module)
+    binds = _binding_map(text, md) if binding else None
     globals_ = _plan_globals(table)
-    _edit_resources(module, q, edits, table, globals_)
+    _edit_resources(module, q, edits, table, globals_, binds)
     _edit_ray_index(q, edits)
     _edit_query(module, q, edits, exports)
 
@@ -176,10 +226,111 @@ def lower(module, q, exports=None):
     edits[fn.index] = 'define void @%s() #1 {' % exports['raygen']
 
     out = render(module, edits)
-    out = _add_types_and_globals(out, globals_)
-    out = _swap_declarations(out, q, globals_)
-    out = _append_shaders(out, module, q, exports, table, globals_)
-    out = _rewrite_metadata(out, md, table, globals_, q, exports)
+    out = _add_types_and_globals(out, globals_, q.needs_record_constants, binding)
+    out = _swap_declarations(out, q, globals_, binding)
+    out = _append_shaders(out, module, q, exports, table, globals_, binds)
+    out = _rewrite_metadata(out, md, table, globals_, q, exports, binding)
+    return out
+
+
+# Shader Model 6.6 reaches a resource by BINDING, not by a range index.
+#
+# Unreal's RayQuery shaders are cs_6_6 and every one of them does this. The
+# rewriter was built against 6.5, and that single difference caused 124 of the
+# 157 refusals a real Unreal run produced: handles made this way were not on
+# the recomputable list, and the globals synthesised for them were never loaded.
+#
+#   cs_6_6   createHandleFromBinding (217) -> annotateHandle (216)
+#   lib_6_6  createHandleForLib      (160) -> annotateHandle (216)
+#
+# So the conversion is 217 -> 160, and the annotateHandle after it is kept
+# untouched. Read off DXC, see phase5/cases/reference/lib_sm66_binding_ref.hlsl.
+BIND_HANDLE = 217
+ANNOTATE_HANDLE = 216
+# The library form's global is a HANDLE, not the resource type, and the
+# overload is named after the handle type too. That is the part that cannot be
+# guessed from the 6.5 path, where both are the resource type.
+HANDLE_TYPE = '%dx.types.Handle'
+
+
+# The module-level shader flags, tag 0 of the entry point's properties.
+#
+# The lowering used to hardcode 16 here, which happened to be right for every
+# shader this project had ever seen: they all declared 0x2000010, and the only
+# bit the lowering removes is 0x2000000. An Unreal shader declares 0x42000010,
+# so 16 was wrong by exactly the bit it did not know about and the validator
+# said "Flags must match usage".
+#
+# Carrying the value through and clearing what the lowering removes is right in
+# both cases, and reproduces the old output byte for byte.
+#
+# 0x2000000 is the raytracing tier 1.1 shader flag: measured on GeometryIndex,
+# which sets it and makes CreateStateObject refuse the library on a GTX 1070.
+# Every RayQuery op is gone after lowering, so the flag must go with them.
+RT11_SHADER_FLAG = 0x2000000
+
+
+def _module_flags(text, md):
+    m = re.search(r'!dx\.entryPoints\s*=\s*!\{!(\d+)\}', text)
+    if not m:
+        return 0
+    fields = [f.strip() for f in md[int(m.group(1))].split(',')]
+    if len(fields) < 5 or not fields[4].startswith('!'):
+        return 0
+    props = md.get(int(fields[4][1:]), '')
+    p = [x.strip() for x in props.split(',')]
+    for i in range(0, len(p) - 1, 2):
+        if p[i] == 'i32 0':
+            v = re.match(r'i64\s+(\d+)', p[i + 1])
+            if v:
+                return int(v.group(1))
+    return 0
+
+
+def _uses_binding(module):
+    return any(i.dxop == BIND_HANDLE for _, i in module.functions[0].instrs()) \
+        if module.functions else False
+
+
+def _resbind(instr):
+    """(class, space, lowerBound) from a createHandleFromBinding operand.
+
+    `%dx.types.ResBind { i32 lower, i32 upper, i32 space, i8 class }`, read off
+    real DXC output: `{ i32 4, i32 4, i32 0, i8 2 }` is cbuffer b4, space 0.
+    """
+    # SRV t0 space0 is all zeroes, and LLVM prints an all-zero struct as
+    # `zeroinitializer` rather than writing the fields out. Nothing in the
+    # Unreal shaders was bound there, so only an independently written case
+    # reached this.
+    if 'zeroinitializer' in instr.args[1]:
+        return 0, 0, 0
+    m = re.search(r'\{\s*i32\s+(-?\d+),\s*i32\s+(-?\d+),\s*i32\s+(-?\d+),'
+                  r'\s*i8\s+(-?\d+)\s*\}', instr.args[1])
+    if not m:
+        raise LowerError('cannot read the ResBind of %s' % instr.body[:60])
+    return int(m.group(4)), int(m.group(3)), int(m.group(1))
+
+
+def _binding_map(text, md):
+    """{(class, space, lowerBound) -> record node id}.
+
+    A record is `{id, global, name, space, lowerBound, rangeSize, ...}`, so the
+    binding in the call is matched to the record by space and lower bound
+    rather than by the range index the 6.5 form carries."""
+    m = re.search(r'!dx\.resources\s*=\s*!\{!(\d+)\}', text)
+    if not m:
+        raise LowerError('module has no !dx.resources')
+    out = {}
+    for cls, g in enumerate(x.strip() for x in md[int(m.group(1))].split(',')):
+        if g == 'null':
+            continue
+        for tok in md[int(g[1:])].split(','):
+            nid = int(tok.strip()[1:])
+            f = [x.strip() for x in md[nid].split(',')]
+            sp = re.match(r'i32\s+(-?\d+)', f[3])
+            lo = re.match(r'i32\s+(-?\d+)', f[4])
+            if sp and lo:
+                out[(cls, int(sp.group(1)), int(lo.group(1)))] = nid
     return out
 
 
@@ -194,12 +345,43 @@ def _plan_globals(table):
     return g
 
 
-def _handle_text(instr, table, globals_):
-    """The load + createHandleForLib that replaces one createHandle.
+def _handle_text(instr, table, globals_, binds=None):
+    """The load + createHandleForLib that replaces one handle creation.
 
     Shared, because the any-hit shader has to recreate any resource handle the
     Proceed loop body used. A handle is not caller state: it names a resource,
     and every shader in the library can reach it."""
+    if instr.dxop == BIND_HANDLE:
+        # Shader Model 6.6. The binding names the resource directly, so the
+        # record is found by space and lower bound rather than by a range
+        # index. The annotateHandle that follows is left exactly as it was: it
+        # is legal in a library and carries the resource properties.
+        cls, space, lower = _resbind(instr)
+        nid = (binds or {}).get((cls, space, lower))
+        if nid is None:
+            raise LowerError(
+                'createHandleFromBinding names class %d space %d register %d, '
+                'which !dx.resources does not describe' % (cls, space, lower))
+        sym, _, _, _ = globals_[(cls, nid)]
+        idx = re.match(r'i32\s+(\d+)$', instr.args[2].strip())
+        if not idx:
+            # The 6.5 path DOES support this, through a getelementptr on the
+            # array global. The 6.6 form is refused only because the shape of
+            # an ARRAY global in the binding form has not been measured off
+            # DXC, and guessing it is how a lowering goes silently wrong.
+            # phase5/cases/reference/ is where that question gets answered.
+            raise rq.Unsupported(
+                'resource handle %s comes from an array binding indexed '
+                'dynamically (%s); the Shader Model 6.6 form of that has not '
+                'been measured, and the 6.5 form is what this lowers'
+                % (instr.result, instr.args[2].strip()))
+        raw = '%%rq.raw.%s' % instr.result[1:]
+        return (
+            '  {raw} = load {h}, {h}* @{sym}, align 4\n'
+            '  {res} = call {h} @dx.op.createHandleForLib.dx.types.Handle'
+            '(i32 160, {h} {raw})  ; CreateHandleForLib(Resource)'
+        ).format(raw=raw, h=HANDLE_TYPE, sym=sym, res=instr.result)
+
     cls = int(re.match(r'i8\s+(\d+)', instr.args[1].strip()).group(1))
     rid = int(re.match(r'i32\s+(\d+)', instr.args[2].strip()).group(1))
     recs = table.get(cls, [])
@@ -261,12 +443,12 @@ def _dynamic_index(instr):
     return None if re.match(r'i32\s+\d+$', arg) else arg
 
 
-def _edit_resources(module, q, edits, table, globals_):
-    """createHandle(57, class, rangeId, ...) -> load + createHandleForLib."""
+def _edit_resources(module, q, edits, table, globals_, binds=None):
+    """Handle creation -> load + createHandleForLib, in either binding form."""
     for block, instr in q.fn.instrs():
-        if instr.dxop != 57:
+        if instr.dxop not in (57, BIND_HANDLE):
             continue
-        edits[instr.index] = _handle_text(instr, table, globals_)
+        edits[instr.index] = _handle_text(instr, table, globals_, binds)
 
 
 def _edit_ray_index(q, edits):
@@ -301,7 +483,7 @@ def _edit_query(module, q, edits, exports):
     if q.loop:
         header, latch, body = q.loop
         exit_label = _loop_exit(fn, header, latch, body)
-        _check_loop_isolated(fn, q, header, latch, body)
+        _check_loop_isolated(fn, q, header, latch, body, _type_names(module.text))
 
     edits[q.trace.index] = _trace_block(q, ra, exit_label)
 
@@ -328,26 +510,40 @@ def _edit_query(module, q, edits, exports):
                 edits[i.index] = None
 
     _edit_committed(q, edits)
+    # After the loop blocks have been marked for deletion, so a RayFlags
+    # read INSIDE the loop keeps its deletion and only the raygen ones get
+    # the constant.
+    _edit_ray_flags(q, edits)
 
 
 def _trace_block(q, ra, exit_label):
+    # RayContributionToHitGroupIndex stays 0 and MissShaderIndex stays 0, so
+    # the record a hit lands on is the instance contribution plus the geometry
+    # multiplier times the geometry index.
+    #
+    # The multiplier is 1 only when the shader asks what geometry it hit. At 0
+    # every geometry of an instance shares one record, which is what this did
+    # before and is one record instead of one per geometry; turning it on
+    # unconditionally would grow every scene's table for nothing.
     """Payload init plus the TraceRay that replaces the inline query."""
-    flags = q.ray_flags
+    geom_mult = 1 if q.needs_record_constants else 0
+    flag_setup, flag_text = q.flags_operand
     lines = []
     for idx, ty, align in [(0, 'float', 8), (1, '<2 x float>', 4), (2, 'i32', 4),
                            (3, 'i32', 4), (4, 'i32', 4), (5, 'i32', 4),
                            (6, 'i32', 4), (7, 'i32', 4), (8, '[12 x float]', 4),
-                           (9, 'i32', 4)]:
+                           (9, 'i32', 4), (10, 'i32', 4)]:
         zero = '0.000000e+00' if ty == 'float' else (
             'zeroinitializer' if (ty.startswith('<') or ty.startswith('[')) else '0')
         lines.append('  %%rq.pl%d = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 %d'
                      % (idx, PAYLOAD, PAYLOAD, idx))
         lines.append('  store %s %s, %s* %%rq.pl%d, align %d' % (ty, zero, ty, idx, align))
+    lines += flag_setup
     lines += [
-        '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, i32 %d, '
-        '%s, i32 0, i32 0, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%rq.pl)'
+        '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, %s, '
+        '%s, i32 0, i32 %d, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%rq.pl)'
         '  ; TraceRay(...)' % (
-            PAYLOAD[1:], q.as_handle, flags, ra['mask'],
+            PAYLOAD[1:], q.as_handle, flag_text, ra['mask'], geom_mult,
             ra['origin'][0], ra['origin'][1], ra['origin'][2], ra['tmin'],
             ra['direction'][0], ra['direction'][1], ra['direction'][2], ra['tmax'],
             PAYLOAD),
@@ -377,7 +573,151 @@ def _preheader(fn, q, header, body):
     return None
 
 
-def _check_loop_isolated(fn, q, header, latch, body):
+# Instructions the any-hit shader can simply RUN AGAIN, because their answer
+# does not depend on anything only the raygen knows.
+#
+# This is the same reasoning that exempted resource handles, one level up. A
+# handle is not caller state because it names a resource every shader in the
+# library can reach; a shader parameter loaded from a cbuffer is not caller
+# state either, because the cbuffer is bound by the GLOBAL root signature and
+# holds the same bytes for every invocation of the dispatch. Neither is a value
+# computed from those by pure arithmetic.
+#
+# That matters because it is the ordinary shape of an alpha test: read the
+# thresholds before the loop, compare against them inside it. Unreal refused 59
+# shaders here.
+#
+# The list is deliberately short, and what is NOT on it is the point:
+#
+#   load / any buffer or texture fetch
+#       a UAV the raygen wrote before the loop would read back differently.
+#       A read inside the loop is a different thing and is already supported.
+#   phi
+#       its value depends on which path the RAYGEN took to reach it, which is
+#       exactly the caller state the payload cannot carry.
+#   sdiv / udiv / srem / urem
+#       recomputing hoists the operation, and integer division by zero is
+#       undefined. A pure operation that cannot trap is safe to hoist; one that
+#       can is not.
+#   any other dx.op
+#       not enumerated means not verified, the same rule the opcode whitelist
+#       follows.
+_PURE = {
+    'add', 'sub', 'mul', 'and', 'or', 'xor', 'shl', 'lshr', 'ashr',
+    'fadd', 'fsub', 'fmul', 'fdiv', 'fneg',
+    'icmp', 'fcmp', 'select', 'extractvalue', 'extractelement',
+    'zext', 'sext', 'trunc', 'bitcast', 'sitofp', 'uitofp', 'fptosi',
+    'fptoui', 'fpext', 'fptrunc', 'getelementptr',
+}
+# dx.op calls that are recomputable. 57 is createHandle and 217 is its Shader
+# Model 6.6 replacement, both exempt and both re-emitted through _handle_text.
+# 216 is annotateHandle, which follows 217 and carries only constant resource
+# properties. 59 is cbufferLoadLegacy. 93 is threadId, which the any-hit reaches
+# as DispatchRaysIndex: the SAME ray, so the same value, and legal in every ray
+# tracing stage.
+#
+# 216 and 217 being absent is what refused 118 of Unreal's shaders: every one of
+# them reaches its cbuffer through the 6.6 binding form, so no handle was ever
+# exempt and every value built on one looked like caller state.
+_PURE_DXOP = {57, 59, 93, ANNOTATE_HANDLE, BIND_HANDLE}
+
+
+# Every %name an instruction READS, not just its call arguments.
+#
+# Instr.uses() decodes call arguments and phi incomings, which is what the rest
+# of this pass needs. It is not enough for the isolation check: a value can
+# reach the loop body through ordinary arithmetic, `fcmp float %bary, %thresh`,
+# and uses() cannot see it. The check then let it through, the generated hit
+# shader referenced a value it never defined, and the ASSEMBLER reported it, as
+# "use of undefined value". Loud, but nowhere near the cause.
+#
+# Types are told from values by asking the module, not by guessing: a name is a
+# type exactly when the module declares `%name = type ...`. Guessing on the
+# shape of the name does not work, because %rq.pl and %dx.types.Handle look
+# alike.
+_TYPEDEF = re.compile(r'^(%"[^"]*"|%[\w.$-]+)\s*=\s*type\s', re.M)
+# A quoted name first, because %"class.RWStructuredBuffer<Result>" holds
+# characters an unquoted one cannot and would otherwise be cut at the quote.
+_NAME = re.compile(r'%"[^"]*"|%[\w.$-]+')
+
+
+def _type_names(text):
+    return set(_TYPEDEF.findall(text))
+
+
+def _operands(instr, types):
+    """The values this instruction reads, whatever kind of instruction it is."""
+    # A phi writes its predecessors as `[ %val, %bb12 ]`, with no `label`
+    # keyword to mark them, so the general scan below counts %bb12 as a value
+    # read. Unreal's loop bodies are full of phis, and the check then refused
+    # 118 shaders for "reading" their own predecessor blocks.
+    #
+    # uses() already decodes a phi correctly: incoming VALUES, which do count,
+    # and not the blocks, which do not.
+    if instr.is_phi:
+        return instr.uses()
+    body = instr.body
+    cut = body.find(';')
+    if cut >= 0:
+        body = body[:cut]
+    out = []
+    for m in _NAME.finditer(body):
+        n = m.group(0)
+        if n in types or n == instr.result:
+            continue
+        # `label %bb42` is a branch target, not a value.
+        before = body[:m.start()].rstrip()
+        if before.endswith('label'):
+            continue
+        out.append(n)
+    return out
+
+
+def _recomputable(fn, types):
+    """{result -> instr} for every value the generated hit shader can rebuild.
+
+    A fixpoint, because a chain is only recomputable if every link is."""
+    ok = {}
+    changed = True
+    while changed:
+        changed = False
+        for _, i in fn.instrs():
+            if not i.result or i.result in ok:
+                continue
+            if i.dxop is not None and i.dxop not in _PURE_DXOP:
+                continue
+            if i.dxop is None:
+                op = re.match(r'\s*%\S+\s*=\s*(\w+)', i.line)
+                if not op or op.group(1) not in _PURE:
+                    continue
+            if all(u in ok or u == i.result for u in _operands(i, types)):
+                ok[i.result] = i
+                changed = True
+    return ok
+
+
+def _needed_chain(fn, recomputable, wanted, types, skip=()):
+    """The recomputable instructions behind `wanted`, in source order.
+
+    Source order is enough: every one of them is outside the loop and pure, so
+    the raygen's order already respects their dependencies.
+
+    `skip` is what the loop body defines for itself. Without it the closure
+    walks straight back into the body and rebuilds its instructions in the
+    prologue as well, which is a duplicate definition and, where the prologue
+    copy lands first, a use of a value the body has not defined yet."""
+    need = set()
+    frontier = [w for w in wanted if w not in skip]
+    while frontier:
+        r = frontier.pop()
+        if r in need or r in skip or r not in recomputable:
+            continue
+        need.add(r)
+        frontier.extend(_operands(recomputable[r], types))
+    return [i for _, i in fn.instrs() if i.result in need]
+
+
+def _check_loop_isolated(fn, q, header, latch, body, types):
     """The any-hit shader is a separate invocation with only the payload for
     shared state, so the loop body must not read caller locals or leak values
     back out. Both are in the brief's no-valid-lowering table."""
@@ -387,14 +727,14 @@ def _check_loop_isolated(fn, q, header, latch, body):
         for i in blk.instrs:
             if i.result:
                 defined.add(i.result)
-            used.update(i.uses())
+            used.update(_operands(i, types))
 
     # A resource handle read inside the loop is NOT caller state. It names a
     # resource, and the any-hit shader can create its own handle for the same
     # one, so those are recreated rather than refused. Real alpha testing reads
     # a texture or buffer in the loop body, so refusing this would have blocked
     # the most common shape there is.
-    handles = {i.result for _, i in fn.instrs() if i.dxop == 57 and i.result}
+    handles = set(_recomputable(fn, types))
 
     # But that exemption holds only for a handle the MODULE fully determines.
     # A dynamically indexed one depends on a value computed in the raygen, and
@@ -418,11 +758,39 @@ def _check_loop_isolated(fn, q, header, latch, body):
     for b, i in fn.instrs():
         if b.label in body:
             continue
-        for u in i.uses():
+        for u in _operands(i, types):
             if u in defined:
                 raise rq.Unsupported(
                     'value %s defined in the Proceed loop is used after it; '
                     'the any-hit shader cannot return it' % u)
+
+
+def _edit_ray_flags(q, edits):
+    """RayFlags() read in the raygen becomes the constant it must be.
+
+    dx.op.rayFlags is legal in a hit or miss shader, not in a raygen, so the
+    loop-body uses go through CANDIDATE_MAP and these do not. The value is the
+    same one the lowering hands TraceRay, and the analysis refuses a query whose
+    flags are not a compile-time constant, so there is nothing to look up at
+    runtime."""
+    for _, instr in q.candidate_ops:
+        if instr.dxop != rq.RAY_FLAGS:
+            continue
+        # A read inside the loop already has an edit: the whole block is marked
+        # for deletion, and the loop body is re-emitted into the any-hit where
+        # dx.op.rayFlags IS legal. Overwriting that entry would resurrect the
+        # instruction in the raygen as well as the any-hit.
+        if instr.index in edits:
+            q.rayflags_in_loop = True
+            continue
+        if q.dyn_flags is not None:
+            edits[instr.index] = '  %s = add i32 %d, 0' % (instr.result, q.ray_flags)
+        else:
+            # RayFlags() can only be called after TraceRayInline, so the
+            # runtime operand dominates this point.
+            from dxil import operand_name
+            edits[instr.index] = '  %s = or i32 %s, %d' % (
+                instr.result, operand_name(q.trace.args[3]), q.const_flags or 0)
 
 
 def _edit_committed(q, edits):
@@ -459,27 +827,43 @@ def _edit_committed(q, edits):
 
 # --- generated text --------------------------------------------------------
 
-def _add_types_and_globals(text, globals_):
+def _add_types_and_globals(text, globals_, needs_record=False, binding=False):
     decls = ['%s = type %s' % (PAYLOAD, PAYLOAD_TYPE),
              '%s = type { <2 x float> }' % ATTRS, '']
+    if needs_record:
+        # Two words, matching the two root constants the shim puts in every hit
+        # group record. Declared here even when the original shader had no
+        # cbuffer of its own, which is why CBufRet is added conditionally too.
+        decls.insert(2, '%s = type { i32, i32 }' % RECORD_TYPE)
+        if ('%s = type' % CBRET) not in text:
+            decls.insert(3, '%s = type { i32, i32, i32, i32 }' % CBRET)
+        decls.append('%s = external constant %s, align 4'
+                     % (RECORD_GLOBAL, RECORD_TYPE))
     seen = set()
     for sym, gty, elem, _ in globals_.values():
         if sym in seen:
             continue
         seen.add(sym)
-        decls.append('@%s = external constant %s, align 4' % (sym, gty))
+        # In the binding form the global holds a HANDLE whatever the resource
+        # is; the RECORD bitcasts it back to the resource type. Copied from
+        # DXC: `@CB = external constant %dx.types.Handle`.
+        decls.append('@%s = external constant %s, align 4'
+                     % (sym, HANDLE_TYPE if binding else gty))
     anchor = re.search(r'^%dx\.types\.Handle = type .*$', text, re.M)
     if not anchor:
         raise LowerError('cannot find %dx.types.Handle to anchor declarations')
     return text[:anchor.end()] + '\n' + '\n'.join(decls) + text[anchor.end():]
 
 
-def _swap_declarations(text, q, globals_):
+def _swap_declarations(text, q, globals_, binding=False):
     """Drop the rayQuery and compute-only declares, add the library ones."""
     for pat in [r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.rayQuery_[^\n]*\n',
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.allocateRayQuery[^\n]*\n',
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandle\(i32, i8[^\n]*\n',
-                r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.threadId[^\n]*\n']:
+                r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.threadId[^\n]*\n',
+                # The 6.6 handle creation is converted away, so its declare
+                # goes too: an unused declare is itself a validation error.
+                r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandleFromBinding[^\n]*\n']:
         text = re.sub(pat, '\n', text)
 
     new = ['', '; Function Attrs: nounwind readnone',
@@ -511,9 +895,29 @@ def _swap_declarations(text, q, globals_):
         ({rq.CANDIDATE_OBJECT_RAY_DIRECTION},
          'declare float @dx.op.objectRayDirection.f32(i32, i8) #0'),
     ]
+    # Only reached from a generated hit shader. A raygen read of RayFlags
+    # became a constant, so a shader reading it only there declares nothing,
+    # and an unused declare is itself a validation error.
+    if q.rayflags_in_loop:
+        new += ['', '; Function Attrs: nounwind readnone',
+                'declare i32 @dx.op.rayFlags.i32(i32) #0']
     for ops, decl in conditional:
         if used_ops & ops:
             new += ['', '; Function Attrs: nounwind readnone', decl]
+
+    # The record read. Both are #2, nounwind readonly, copied from DXC output.
+    #
+    # cbufferLoadLegacy may ALREADY be declared, because the application's own
+    # shader very likely has a cbuffer of its own; declaring it twice is as much
+    # an error as declaring it unused.
+    if q.needs_record_constants:
+        new += ['', '; Function Attrs: nounwind readonly',
+                'declare %%dx.types.Handle @%s(i32, %s) #2'
+                % (RECORD_HANDLE_FN, RECORD_TYPE)]
+        if '@dx.op.cbufferLoadLegacy.i32(' not in text:
+            new += ['', '; Function Attrs: nounwind readonly',
+                    'declare %s @dx.op.cbufferLoadLegacy.i32'
+                    '(i32, %%dx.types.Handle, i32) #2' % CBRET]
     if q.needs_intersection:
         new += ['', '; Function Attrs: nounwind',
                 'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #1'
@@ -522,14 +926,21 @@ def _swap_declarations(text, q, globals_):
     # AnyHitNull always does and it is nothing but an IgnoreHit.
     new += ['', '; Function Attrs: noreturn nounwind',
             'declare void @dx.op.ignoreHit(i32) #3']
-    seen = set()
-    for sym, gty, elem, _ in globals_.values():
-        fnname, _ = _handle_fn(elem)
-        if fnname in seen:
-            continue
-        seen.add(fnname)
+    if binding:
+        # One overload serves every resource in the 6.6 form, because the
+        # global is a handle whatever the resource is.
         new += ['', '; Function Attrs: nounwind readonly',
-                'declare %%dx.types.Handle @%s(i32, %s) #2' % (fnname, elem)]
+                'declare %s @dx.op.createHandleForLib.dx.types.Handle'
+                '(i32, %s) #2' % (HANDLE_TYPE, HANDLE_TYPE)]
+    else:
+        seen = set()
+        for sym, gty, elem, _ in globals_.values():
+            fnname, _ = _handle_fn(elem)
+            if fnname in seen:
+                continue
+            seen.add(fnname)
+            new += ['', '; Function Attrs: nounwind readonly',
+                    'declare %%dx.types.Handle @%s(i32, %s) #2' % (fnname, elem)]
 
     anchor = text.index('\nattributes #0 =')
     text = text[:anchor] + '\n' + '\n'.join(new) + text[anchor:]
@@ -568,6 +979,19 @@ def _closesthit(name, status, q):
                   % (idx, PAYLOAD, PAYLOAD, idx))
         ch.append('  store %s %%id%d, %s* %%pi%d, align 4' % (ty, idx, ty, idx))
 
+    # The record's two numbers, when the shader asked for either. Both are
+    # stored whenever either is read: one cbuffer load answers both, so
+    # splitting them would cost a branch and save nothing.
+    if q.needs_record_constants:
+        ch += _record_read('g', 0, '%rq.geo')
+        ch.append('  %%rq.gp = getelementptr inbounds %s, %s* %%p, i32 0, i32 5'
+                  % (PAYLOAD, PAYLOAD))
+        ch.append('  store i32 %rq.geo, i32* %rq.gp, align 4')
+        ch.append('  %%rq.con = extractvalue %s %%rq.cbrg, 1' % CBRET)
+        ch.append('  %%rq.cp = getelementptr inbounds %s, %s* %%p, i32 0, i32 10'
+                  % (PAYLOAD, PAYLOAD))
+        ch.append('  store i32 %rq.con, i32* %rq.cp, align 4')
+
     # Twelve fetches and twelve stores, so they are emitted ONLY when the
     # shader actually reads the matrix. The payload field exists either way,
     # because a layout that changes shape is a layout that gets an offset
@@ -588,7 +1012,7 @@ def _closesthit(name, status, q):
     return '\n'.join(ch)
 
 
-def _append_shaders(text, module, q, exports, table, globals_):
+def _append_shaders(text, module, q, exports, table, globals_, binds=None):
     # q is used below to decide whether the closest-hit fetches the matrix.
     """Emit the generated shader set after the raygen."""
     fns = []
@@ -598,12 +1022,12 @@ def _append_shaders(text, module, q, exports, table, globals_):
         # arm dies and this is an intersection shader, folded to
         # CANDIDATE_NON_OPAQUE_TRIANGLE the procedural arm dies and it is an
         # any-hit. Each keeps the other's dead arm as valid but unreachable IR.
-        fns.append(_intersection(module, q, exports, table, globals_))
-        fns.append(_anyhit(module, q, exports, table, globals_))
+        fns.append(_intersection(module, q, exports, table, globals_, binds))
+        fns.append(_anyhit(module, q, exports, table, globals_, binds))
     elif q.needs_intersection:
-        fns.append(_intersection(module, q, exports, table, globals_))
+        fns.append(_intersection(module, q, exports, table, globals_, binds))
     elif q.loop:
-        fns.append(_anyhit(module, q, exports, table, globals_))
+        fns.append(_anyhit(module, q, exports, table, globals_, binds))
 
     if q.needs_both:
         # And two closest-hits, because the committed status differs and a
@@ -651,7 +1075,8 @@ def _append_shaders(text, module, q, exports, table, globals_):
     return '\n'.join(lines)
 
 
-def _intersection(module, q, exports, table, globals_):
+def _intersection(module, q, exports, table, globals_, binds=None):
+    types = _type_names(module.text)
     """The Proceed loop body, re-rooted as an INTERSECTION shader.
 
     The same body as the any-hit case, with one substitution changed: where
@@ -697,14 +1122,27 @@ def _intersection(module, q, exports, table, globals_):
     out = ['define void @%s() #1 {' % exports['intersection'],
            '  %%rq.at = alloca %s, align 8' % ATTRS]
 
-    used = set()
+    used, inBody = set(), set()
     for label in body:
         if label != latch:
             for i in fn.block(label).instrs:
-                used.update(i.uses())
-    for _, i in fn.instrs():
-        if i.dxop == 57 and i.result in used:
-            out.append(_handle_text(i, table, globals_))
+                used.update(_operands(i, types))
+                if i.result:
+                    inBody.add(i.result)
+    # Everything the body reads from outside itself, rebuilt here in source
+    # order. A resource handle becomes its library form; a thread id becomes
+    # DispatchRaysIndex, which is the SAME ray so the same value; everything
+    # else is pure and is emitted as it stood. _check_loop_isolated has already
+    # refused anything not on that list.
+    for i in _needed_chain(fn, _recomputable(fn, types), used, types, inBody):
+        if i.dxop in (57, BIND_HANDLE):
+            out.append(_handle_text(i, table, globals_, binds))
+        elif i.dxop == 93:
+            comp = re.match(r'i32\s+(\d+)', i.args[1].strip()).group(1)
+            out.append('  %s = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 %s)'
+                       '  ; DispatchRaysIndex(col)' % (i.result, comp))
+        else:
+            out.append(i.line)
 
     for label in order:
         blk = fn.block(label)
@@ -730,6 +1168,11 @@ def _intersection(module, q, exports, table, globals_):
             if i.dxop == rq.ABORT:
                 # Nothing to set: an intersection shader that returns has
                 # reported nothing, and there is no later invocation to gate.
+                continue
+            if i.dxop in RECORD_WORD:
+                # The record answers, because nothing in the shader can. The
+                # local root signature bound this record's own constants.
+                out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result)
                 continue
             if i.dxop in CANDIDATE_MAP:
                 ty, callee, op, extra = CANDIDATE_MAP[i.dxop]
@@ -760,7 +1203,8 @@ def rq_operand(arg):
     return n if n else arg.strip().split()[-1]
 
 
-def _anyhit(module, q, exports, table, globals_):
+def _anyhit(module, q, exports, table, globals_, binds=None):
+    types = _type_names(module.text)
     """The Proceed loop body, re-rooted as an any-hit shader.
 
     Accept is falling off the end; reject is IgnoreHit. Note the polarity is
@@ -809,14 +1253,27 @@ def _anyhit(module, q, exports, table, globals_):
 
     # Recreate every resource handle the body uses, under the SAME SSA name it
     # had in the raygen, so the transplanted instructions need no rewriting.
-    used = set()
+    used, inBody = set(), set()
     for label in body:
         if label != latch:
             for i in fn.block(label).instrs:
-                used.update(i.uses())
-    for _, i in fn.instrs():
-        if i.dxop == 57 and i.result in used:
-            out.append(_handle_text(i, table, globals_))
+                used.update(_operands(i, types))
+                if i.result:
+                    inBody.add(i.result)
+    # Everything the body reads from outside itself, rebuilt here in source
+    # order. A resource handle becomes its library form; a thread id becomes
+    # DispatchRaysIndex, which is the SAME ray so the same value; everything
+    # else is pure and is emitted as it stood. _check_loop_isolated has already
+    # refused anything not on that list.
+    for i in _needed_chain(fn, _recomputable(fn, types), used, types, inBody):
+        if i.dxop in (57, BIND_HANDLE):
+            out.append(_handle_text(i, table, globals_, binds))
+        elif i.dxop == 93:
+            comp = re.match(r'i32\s+(\d+)', i.args[1].strip()).group(1)
+            out.append('  %s = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 %s)'
+                       '  ; DispatchRaysIndex(col)' % (i.result, comp))
+        else:
+            out.append(i.line)
 
     if aborts:
         out.append('  %%rq.pab = getelementptr inbounds %s, %s* %%p, i32 0, i32 9'
@@ -856,6 +1313,11 @@ def _anyhit(module, q, exports, table, globals_):
                            '  ; HitKind()' % hk)
                 out.append('  %s = icmp eq i32 %s, %d' % (i.result, hk, HIT_KIND_FRONT))
                 continue
+            if i.dxop in RECORD_WORD:
+                # The record answers, because nothing in the shader can. The
+                # local root signature bound this record's own constants.
+                out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result)
+                continue
             if i.dxop in CANDIDATE_MAP:
                 # Same operands as the RayQuery form, minus the query handle.
                 ty, callee, op, extra = CANDIDATE_MAP[i.dxop]
@@ -888,11 +1350,18 @@ def Block_successors(line):
     return re.findall(r'label\s+(%[\w.$-]+)', line)
 
 
-def _rewrite_metadata(text, md, table, globals_, q, exports):
+def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
     """Point the resource records at the globals and rebuild the entry points."""
     for (cls, nid), (sym, gty, elem, name) in globals_.items():
         fields = [f.strip() for f in md[nid].split(',')]
-        fields[1] = re.sub(r'\*\s+\S+$', '* @%s' % sym, fields[1])
+        if binding:
+            # `%CB* bitcast (%dx.types.Handle* @CB to %CB*)`, copied from DXC.
+            # The global holds a handle; the record still has to name the
+            # resource type, so it casts.
+            fields[1] = ('%s* bitcast (%s* @%s to %s*)'
+                         % (gty, HANDLE_TYPE, sym, gty))
+        else:
+            fields[1] = re.sub(r'\*\s+\S+$', '* @%s' % sym, fields[1])
         fields[2] = '!"%s"' % name
         text = re.sub(r'^!%d = !\{.*\}\s*$' % nid,
                       '!%d = !{%s}' % (nid, ', '.join(fields)), text, flags=re.M)
@@ -917,6 +1386,29 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
         return nid
 
     nodes = []
+
+    # The record cbuffer, added to whatever the application already had.
+    #
+    # Shape copied from DXC, not invented: a cbuffer record is
+    # {id, global, name, space, lowerBound, rangeSize, sizeInBytes, extra}.
+    # space 1 keeps it clear of anything the application's own global root
+    # signature binds, which the shim must not disturb. See
+    # phase5/cases/reference/lib_localroot_ref.hlsl.
+    if q.needs_record_constants:
+        groups = [g.strip() for g in md[int(res)].split(',')]
+        while len(groups) < 4:
+            groups.append('null')
+        have = []
+        if groups[2] != 'null':
+            have = [x.strip() for x in md[int(groups[2][1:])].split(',')]
+        rec = node('i32 %d, %s* %s, !"rq_record", i32 1, i32 0, i32 1, i32 8, null'
+                   % (len(have), RECORD_TYPE, RECORD_GLOBAL))
+        groups[2] = '!%d' % node(', '.join(have + ['!%d' % rec]))
+        # Rewritten in place, so !dx.resources keeps pointing at the same node
+        # and nothing else has to learn a new id.
+        text = re.sub(r'^!%s = !\{.*\}\s*$' % res,
+                      '!%s = !{%s}' % (res, ', '.join(groups)), text, flags=re.M)
+
     sig_h = '(%s*, %s*)' % (PAYLOAD, ATTRS)
     sig_p = '(%s*)' % PAYLOAD
 
@@ -954,7 +1446,7 @@ def _rewrite_metadata(text, md, table, globals_, q, exports):
     # Entry points: a resource-only record, then one per export. Tags are
     # 8 shader kind, 6 payload bytes, 7 attribute bytes, 5 auto binding space.
     zero = node('i32 0')
-    flags = node('i32 0, i64 16')
+    flags = node('i32 0, i64 %d' % (_module_flags(text, md) & ~RT11_SHADER_FLAG))
     eps = [node('null, !"", null, !%s, !%d' % (res, flags))]
 
     def entry(name, sig, kind, payload, attrs):

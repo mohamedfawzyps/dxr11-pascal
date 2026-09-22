@@ -68,12 +68,40 @@ BlasInfo Lookup(D3D12_GPU_VIRTUAL_ADDRESS address);
 // by any single record.
 enum Reach : uint8_t { kReachNone = 0, kReachTriangles = 1, kReachProcedural = 2 };
 
+// What a hit group record has to tell the shader about itself.
+//
+// GeometryIndex() in a DXR 1.0 hit shader is a Tier 1.1 feature and
+// CreateStateObject refuses it on this hardware, and HLSL exposes no hit-shader
+// intrinsic for the instance contribution at all. Both answers are known HERE,
+// while the table is being built, so they travel in the record as local root
+// signature constants and the hit shader reads them back. Measured at
+// SFI0 = 0x0: see phase5/cases/reference/lib_localroot_ref.hlsl.
+struct RecordConstants {
+    UINT geometryIndex = 0;
+    UINT instanceContribution = 0;
+    bool assigned = false;
+};
+
 struct TlasInfo {
     bool valid = false;
     UINT instanceCount = 0;
     // The largest InstanceContributionToHitGroupIndex any instance carries.
     // The shader table has to be at least this much bigger than one record.
     UINT maxContribution = 0;
+    // How many records the scene needs, which with
+    // MultiplierForGeometryContributionToShaderIndex = 1 is
+    // max(contribution + geometryCount) and NOT maxContribution + 1: each
+    // instance occupies one record per geometry in its structure.
+    UINT recordCount = 0;
+    // Per record, the two numbers the hit shader will read back.
+    std::vector<RecordConstants> constants;
+    // Two instances whose (contribution, geometry) pairs land on the SAME
+    // record but disagree about what it means. One record cannot answer twice,
+    // so this is refused rather than answered wrongly. It does not arise in the
+    // usual layout, where an engine assigns contributions as a running sum of
+    // geometry counts precisely so records do not collide.
+    bool constantsConflict = false;
+    UINT conflictSlot = 0;
     // Which geometry types the instances actually reach. Both true is the
     // mixed case the shim cannot yet build a table for.
     bool anyTriangles = false;
@@ -81,9 +109,9 @@ struct TlasInfo {
     // Instances whose bottom-level structure was never seen being built, so
     // its type is not known. Nonzero means the answer above is incomplete.
     UINT unknownBlas = 0;
-    // What reaches each record index, one entry per index up to
-    // maxContribution. This is what lets the table carry a record of the right
-    // TYPE at each slot rather than one record everywhere.
+    // What reaches each record index, one entry per record. This is what lets
+    // the table carry a record of the right TYPE at each slot rather than one
+    // record everywhere.
     std::vector<uint8_t> reach;
 };
 
@@ -152,6 +180,11 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
 // for MORE records of MORE types than one scene needs, which costs a few
 // wasted slots and never a wrong one.
 std::vector<uint8_t> RecordKinds();
+
+// The per-record constants, merged over every top-level structure read so far,
+// sized to the largest. Slots nothing reaches keep {0,0}, which is harmless:
+// a record nothing resolves to is never executed.
+std::vector<RecordConstants> RecordConstantsTable();
 
 // How many bottom-level structures have been seen, and of what kinds. For the
 // log and for tests, so the tracking can be shown to work before anything

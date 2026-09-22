@@ -273,6 +273,13 @@ class Module(object):
                 continue
             m = re.match(r'^([\w.$-]+):', line)
             if m:
+                # A labelled FIRST block IS the entry block, not a second one.
+                # The normaliser adds `bb0:` when a phi names the entry as a
+                # predecessor, and without this that would leave an empty
+                # implicit block standing in front of it.
+                if (len(fn.blocks) == 1 and fn.blocks[0].label is None
+                        and not fn.blocks[0].instrs):
+                    fn.blocks.pop()
                 blk = Block('%' + m.group(1), line, n)
                 fn.blocks.append(blk)
                 continue

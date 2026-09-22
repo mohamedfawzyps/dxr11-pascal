@@ -27,6 +27,9 @@ $cases = @(
     @{ name = 'indep'; src = 'phase5\cases\rayquery_indep.ll'; pat = 'alpha'; flags = @();
        gt = @('--cs', 'phase5\cases\rayquery_indep.hlsl');
        desc = 'independently written: resource READ INSIDE the Proceed loop' },
+    @{ name = 'sm66'; src = 'phase5\cases\rayquery_sm66.ll'; pat = 'alpha'; flags = @();
+       gt = @('--cs', 'phase5\cases\rayquery_sm66.hlsl');
+       desc = 'Shader Model 6.6 resource binding, in the raygen AND the any-hit' },
     @{ name = 'proc'; src = 'phase5\cases\rayquery_proc.ll'; pat = 'alpha'; flags = @('--proc');
        gt = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--proc');
        desc = 'procedural primitives, generated INTERSECTION shader' },

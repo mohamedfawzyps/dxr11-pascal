@@ -39,14 +39,29 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     TlasInfo t;
     t.valid = true;
     t.instanceCount = count;
-    for (UINT i = 0; i < count; ++i) {
-        if (d[i].InstanceContributionToHitGroupIndex > t.maxContribution)
-            t.maxContribution = d[i].InstanceContributionToHitGroupIndex;
-    }
-    t.reach.assign(static_cast<size_t>(t.maxContribution) + 1, kReachNone);
+// How many records one instance occupies. With the geometry multiplier at 1
+    // that is one per geometry in its bottom-level structure, so an instance
+    // whose structure holds four geometries covers four consecutive records.
+    // A structure never seen being built counts as one, which is what this did
+    // before geometry ever entered the index.
+    auto geometriesOf = [&](D3D12_GPU_VIRTUAL_ADDRESS blas) -> UINT {
+        auto it = g_blas.find(blas);
+        if (it == g_blas.end()) return 1;
+        return it->second.geometryCount ? it->second.geometryCount : 1;
+    };
 
     for (UINT i = 0; i < count; ++i) {
-        const UINT slot = d[i].InstanceContributionToHitGroupIndex;
+        const UINT ic = d[i].InstanceContributionToHitGroupIndex;
+        if (ic > t.maxContribution) t.maxContribution = ic;
+        const UINT end = ic + geometriesOf(d[i].AccelerationStructure);
+        if (end > t.recordCount) t.recordCount = end;
+    }
+    if (t.recordCount == 0) t.recordCount = 1;
+    t.reach.assign(t.recordCount, kReachNone);
+    t.constants.assign(t.recordCount, RecordConstants{});
+
+    for (UINT i = 0; i < count; ++i) {
+        const UINT ic = d[i].InstanceContributionToHitGroupIndex;
         uint8_t bits = kReachNone;
         auto it = g_blas.find(d[i].AccelerationStructure);
         if (it == g_blas.end()) { ++t.unknownBlas; continue; }
@@ -58,7 +73,26 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         }
         if (bits & kReachTriangles)  t.anyTriangles = true;
         if (bits & kReachProcedural) t.anyProcedural = true;
-        t.reach[slot] |= bits;
+
+        const UINT geoms = geometriesOf(d[i].AccelerationStructure);
+        for (UINT gi = 0; gi < geoms; ++gi) {
+            const UINT slot = ic + gi;
+            if (slot >= t.recordCount) break;
+            t.reach[slot] |= bits;
+
+            RecordConstants& rc = t.constants[slot];
+            if (rc.assigned) {
+                // Same slot, different meaning. Detected, never averaged.
+                if (rc.geometryIndex != gi || rc.instanceContribution != ic) {
+                    if (!t.constantsConflict) t.conflictSlot = slot;
+                    t.constantsConflict = true;
+                }
+            } else {
+                rc.geometryIndex = gi;
+                rc.instanceContribution = ic;
+                rc.assigned = true;
+            }
+        }
     }
 
     const bool isNew = g_tlas.find(tlas) == g_tlas.end();
@@ -285,6 +319,25 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
     // triangles, the real triangle record; both produce no hit, which is the
     // same answer the shader gives on Tier 1.1, where it never commits a
     // procedural candidate either.
+    // A record that two instances disagree about is refused whatever the
+    // shader commits, because the geometry index and the contribution it
+    // carries would be wrong for one of them. Checked before the procedural
+    // question, since it is not conditional on the shader at all.
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        for (const auto& kv : g_tlas) {
+            const TlasInfo& t = kv.second;
+            if (!t.valid || !t.constantsConflict) continue;
+            if (why)
+                *why = "two instances put different (contribution, geometry) "
+                       "pairs on hit group record " +
+                       std::to_string(t.conflictSlot) +
+                       ", so that record cannot carry the geometry index for "
+                       "both. One record answers once";
+            return true;
+        }
+    }
+
     if (!shaderCommitsProcedural) return false;
 
     // For a shader that DOES commit procedural hits, one slot holding both
@@ -308,6 +361,19 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
         }
     }
     return false;
+}
+
+std::vector<RecordConstants> RecordConstantsTable() {
+    std::lock_guard<std::mutex> g(g_lock);
+    std::vector<RecordConstants> out;
+    for (const auto& kv : g_tlas) {
+        const TlasInfo& t = kv.second;
+        if (!t.valid) continue;
+        if (out.size() < t.constants.size()) out.resize(t.constants.size());
+        for (size_t i = 0; i < t.constants.size(); ++i)
+            if (t.constants[i].assigned && !out[i].assigned) out[i] = t.constants[i];
+    }
+    return out;
 }
 
 std::vector<uint8_t> RecordKinds() {

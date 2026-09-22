@@ -1,0 +1,37 @@
+// Version resource for the proxy dxgi.dll.
+//
+// Same reasoning as d3d12_proxy.rc: a file that gets copied into a game folder
+// and forgotten should say which build it is without being run. The strings
+// deliberately do not imitate Microsoft's dxgi.dll.
+
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    DXR_TIER11_VERSION_COMMA
+PRODUCTVERSION DXR_TIER11_VERSION_COMMA
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_DLL
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"   // US English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "pascal-dxr-tier-1.1 project"
+            VALUE "FileDescription",  "DXGI shim: reports Pascal under a Turing device id"
+            VALUE "FileVersion",      DXR_TIER11_VERSION
+            VALUE "InternalName",     "pascal-dxr-tier-1.1-dxgi"
+            VALUE "OriginalFilename", "dxgi.dll"
+            VALUE "ProductName",      "GTX Pascal DXR Tier 1.1"
+            VALUE "ProductVersion",   DXR_TIER11_VERSION
+            VALUE "Comments",         "Not Microsoft's dxgi.dll. A proxy that forwards to it."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END

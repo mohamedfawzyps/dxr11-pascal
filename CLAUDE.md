@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.14.0.
+proxy/version.h, and is currently 0.24.0.
 
 ## Current position (2026-09-22)
 
@@ -81,6 +81,81 @@ only its author runs:
 - The log prefix is `[dxr-tier-11-proxy-log]` and it names the version and the
   DXC it loaded, because a bug report arrives as a log file from a binary
   nobody can identify.
+
+**UNREAL REFUSES PASCAL BY PCI DEVICE ID, AND THE TIER HAS NOTHING TO DO WITH
+IT.** This is the most consequential external fact the project has found, and
+it was found by running a real game rather than by reading anything.
+
+`Engine/Source/Runtime/D3D12RHI/Private/Windows/WindowsD3D12Device.cpp`,
+verified in stock UE 5.7.4:
+
+    static bool IsRayTracingEmulated(uint32 DeviceId)
+    { ... 0x1B81, // "NVIDIA GeForce GTX 1070" ... }
+
+    if (GRHISupportsRayTracing && IsRayTracingEmulated(AdapterDesc.DeviceId))
+    {
+        DisableRayTracingSupport();
+        UE_LOG(..., TEXT("Ray tracing is disabled for NVIDIA cards with the Pascal architecture."));
+    }
+
+It runs AFTER the tier check. The shim reports 1.1, Unreal sets
+`GRHISupportsRayTracing`, then reads the device id and turns it all back off.
+**No cvar, no command line flag, no config guards it**: the
+`GAllowEmulatedRayTracing` escape hatch older versions had was removed. Grepped
+for it, for `ForceEnableRayTracing` and for `AllowEmulated`; nothing.
+
+So `proxy/dxgi_spoof.{h,cpp}` and a second proxy DLL, `dxgi.dll`, report a
+Pascal card under a Turing device id. See docs and the CHANGELOG. Facts worth
+carrying:
+
+- **DXGI adapters SHARE one vtable and it lives in the module image.**
+  Measured, not assumed, because this project has been wrong both ways before:
+  queues share, lists get per-object heap vtables. `IDXGIAdapter4` is the same
+  object with the same table, so `GetDesc`, `GetDesc1`, `GetDesc2` and
+  `GetDesc3` are four slots in one place and cover every adapter from every
+  factory. **Nothing is wrapped**, so `D3D12CreateDevice` keeps receiving the
+  real object and there is no unwrapping problem.
+- **It cannot be done from d3d12.dll.** Unreal calls `IDXGIAdapter::GetDesc`
+  BEFORE its first `D3D12CreateDevice`, so no d3d12 export is early enough. The
+  hook installs from `CreateDXGIFactory*`, which is the last moment before the
+  first adapter can exist.
+- **Exactly one field changes**: `DeviceId`, on the cards Unreal itself lists.
+  NOT the vendor id, so NVAPI still runs. NOT the description, because
+  `FWindowsPlatformMisc::GetGPUDriverInfo` matches the description STRING
+  against `EnumDisplayDevices` and lying there breaks a real lookup for nothing.
+- **Every capability answer stays true.** Unreal asks NVAPI for shader
+  execution reordering, cluster ops, atomic64 and the driver version, and all
+  of those reach the real device. SER correctly reports unsupported. Unreal
+  never asks the hardware what it IS, only what it can DO, and only the first
+  question is answered differently.
+- The default id is 0x1F08, an RTX 2060: lowest-end Turing, and Turing rather
+  than Ampere because Unreal carries a separate `IsNvidiaAmpereGPU` list.
+- The install self-tests all four slots on a real denied adapter and rolls back
+  every slot as a unit if any check fails.
+
+**What was ruled out first, and each is worth not re-deriving.** The GTX 1070
+passes EVERY hardware gate Unreal has, measured on the real device: feature
+level 12_1, shader model 6.8, resource binding tier 3, wave ops, and 64-bit
+typed atomics on typed resources. Atomic64 was the expected blocker and is not
+one. The game ran on SM6, proven by `<Project>_PCD3D_SM6.upipelinecache` being
+written during the run. And cooking is host-independent:
+`ShouldCompileRayTracingShadersForProject` reads `GRayTracingPlatformMask`,
+filled from `TargetPlatformSettings->GetRayTracingShaderFormats()`, so building
+a game on a Pascal machine does NOT omit the ray tracing shaders.
+
+**One log line looked like proof and was not.**
+`CreateCommandSignature(DISPATCH_RAYS)` is keyed off
+`GRHISupportsRayTracingDispatchIndirect`, which comes from the TIER alone, not
+from `GRHISupportsRayTracing`. It showed the tier was believed, nothing more.
+The device wrapper's startup `caps:` lines now report Unreal's own SM6 gate for
+exactly this reason: so the caps branch is ruled out in one line rather than an
+afternoon.
+
+**`fopen_s` and `_wfopen_s` open EXCLUSIVELY.** `d3d12.dll` opened the log
+first and `dxgi.dll` then could not, so a demonstrably loaded DLL logged
+nothing at all. A silent component looks exactly like one that never ran. Both
+use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
+`proxy/proxy_log.cpp`, linked into both DLLs.
 
 - Phase 1 signing test: PASSED. See below and docs/phase1-signing.md.
 - Phase 2 hand-lowering test: PASSED, bit-exact on both patterns. See
@@ -744,7 +819,347 @@ only its author runs:
   the `table` case is now in the dispatch suite too, which is coverage that was
   previously IMPOSSIBLE rather than merely absent.
 
-- **Three defects found by pointing it at real engine shaders, NOT yet fixed.**
+- **WHAT UNREAL ACTUALLY REFUSES, MEASURED (2026-09-22).** With the stream-form
+  gap closed, a real UE 5.8.2 run produced ~158 refusals, and they are not
+  spread evenly. Counted from one session of Escher:
+
+      105  CandidateGeometryIndex                       (203)
+       33  "2 concurrent RayQuery objects"              Lumen x3, Niagara
+       12  CandidateInstanceContributionToHitGroupIndex (214)
+        4  entry-block phi bug, use of undefined '%bb0'
+        3  CommittedGeometryIndex                       (209)
+        1  RayFlags                                     (195)
+
+  The three unknown opcodes were identified by asking DXC, not by reading the
+  gaps in the table: `phase5/cases/reference/rq_opcodes_ref.hlsl` names the
+  whole StateScalar family in one compile and is there so this never has to be
+  guessed. 195 RayFlags, 198 RayTMin, 203 CandidateGeometryIndex, 214 and 215
+  the two InstanceContributionToHitGroupIndex forms.
+
+- **`GeometryIndex` AND `InstanceContributionToHitGroupIndex`: DONE, all four
+  accessors, bit-exact against WARP on the 1070.** 120 of the 158 refusals
+  Unreal produced, closed by one mechanism. The reason they were impossible was
+  true and is now obsolete: Both were written off
+  for reasons that only hold while the APPLICATION owns the shader table:
+  `GeometryIndex()` in a DXR 1.0 hit shader is itself Tier 1.1, and HLSL
+  exposes no hit-shader intrinsic for the contribution at all. **The shim
+  builds the table.** So the record carries the answers as local root signature
+  root constants, and the hit shader reads them back.
+
+  With `MultiplierForGeometryContributionToShaderIndex = 1` a hit lands on
+  record `InstanceContribution + GeometryIndex`, and the shim knows both numbers
+  for every record it writes.
+
+  That is one mechanism for FOUR accessors, 120 of the 158 refusals above.
+
+  **MEASURED, and this was the gate: SFI0 = 0x0.**
+  `phase5/cases/reference/lib_localroot_ref.hlsl` reads both values from
+  `cbuffer ... : register(b0, space1)` in an any-hit and a closest-hit, and the
+  container carries NO feature flag at all. That is the whole difference from
+  `GeometryIndex()`, which sets 0x2000000 and makes `CreateStateObject` return
+  E_INVALIDARG on the 1070. Not optional to check: this project has already
+  been caught once by an intrinsic that looked ordinary and was Tier 1.1.
+
+  The shape is machinery the rewriter already has: a global of a named type,
+  `createHandleForLib` (160) on it, then `cbufferLoadLegacy` (59). The same
+  synthesis it already does for `@rq_uav0`.
+
+  How it is built: per-record (geometryIndex, instanceContribution) from the
+  instance data, with the table sized by `max(contribution + geometryCount)` and
+  a REFUSAL when two different pairs collide on one record, because one record
+  answers once; a local root signature of two root constants at b0 space1,
+  associated with the HIT GROUPS only so raygen and miss records stay 32 bytes;
+  hit records growing to 64; the candidate forms read in the any-hit and
+  intersection shaders, the committed forms carried in the payload from the
+  closest-hit. The payload went 88 to 92 bytes and `PAYLOAD_BYTES` moves
+  together in `lower.py`, `rq_lower.cpp`, `rq_pipeline.cpp` and the harness, or
+  `CreateStateObject` fails.
+
+  **The test had to exist before the feature could be believed.** Every scene
+  here had ONE geometry per structure, so every correct answer was 0 and a
+  lowering that dropped the index would have passed. `--geom` builds one BLAS
+  with four geometries, and the candidate values GATE THE COMMIT rather than
+  escaping the loop, which the rewriter refuses and rightly. `geometry +
+  contribution != 3` commits, so the missing quadrant is geometry 3 without
+  `--contrib` and geometry 1 with it: **the gap MOVES**, so neither accessor
+  can be a constant.
+
+  Three bugs caught by running it, none by reading it: the
+  `needsRecordConstants` flag was set on one collection branch of two and so
+  missed every candidate form; the payload field list stopped at 9 so the
+  raygen read `%rq.pl10` with nothing defining it; and `test_reject.py` asserted
+  CommittedGeometryIndex must be REFUSED, which failed the moment it started
+  working. That last one is the THIRD time here a test encoded a fact about the
+  world and the fact moved. It is kept and flipped to an acceptance.
+
+- **`RayFlags` (195): DONE, and it exposed a silent wrongness.** 59 of Unreal's
+  shaders refused on it once GeometryIndex stopped blocking them first. Two
+  routes: `dx.op.rayFlags` (144) inside the loop, where it is legal, and a
+  FOLDED CONSTANT in the raygen, where it is not. A test reading it in one place
+  only would not tell them apart.
+  - The lowering had been trusting the TraceRayInline flags to be a
+    compile-time constant. `_imm` gives None otherwise and `(dyn_flags or 0)`
+    turned that into 0, so a shader computing flags at runtime would have
+    traced with the WRONG flags, silently. Now refused, in both implementations.
+  - The first version of the test used CULL_BACK_FACING_TRIANGLES and culled
+    the only triangle, so both sides reported 0 hits and it could not fail.
+
+- **The ENTRY-BLOCK phi bug: FIXED.** The oldest known defect here, and the
+  last of the assembler failures. DXC gives the entry block no label, because
+  nothing can branch to it, so normalisation had nothing to rename; but an `if`
+  with no `else` straight out of the entry makes a phi NAME it as a
+  predecessor, and `%bb0` then referred to a block that did not exist.
+  - The normaliser adds the label only when the function references it, so
+    modules that never needed one stay byte-for-byte unchanged.
+  - Both module parsers always created an implicit entry block, so a labelled
+    first block became a SECOND block and the entry came out empty. A labelled
+    first block is now taken as the entry.
+  - **It survived the whole of Phase 5 because EVERY case opened with
+    `if (tid.x >= width) return;`.** That guard puts a block between the entry
+    and everything else. One shared habit across every test, hiding one bug.
+    Same shape as the assumption the independent shader found: a suite made of
+    cases written to demonstrate a lowering shares its author's blind spots.
+
+- **Two bugs only a real engine's CONTROL FLOW exposes, both fixed.**
+  - **A phi's predecessor blocks were counted as value reads.** A phi writes
+    them as `[ %val, %bb12 ]`, with no `label` keyword, so the operand scan saw
+    %bb12 as a value and the isolation check refused 118 Unreal shaders for
+    "reading" their own blocks. `Uses()` already decodes a phi correctly, so a
+    phi now delegates to it.
+  - **The metadata scan did not match `distinct`.** A [branch] or [loop] hint
+    makes DXC emit `!16 = distinct !{!16, "dx.controlflow.hints", i32 1}`. That
+    id stayed invisible, `max(md)+1` started too low, and the fresh-id counter
+    handed out an id already in use: "Metadata id is already used". Unreal uses
+    those hints constantly.
+  - `rayquery_phi.hlsl` carries both. `[branch]` is load-bearing in it: without
+    it DXC flattens the if into a select, there is no phi, and the case tests
+    nothing.
+
+- **CLOSING ONE REFUSAL EXPOSES THE NEXT, and that has now happened four
+  versions running.** GeometryIndex hid RayFlags and loop isolation; those hid
+  the runtime ray flags; that hid the phi bug; the phi bug hid the `distinct`
+  metadata bug. Each was invisible while the one in front of it refused the
+  same shaders first. Expect the count to stay high and the COMPOSITION to be
+  the signal, not the total.
+
+- **Ray flags computed at RUNTIME: supported.** `dx.op.traceRay` takes
+  RayFlags as an ordinary i32 operand, not an immediate. Measured, see
+  phase5/cases/reference/lib_dynflags_ref.hlsl. Unreal does this in 118
+  shaders, which became the largest refusal the moment the others were closed.
+  - The lowering used to FOLD the flags, and `(dyn_flags or 0)` silently turned
+    an unknown value into 0, so a shader traced with the wrong flags and
+    nothing said so. That was refused for one version, correctly; passing the
+    operand through is the actual answer. The refusal was right about the bug
+    and wrong about the question.
+  - `Query.ray_flags` still reports only the STATICALLY KNOWN bits, and that is
+    deliberate: it is what decides whether traversal is provably fixed-function.
+    A query with no Proceed loop and no FORCE_OPAQUE template is still refused,
+    because a runtime value cannot prove it.
+
+- **Loop isolation: WIDENED, correctly, and the primitive under it was
+  wrong.** Unreal refused 59 shaders on "reads values defined outside it",
+  which is the ordinary shape of an alpha test: read the thresholds once,
+  compare per candidate.
+  - **A cbuffer read, the ray index and pure arithmetic on them are NOT caller
+    state.** The cbuffer is bound by the global root signature and holds the
+    same bytes for the whole dispatch; DispatchRaysIndex in the any-hit is the
+    SAME ray. So the generated hit shader rebuilds the chain instead of
+    refusing. Same reasoning that exempted resource handles, one level up.
+  - **What is NOT on the whitelist is the point.** No loads, because a UAV the
+    raygen wrote reads back differently. No phis, because a phi depends on
+    which path the RAYGEN took, which is the caller state the payload cannot
+    carry. No integer division, because recomputing hoists it and division by
+    zero is undefined. No other dx.op, the same rule the opcode whitelist has.
+  - **`Instr.uses()` only decoded CALL ARGUMENTS and phi incomings.** A value
+    reaching the loop body through ordinary arithmetic, `fcmp float %bary,
+    %thresh`, was invisible to the isolation check. The generated shader then
+    referenced a value it never defined and the ASSEMBLER said so: loud, but
+    nowhere near the cause. Almost certainly what the 6 "use of undefined
+    value" failures in Unreal's log were. There is now a complete operand scan.
+  - **Types are told from values by asking the module**, not by guessing:
+    a name is a type exactly when the module declares `%name = type`.
+    `%rq.pl` and `%dx.types.Handle` look alike.
+  - **The closure must skip what the body defines for itself**, or it walks
+    back into the loop and rebuilds those instructions in the prologue too,
+    which is a duplicate definition.
+  - **The boundary is tested, not just the feature.** `param` proves the
+    exemption works, `refuse_uav_in_loop` proves it STOPS. An exemption is
+    exactly the kind of thing that widens quietly.
+
+- **UNREAL HAS NO EMULATION CODE FOR PASCAL, and "emulated" describes the
+  DRIVER, not the engine.** Asked because if Epic shipped an emulator it would
+  save this project enormous work. It does not exist.
+  - Grepped all of `Engine/Source/Runtime` for `emulat` in the RHI layers.
+    Every hit is the device id list, shader BUNDLE emulation, or Intel's
+    emulated atomic64. `IsRayTracingEmulated` has ONE caller and does ONE
+    thing: `DisableRayTracingSupport()`. There is no implementation behind it.
+  - `Pascal` appears nowhere in the runtime except units of pressure in
+    UnitConversion.cpp.
+  - Unreal drives the DXR 1.0 API identically for every card.
+  - Lumen's "software ray tracing" is SIGNED DISTANCE FIELD tracing
+    (UseMeshSDFTracing, UseGlobalSDFTracing, heightfields). A different
+    technique: no BVH, no triangles, never touches an acceleration structure
+    or a RayQuery shader. Not a fallback we could borrow.
+  - So the name means what this project's premise already said: NVIDIA's DRIVER
+    runs BVH traversal and ray/triangle intersection on Pascal's shader cores
+    instead of RT cores. The emulation is below the API.
+  - **`GAllowEmulatedRayTracing = 1` therefore enabled nothing. It disabled a
+    REFUSAL.** Which makes the dxgi device id spoof functionally identical to
+    that old cvar: it defeats a model-name check, not a capability check, which
+    is exactly why it changes only the device id and leaves every capability
+    answer truthful.
+  - INFERRED, not verified: that Epic's motive was performance. The only
+    action is to disable and no comment states a reason. If so they were not
+    wrong, and a working Escher should be expected to be SLOW. That is the
+    driver, not the shim, and the brief already accepts 1 fps.
+
+- **UNREAL'S SHADERS ARE SHADER MODEL 6.6, AND THE REWRITER WAS BUILT FOR
+  6.5.** The single biggest finding since the device id denylist, and it
+  explains 124 of the 157 refusals at a stroke. Measured from the dumped
+  containers, not inferred.
+
+      cs_6_6 (Unreal)  createHandleFromBinding (217) -> annotateHandle (216)
+      lib_6_6 (target) createHandleForLib      (160) -> annotateHandle (216)
+
+  `refused_010.dxil` is `!{!"cs", i32 6, i32 6}` with SEVEN uses of 217 and
+  ZERO of either 57 or 160. Every resource chain looks like
+
+      createHandleFromBinding -> annotateHandle -> cbufferLoadLegacy ->
+      extractvalue -> icmp
+
+  which is EXACTLY the recomputable shape already supported, written in the
+  newer opcodes. So:
+  - the 118 "loop body reads values defined outside it" are handles made with
+    217, which is not on the recomputable list, so nothing is exempt;
+  - the 6 "Internal declaration 'rq_cbv0' is unused" are the globals the
+    rewriter synthesises for every resource, which a 6.6 module never loads.
+
+  **The target shape, read off DXC** (phase5/cases/reference/lib_sm66_binding_ref.hlsl):
+
+      %CB = type { float, i32 }
+      @CB = external constant %dx.types.Handle        ; HANDLE type, not %CB
+      !6 = !{i32 0, %CB* bitcast (%dx.types.Handle* @CB to %CB*), !"CB", ...}
+
+      %1 = load %dx.types.Handle, %dx.types.Handle* @CB, align 4
+      %2 = call %dx.types.Handle @dx.op.createHandleForLib.dx.types.Handle(i32 160, %dx.types.Handle %1)
+      %3 = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %2, %dx.types.ResourceProperties { i32 13, i32 8 })
+
+  Differences from the 6.5 path the rewriter implements: the global is
+  `%dx.types.Handle` rather than the resource type, the overload is
+  `.dx.types.Handle` rather than `.CB`, the record BITCASTS the handle global,
+  and an annotateHandle follows and must be kept.
+
+- **Shader Model 6.6 binding: DONE (0.25.0), and a real Unreal shader now
+  lowers, validates and signs.** `RayTracingDebugMainCS`, dumped from the
+  running game, goes container in and signed container out through
+  `dxrw rewrite`, and the Python and the C++ produce byte-identical text.
+  217 becomes `createHandleForLib` (160), the same target 6.5 already used, and
+  216/217 join the recomputable list so the handles stop looking like caller
+  state. The target shape above is implemented exactly as measured.
+  - **The module shader flags were hardcoded and happened to be right.** The
+    lowering wrote `i64 16`. Every shader this project had seen declared
+    `0x2000010`, and the only bit the lowering removes is the tier 1.1 flag
+    `0x2000000`, so 16 was correct by coincidence. Unreal declares
+    `0x42000010`, and the validator said "Flags must match usage. Flags
+    declared=16, actual=1073741840", which names the symptom and not the
+    cause. The flags now come from the entry point's properties with that bit
+    cleared, which reproduces 16 exactly for every existing case, so nothing
+    else moved by a byte.
+  - **`createHandleFromHeap` (218) turns out to be sound as it stands.** A heap
+    handle used only in the raygen stays where it is, unchanged and correct.
+    One used inside the Proceed loop is refused, because 218 is NOT on the
+    recomputable list and the isolation check therefore catches it. The
+    blanket refusal the docs promised would have blocked the raygen case for
+    nothing. Measured on `RayTracingDebugMainCS`, which uses 16 of them and
+    keeps all 16 in the raygen.
+  - **The independent case earned its keep again, on its first run.**
+    `phase5/cases/rayquery_sm66.hlsl` is the `indep` shader at 6.6, so it
+    converts a handle in the raygen AND recreates one in the generated any-hit.
+    It failed in a way the Unreal shader never could: LLVM prints an all-zero
+    `ResBind` as `zeroinitializer` rather than writing the fields out, and
+    nothing Unreal bound sat at SRV t0 space0. `build_phase5.bat` compiles
+    every `*sm66.hlsl` at `cs_6_6` after the 6.5 pass, so the shader model is
+    the test and the HLSL is deliberately not 6.6-specific.
+  - **Still refused, and named honestly:** a resource array reached through a
+    6.6 binding and indexed dynamically. The 6.5 path supports exactly that,
+    through a getelementptr on the array global. The 6.6 form is refused only
+    because the shape of an ARRAY global in the binding form has not been
+    measured off DXC. One reference compile would settle it.
+  - Two C++ divergences from the Python surfaced here, both invisible until a
+    shader needed record constants AND ray flags at once: `@rq_record`
+    declared after the resource globals rather than before, and the closest-hit
+    reading the record before the index fields rather than after. Neither
+    changed behaviour. **That is what byte-identity is for: it catches drift
+    while it is still cosmetic.**
+- **THE 33 "CONCURRENT" QUERIES ARE SEQUENTIAL. The refusal is false.**
+  Confirmed from `refused_002.dxil`, NiagaraCollisionRayTraceCS:
+
+      %120  allocate line 202, traced 203, last read 227
+      %379  allocate line 521, traced 522, last read 546
+
+  The first query is finished three hundred lines before the second is
+  allocated. They never overlap. The check refuses on
+  `FindOp(kAllocate).size() != 1`, which counts ALLOCATIONS, not liveness, and
+  the message says "concurrent" about something it never measured. Same shape
+  as the alphaMask over-refusal and the loop-isolation one.
+
+  Lowering them is still real work, because each query needs its own TraceRay
+  and its own generated hit shaders, but "no lowering exists" was wrong.
+
+- **So all 157 refusals are now explained, and none of them is "this cannot be
+  done".** 124 are one shader model gap, 33 are one false refusal.
+
+- **Unreal's refusals as of 0.23.0**, with every assembler cause but one
+  closed: 118 loop isolation, 33 concurrent queries, 6 unused `rq_cbv0`, 1
+  assembler. The isolation ones now name real VALUES rather than block labels,
+  so they are genuine caller locals and not the phi bug.
+  - **Two reproductions of the unused-`rq_cbv0` refusal FAILED**, and that is
+    worth recording. A cbuffer read only inside the Proceed loop lowers and
+    signs, because the hit shader rebuilds the handle and keeps it used. A
+    cbuffer declared and never read is eliminated by DXC before the rewriter
+    sees it. So it is neither obvious shape, and the next guess would be a
+    guess.
+  - The right next move for ALL THREE is the dump, not more reasoning.
+
+- **Refused shaders can be DUMPED now**, `dump` in the ini or
+  `DXR_TIER11_DUMP`: a `.dxil` container per refusal with a `.txt` saying why,
+  off by default, capped at 64. `dxrw rewrite` takes one back and reproduces
+  the same refusal offline, so a shader that only exists inside somebody's game
+  process can be disassembled and read. Built because the concurrent-query
+  refusal cannot be settled from a log line.
+
+- **The "2 concurrent RayQuery objects" refusal counts ALLOCATIONS, not
+  overlap.** `rq_analyze.cpp` refuses when `FindOp(kAllocate).size() != 1`. Two
+  queries used one after the other, never live at the same time, are refused
+  identically. Same shape as the `alphaMask` over-refusal: right in principle,
+  wrong for the case in front of it, and it is costing 33 of Unreal's shaders.
+  Whether Lumen's two are really concurrent needs the DXIL, which means dumping
+  refused shaders to disk.
+
+- **The transparency check has a reliability signal, and it is the frame
+  count.** `run_proxy_test.ps1` reported 14381 of 14400 pixels differing twice
+  in a row, in a path the change could not reach. Both bad runs had captured 2
+  and 5 frames instead of 8; three consecutive runs at 8 frames all reported 0.
+  A run that captured fewer than 8 frames should not be believed either way.
+
+- **In Unreal, a refusal is a crash.** The shim claims Tier 1.1, refuses a
+  shader, forwards it unchanged so the driver gives its own error, and Unreal
+  turns that into `LowLevelFatalError ... Shader compilation failures are
+  Fatal`. "Refuse loudly and let the driver decide" was right when the
+  alternative was a wrong render; against a shipping game it turns a missing
+  feature into a game that will not launch. **The answer is to lower them, not
+  to degrade them:** the premise of this project is to emulate Tier 1.1, and a
+  shim that switches ray tracing features off has not emulated anything.
+
+- **FIRST REAL ENGINE RESULT (2026-09-22).** Unreal Engine 5.8.2, a shipping
+  game, on the GTX 1070, with both proxies installed: **8 bottom-level
+  acceleration structures built, 208 DXR state objects created, all
+  `hr=0x00000000`, and one AddToStateObject emulated, 201 + 13 into 213
+  subobjects.** The DXR 1.0 path works at engine scale, not just on this
+  project's own harness. What stopped it there was the stream-form PSO gap
+  below, not anything in the lowering.
+
+- **Two defects found by pointing it at real engine shaders, NOT yet fixed.**
   Investigating Falcor and RTXPT as targets turned these up in an hour, and
   each would meet a real application before any of the interesting refusals do:
   - **A RayQuery shader with no early-out bounds check does not lower.** The
@@ -755,12 +1170,26 @@ only its author runs:
     **Every shader in the suite opens with `if (tid.x >= width) return;`**, and
     that one shared habit hid it. The probe is
     `phase5/cases/reference/rq_bindless_probe.hlsl`.
-  - **`CreatePipelineState`, the pipeline stream form, detects RayQuery and
-    forwards it.** Only `CreateComputePipelineState` gets the substitution.
-    Engines with a unified PSO cache use the stream form.
-  - **`createHandleFromHeap` is documented as refused and is not.** The string
-    appears nowhere in the rewriter. A bindless SM 6.6 shader is accepted and
-    classified as pattern 1, then fails later for the first reason above.
+  - **`CreatePipelineState`, the pipeline stream form: FIXED, and it was worse
+    than this said.** It did not detect either. The walker gave up at the first
+    subobject that was not a shader, and a real engine's compute stream puts
+    ROOT_SIGNATURE first, so it never reached the CS. Every RayQuery shader in
+    a real game went to the Tier 1.0 driver unexamined, the driver rejected
+    them, and Unreal treats a failed compute PSO as FATAL. Now
+    `proxy/pso_stream.{h,cpp}`, with the same substitution the struct form has,
+    covered by the `stream` case in the dispatch suite.
+    - **A subobject's payload sits at the natural alignment of its inner type,
+      not at a fixed offset.** `{tag(4); UINT}` puts the payload at 4 and is 8
+      bytes; `{tag(4); pad(4); ptr}` puts it at 8 and is 16. A fixed offset
+      desynchronises on the first NODE_MASK. Caught on the first run of the new
+      test, which reported stopping at subobject type 919831536, a fragment of
+      a pointer. Sizes come from `sizeof`/`alignof` so the compiler owns them.
+    - **The suite had only ever used the struct form**, which is exactly how
+      this survived. A new entry point is a new case, not a variation.
+  - **`createHandleFromHeap` is documented as refused and is not. RESOLVED in
+    0.25.0, and the documented refusal was the thing that was wrong**: passing
+    a raygen-only heap handle through is correct, and an in-loop one is already
+    caught by the isolation check. See the 6.6 entry above.
 
 - **What a survey of real engines actually found**, and it reframes the
   remaining work:
@@ -854,7 +1283,10 @@ Dev machine (Windows x64), everything under `C:\DW`:
 - `C:\DW\DirectX-Graphics-Samples` - Microsoft samples, source of the DXR 1.0
   app used to validate the proxy.
 - Build scripts: `build.bat` (phase 1), `build_phase2.bat`, `build_proxy.bat`,
-  `build_sample.bat`, `build_phase4.bat`.
+  `build_dxgi.bat`, `build_sample.bat`, `build_phase4.bat`.
+  `build_dxgi.bat` builds the SECOND proxy, `dxgi.dll`, which exists only to
+  report a Pascal card under a Turing device id. Separate from `d3d12.dll` so
+  it can be removed on its own, but not optional in practice for Unreal.
   `tools\dxr-tier-11-setup.bat` is the end-user installer, a WinForms
   PowerShell script: pick the .exe, install, toggle, read the log. It is loud
   about missing DXC, because that is the failure that otherwise surfaces much
@@ -1311,12 +1743,23 @@ anything.
   real application use `dxcpl.exe`, the DirectX Control Panel, which forces the
   layer on for any executable you name.
 
-The shim itself reads exactly TWO settings, and no others. `tier11` defaults ON
-and `nowrap` defaults off, each settable in `dxr-tier-11.ini` beside the DLL or as
-`DXR_TIER11` / `DXR_TIER11_NOWRAP` in the environment, which wins. `nowrap` is
-not a companion to `tier11`, it OVERRIDES it: everything the shim does lives on
-the device object it hands the application, the Tier 1.1 answer included, so
-declining to hand that object over switches the whole layer off.
+The shim reads exactly SIX settings, and no others. Four are `d3d12.dll`'s
+and two are `dxgi.dll`'s. `tier11` defaults
+ON, `nowrap` defaults off and `log` defaults to `%TEMP%`, each settable in
+`dxr-tier-11.ini` beside the DLL or as `DXR_TIER11` / `DXR_TIER11_NOWRAP` /
+`DXR_TIER11_LOG` in the environment, which wins. `nowrap` is not a companion to
+`tier11`, it OVERRIDES it: everything the shim does lives on the device object
+it hands the application, the Tier 1.1 answer included, so declining to hand
+that object over switches the whole layer off.
+
+`spoof` defaults ON and `spoofid` defaults to 0x1F08, both read only by
+`dxgi.dll`, which does nothing at all unless that file was copied in.
+
+`log` takes a file or a FOLDER, resolves a relative path against the SHIM's
+directory rather than the process working directory, and falls back to `%TEMP%`
+with a complaint on the first line if it cannot open what it was given. It is
+the one setting read from `DllMain`, because the start marker is written there
+and has to know where to go; see the exception written into proxy/config.h.
 
 Check sensitivity before believing a pass, and check the CHECK. Five times in
 this project a test passed for the wrong reason:

@@ -42,6 +42,16 @@ for %%f in ("%~dp0phase5\cases\*.hlsl") do (
     if exist "%~dp0phase5\cases\%%~nf.ll" (echo   ok  case %%~nf) else (echo   -   case %%~nf is not a cs_6_5 shader, skipped)
 )
 
+rem Shader Model 6.6 cases, compiled AFTER the 6.5 pass so they overwrite what
+rem it produced. 6.6 reaches a resource through createHandleFromBinding rather
+rem than createHandle, which is the whole point of these: the shader model is
+rem the test, not anything in the HLSL.
+for %%f in ("%~dp0phase5\cases\*sm66.hlsl") do (
+    "%DXC%" -T cs_6_6 -E main -Fc "%~dp0phase5\cases\%%~nf.ll" ^
+            -Fo "%~dp0phase5\cases\%%~nf.dxil" "%%f" >nul 2>&1
+    if exist "%~dp0phase5\cases\%%~nf.ll" (echo   ok  case %%~nf ^(cs_6_6^)) else (echo   -   case %%~nf is not a cs_6_6 shader, skipped)
+)
+
 echo.
 echo Disassembly in phase5\dxil\*.ll, containers in phase5\dxil\*.dxil
 echo Findings in docs\phase5-dxil-recon.md

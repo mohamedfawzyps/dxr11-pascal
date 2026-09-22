@@ -117,19 +117,44 @@ std::string Normalize(const std::string& text) {
 
     std::vector<std::string> out;
     bool inBody = false;
+    // The ENTRY block is the awkward one. DXC gives it no label, because
+    // nothing can branch to it, so there is nothing here to rename. But a phi
+    // may still name it as a PREDECESSOR: an `if` with no `else` straight out
+    // of the entry block produces `phi [ 0.0, %0 ], [ 0.5, %9 ]`. That %0
+    // becomes %bb0, nothing defines bb0, and the assembler says "use of
+    // undefined value '%bb0'". A label is added when, and only when, the
+    // function turns out to reference it, so a module that never needed one is
+    // byte-for-byte unchanged.
+    size_t bodyStart = 0;
+    bool sawEntryLabel = false, refsEntry = false;
     for (const std::string& raw : SplitLines(text)) {
         std::string line = raw;
-        if (line.rfind("define ", 0) == 0) { inBody = true; out.push_back(line); continue; }
-        if (inBody && line == "}") { inBody = false; out.push_back(line); continue; }
+        if (line.rfind("define ", 0) == 0) {
+            inBody = true;
+            bodyStart = out.size();
+            sawEntryLabel = false;
+            refsEntry = false;
+            out.push_back(line);
+            continue;
+        }
+        if (inBody && line == "}") {
+            inBody = false;
+            if (refsEntry && !sawEntryLabel)
+                out.insert(out.begin() + bodyStart + 1, "bb0:");
+            out.push_back(line);
+            continue;
+        }
         if (!inBody) { out.push_back(line); continue; }
 
         std::smatch m;
         if (std::regex_match(line, m, kLabelPred)) {
+            if (m[1].str() == "0") sawEntryLabel = true;
             const std::string preds = std::regex_replace(m[3].str(), kNumInPreds, "%bb$1");
             out.push_back("bb" + m[1].str() + ":" + m[2].str() + "; preds = " + preds);
             continue;
         }
         if (std::regex_match(line, m, kLabelOnly)) {
+            if (m[1].str() == "0") sawEntryLabel = true;
             out.push_back("bb" + m[1].str() + ":");
             continue;
         }
@@ -138,6 +163,8 @@ std::string Normalize(const std::string& text) {
         if (line.find(" = phi ") != std::string::npos)
             line = std::regex_replace(line, kPhiBlock, ", %bb$1 ]");
         line = std::regex_replace(line, kAnyNum, "%v$1");
+        static const std::regex kEntryRef(R"(%bb0\b)");
+        if (std::regex_search(line, kEntryRef)) refsEntry = true;
         out.push_back(line);
     }
     return JoinLines(out);
@@ -326,6 +353,14 @@ Module::Module(const std::string& moduleText) : text(moduleText) {
         if (line == "}") { fn->endIndex = n; fn = nullptr; blk = nullptr; continue; }
         std::smatch m;
         if (std::regex_search(line, m, kBlockLabel) && m.position(0) == 0) {
+            // A labelled FIRST block IS the entry block, not a second one. The
+            // normaliser adds `bb0:` when a phi names the entry as a
+            // predecessor, and without this that would leave an empty implicit
+            // block standing in front of it.
+            if (fn->blocks.size() == 1 && fn->blocks[0].label.empty() &&
+                fn->blocks[0].instrs.empty()) {
+                fn->blocks.pop_back();
+            }
             Block b;
             b.label = "%" + m[1].str();
             b.index = n;
