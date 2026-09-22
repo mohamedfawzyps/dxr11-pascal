@@ -17,6 +17,17 @@ build.
 
 ---
 
+## 0.36.3
+
+- `rqonly = N` builds ONLY the N-th RayQuery shader that lowers, counting from
+  0, and refuses every other one even though it lowered. `rqlimit` can only ask
+  "how many", and the bisect it produced ended on a question that is not a
+  number: the seventh shader kills the device inside the game and builds
+  perfectly offline, with its own root signature, alongside the other six. So
+  the next thing to separate is whether that shader alone does it or whether it
+  needs the other six present. `rqonly` takes precedence over `rqlimit`.
+  A bisect knob, not a setting.
+
 ## 0.36.2 (2026-09-22)
 
 ### rqlimit counted the wrong thing, and burned two runs doing it

@@ -1241,7 +1241,8 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       rqphase = 2, rqlimit = 1   exactly ONE state object built  RUNS, clean exit
       rqphase = 2, rqlimit = 4   four state objects built       RUNS, clean exit
       rqphase = 2, rqlimit = 6   six state objects built        RUNS, clean exit
-      rqphase = 2, rqlimit = 7   all seven, the suspect last    next run
+      rqphase = 2, rqlimit = 7   all seven, the suspect last    CRASHES
+      rqphase = 2, rqonly  = 6   ONLY the suspect               next run
       (unset)           + shader table + dispatch                CRASHES
 
   **ONE STATE OBJECT DOES NOT KILL THE DEVICE, AND THAT IS THE FIRST REAL
@@ -1291,6 +1292,40 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   therefore dumps its `.rs.bin`. The dump is written BEFORE
   `CreateStateObject`, so that set survives even when the device dies on the
   call.
+
+  **THE BISECT FINISHED, AND IT NAMED ONE CALL TO THE INSTANT.** `rqlimit = 7`
+  crashed. Six `state object BUILT` lines, no seventh, no logged
+  `CreateStateObject` failure, and then, 337 ms later, the last line in the
+  log:
+
+      device QI PASSED THROUGH UNWRAPPED: {9727A022-CF1D-4DDA-9EBA-EFFA653FC506}
+
+  That IID is **`ID3D12DeviceRemovedExtendedData1`**, checked in the Windows
+  SDK `d3d12.idl`, so it is Unreal's own device-removed handler collecting
+  DRED. The device was already gone by then. The seventh `CreateStateObject`
+  is the call that does it, and nothing else ran in between.
+
+  **AND THE SEVENTH IS NOT POISON. THE SAME CALL SUCCEEDS OFFLINE.** The dump
+  is written before `CreateStateObject`, so `lowered_006.*` survived with its
+  `.rs.bin` this time. Replayed on the same 1070 with `sotest`:
+
+      lowered_006 alone, with its own root signature   hr=0x00000000
+      all seven, in order, held at once                0 failed, device alive
+
+  So the library is not the variable, the root signature is not the variable,
+  and the count is not the variable. **Everything about the call is
+  reproducible and benign outside Escher's process.** That is the same
+  contradiction this brief already records, now narrowed from "somewhere in
+  the run" to one call whose inputs are all on disk.
+
+  **What is left to separate, and `rqonly` is the instrument.** 0.36.3 adds
+  `rqonly = N`: build ONLY the N-th shader that lowers, counting from 0,
+  refusing every other one even though it lowered. `rqlimit` can only ask how
+  many, and the question is no longer a number. `rqonly = 6` builds the
+  suspect on its own, so either that shader alone kills this process, which
+  puts the difference entirely in the process context, or it needs the other
+  six present, which makes it an interaction and lets `rqonly` walk 0..5 to
+  find the partner.
 
   **THE SET OF SEVEN IS STABLE, WHICH THIS BISECT DEPENDS ON AND NOBODY HAD
   CHECKED.** Unreal creates compute PSOs on worker threads, so "the first N to
@@ -2159,7 +2194,7 @@ anything.
   real application use `dxcpl.exe`, the DirectX Control Panel, which forces the
   layer on for any executable you name.
 
-The shim reads exactly SIX settings, and no others. Four are `d3d12.dll`'s
+The shim reads six SHIPPING settings. It also reads the bisect knobs `nowrap`, `rqstub`, `rqphase`, `rqlimit`, `rqonly` and `dump`, which are diagnostics for the GPU crash and are not part of the product. Four are `d3d12.dll`'s
 and two are `dxgi.dll`'s. `tier11` defaults
 ON, `nowrap` defaults off and `log` defaults to `%TEMP%`, each settable in
 `dxr-tier-11.ini` beside the DLL or as `DXR_TIER11` / `DXR_TIER11_NOWRAP` /

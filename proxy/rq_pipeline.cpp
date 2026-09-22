@@ -180,19 +180,23 @@ void Dxr11RayQueryPhaseNote(const char* what, const char* detail) {
              (detail && *detail) ? ": " : "", (detail && *detail) ? detail : "");
 }
 
-// rqlimit: cap how many state objects actually get BUILT.
+// rqlimit and rqonly: cap or single out which shaders actually get BUILT.
 //
-// It used to count every shader that reached TryCreate, and that measured the
-// wrong thing. The first shader Unreal happens to create is not the first one
-// that LOWERS: with `rqlimit = 1` the whole budget went to a shader the
-// rewriter then refused for loop isolation, so nothing was built and the run
-// answered nothing. It cost two runs before the log was readable enough to
-// show it.
+// Both count only shaders that reached this point, meaning they LOWERED.
+// Counting the ones the rewriter refused made "rqlimit = 1" spend its budget
+// on a shader that never built anything, and three runs answered nothing.
 //
-// Counted after the rewrite instead, so a refused shader does not spend the
-// budget and "rqlimit = N" means what it says: at most N state objects.
+//   rqlimit = N   build the first N that lower
+//   rqonly  = N   build ONLY the N-th (0-based), refuse every other
+//
+// rqonly exists because rqlimit can only ask "how many", and the bisect it
+// produced ended on a question it cannot answer: the seventh shader kills
+// the device in the game and builds perfectly offline, so the next thing to
+// separate is whether that shader alone does it or whether it needs the
+// other six present. rqonly takes precedence when both are set.
 static bool RayQueryLimitReached(std::string* why) {
     static int s_limit = -2;
+    static int s_only = -2;
     static LONG s_built = 0;
     if (s_limit == -2) {
         const cfg::Text t = cfg::GetText("DXR_TIER11_RQLIMIT", "rqlimit");
@@ -204,10 +208,31 @@ static bool RayQueryLimitReached(std::string* why) {
                      "a BISECT for a driver crash, not something to leave set.\n",
                      s_limit, t.source, s_limit);
     }
-    if (s_limit < 0) return false;
+    if (s_only == -2) {
+        const cfg::Text t = cfg::GetText("DXR_TIER11_RQONLY", "rqonly");
+        s_only = t.value.empty() ? -1 : _wtoi(t.value.c_str());
+        if (s_only >= 0)
+            ProxyLog("[dxr-tier-11-proxy-log] rqonly = %d (from %s): ONLY the %d-th "
+                     "RayQuery shader to lower gets a state object, counting from 0. "
+                     "Every other one is refused even though it lowered. This "
+                     "overrides rqlimit, and is a BISECT, not something to leave "
+                     "set.\n",
+                     s_only, t.source, s_only);
+    }
+    if (s_only < 0 && s_limit < 0) return false;
+
     const LONG n = InterlockedIncrement(&s_built) - 1;
+    char buf[224];
+    if (s_only >= 0) {
+        if (n == s_only) return false;
+        std::snprintf(buf, sizeof(buf),
+                      "rqonly = %d; this shader DID lower but is the %ld-th to do "
+                      "so, and is being forwarded on purpose",
+                      s_only, static_cast<long>(n));
+        *why = buf;
+        return true;
+    }
     if (n < s_limit) return false;
-    char buf[192];
     std::snprintf(buf, sizeof(buf),
                   "rqlimit = %d reached; this shader DID lower but is the %ld-th to "
                   "do so, and is being forwarded on purpose",
