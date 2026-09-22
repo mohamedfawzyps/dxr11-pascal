@@ -1238,10 +1238,38 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       rqstub = 1        real do-nothing PSO, nothing lowered     RUNS
       rqphase = 1       + rewrite the DXIL, throw it away        RUNS
       rqphase = 2       + CreateStateObject                      CRASHES x2
-      rqphase = 2, rqlimit = 1   only the FIRST shader lowered   RUNS, see below
+      rqphase = 2, rqlimit = 1   exactly ONE state object built  RUNS, clean exit
+      rqphase = 2, rqlimit = 4   the first FOUR to lower         next run
       (unset)           + shader table + dispatch                CRASHES
 
-  **THE `rqlimit = 1` ROW PROVES NOTHING YET, AND THE SHIM IS WHY.** Under any
+  **ONE STATE OBJECT DOES NOT KILL THE DEVICE, AND THAT IS THE FIRST REAL
+  ANSWER THIS BISECT HAS PRODUCED.** Shim 0.36.2, `rqphase = 2`,
+  `rqlimit = 1`, debug layer forced on: exactly **one** `state object BUILT`
+  line, 162 refusals, and the game ran to its own clean `end:` marker. So
+  `CreateStateObject` on a generated library, inside Escher's process, is
+  survivable once. The suspect that survived five versions of elimination is
+  not a single call.
+
+  **AND THE REMAINING RANGE IS TINY, WHICH NOBODY EXPECTED.** Of those 163
+  RayQuery shaders only **SEVEN lower at all**, measured for the first time
+  now that the rewriter sees every one of them:
+
+      120  Proceed loop body reads values defined outside it
+       35  2 concurrent RayQuery objects
+        7  LOWERED  (1 built, 6 held back by rqlimit = 1)
+        1  assembler: use of undefined value '%v111' on CommittedRayT (200)
+
+  So "unlimited at phase 2" means seven state objects, and the crash lives in
+  2..7. That is two or three runs of bisect, not an open-ended search.
+
+  **The refusal composition is itself new**, because every previous count was
+  taken with 162 shaders forwarded unexamined. The 120 and the 35 are the two
+  known false refusals, loop isolation and the allocation count, so the real
+  lowering rate is far higher than seven; seven is what TODAY's rewriter
+  manages, not what the shaders permit.
+
+  **THE `rqlimit = 1` ROW PROVED NOTHING FOR TWO RUNS BEFORE THAT, AND THE SHIM
+  WAS WHY.** Under any
   phase, 0.36.0 gave a REFUSED shader a do-nothing pipeline by returning BEFORE
   the log line and before `shdump::Refused`. So both outcomes were silent and
   the run could not say whether its one allowed shader lowered and built a
@@ -1267,13 +1295,10 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   state objects.
 
   **Three runs asked "does one state object kill it" and none of them built
-  one.** The lesson is not about `rqlimit`. It is that a bisect knob has to be
-  shown to move the thing it names, and none of these did, because the log
-  could not report what the knob actually did until it was made to.
-
-  **One real number came out of it:** Escher's frontend alone creates **163
-  RayQuery shaders**. The genuine refusal rate is still unknown, because 162 of
-  them were forwarded before the rewriter ever saw them.
+  one**, and the fourth answered it. The lesson is not about `rqlimit`. It is
+  that a bisect knob has to be shown to MOVE the thing it names, and none of
+  those three did, because the log could not report what the knob had actually
+  done until it was made to. Two of them were then read as results.
 
   **THE SHADER DUMP HAS NOTHING TO DO WITH IT, AND THE "PERFECT CORRELATION"
   WAS AN ARTEFACT OF NOT READING THE LOG.** `shader dumping is ON` appears
