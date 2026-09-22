@@ -40,7 +40,24 @@ void Refused(const void* container, size_t size, const char* why);
 //
 // Same setting, same cap, separate counter, because a run that lowers a lot
 // and refuses a little should not lose its refusals to the limit.
+// `shape` is the state object shape the shim chose for this shader, written
+// out verbatim so an offline replay builds the SAME subobjects rather than
+// guessing them back out of the container. Guessing was the first version and
+// it read "Isect" out of a library that has no intersection shader.
 void Lowered(const void* original, size_t originalSize,
-             const void* lowered, size_t loweredSize);
+             const void* lowered, size_t loweredSize,
+             void* rootSignature, const char* shape);
+
+// Remember the blob an application built a root signature from.
+//
+// Replaying a lowered library offline needs the GLOBAL root signature it was
+// built against, and D3D12 offers no way to get a blob back out of an
+// ID3D12RootSignature. But every root signature an application creates goes
+// through the wrapped device, so the blob can be kept on the way past, keyed
+// by the object that came back. Same trick res_tracker uses for buffers, and
+// the same lifetime rule: no reference is held, so a stale key is possible and
+// harmless, because a lookup only happens while the application is handing
+// that object to a pipeline it is creating right now.
+void NoteRootSignature(void* rs, const void* blob, size_t size);
 
 }  // namespace shdump

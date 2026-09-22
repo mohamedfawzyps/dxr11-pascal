@@ -446,7 +446,16 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature
 }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) { FWD(CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap)); }
 UINT STDMETHODCALLTYPE Dxr11Device::GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) { FWD(GetDescriptorHandleIncrementSize(DescriptorHeapType)); }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateRootSignature(UINT nodeMask, const void* pBlobWithRootSignature, SIZE_T blobLengthInBytes, REFIID riid, void** ppvRootSignature) { FWD(CreateRootSignature(nodeMask, pBlobWithRootSignature, blobLengthInBytes, riid, ppvRootSignature)); }
+// Remembers the blob when shader dumping is on, so a lowered library can be
+// replayed offline against the root signature it was actually built with.
+// D3D12 gives no way back from the object to the blob. See shader_dump.h.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateRootSignature(UINT nodeMask, const void* pBlobWithRootSignature, SIZE_T blobLengthInBytes, REFIID riid, void** ppvRootSignature) {
+    const HRESULT hr = m_real->CreateRootSignature(nodeMask, pBlobWithRootSignature, blobLengthInBytes, riid, ppvRootSignature);
+    if (SUCCEEDED(hr) && ppvRootSignature && *ppvRootSignature)
+        shdump::NoteRootSignature(*ppvRootSignature, pBlobWithRootSignature,
+                                  static_cast<size_t>(blobLengthInBytes));
+    return hr;
+}
 void STDMETHODCALLTYPE Dxr11Device::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateConstantBufferView(pDesc, DestDescriptor)); }
 void STDMETHODCALLTYPE Dxr11Device::CreateShaderResourceView(ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateShaderResourceView(pResource, pDesc, DestDescriptor)); }
 void STDMETHODCALLTYPE Dxr11Device::CreateUnorderedAccessView(ID3D12Resource* pResource, ID3D12Resource* pCounterResource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor)); }

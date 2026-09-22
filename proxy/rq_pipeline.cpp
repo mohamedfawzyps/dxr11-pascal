@@ -116,6 +116,16 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
 
     // --- rewrite ------------------------------------------------------------
     Xform x;
+    // What the shim decided about this shader, in one line, so sotest can
+    // rebuild the same state object instead of inferring it from the bytes.
+    auto ShapeLine = [](const Xform& f) {
+        char b[160];
+        std::snprintf(b, sizeof(b),
+                      "anyhit=%d intersection=%d both=%d recordconstants=%d\n",
+                      f.hasAnyHit ? 1 : 0, f.hasIntersection ? 1 : 0,
+                      f.needsBoth ? 1 : 0, f.needsRecordConstants ? 1 : 0);
+        return std::string(b);
+    };
     std::vector<uint8_t> lib;
     std::string err;
     if (!dxch::RewriteContainer(desc->CS.pShaderBytecode,
@@ -130,7 +140,8 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     // dumping after the call would miss it.
     shdump::Lowered(desc->CS.pShaderBytecode,
                     static_cast<size_t>(desc->CS.BytecodeLength),
-                    lib.data(), lib.size());
+                    lib.data(), lib.size(), desc->pRootSignature,
+                    ShapeLine(x).c_str());
 
     // --- state object -------------------------------------------------------
     // The application's compute root signature becomes the GLOBAL root

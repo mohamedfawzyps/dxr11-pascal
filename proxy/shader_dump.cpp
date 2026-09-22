@@ -6,8 +6,10 @@
 #include <share.h>
 
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace shdump {
 namespace {
@@ -17,6 +19,12 @@ bool g_ready = false;
 std::wstring g_dir;          // empty means off
 unsigned g_written = 0;
 unsigned g_lowered = 0;      // its own counter, see shader_dump.h
+
+// Bounded on purpose. An engine makes a few dozen root signatures; anything
+// that makes thousands is not something to keep blobs for.
+const size_t kMaxRootSigs = 512;
+std::map<void*, std::vector<unsigned char>> g_rootSigs;
+int g_wantRootSigs = -1;     // -1 not asked yet
 
 bool WriteFile(const std::wstring& path, const void* p, size_t n) {
     FILE* f = _wfsopen(path.c_str(), L"wb", _SH_DENYNO);
@@ -89,8 +97,20 @@ void Refused(const void* container, size_t size, const char* why) {
                  "will be written this run\n", kMax);
 }
 
+void NoteRootSignature(void* rs, const void* blob, size_t size) {
+    if (!rs || !blob || size == 0) return;
+    std::lock_guard<std::mutex> g(g_lock);
+    if (g_wantRootSigs < 0)
+        g_wantRootSigs = cfg::GetText("DXR_TIER11_DUMP", "dump").value.empty() ? 0 : 1;
+    if (!g_wantRootSigs) return;
+    if (g_rootSigs.size() >= kMaxRootSigs && !g_rootSigs.count(rs)) return;
+    const unsigned char* p = static_cast<const unsigned char*>(blob);
+    g_rootSigs[rs].assign(p, p + size);
+}
+
 void Lowered(const void* original, size_t originalSize,
-             const void* lowered, size_t loweredSize) {
+             const void* lowered, size_t loweredSize,
+             void* rootSignature, const char* shape) {
     if (!original || !lowered || originalSize == 0 || loweredSize == 0) return;
 
     std::lock_guard<std::mutex> g(g_lock);
@@ -107,6 +127,16 @@ void Lowered(const void* original, size_t originalSize,
     // it is the one the driver saw.
     WriteFile(g_dir + stem + L".in.dxil", original, originalSize);
     WriteFile(g_dir + stem + L".out.dxil", lowered, loweredSize);
+
+    // The global root signature the state object was built with. Without it
+    // the library cannot be replayed at all: CreateStateObject needs one and
+    // the bindings have to match what the DXIL declares.
+    auto it = g_rootSigs.find(rootSignature);
+    if (it != g_rootSigs.end())
+        WriteFile(g_dir + stem + L".rs.bin", it->second.data(), it->second.size());
+
+    if (shape && *shape)
+        WriteFile(g_dir + stem + L".shape.txt", shape, std::strlen(shape));
 
     if (n + 1 == kMax)
         ProxyLog("[dxr-tier-11-proxy-log] lowered dump limit of %u reached; no more "

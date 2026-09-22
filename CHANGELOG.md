@@ -17,6 +17,60 @@ build.
 
 ---
 
+## 0.30.0 (2026-09-22)
+
+### rqdispatch answered nothing, and the reason IS the answer
+
+`rqdispatch = 0` crashed the GPU exactly as before. But **the log never printed
+the `rqdispatch = 0` line**, and that setting is read inside the dispatch path.
+Its absence means `DispatchAsRays` was never called.
+
+So no lowered dispatch has ever executed, in that run or any earlier one. The
+bisect was a no-op on a code path that never runs, which is why it changed
+nothing. Reading the log for what is MISSING was worth more than the
+experiment.
+
+That settles the split anyway: **the device dies while state objects are being
+created, before a single generated ray is traced.** Six libraries compile, then
+the device is gone.
+
+### Capturing the root signature, because a library alone cannot be replayed
+
+`sotest lowered_006.out.dxil` on WARP returns `E_INVALIDARG`: the library
+declares bindings and `CreateStateObject` needs a global root signature that
+provides them. D3D12 offers no way to get a blob back out of an
+`ID3D12RootSignature`, so there was nothing on disk to rebuild one from.
+
+Every root signature an application creates goes through the wrapped device, so
+the blob is kept on the way past, keyed by the object that came back. Same
+trick `res_tracker` uses for buffers and the same lifetime rule: no reference
+is held. The dump now writes `lowered_NNN.rs.bin` beside the pair.
+
+### sotest: one question, one second, no game
+
+`phase5/sotest.cpp`, built by `build_sotest.bat`. It takes the dumped set and
+builds the SAME state object `rq_pipeline.cpp` builds, on hardware or on WARP.
+
+The dump writes four files now, because a library and a root signature are not
+enough: the hit group TYPES depend on what the lowering produced, and the first
+version of sotest inferred those by searching the container for export names.
+`lowered_NNN.shape.txt` records what the shim actually decided, and sotest
+refuses to run without it rather than guessing and reporting a state object
+nobody built.
+
+    sotest lowered_006.out.dxil lowered_006.rs.bin
+    sotest lowered_006.out.dxil lowered_006.rs.bin warp
+
+Three runs of a real game have been spent on this and each answered one
+question. A driver that falls over falls over here instead, on one shader, with
+nothing else running, and `GetDeviceRemovedReason` is asked directly rather
+than read out of a crash report afterwards.
+
+WARP first is the useful order: if WARP accepts a library the fault is likely
+NVIDIA's, and if WARP refuses it the message says what is actually wrong.
+
+---
+
 ## 0.29.0 (2026-09-22)
 
 ### The GPU crash is ours, and rqlimit was the wrong instrument
