@@ -182,7 +182,7 @@ type %TEMP%\dxr-tier-11-proxy.log
 A healthy start looks like this:
 
 ```
-[dxr-tier-11-proxy-log] attached to process, version 0.13.0
+[dxr-tier-11-proxy-log] attached to process, version 0.14.0
 [dxr-tier-11-proxy-log] device wrapping enabled
 [dxr-tier-11-proxy-log] device wrapper created (real=..., Device6=yes, Device7=yes, tier=1.0)
 [dxr-tier-11-proxy-log] DXR_TIER11=1: reporting Tier 1.1 to the application.

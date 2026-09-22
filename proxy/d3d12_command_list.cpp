@@ -120,16 +120,25 @@ Dxr11CommandList* Dxr11CommandList::From(ID3D12CommandList* maybe) {
 }
 
 Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
-    : m_real(real), m_real5(nullptr), m_real6(nullptr), m_refs(1) {
+    : m_real(real), m_real5(nullptr), m_real6(nullptr),
+      m_real7(nullptr), m_real8(nullptr), m_real9(nullptr), m_real10(nullptr), m_refs(1) {
     if (m_real) {
         m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList5), (void**)&m_real5);
         m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList6), (void**)&m_real6);
+        m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList7), (void**)&m_real7);
+        m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList8), (void**)&m_real8);
+        m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList9), (void**)&m_real9);
+        m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList10), (void**)&m_real10);
     }
 }
 
 Dxr11CommandList::~Dxr11CommandList() {
     m_bindings.ReleaseAll();
     m_gfx.ReleaseAll();
+    if (m_real10) m_real10->Release();
+    if (m_real9) m_real9->Release();
+    if (m_real8) m_real8->Release();
+    if (m_real7) m_real7->Release();
     if (m_real6) m_real6->Release();
     if (m_real5) m_real5->Release();
     if (m_real)  m_real->Release();
@@ -160,13 +169,21 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::QueryInterface(REFIID riid, void** p
         riid == __uuidof(ID3D12GraphicsCommandList2) || riid == __uuidof(ID3D12GraphicsCommandList3) ||
         riid == __uuidof(ID3D12GraphicsCommandList4) ||
         (riid == __uuidof(ID3D12GraphicsCommandList5) && m_real5) ||
-        (riid == __uuidof(ID3D12GraphicsCommandList6) && m_real6)) {
+        (riid == __uuidof(ID3D12GraphicsCommandList6) && m_real6) ||
+        (riid == __uuidof(ID3D12GraphicsCommandList7) && m_real7) ||
+        (riid == __uuidof(ID3D12GraphicsCommandList8) && m_real8) ||
+        (riid == __uuidof(ID3D12GraphicsCommandList9) && m_real9) ||
+        (riid == __uuidof(ID3D12GraphicsCommandList10) && m_real10)) {
         AddRef();
-        *ppvObject = static_cast<ID3D12GraphicsCommandList6*>(this);
+        *ppvObject = static_cast<ID3D12GraphicsCommandList10*>(this);
         return S_OK;
     }
     if (riid == __uuidof(ID3D12GraphicsCommandList5) ||
-        riid == __uuidof(ID3D12GraphicsCommandList6))
+        riid == __uuidof(ID3D12GraphicsCommandList6) ||
+        riid == __uuidof(ID3D12GraphicsCommandList7) ||
+        riid == __uuidof(ID3D12GraphicsCommandList8) ||
+        riid == __uuidof(ID3D12GraphicsCommandList9) ||
+        riid == __uuidof(ID3D12GraphicsCommandList10))
         return E_NOINTERFACE;
 
     // Anything above GraphicsCommandList6 goes out unwrapped and bypasses our
@@ -737,11 +754,19 @@ void Dxr11CommandList::FlushQueuedSplit() {
         return;
     }
 
+    if (m_real10) { m_real10->Release(); m_real10 = nullptr; }
+    if (m_real9) { m_real9->Release(); m_real9 = nullptr; }
+    if (m_real8) { m_real8->Release(); m_real8 = nullptr; }
+    if (m_real7) { m_real7->Release(); m_real7 = nullptr; }
     if (m_real6) { m_real6->Release(); m_real6 = nullptr; }
     if (m_real5) { m_real5->Release(); m_real5 = nullptr; }
     m_real = next.Detach();
     m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList5), (void**)&m_real5);
     m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList6), (void**)&m_real6);
+    m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList7), (void**)&m_real7);
+    m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList8), (void**)&m_real8);
+    m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList9), (void**)&m_real9);
+    m_real->QueryInterface(__uuidof(ID3D12GraphicsCommandList10), (void**)&m_real10);
 
     // A fresh list has no state at all, so give the application back everything
     // it had set. The dispatch-only list gets only the compute half, since that
@@ -854,4 +879,47 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
 
     CloseHandle(evt);
     return true;
+}
+
+// --- ID3D12GraphicsCommandList7 to 10 ---------------------------------------
+//
+// Forwarding, but they exist for the same reason the device's higher
+// interfaces do: Unreal asks a command list for ID3D12GraphicsCommandList10,
+// and handing over the real list means every command it records afterwards
+// bypasses this shim.
+//
+// Barrier and DispatchGraph go through WorkBarrier because they record work
+// that must be ordered after a queued indirect dispatch. The other four are
+// state.
+//
+// NOT replayed across a split, alongside the stream output targets,
+// predication, sample positions and shading rate already listed in the header:
+// SetProgram, the depth bias, the stencil refs and the strip cut value.
+// Nothing tested sets one across a split, and a work graph sharing a recording
+// with an indirect ray dispatch would be a remarkable thing to find.
+
+void STDMETHODCALLTYPE Dxr11CommandList::Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP* pBarrierGroups) {
+    WorkBarrier();
+    if (m_real7) m_real7->Barrier(NumBarrierGroups, pBarrierGroups);
+}
+
+void STDMETHODCALLTYPE Dxr11CommandList::OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) {
+    if (m_real8) m_real8->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef);
+}
+
+void STDMETHODCALLTYPE Dxr11CommandList::RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) {
+    if (m_real9) m_real9->RSSetDepthBias(DepthBias, DepthBiasClamp, SlopeScaledDepthBias);
+}
+
+void STDMETHODCALLTYPE Dxr11CommandList::IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) {
+    if (m_real9) m_real9->IASetIndexBufferStripCutValue(IBStripCutValue);
+}
+
+void STDMETHODCALLTYPE Dxr11CommandList::SetProgram(const D3D12_SET_PROGRAM_DESC* pDesc) {
+    if (m_real10) m_real10->SetProgram(pDesc);
+}
+
+void STDMETHODCALLTYPE Dxr11CommandList::DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC* pDesc) {
+    WorkBarrier();
+    if (m_real10) m_real10->DispatchGraph(pDesc);
 }

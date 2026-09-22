@@ -17,6 +17,56 @@ build.
 
 ---
 
+## 0.14.0 (2026-09-22)
+
+### The wrapper covered ID3D12Device7. Unreal asks for Device12.
+
+The first test against a real engine, Unreal Engine 5.8, and the shim was
+bypassed almost entirely. Not a RayQuery problem: nothing in the lowering ran,
+because nothing ever reached it.
+
+| Implemented | Unreal asked for | What happened |
+|---|---|---|
+| `ID3D12Device7` | Device8 to Device12 | handed over **unwrapped** |
+| `ID3D12GraphicsCommandList6` | CommandList7 to CommandList10 | handed over **unwrapped** |
+
+Once an application holds an unwrapped `ID3D12Device8`, every call on that
+pointer goes straight to the driver: `CreateComputePipelineState`,
+`CreateStateObject`, `CreateCommandList`, and `CheckFeatureSupport`. The tier
+was reported once, to the wrapper, and then the application upgraded its
+interface and never asked us anything again. Toggling ray tracing in the editor
+did nothing because Unreal was reading the real Tier 1.0 off the real device.
+
+Not one `USES RAYQUERY` line appeared in a whole session, despite detection
+being hooked on all three pipeline creation paths.
+
+Both wrappers now go to the SDK ceiling, `ID3D12Device15` and
+`ID3D12GraphicsCommandList10`, keeping the existing rule that a level the real
+device lacks is refused with `E_NOINTERFACE` rather than answered with a vtable
+it cannot honour. `Barrier` and `DispatchGraph` close a queued indirect
+dispatch first, as the other work-recording methods do.
+
+**This was a known hole that was measured as harmless and was not.** The
+project had already caught `D3D12RaytracingSimpleLighting` asking for
+`ID3D12GraphicsCommandList5` and noted that nothing else in the test apps did
+that. Everything else in the test apps was a Microsoft sample from 2018.
+
+So the startup log now names the ceiling on every run:
+
+    highest device interface available: ID3D12Device15 (this shim implements up to 15)
+
+A GTX 1070 on a current driver offers Device15, so the gap was eight interface
+versions wide.
+
+### Verified
+
+Full regression unchanged: 14 render cases, 4 gates, the probe at
+14450 + 2312 + 48774 = 65536, and `D3D12RaytracingHelloWorld` 0 of 14400 pixels
+different. The raytest run now logs no passed-through interfaces at all, where
+before it was silent only because the harness never asked for one.
+
+---
+
 ## 0.13.0 (2026-09-22)
 
 ### Renamed everything that read as DirectX 11

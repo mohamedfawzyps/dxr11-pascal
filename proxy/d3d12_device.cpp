@@ -93,8 +93,27 @@ static void NoteRayQueryInStream(bool tier11, const D3D12_PIPELINE_STATE_STREAM_
     }
 }
 
+// Does the real device offer ID3D12Device<n>? One place, so the startup log
+// and QueryInterface cannot disagree.
+bool Dxr11Device::Highest(int n) const {
+    switch (n) {
+        case 6:  return m_real6 != nullptr;
+        case 7:  return m_real7 != nullptr;
+        case 8: return m_real8 != nullptr;
+        case 9: return m_real9 != nullptr;
+        case 10: return m_real10 != nullptr;
+        case 11: return m_real11 != nullptr;
+        case 12: return m_real12 != nullptr;
+        case 13: return m_real13 != nullptr;
+        case 14: return m_real14 != nullptr;
+        case 15: return m_real15 != nullptr;
+        default: return false;
+    }
+}
+
 Dxr11Device::Dxr11Device(ID3D12Device5* real)
-    : m_real(real), m_tier11(false), m_real6(nullptr), m_real7(nullptr), m_refs(1) {
+    : m_real(real), m_tier11(false), m_real6(nullptr), m_real7(nullptr),
+      m_real8(nullptr), m_real9(nullptr), m_real10(nullptr), m_real11(nullptr), m_real12(nullptr), m_real13(nullptr), m_real14(nullptr), m_real15(nullptr), m_refs(1) {
     if (m_real) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
         if (SUCCEEDED(m_real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
@@ -105,13 +124,38 @@ Dxr11Device::Dxr11Device(ID3D12Device5* real)
     if (m_real) {
         m_real->QueryInterface(__uuidof(ID3D12Device6), (void**)&m_real6);
         m_real->QueryInterface(__uuidof(ID3D12Device7), (void**)&m_real7);
+        m_real->QueryInterface(__uuidof(ID3D12Device8), (void**)&m_real8);
+        m_real->QueryInterface(__uuidof(ID3D12Device9), (void**)&m_real9);
+        m_real->QueryInterface(__uuidof(ID3D12Device10), (void**)&m_real10);
+        m_real->QueryInterface(__uuidof(ID3D12Device11), (void**)&m_real11);
+        m_real->QueryInterface(__uuidof(ID3D12Device12), (void**)&m_real12);
+        m_real->QueryInterface(__uuidof(ID3D12Device13), (void**)&m_real13);
+        m_real->QueryInterface(__uuidof(ID3D12Device14), (void**)&m_real14);
+        m_real->QueryInterface(__uuidof(ID3D12Device15), (void**)&m_real15);
     }
     ProxyLog("[dxr-tier-11-proxy-log] device wrapper created (real=%p, Device6=%s, Device7=%s, tier=%s)\n",
              (void*)m_real, m_real6 ? "yes" : "no", m_real7 ? "yes" : "no",
              m_tier11 ? "1.1" : "1.0");
+    // The highest device interface the real device offers. Unreal asks for
+    // Device12; anything we do not implement is handed over UNWRAPPED and the
+    // application escapes the shim entirely, which is how the first real test
+    // of this project failed. Logged so the next ceiling is visible before it
+    // costs a day.
+    int top = 5;
+    for (int n = 6; n <= 15; ++n) if (Highest(n)) top = n;
+    ProxyLog("[dxr-tier-11-proxy-log] highest device interface available: ID3D12Device%d "
+             "(this shim implements up to 15)\n", top);
 }
 
 Dxr11Device::~Dxr11Device() {
+    if (m_real15) m_real15->Release();
+    if (m_real14) m_real14->Release();
+    if (m_real13) m_real13->Release();
+    if (m_real12) m_real12->Release();
+    if (m_real11) m_real11->Release();
+    if (m_real10) m_real10->Release();
+    if (m_real9) m_real9->Release();
+    if (m_real8) m_real8->Release();
     if (m_real7) m_real7->Release();
     if (m_real6) m_real6->Release();
     if (m_real)  m_real->Release();
@@ -136,15 +180,31 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::QueryInterface(REFIID riid, void** ppvObj
         riid == __uuidof(ID3D12Device2) || riid == __uuidof(ID3D12Device3) ||
         riid == __uuidof(ID3D12Device4) || riid == __uuidof(ID3D12Device5) ||
         (riid == __uuidof(ID3D12Device6) && m_real6) ||
-        (riid == __uuidof(ID3D12Device7) && m_real7)) {
+        (riid == __uuidof(ID3D12Device7) && m_real7) ||
+        (riid == __uuidof(ID3D12Device8) && m_real8) ||
+        (riid == __uuidof(ID3D12Device9) && m_real9) ||
+        (riid == __uuidof(ID3D12Device10) && m_real10) ||
+        (riid == __uuidof(ID3D12Device11) && m_real11) ||
+        (riid == __uuidof(ID3D12Device12) && m_real12) ||
+        (riid == __uuidof(ID3D12Device13) && m_real13) ||
+        (riid == __uuidof(ID3D12Device14) && m_real14) ||
+        (riid == __uuidof(ID3D12Device15) && m_real15)) {
         AddRef();
-        *ppvObject = static_cast<ID3D12Device7*>(this);
+        *ppvObject = static_cast<ID3D12Device15*>(this);
         return S_OK;
     }
 
-    // Asked for Device6/7 but the real device does not have it. Say so rather
-    // than handing back a pointer whose vtable the device cannot honour.
-    if (riid == __uuidof(ID3D12Device6) || riid == __uuidof(ID3D12Device7))
+    // Asked for a higher device interface than the real device has. Say so
+    // rather than handing back a pointer whose vtable it cannot honour.
+    if (riid == __uuidof(ID3D12Device6) || riid == __uuidof(ID3D12Device7) ||
+        riid == __uuidof(ID3D12Device8) ||
+        riid == __uuidof(ID3D12Device9) ||
+        riid == __uuidof(ID3D12Device10) ||
+        riid == __uuidof(ID3D12Device11) ||
+        riid == __uuidof(ID3D12Device12) ||
+        riid == __uuidof(ID3D12Device13) ||
+        riid == __uuidof(ID3D12Device14) ||
+        riid == __uuidof(ID3D12Device15))
         return E_NOINTERFACE;
 
     HRESULT hr = m_real->QueryInterface(riid, ppvObject);
@@ -635,4 +695,171 @@ HRESULT Dxr11WrapDevice(IUnknown* realDevice, REFIID riid, void** ppDevice) {
     hr = wrapper->QueryInterface(riid, ppDevice);
     wrapper->Release();   // drop our construction ref; QI took its own
     return hr;
+}
+
+// --- interfaces above Device7 -----------------------------------------------
+//
+// All forwarding. They exist so that an application asking for a newer
+// device interface still gets the WRAPPER: Unreal asks for Device12, and
+// handing over the real device there means every later call, including
+// CheckFeatureSupport and every pipeline creation, bypasses this shim.
+
+// --- Dxr11Device ID3D12Device8 -----------------------------------------------
+
+D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Dxr11Device::GetResourceAllocationInfo2(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC1 *pResourceDescs, D3D12_RESOURCE_ALLOCATION_INFO1 *pResourceAllocationInfo1) {
+    if (!m_real8) return D3D12_RESOURCE_ALLOCATION_INFO{};
+    return m_real8->GetResourceAllocationInfo2(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource2(const D3D12_HEAP_PROPERTIES *pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, REFIID riidResource, void **ppvResource) {
+    if (!m_real8) return E_NOINTERFACE;
+    return m_real8->CreateCommittedResource2(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePlacedResource1(ID3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, REFIID riid, void **ppvResource) {
+    if (!m_real8) return E_NOINTERFACE;
+    return m_real8->CreatePlacedResource1(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+}
+
+void STDMETHODCALLTYPE Dxr11Device::CreateSamplerFeedbackUnorderedAccessView(ID3D12Resource *pTargetedResource, ID3D12Resource *pFeedbackResource, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real8) return;
+    return m_real8->CreateSamplerFeedbackUnorderedAccessView(pTargetedResource, pFeedbackResource, DestDescriptor);
+}
+
+void STDMETHODCALLTYPE Dxr11Device::GetCopyableFootprints1(const D3D12_RESOURCE_DESC1 *pResourceDesc, UINT FirstSubresource, UINT NumSubresources, UINT64 BaseOffset, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *pLayouts, UINT *pNumRows, UINT64 *pRowSizeInBytes, UINT64 *pTotalBytes) {
+    if (!m_real8) return;
+    return m_real8->GetCopyableFootprints1(pResourceDesc, FirstSubresource, NumSubresources, BaseOffset, pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes);
+}
+
+
+
+// --- Dxr11Device ID3D12Device9 -----------------------------------------------
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC *pDesc, REFIID riid, void **ppvSession) {
+    if (!m_real9) return E_NOINTERFACE;
+    return m_real9->CreateShaderCacheSession(pDesc, riid, ppvSession);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS Kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS Control) {
+    if (!m_real9) return E_NOINTERFACE;
+    return m_real9->ShaderCacheControl(Kinds, Control);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID CreatorID, REFIID riid, void **ppCommandQueue) {
+    if (!m_real9) return E_NOINTERFACE;
+    return m_real9->CreateCommandQueue1(pDesc, CreatorID, riid, ppCommandQueue);
+}
+
+
+
+// --- Dxr11Device ID3D12Device10 -----------------------------------------------
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource3(const D3D12_HEAP_PROPERTIES *pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, UINT32 NumCastableFormats, const DXGI_FORMAT *pCastableFormats, REFIID riidResource, void **ppvResource) {
+    if (!m_real10) return E_NOINTERFACE;
+    return m_real10->CreateCommittedResource3(pHeapProperties, HeapFlags, pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riidResource, ppvResource);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePlacedResource2(ID3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE *pOptimizedClearValue, UINT32 NumCastableFormats, const DXGI_FORMAT *pCastableFormats, REFIID riid, void **ppvResource) {
+    if (!m_real10) return E_NOINTERFACE;
+    return m_real10->CreatePlacedResource2(pHeap, HeapOffset, pDesc, InitialLayout, pOptimizedClearValue, NumCastableFormats, pCastableFormats, riid, ppvResource);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource2(const D3D12_RESOURCE_DESC *pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, UINT32 NumCastableFormats, const DXGI_FORMAT *pCastableFormats, REFIID riid, void **ppvResource) {
+    if (!m_real10) return E_NOINTERFACE;
+    return m_real10->CreateReservedResource2(pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riid, ppvResource);
+}
+
+
+
+// --- Dxr11Device ID3D12Device11 -----------------------------------------------
+
+void STDMETHODCALLTYPE Dxr11Device::CreateSampler2(const D3D12_SAMPLER_DESC2 *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real11) return;
+    return m_real11->CreateSampler2(pDesc, DestDescriptor);
+}
+
+
+
+// --- Dxr11Device ID3D12Device12 -----------------------------------------------
+
+D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Dxr11Device::GetResourceAllocationInfo3(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC1 *pResourceDescs, const UINT32 *pNumCastableFormats, const DXGI_FORMAT *const *ppCastableFormats, D3D12_RESOURCE_ALLOCATION_INFO1 *pResourceAllocationInfo1) {
+    if (!m_real12) return D3D12_RESOURCE_ALLOCATION_INFO{};
+    return m_real12->GetResourceAllocationInfo3(visibleMask, numResourceDescs, pResourceDescs, pNumCastableFormats, ppCastableFormats, pResourceAllocationInfo1);
+}
+
+
+
+// --- Dxr11Device ID3D12Device13 -----------------------------------------------
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::OpenExistingHeapFromAddress1(const void *pAddress, SIZE_T size, REFIID riid, void **ppvHeap) {
+    if (!m_real13) return E_NOINTERFACE;
+    return m_real13->OpenExistingHeapFromAddress1(pAddress, size, riid, ppvHeap);
+}
+
+
+
+// --- Dxr11Device ID3D12Device14 -----------------------------------------------
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateRootSignatureFromSubobjectInLibrary(UINT nodeMask, const void *pLibraryBlob, SIZE_T blobLengthInBytes, LPCWSTR subobjectName, REFIID riid, void **ppvRootSignature) {
+    if (!m_real14) return E_NOINTERFACE;
+    return m_real14->CreateRootSignatureFromSubobjectInLibrary(nodeMask, pLibraryBlob, blobLengthInBytes, subobjectName, riid, ppvRootSignature);
+}
+
+
+
+// --- Dxr11Device ID3D12Device15 -----------------------------------------------
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::RegisterTrimNotificationCallback(D3D12_REGISTER_TRIM_NOTIFICATION *pData) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->RegisterTrimNotificationCallback(pData);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::UnregisterTrimNotificationCallback(DWORD CallbackCookie) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->UnregisterTrimNotificationCallback(CallbackCookie);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateShaderResourceView(ID3D12Resource *pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateShaderResourceView(pResource, pDesc, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateUnorderedAccessView(ID3D12Resource *pResource, ID3D12Resource *pCounterResource, const D3D12_UNORDERED_ACCESS_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateConstantBufferView(pDesc, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateSampler2(const D3D12_SAMPLER_DESC2 *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateSampler2(pDesc, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateRenderTargetView(ID3D12Resource *pResource, const D3D12_RENDER_TARGET_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateRenderTargetView(pResource, pDesc, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateDepthStencilView(ID3D12Resource *pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateDepthStencilView(pResource, pDesc, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateSamplerFeedbackUnorderedAccessView(ID3D12Resource *pTargetedResource, ID3D12Resource *pFeedbackResource, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->TryCreateSamplerFeedbackUnorderedAccessView(pTargetedResource, pFeedbackResource, DestDescriptor);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateQueryHeap1(const D3D12_QUERY_HEAP_DESC *pDesc, D3D12_QUERY_HEAP_FLAGS Flags, REFIID riid, void **ppvHeap) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->CreateQueryHeap1(pDesc, Flags, riid, ppvHeap);
+}
+
+HRESULT STDMETHODCALLTYPE Dxr11Device::ResolveQueryData(ID3D12QueryHeap *pQueryHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT NumQueries, void *pResolvedQueryData) {
+    if (!m_real15) return E_NOINTERFACE;
+    return m_real15->ResolveQueryData(pQueryHeap, Type, StartIndex, NumQueries, pResolvedQueryData);
 }

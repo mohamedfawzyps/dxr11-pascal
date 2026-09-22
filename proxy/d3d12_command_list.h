@@ -145,7 +145,7 @@ extern const GUID IID_Dxr11CommandList;
 
 class Dxr11RayQueryPso;
 
-class Dxr11CommandList : public ID3D12GraphicsCommandList6 {
+class Dxr11CommandList : public ID3D12GraphicsCommandList10 {
 public:
     // Takes ownership of one reference on `real`, and acquires its own on the
     // GraphicsCommandList5/6 interfaces if the runtime offers them.
@@ -276,6 +276,20 @@ public:
     // --- ID3D12GraphicsCommandList6 ---
     void STDMETHODCALLTYPE DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override;
 
+    // --- ID3D12GraphicsCommandList7 ---
+    void STDMETHODCALLTYPE Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups) override;
+
+    // --- ID3D12GraphicsCommandList8 ---
+    void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) override;
+
+    // --- ID3D12GraphicsCommandList9 ---
+    void STDMETHODCALLTYPE RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) override;
+    void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) override;
+
+    // --- ID3D12GraphicsCommandList10 ---
+    void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC *pDesc) override;
+    void STDMETHODCALLTYPE DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC *pDesc) override;
+
 private:
     // Ends the current segment at an indirect dispatch: copies the arguments to
     // a readback buffer, closes the segment, opens a fresh one and replays the
@@ -308,6 +322,10 @@ private:
     Dxr11RayQueryPso* m_rqPso = nullptr;
 
     ID3D12GraphicsCommandList6* m_real6;
+    ID3D12GraphicsCommandList7* m_real7;
+    ID3D12GraphicsCommandList8* m_real8;
+    ID3D12GraphicsCommandList9* m_real9;
+    ID3D12GraphicsCommandList10* m_real10;
     LONG                        m_refs;
 
     // Split machinery. Empty and untouched for a recording with no indirect ray
