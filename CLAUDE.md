@@ -1383,13 +1383,43 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   `HardwareRayTraceLightSamplesCS`, which survived longest, and the README says
   this in its first paragraph.
 
-  INFERRED, not established: the driver's shader disk cache. The crash looks
-  like it happens while the driver actually COMPILES the library, on a cache
-  miss, and stops once an entry exists. The test is to clear NVIDIA's DXCache
-  under %LOCALAPPDATA% and sweep again, which has not been run.
-  **Against that inference**: the game crashed on the same shader across many
-  separate runs, and a warm disk cache should have prevented that. The story is
-  not complete.
+  **THE CACHE TEST WAS RUN AND IT CONFIRMS THAT.** NVIDIA's DXCache under
+  %LOCALAPPDATA%, 550 MB, emptied, then the same nineteen swept three times:
+
+      cold cache    6 crashed   008 009 010 012 013 015
+      again         2 crashed   010 012
+      again         1 crashed   010
+
+  The same decay as before, from a known starting point. So the crash happens
+  while the driver actually COMPILES the library, and a compile that survives
+  leaves a cache entry that stops it happening again.
+
+  **It is PROBABILISTIC PER COMPILE, not a property of a given library.** The
+  cold-cache set is not the set from the first sweep of all: 016 and 018
+  crashed then and survived the cold run, while 009 and 012 did the reverse,
+  and 010 needed three attempts to get through. A driver shader compiler that
+  fails about a third of the time on the same input is a race or uninitialised
+  memory, not a rejected construct.
+
+  **AND THE CRASHERS ARE ONE SHADER FAMILY.** All six are MegaLights light
+  sampling:
+
+      CRASH  008 009 010     VolumeHardwareRayTraceLightSamplesCS
+      CRASH  012 013 015     HardwareRayTraceLightSamplesCS
+      ok     011 014 016 017 the rest of that same family
+      ok     000 001         LumenReflectionHardwareRayTracingCS, the two
+                             BIGGEST at 48144 and 53852 bytes
+      ok     002..007 018    Niagara, Barycentrics, DebugPicking,
+                             DebugTraversal, LumenSceneDirectLighting
+
+  Six of the ten in that family, none of the nine outside it on that sweep.
+  That is the same family that produces the UAV-append refusal, and the same
+  family that is the largest refusal source overall. Whatever is special about
+  these shaders is worth finding once.
+
+  **There is now a repeatable experiment**, which there was not this morning:
+  clear DXCache, sweep, count. That is the procedure any bisect of the library
+  has to use, because a single clean run means nothing.
 
   It is also not size. 53852 bytes builds fine and 16764 crashed.
 
