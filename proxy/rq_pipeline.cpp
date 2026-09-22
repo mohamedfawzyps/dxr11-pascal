@@ -1,5 +1,6 @@
 #include "rq_pipeline.h"
 
+#include "config.h"
 #include "proxy_log.h"
 #include "shader_dump.h"
 #include "rewriter/dxc_host.h"
@@ -83,6 +84,34 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     if (!dev || !desc || !desc->CS.pShaderBytecode) {
         *why = "no compute shader bytecode";
         return nullptr;
+    }
+
+    // A bisect, not a setting. See rq_pipeline.h.
+    {
+        static LONG s_seen = 0;
+        static int s_limit = -2;
+        static LONG s_logged = 0;
+        if (s_limit == -2) {
+            const cfg::Text t = cfg::GetText("DXR_TIER11_RQLIMIT", "rqlimit");
+            s_limit = t.value.empty() ? -1 : _wtoi(t.value.c_str());
+            if (s_limit >= 0)
+                ProxyLog("[dxr-tier-11-proxy-log] rqlimit = %d (from %s): only the first "
+                         "%d RayQuery shaders will be substituted, the rest are forwarded "
+                         "unchanged. This is a BISECT for a driver crash, not something to "
+                         "leave set.\n", s_limit, t.source, s_limit);
+        }
+        if (s_limit >= 0) {
+            const LONG n = InterlockedIncrement(&s_seen) - 1;
+            if (n >= s_limit) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                              "rqlimit = %d reached; this is RayQuery shader %ld and is "
+                              "being forwarded on purpose", s_limit, static_cast<long>(n));
+                *why = buf;
+                InterlockedIncrement(&s_logged);
+                return nullptr;
+            }
+        }
     }
 
     // --- rewrite ------------------------------------------------------------

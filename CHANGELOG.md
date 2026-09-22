@@ -17,6 +17,48 @@ build.
 
 ---
 
+## 0.28.0 (2026-09-22)
+
+### rqlimit, a bisect for the driver crash
+
+0.26.0 and 0.27.0 both ended the same way: the shim lowers shaders, the driver
+compiles their state objects, and then the device dies with
+`DXGI_ERROR_DRIVER_INTERNAL_ERROR`. 0.27.0 got further, six shaders lowered
+instead of four, and crashed in the same place.
+
+Nothing in the log says WHICH of them the driver could not survive, and
+reasoning about it has produced two plausible stories and no evidence. So:
+
+    rqlimit = 0    substitute nothing, forward every RayQuery shader
+    rqlimit = 3    substitute the first three, forward the rest
+    (unset)        substitute all of them, the normal behaviour
+
+Shaders are counted in creation order, which is stable enough across runs of
+the same scene to bisect with. A forwarded one is logged with its index and the
+reason, so the log says exactly what was skipped and why.
+
+This is a diagnostic, not a setting, and it says so when it is on.
+
+Measured both ways rather than assumed: with `rqlimit = 0` the dispatch suite's
+first case fails with `CreateComputePipelineState (hr=0x80070057)`, which is
+the driver rejecting a RayQuery shader on Tier 1.0, exactly what forwarding is
+supposed to produce. Unset, all 23 cases pass again.
+
+### What the dump established
+
+`lowered_006.in.dxil` is 13132 bytes, which is `RayTracingDebugMainCS`, the
+same shader dumped as `refused_010.dxil` two versions ago. Dumps are written
+before `CreateStateObject`, so 000 through 005 are the six that succeeded and
+006 is the one that reported device-removed.
+
+That does NOT make 006 the culprit. Device-removed on a creation call usually
+means the device was already gone, so 006 is as likely to be the first call
+after the crash as the cause of it.
+
+All seven use `createHandleFromHeap`, so bindless is not what separates them.
+
+---
+
 ## 0.27.0 (2026-09-22)
 
 ### Dump the shaders that LOWER, not only the ones that do not
