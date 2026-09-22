@@ -1240,7 +1240,8 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       rqphase = 2       + CreateStateObject                      CRASHES x2
       rqphase = 2, rqlimit = 1   exactly ONE state object built  RUNS, clean exit
       rqphase = 2, rqlimit = 4   four state objects built       RUNS, clean exit
-      rqphase = 2, rqlimit = 6   the first SIX to lower         next run
+      rqphase = 2, rqlimit = 6   six state objects built        RUNS, clean exit
+      rqphase = 2, rqlimit = 7   all seven, the suspect last    next run
       (unset)           + shader table + dispatch                CRASHES
 
   **ONE STATE OBJECT DOES NOT KILL THE DEVICE, AND THAT IS THE FIRST REAL
@@ -1267,6 +1268,29 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   `state object BUILT` lines, clean `end:` marker. So the crash is the 5th,
   6th or 7th of the seven, and it is now a choice between three named shaders
   rather than a property of the call.
+
+  **THE BISECT IS DOWN TO ONE SHADER.** `rqlimit = 6` built six and ran to a
+  clean exit, so it is the SEVENTH to lower. It stands out physically, which
+  none of the reasoning predicted: **13132 bytes of input against 3968 to 6004
+  for the six that are fine**, lowering to a 28984 byte library. It is on disk
+  as `archive/lowered-rqlimit-6/SUSPECT_7th.in.dxil`, and it lowers offline
+  without complaint, pattern 3, alpha-tested with a generated any-hit.
+
+  **AN OFFLINE PROBE OF IT LOOKED LIKE AN INSTANT ANSWER AND WAS NOTHING.**
+  `sotest` on the suspect's library gave `CreateStateObject E_INVALIDARG` on
+  the 1070, which is exactly the result the whole investigation has been
+  looking for. **The control killed it:** one of the SIX that built fine in the
+  game gives the identical `E_INVALIDARG` when run the same way. The cause is
+  that the shim only writes a `.rs.bin` for a shader it actually BUILDS, so a
+  shader held back by `rqlimit` is dumped without its root signature, and no
+  DXR state object builds without a global root signature. **A probe that
+  fails identically for a good and a bad input measures nothing**, which is the
+  same rule this brief already states for an oracle that stays silent.
+
+  So the faithful replay needs `rqlimit = 7`, which builds the suspect and
+  therefore dumps its `.rs.bin`. The dump is written BEFORE
+  `CreateStateObject`, so that set survives even when the device dies on the
+  call.
 
   **THE SET OF SEVEN IS STABLE, WHICH THIS BISECT DEPENDS ON AND NOBODY HAD
   CHECKED.** Unreal creates compute PSOs on worker threads, so "the first N to
