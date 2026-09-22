@@ -16,6 +16,15 @@ std::mutex g_lock;
 bool g_ready = false;
 std::wstring g_dir;          // empty means off
 unsigned g_written = 0;
+unsigned g_lowered = 0;      // its own counter, see shader_dump.h
+
+bool WriteFile(const std::wstring& path, const void* p, size_t n) {
+    FILE* f = _wfsopen(path.c_str(), L"wb", _SH_DENYNO);
+    if (!f) return false;
+    std::fwrite(p, 1, n, f);
+    std::fclose(f);
+    return true;
+}
 
 // Enough to diagnose a refusal pattern, few enough that nobody's disk fills up
 // while they are playing. Unreal refused 158 shaders in a session and the
@@ -70,14 +79,37 @@ void Refused(const void* container, size_t size, const char* why) {
     wchar_t stem[64];
     swprintf_s(stem, L"refused_%03u", n);
 
-    FILE* f = _wfsopen((g_dir + stem + L".dxil").c_str(), L"wb", _SH_DENYNO);
-    if (f) { std::fwrite(container, 1, size, f); std::fclose(f); }
+    WriteFile(g_dir + stem + L".dxil", container, size);
 
-    f = _wfsopen((g_dir + stem + L".txt").c_str(), L"w", _SH_DENYNO);
+    FILE* f = _wfsopen((g_dir + stem + L".txt").c_str(), L"w", _SH_DENYNO);
     if (f) { std::fputs(why ? why : "(no reason given)", f); std::fclose(f); }
 
     if (n + 1 == kMax)
         ProxyLog("[dxr-tier-11-proxy-log] shader dump limit of %u reached; no more "
+                 "will be written this run\n", kMax);
+}
+
+void Lowered(const void* original, size_t originalSize,
+             const void* lowered, size_t loweredSize) {
+    if (!original || !lowered || originalSize == 0 || loweredSize == 0) return;
+
+    std::lock_guard<std::mutex> g(g_lock);
+    if (!g_ready) InitLocked();
+    if (g_dir.empty()) return;
+    if (g_lowered >= kMax) return;
+
+    const unsigned n = g_lowered++;
+    wchar_t stem[64];
+    swprintf_s(stem, L"lowered_%03u", n);
+
+    // Both halves. The input is what `dxrw rewrite` needs to reproduce the
+    // lowering; the output is what CreateStateObject was actually handed, and
+    // it is the one the driver saw.
+    WriteFile(g_dir + stem + L".in.dxil", original, originalSize);
+    WriteFile(g_dir + stem + L".out.dxil", lowered, loweredSize);
+
+    if (n + 1 == kMax)
+        ProxyLog("[dxr-tier-11-proxy-log] lowered dump limit of %u reached; no more "
                  "will be written this run\n", kMax);
 }
 

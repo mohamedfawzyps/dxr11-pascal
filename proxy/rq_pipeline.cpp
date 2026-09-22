@@ -1,6 +1,7 @@
 #include "rq_pipeline.h"
 
 #include "proxy_log.h"
+#include "shader_dump.h"
 #include "rewriter/dxc_host.h"
 #include "rewriter/ll_model.h"
 #include "rewriter/rq_analyze.h"
@@ -94,6 +95,13 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
         *why = err;
         return nullptr;
     }
+
+    // Before CreateStateObject, deliberately. A library that lowers cleanly
+    // and then kills the driver is exactly the case worth having on disk, and
+    // dumping after the call would miss it.
+    shdump::Lowered(desc->CS.pShaderBytecode,
+                    static_cast<size_t>(desc->CS.BytecodeLength),
+                    lib.data(), lib.size());
 
     // --- state object -------------------------------------------------------
     // The application's compute root signature becomes the GLOBAL root

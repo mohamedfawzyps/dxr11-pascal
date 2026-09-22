@@ -28,4 +28,19 @@ namespace shdump {
 // including reading the setting more than once.
 void Refused(const void* container, size_t size, const char* why);
 
+// Write one shader that DID lower, as a pair: the application's container and
+// the library generated from it.
+//
+// Refusals were the only thing dumped, which left the successes unreachable.
+// A real Unreal session lowered four shaders, built their state objects, and
+// then the driver died with DXGI_ERROR_DRIVER_INTERNAL_ERROR. Those four were
+// the prime suspects and none of them existed anywhere on disk, so there was
+// nothing to replay through CreateStateObject without launching the game
+// again.
+//
+// Same setting, same cap, separate counter, because a run that lowers a lot
+// and refuses a little should not lose its refusals to the limit.
+void Lowered(const void* original, size_t originalSize,
+             const void* lowered, size_t loweredSize);
+
 }  // namespace shdump

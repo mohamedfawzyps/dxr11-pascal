@@ -17,6 +17,45 @@ build.
 
 ---
 
+## 0.27.0 (2026-09-22)
+
+### Dump the shaders that LOWER, not only the ones that do not
+
+A real Unreal session lowered four shaders, built their state objects, and then
+the driver died with `DXGI_ERROR_DRIVER_INTERNAL_ERROR`. Those four were the
+prime suspects and **none of them existed anywhere on disk**, because `dump`
+only ever wrote refusals. There was nothing to replay through
+`CreateStateObject` short of launching the game again.
+
+`lowered_NNN.in.dxil` is the application's container, `lowered_NNN.out.dxil` is
+the library this shim generated and handed to the driver. The input is what
+`dxrw rewrite` needs to reproduce the lowering; the output is what the driver
+actually saw, which is the one that matters when the driver is the thing that
+crashed.
+
+Written **before** `CreateStateObject`, deliberately. A library that lowers
+cleanly and then kills the driver is exactly the case worth having, and dumping
+after the call would miss it.
+
+Same `dump` setting and same cap, but its own counter, so a run that lowers a
+lot and refuses a little does not lose its refusals to the limit.
+
+Checked rather than assumed: `dxrw rewrite` on a dumped `.in.dxil` reproduces
+the dumped `.out.dxil` byte for byte, so what lands on disk is genuinely
+replayable.
+
+### The 0.26.0 fixes had not been installed
+
+The run that reported them still failing was `shim 0.25.0`, which the log said
+on its first line. The version was bumped and `dxrw.exe` rebuilt, but the proxy
+DLL itself was not, so nothing new ran. The `dxgi.dll` beside the game was
+older still, at 0.24.0.
+
+Nothing in the tooling catches this. The log prints the version on every run
+and that is the evidence, but it takes somebody reading it.
+
+---
+
 ## 0.26.0 (2026-09-22)
 
 ### Attribute group numbers are the module's, not a constant
