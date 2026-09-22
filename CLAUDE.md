@@ -1242,7 +1242,7 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       rqphase = 2, rqlimit = 4   four state objects built       RUNS, clean exit
       rqphase = 2, rqlimit = 6   six state objects built        RUNS, clean exit
       rqphase = 2, rqlimit = 7   all seven, the suspect last    CRASHES
-      rqphase = 2, rqonly  = 6   ONLY the suspect               next run
+      rqphase = 2, rqonly  = 6   ONLY the suspect, NOTHING else  CRASHES
       (unset)           + shader table + dispatch                CRASHES
 
   **ONE STATE OBJECT DOES NOT KILL THE DEVICE, AND THAT IS THE FIRST REAL
@@ -1317,6 +1317,33 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   reproducible and benign outside Escher's process.** That is the same
   contradiction this brief already records, now narrowed from "somewhere in
   the run" to one call whose inputs are all on disk.
+
+  **IT IS ONE SHADER, ON ITS OWN, AND IT HAS A NAME.** `rqonly = 6` built
+  **zero** other state objects and the device died at exactly the same place.
+  Every run now lines up without an exception:
+
+      rqlimit = 4   suspect REFUSED   4 built   163 shaders seen   RUNS
+      rqlimit = 6   suspect REFUSED   6 built   163 shaders seen   RUNS
+      rqlimit = 7   suspect BUILT     6 built    11 shaders seen   CRASHES
+      rqonly  = 6   suspect BUILT     0 built    11 shaders seen   CRASHES
+
+  The crash happens if and only if that one shader gets a state object, and
+  it needs no company at all. The count was never the variable, and the two
+  surviving runs only survived because `rqlimit` happened to refuse the
+  suspect.
+
+  **The shader is `RayTracingDebugMainCS`**, read out of the dumped container.
+  It is the SAME shader this brief already records as the first real Unreal
+  shader to lower, validate and sign, in 0.25.0, and the one the
+  `createHandleFromHeap` finding was measured on, 16 heap handles all kept in
+  the raygen. 13132 bytes in, 28984 out, more than twice the largest of the
+  six that are harmless.
+
+  **So every input is exonerated and the process is the whole difference.**
+  Same library bytes, same root signature, same `D3D12Core.dll 1.618.5.0`,
+  same GPU, same driver: offline it builds and the device lives, in Escher it
+  removes the device. Nothing left to vary except what that device has
+  already been asked to do.
 
   **What is left to separate, and `rqonly` is the instrument.** 0.36.3 adds
   `rqonly = N`: build ONLY the N-th shader that lowers, counting from 0,

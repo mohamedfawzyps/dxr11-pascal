@@ -17,6 +17,22 @@ build.
 
 ---
 
+## 0.36.4
+
+- The D3D12 debug layer is relayed into the proxy log as it speaks, through
+  `ID3D12InfoQueue1::RegisterMessageCallback`. The layer reports through
+  `OutputDebugString`, so reading it meant running DbgView beside the game and
+  correlating two clocks by eye. That is useless for a device removal: the call
+  that kills the device never returns, so nothing can drain an `ID3D12InfoQueue`
+  afterwards. A registered callback is delivered synchronously, while the call
+  is still inside the runtime, so a message produced inside a call that never
+  returns still gets written. INFO and MESSAGE are dropped. Present only when
+  the debug layer is running, which for a shipping game means `dxcpl.exe`.
+- `CreateStateObject` is announced in the log BEFORE it is called, so the last
+  line of a dead log names the call rather than leaving it to be inferred from
+  an absence.
+- Neither changes behaviour. 23 dispatch cases and all four gates pass.
+
 ## 0.36.3
 
 - `rqonly = N` builds ONLY the N-th RayQuery shader that lowers, counting from

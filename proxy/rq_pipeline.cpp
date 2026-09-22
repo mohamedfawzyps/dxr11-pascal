@@ -425,6 +425,15 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     sod.pSubobjects = subs;
 
     ID3D12StateObject* so = nullptr;
+    // Logged BEFORE the call, and this is not a debug leftover. One specific
+    // generated library kills the device inside CreateStateObject, so that
+    // call never returns and never logs a result. Without a line in front of
+    // it the log ends on whatever came before and the call has to be inferred
+    // from an absence. Now the last line in a dead log NAMES the call.
+    ProxyLog("[dxr-tier-11-proxy-log] about to call CreateStateObject: %zu byte "
+             "library, %u subobjects, global root signature %p. If this is the "
+             "last line in the log, that call is where the device went.\n",
+             lib.size(), static_cast<unsigned>(n), (void*)desc->pRootSignature);
     HRESULT hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&so));
     if (FAILED(hr)) {
         char buf[96];

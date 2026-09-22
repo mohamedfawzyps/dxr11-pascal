@@ -14,5 +14,5 @@
 // Keep all three in step with the tag and with CHANGELOG.md.
 #pragma once
 
-#define DXR_TIER11_VERSION       "0.36.3"
-#define DXR_TIER11_VERSION_COMMA 0, 36, 3, 0
+#define DXR_TIER11_VERSION       "0.36.4"
+#define DXR_TIER11_VERSION_COMMA 0, 36, 4, 0

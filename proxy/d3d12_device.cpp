@@ -24,6 +24,7 @@
 #include "rewriter/dxc_host.h"
 
 #include <windows.h>
+#include <d3d12sdklayers.h>
 #include <new>
 #include <string>
 
@@ -99,6 +100,68 @@ bool Dxr11Device::Highest(int n) const {
     }
 }
 
+// The D3D12 debug layer, relayed INTO THIS LOG, at the moment it speaks.
+//
+// The layer reports through OutputDebugString, so reading it has meant
+// running DbgView beside the game and then correlating two clocks by eye.
+// That is workable for a message and useless for a device removal: the call
+// that kills the device never returns, so nothing can drain an InfoQueue
+// afterwards, and the last thing the shim manages to write is whatever it
+// logged BEFORE the call.
+//
+// ID3D12InfoQueue1::RegisterMessageCallback delivers each message
+// SYNCHRONOUSLY, while the call is still inside the runtime, so the layer's
+// own words land in this log interleaved with our own lines and in the right
+// order. That is the difference between "the device went during
+// CreateStateObject" and knowing what D3D12 said about it.
+//
+// Present only when the debug layer is running, which for a shipping game
+// means dxcpl.exe was pointed at the executable. Absent is normal and silent.
+// INFO and MESSAGE are dropped because the layer is extremely chatty at those
+// levels and the interesting ones are never there.
+static void CALLBACK Dxr11DebugLayerMessage(D3D12_MESSAGE_CATEGORY,
+                                            D3D12_MESSAGE_SEVERITY sev,
+                                            D3D12_MESSAGE_ID id,
+                                            LPCSTR desc, void*) {
+    if (sev == D3D12_MESSAGE_SEVERITY_INFO ||
+        sev == D3D12_MESSAGE_SEVERITY_MESSAGE)
+        return;
+    const char* s = "?";
+    switch (sev) {
+        case D3D12_MESSAGE_SEVERITY_CORRUPTION: s = "CORRUPTION"; break;
+        case D3D12_MESSAGE_SEVERITY_ERROR:      s = "ERROR";      break;
+        case D3D12_MESSAGE_SEVERITY_WARNING:    s = "WARNING";    break;
+        default: break;
+    }
+    ProxyLog("[dxr-tier-11-proxy-log] D3D12 %s #%d: %s\n", s, (int)id,
+             desc ? desc : "(no description)");
+}
+
+static void InstallDebugLayerRelay(ID3D12Device5* real) {
+#ifdef __ID3D12InfoQueue1_INTERFACE_DEFINED__
+    if (!real) return;
+    ID3D12InfoQueue1* q = nullptr;
+    if (FAILED(real->QueryInterface(__uuidof(ID3D12InfoQueue1), (void**)&q)) || !q)
+        return;
+    DWORD cookie = 0;
+    const HRESULT hr = q->RegisterMessageCallback(
+        Dxr11DebugLayerMessage, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr,
+        &cookie);
+    // The cookie is deliberately not kept. Unregistering would mean holding a
+    // reference to the queue for the device's whole life to hand it back, and
+    // the callback outliving us by a few microseconds at teardown is cheaper
+    // than that. The queue is released here either way.
+    ProxyLog("[dxr-tier-11-proxy-log] debug layer relay %s: every WARNING, ERROR "
+             "and CORRUPTION message D3D12 produces now lands in THIS log, in "
+             "order, including ones produced inside a call that never "
+             "returns.\n",
+             SUCCEEDED(hr) ? "installed" : "could NOT be installed");
+    q->Release();
+#else
+    (void)real;
+#endif
+}
+
 Dxr11Device::Dxr11Device(ID3D12Device5* real)
     : m_real(real), m_tier11(false), m_real6(nullptr), m_real7(nullptr),
       m_real8(nullptr), m_real9(nullptr), m_real10(nullptr), m_real11(nullptr), m_real12(nullptr), m_real13(nullptr), m_real14(nullptr), m_real15(nullptr), m_refs(1) {
@@ -124,6 +187,7 @@ Dxr11Device::Dxr11Device(ID3D12Device5* real)
     ProxyLog("[dxr-tier-11-proxy-log] device wrapper created (real=%p, Device6=%s, Device7=%s, tier=%s)\n",
              (void*)m_real, m_real6 ? "yes" : "no", m_real7 ? "yes" : "no",
              m_tier11 ? "1.1" : "1.0");
+    InstallDebugLayerRelay(m_real);
     // The highest device interface the real device offers. Unreal asks for
     // Device12; anything we do not implement is handed over UNWRAPPED and the
     // application escapes the shim entirely, which is how the first real test
