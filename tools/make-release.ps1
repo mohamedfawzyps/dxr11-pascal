@@ -37,9 +37,22 @@ $atTag = (& git -C $root tag --points-at HEAD) -split "`n" | ForEach-Object { $_
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  not a git repository, skipping the tag check" -ForegroundColor DarkGray
 } elseif ($dirty) {
-    throw "The working tree has uncommitted changes. Commit them, then tag $tag, then run this."
+    throw "The working tree has uncommitted changes. A zip built from them would not match any tag. Commit first, then run this."
 } elseif ($atTag -notcontains $tag) {
     $at = if ($atTag -and $atTag[0]) { "HEAD carries " + ($atTag -join ', ') } else { 'HEAD carries no tag' }
+    # Two different situations, and telling them apart matters. If the tag does
+    # not exist yet the answer is to make it. If it exists somewhere else, the
+    # answer is NOT to move it: commits landed after the release, so either
+    # build from the tagged commit or bump the version. Saying "tag this
+    # commit" in that case invites retagging a release that is already out.
+    $where = (& git -C $root rev-list -n 1 $tag 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $where) {
+        $short = $where.Substring(0, 9)
+        throw ("proxy/version.h says $version and $at, but $tag already exists at $short.`n" +
+               "Work has landed since that release. Either build it from the tagged commit:`n" +
+               "    git checkout $tag`n" +
+               "or bump proxy/version.h and tag the new one. Do not move $tag; it is published.")
+    }
     throw "proxy/version.h says $version but $at. Tag this commit first:`n    git tag -a $tag -m ""$tag""`n    git push origin $tag"
 }
 
