@@ -1268,6 +1268,48 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - Standing aside is still the right behaviour. The failure was in reading
     the result, not in the shim.
 
+- **THE BIGGEST REFUSAL IN A REAL GAME IS TWO SMALL THINGS, MEASURED FROM THE
+  DUMP RATHER THAN GUESSED.** 64 refused shaders were on disk from one Escher
+  run. Every one of the 58 "Proceed loop body reads values defined outside it"
+  refusals was disassembled and the named values traced to their definitions.
+  The answer is completely uniform:
+
+      58 of 58 need  dx.op.annotateHandle
+      24 of 58 also need  lshr
+
+      what feeds the annotateHandle:   106 of 106  dx.op.createHandleFromHeap
+      what the heap INDEX is:          106 of 106  extractvalue (a cbuffer field)
+      what the lshr shifts by:          24 of 24   the constant 8
+
+  So every single one is a **bindless resource handle whose descriptor index
+  comes from a cbuffer**, and in 24 cases a constant right shift unpacking that
+  index out of a packed field. Nothing else. No UAV reads, no phis, no genuine
+  caller locals.
+
+  **All of it is recomputable, by the argument this brief already makes twice.**
+  A cbuffer holds the same bytes for the whole dispatch and the descriptor heap
+  is the same heap in the any-hit as in the raygen, so the hit shader can
+  rebuild the handle rather than be handed it. That is exactly why
+  `createHandle`, `createHandleForLib`, `createHandleFromBinding` and cbuffer
+  reads are already exempt. Two additions close the lot:
+
+      createHandleFromHeap (218), when its index chain is recomputable
+      lshr, by a constant amount
+
+  **This brief already predicted half of it and filed it as correct.** The 0.25.0
+  entry says "createHandleFromHeap (218) turns out to be sound as it stands...
+  One used inside the Proceed loop is refused, because 218 is NOT on the
+  recomputable list and the isolation check therefore catches it." True, and
+  measured on a shader that kept all 16 in the raygen. The measurement now says
+  that in-loop case is **the single largest refusal a real game produces**, 58 of
+  157. A limitation recorded honestly is still a limitation, and nothing had
+  counted it.
+
+  The constant shift matters as much as the exemption and for the reason the
+  brief gives for excluding division: recomputing HOISTS, and a variable shift
+  amount can be undefined where the original was guarded. By a constant it
+  cannot be.
+
 - **THE CreateStateObject CRASH IS GONE, AND THE FAILURE MOVED THIRTEEN
   SECONDS LATER.** First run of 0.36.6 with no `rqlimit` and no `rqonly`, so
   every shader that lowers gets a state object:
