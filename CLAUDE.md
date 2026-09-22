@@ -1299,6 +1299,45 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   now hands a refused shader a do-nothing pipeline too. **The note explaining
   why this would happen was already in this brief when the second one was
   written.**
+- **THE DEBUG LAYER NAMED SOMETHING, AND IT IS NOT WHAT ANY THEORY PREDICTED.**
+  Forced on with `dxcpl.exe` and read with DbgView, on the run that crashes:
+
+      D3D12 ERROR: ID3D12Device::CreateComputeShader: Shader uses native 16bit
+      ops, but the device does not support this.
+      [ STATE_CREATION ERROR #622: CREATESHADER_INVALIDBYTECODE ]     x24
+      D3D12: Removing Device.
+      D3D12 WARNING: RemoveDevice: DXGI_ERROR_DRIVER_INTERNAL_ERROR
+
+  Twenty-four compute shaders using native 16-bit ops, which Pascal does not
+  support, rejected one after another, and then the device goes. The removal
+  warning even says it: "strong evidence that the driver has performed an
+  undefined operation; but it may be because the application performed an
+  illegal or undefined operation to begin with".
+
+  **This shim answers the capability truthfully.** `CheckFeatureSupport` is
+  forwarded untouched except for `OPTIONS5.RaytracingTier`, so
+  `D3D12_FEATURE_DATA_D3D12_OPTIONS4.Native16BitShaderOpsSupported` reaches
+  Unreal as FALSE, and `D3D12Adapter.cpp` sets
+  `GRHIGlobals.SupportsNative16BitOps` straight from it. Unreal knows, and
+  creates them anyway, so the permutation choice for these particular shaders
+  does not consult it.
+
+  **The only renderer consumer of that global is TSR**, in
+  `TemporalSuperResolution.cpp`, and it is gated on
+  `bSupportsRealTypes == RuntimeGuaranteed` OR the capability being true, so on
+  Pascal with `RuntimeDependent` it should already decline. Which means these
+  24 are probably something else, and guessing which is how the last day went.
+
+  **The control before anything is concluded**: the same run with `rqstub = 1`,
+  which SURVIVES, and the debug layer still on. If the 24 errors appear there
+  too then they are not the cause, because that configuration lives through
+  them. If they do not appear, then what this shim lowers is what leads Unreal
+  into shaders Pascal cannot create.
+
+  **The tool worked because it is in the runtime.** A Shipping build strips
+  Unreal's own instrumentation, which is why DRED had nothing; `dxcpl` forces a
+  layer the application cannot compile out. Mute Info, keep Warning, Error and
+  Corruption.
 - **THE 33 "CONCURRENT" QUERIES ARE SEQUENTIAL. The refusal is false.**
   Confirmed from `refused_002.dxil`, NiagaraCollisionRayTraceCS:
 
