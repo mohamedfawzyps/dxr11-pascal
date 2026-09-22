@@ -1259,11 +1259,34 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - the second executable: `Escher.exe` is `BootstrapPackagedGame`, 176 KB,
     which `CreateProcess`es the Win64 binary and imports no d3d12 or dxgi.
 
-  **What DRED says**: nothing. `-gpucrashdebugging` turns it on,
-  `RHI.DRED true`, and there are no breadcrumbs and no page fault data, with
-  Aftermath on and writing no dump. Nothing was executing on the GPU and
-  nothing touched a bad address, so `DXGI_ERROR_DRIVER_INTERNAL_ERROR` is a
-  CPU-side driver failure. Heap corruption fits all three observations.
+  **What DRED says, and what it does NOT.** `-gpucrashdebugging` turns it on,
+  `RHI.DRED true`, and the report has no breadcrumbs and no page fault data,
+  with Aftermath on and writing no dump.
+
+  **The missing breadcrumbs mean nothing, and reading them as evidence was an
+  error.** This is a SHIPPING build, and
+
+      WITH_RHI_BREADCRUMBS = (UE_BUILD_DEBUG || UE_BUILD_DEVELOPMENT ||
+                              WITH_PROFILEGPU || (HAS_GPU_STATS && RHI_NEW_GPU_PROFILER))
+      WITH_PROFILEGPU      = !(UE_BUILD_SHIPPING || UE_BUILD_TEST) || ...
+
+  so Unreal writes no breadcrumbs at all in Shipping. DRED had nothing to
+  report because nothing was recorded, not because the GPU was idle. The
+  inference "nothing was executing, so this is a CPU-side failure" does not
+  follow and is withdrawn.
+
+  What still holds: no page fault was recorded, which comes from the runtime
+  rather than from Unreal's instrumentation.
+
+  **The general lesson, and it cost a whole line of reasoning**: a Shipping
+  build strips the instruments, so silence from any of them is the absence of
+  a measurement and not a measurement of absence. The same rule this brief
+  already states for the debug layer, applied to the wrong tool.
+
+  **An instrument Shipping cannot strip** is the D3D12 debug layer, forced on
+  for a named executable with `dxcpl.exe`. It lives in the runtime, not in the
+  application, so the build configuration cannot remove it, and API misuse by
+  this shim is exactly what it reports.
 
   **Two experiments were wrong before they were right, the same way twice.**
   `rqlimit = 0` and the first `rqphase = 1` both ended on Unreal's "Shader
