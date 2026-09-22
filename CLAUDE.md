@@ -1261,7 +1261,10 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - **Read the DXC line before interpreting any run**, alongside the rule
     about reading the configuration line. Both are one line and both decide
     whether the run means anything.
-  - What removed the two DLLs is NOT known. Saying so beats inventing a cause.
+  - The two DLLs had simply been moved out of the folder by hand and not put
+    back. That is the point rather than a footnote: the shim can end up
+    standing aside for entirely ordinary reasons, so the DXC line has to be
+    read on every run and not only when something looks wrong.
   - Standing aside is still the right behaviour. The failure was in reading
     the result, not in the shim.
 
