@@ -1268,6 +1268,51 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - Standing aside is still the right behaviour. The failure was in reading
     the result, not in the shim.
 
+- **THE UAV-APPEND REFUSAL IS NOT CHEAP, AND THE GUESS THAT IT WAS DEBUG-ONLY
+  WAS WRONG.** Named from the dump rather than assumed:
+
+      4  VolumeHardwareRayTraceLightSamplesCS          MegaLights
+      4  HardwareRayTraceLightSamplesCS                MegaLights
+      1  LumenSceneDirectLightingHardwareRayTracingCS  Lumen
+      1  RayTracingDebugMainCS                         the debug pass
+
+  Nine of the ten are real rendering. Refusing them costs MegaLights and Lumen
+  hardware ray tracing, which is most of what this game's ray tracing does.
+
+  **They share ONE construct, not nine algorithms.** Disassembled side by
+  side, the Lumen one and the debug one are instruction for instruction the
+  same shape: a counter increment on a `RWStructuredBuffer<stride=256,
+  counter>`, a record whose first field is the constant **94**, `RayFlags`
+  stored at offset 76, all behind a runtime flag read from a cbuffer. That is
+  one piece of instrumentation appearing in unrelated passes.
+
+  **It comes from the engine's SHARED wrapper**, not from the shaders.
+  `Engine/Shaders/Private/RayTracing/TraceRayInline.ush` owns the
+  `while (RayQ.Proceed())` loop and calls back into each shader through
+  `Callback.OnAnyHit(...)`. So every hardware-ray-tracing pass in Unreal
+  inherits the same loop body shape, which is why one refusal takes out a
+  whole family.
+
+  **THE REFUSAL MESSAGE OVERSTATES ITS OWN CASE.** "Runs a different number of
+  times" is not right in general:
+  - with `FORCE_OPAQUE`, `Proceed()` yields nothing on Tier 1.1 either, so both
+    do ZERO appends;
+  - otherwise the any-hit runs once per non-opaque candidate, which is the
+    same set `Proceed()` yields, so the COUNT matches.
+
+  What genuinely differs is `Abort()`, where this shim's lowering lets
+  traversal continue and so would append extra records, and ORDER, which is
+  implementation-defined for RayQuery traversal anyway and therefore already
+  not guaranteed for a counter-append buffer.
+
+  So the refusal can probably be narrowed to: refuse when the query uses
+  `Abort()`, or when the store is not append-style, meaning not indexed by the
+  counter result. TO VERIFY BEFORE BUILDING IT, and this is the part that
+  decides it: whether DXR guarantees one any-hit invocation per candidate, or
+  permits an implementation to invoke it more than once for the same
+  intersection. If it permits re-invocation, an append cannot be transplanted
+  at all and the refusal stands as written.
+
 - **THE DRIVER CRASH REPRODUCES OFFLINE. ONE SECOND, NO GAME.**
   `phase5/cases/driver-crash/` holds it. `crash.out.dxil` is a library this
   project generated from `VolumeHardwareRayTraceLightSamplesCS`, a real UE
