@@ -1230,6 +1230,48 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   form**: the answer was in something already on this machine, and it went
   unread because guessing felt faster. Eight versions, four real defects, none
   of them the cause.
+- **THE GPU CRASH BISECT, as far as it has got.** Each row is a real run of a
+  shipping UE 5.8.2 game on the GTX 1070. `rqstub` and `rqphase` are in
+  proxy/rq_pipeline.cpp and the example ini.
+
+      nowrap = 1        translate nothing, device unwrapped      RUNS
+      rqstub = 1        real do-nothing PSO, nothing lowered     RUNS
+      rqphase = 1       + rewrite the DXIL, throw it away        RUNS
+      rqphase = 2       + shader dump + CreateStateObject        CRASHES
+      (unset)           + shader table + dispatch                CRASHES
+
+  So the cause is one of exactly two things, and the next run separates them by
+  turning the dump off at `rqphase = 2`.
+
+  **`shdump::Lowered()` was called in precisely the runs that crashed and in
+  none that ran.** A perfect correlation across four configurations, which
+  would mean the diagnostic added to investigate this was causing it. The code
+  is memory-safe on inspection, so treat that as a lead and not a conclusion.
+
+  **What is ruled out, by measurement, and is not worth testing again:**
+  - the generated libraries: each builds on the 1070, all seven at once, 210 in
+    sequence, 168 across eight threads, and on WARP;
+  - the D3D12 runtime: `sotest` exports `D3D12SDKVersion`/`D3D12SDKPath` and
+    loads the game's own `D3D12Core.dll 1.618.5.0`, same result;
+  - Unreal driving ray tracing on Pascal: `rqstub` leaves that entirely intact;
+  - the stand-in pipeline state: it is a real one since 0.34.0;
+  - running DXC in the game's process: `rqphase = 1` runs;
+  - the second executable: `Escher.exe` is `BootstrapPackagedGame`, 176 KB,
+    which `CreateProcess`es the Win64 binary and imports no d3d12 or dxgi.
+
+  **What DRED says**: nothing. `-gpucrashdebugging` turns it on,
+  `RHI.DRED true`, and there are no breadcrumbs and no page fault data, with
+  Aftermath on and writing no dump. Nothing was executing on the GPU and
+  nothing touched a bad address, so `DXGI_ERROR_DRIVER_INTERNAL_ERROR` is a
+  CPU-side driver failure. Heap corruption fits all three observations.
+
+  **Two experiments were wrong before they were right, the same way twice.**
+  `rqlimit = 0` and the first `rqphase = 1` both ended on Unreal's "Shader
+  compilation failures are Fatal", because a forwarded RayQuery shader is fatal
+  in Unreal, so the run stopped well before the point being bisected. A phase
+  now hands a refused shader a do-nothing pipeline too. **The note explaining
+  why this would happen was already in this brief when the second one was
+  written.**
 - **THE 33 "CONCURRENT" QUERIES ARE SEQUENTIAL. The refusal is false.**
   Confirmed from `refused_002.dxil`, NiagaraCollisionRayTraceCS:
 
