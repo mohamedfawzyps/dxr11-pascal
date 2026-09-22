@@ -1425,12 +1425,55 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   `IncrementCounter`/`Append` idiom, ending up inside a DXR 1.0 raygen on
   Pascal's emulated path.
 
+  **AND THE COUNTER IS INSIDE THE PROCEED LOOP, WHICH MAKES IT A REWRITER
+  DEFECT AND NOT JUST A CLUE.** Confirmed against the UE 5.8.2 source Escher
+  was built from,
+  `IMPLEMENT_GLOBAL_SHADER(FRayTracingDebugCS, ".../RayTracingDebug.usf",
+  "RayTracingDebugMainCS", SF_Compute)`. The generated `AnyHit`, in full, is
+  the loop body, and it carries:
+
+      %v233 = annotateHandle ... RWStructuredBuffer<stride=256, counter>
+      %v234 = bufferUpdateCounter(70, %v233, inc)
+              rawBufferStore(140, %v235, %v234, 0,  94, ...)
+              rawBufferStore(140, %v236, %v234, 76, %v232, ...)
+      %v238 = bufferUpdateCounter(70, %v237, inc)
+
+  **A Proceed loop body with SIDE EFFECTS is not transplantable into an
+  any-hit shader, and the rewriter transplants it anyway.** The two run a
+  different number of times, by design:
+  - with `RAY_FLAG_FORCE_OPAQUE`, which this shader sets at RUNTIME for every
+    mode but one, the any-hit never runs at all and the records are never
+    appended;
+  - with `FORCE_NON_OPAQUE` it runs once per candidate, in an
+    implementation-defined order, so the records appear in a different order
+    and a different count.
+
+  So the lowering silently changes an observable. This is the same class as
+  the loop isolation rule and the rule MISSED it: that rule guards what the
+  body READS, and this brief even says "no loads, because a UAV the raygen
+  wrote reads back differently". Nothing guards what the body WRITES. Every
+  shader in the suite has a pure loop body, so nothing here could expose it,
+  which is the fourth time a suite of cases written to demonstrate a lowering
+  shared its author's blind spot.
+
+  **The fix is a refusal with a reason**: a Proceed loop body that stores to a
+  UAV, updates a counter or does an atomic cannot become an any-hit shader.
+  That is correct on its own terms, and it also stops this shim ever building
+  the library that kills the device, which is a symptom fix arriving for an
+  unrelated and better reason.
+
   **STATED HONESTLY: this is a correlation, not a demonstrated cause.** The
   same library still builds offline, so the counter alone is not sufficient.
   But it is the first thing in this whole investigation that cleanly
-  separates the shader that kills the device from the six that do not, and it
-  is actionable: refusing a RayQuery shader whose loop-hosting body updates a
-  UAV counter would be a principled refusal with a reason, not a hack.
+  separates the shader that kills the device from the six that do not, and the
+  refusal above is worth making whether or not it turns out to be the cause.
+
+  **The offline control was re-checked rather than trusted**, because
+  everything rests on it. Twenty builds of the suspect take 1728 ms against
+  1542 ms for twenty of a harmless one, so the driver is doing real, size-
+  dependent compilation work offline and not returning a cached or deferred
+  answer. The control is genuine: the same library really does compile on this
+  card and really does kill the device in Escher.
 
   **261 of Unreal's own DXR state objects are alive when the call is made**,
   counted from the log. Memory is the first thing about a loaded game that an
