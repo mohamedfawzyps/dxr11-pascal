@@ -36,13 +36,33 @@ public:
     // explain why not. `why` is filled on failure and the caller forwards the
     // original creation unchanged, so a refusal costs the application nothing
     // beyond the log line.
-    static Dxr11RayQueryPso* TryCreate(ID3D12Device5* dev,
-                                       const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
-                                       std::string* why);
+    // Returns the CARRIER: a real compute pipeline state, created from a
+    // do-nothing shader and the application's own root signature, with this
+    // object attached to it as private data.
+    //
+    // It used to return the stand-in itself, and the application held an
+    // ID3D12PipelineState that D3D12 never made. Every call that can carry one
+    // back to the runtime then had to be found and trapped, and they were
+    // found one crash at a time: SetPipelineState, then Reset, ClearState and
+    // CreateCommandList, then StorePipeline. Each fix was correct and none of
+    // them was the last one, because there is no list of every place a
+    // pipeline state can go.
+    //
+    // A real object has no such list to get wrong. The application can reset
+    // with it, name it, cache it, serialise it, release it; all of that is
+    // D3D12 handling its own object. This shim only has to notice, at
+    // dispatch, that the object carries a lowered query.
+    static ID3D12PipelineState* TryCreate(ID3D12Device5* dev,
+                                          const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                          std::string* why);
 
-    // Recognise our own object. Returns null for anything else, including a
-    // real pipeline state.
+    // The lowered query attached to a pipeline state, or null for an ordinary
+    // one. A pointer lookup, so it costs nothing on the overwhelmingly common
+    // path where the answer is no.
     static Dxr11RayQueryPso* From(ID3D12PipelineState* p);
+
+    static void RegisterCarrier(ID3D12PipelineState* carrier, Dxr11RayQueryPso* self);
+    static void UnregisterCarrier(Dxr11RayQueryPso* self);
 
     // True when the lowered shader commits PROCEDURAL hits. That decides
     // whether the scene's geometry can be served by it, which the caller asks

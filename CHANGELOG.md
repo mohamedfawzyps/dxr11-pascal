@@ -17,6 +17,52 @@ build.
 
 ---
 
+## 0.34.0 (2026-09-22)
+
+### Stop handing the application an object D3D12 never made
+
+Unreal never created a pipeline library, so 0.33.0's `StorePipeline` guard was
+not the crash either. It is kept, because it is correct, but it was the fourth
+consecutive fix of the same shape and the shape is the problem.
+
+`Dxr11RayQueryPso` was an `ID3D12PipelineState` this shim implemented itself
+and gave to the application. Every call that can carry one back to the runtime
+then has to be found and trapped, and they were found one crash at a time:
+
+    0.x     SetPipelineState
+    0.31.0  Reset, ClearState, CreateCommandList
+    0.33.0  StorePipeline
+
+Each fix was right and none was the last one, **because there is no list of
+every place a pipeline state can go.** An engine can name it, cache it,
+serialise it, hand it to an interface this shim does not wrap, or do something
+nobody here has thought of.
+
+So the application now gets a **real** pipeline state: its own root signature,
+and the do-nothing compute shader 0.32.0 already ships for `rqstub`. The
+lowered query is attached to it with `SetPrivateDataInterface`, the same
+mechanism the AddToStateObject emulation has used since Phase 4.
+
+The carrier's shader is never executed. `Dispatch` is still intercepted and
+still replaced by `SetPipelineState1` plus `DispatchRays`, so what the carrier
+contains has never mattered. What matters is that **D3D12 made it**, so every
+call the application makes on it is D3D12 handling its own object.
+
+Two things fall out of that, and both are simplifications:
+
+- `Reset`, `ClearState` and `CreateCommandList` forward the pointer again.
+  They only look it up now, to know which query the list is bound to.
+- Recognising one is a pointer lookup in a small map rather than a private
+  `QueryInterface`. The carrier owns the query object, so the entry is removed
+  in the query's own destructor and can never outlive it.
+
+### Still not claimed
+
+That this is the crash. But it is a different kind of change from the four
+before it: those closed one door each, this removes the corridor.
+
+---
+
 ## 0.33.0 (2026-09-22)
 
 ### rqstub RUNS the game, so the cause is ours

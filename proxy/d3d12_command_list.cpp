@@ -235,22 +235,14 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     // Unreal resets command lists with a PSO as a matter of course, which is
     // the ordinary way to reuse one, so this was reached on a real engine
     // immediately and never on anything in this project's own tests.
-    if (auto* rq = Dxr11RayQueryPso::From(p)) {
-        m_rqPso = rq;
-        return FWD(Reset(a, nullptr));
-    }
-    m_rqPso = nullptr;
+    // The carrier is a real pipeline state, so it is forwarded like any
+    // other. All this does now is remember which lowered query it carries.
+    m_rqPso = Dxr11RayQueryPso::From(p);
     return FWD(Reset(a, p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) {
     WorkBarrier();
-    // Same reason as Reset above.
-    if (auto* rq = Dxr11RayQueryPso::From(p)) {
-        m_rqPso = rq;
-        FWD(ClearState(nullptr));
-        return;
-    }
-    m_rqPso = nullptr;
+    m_rqPso = Dxr11RayQueryPso::From(p);
     FWD(ClearState(p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
@@ -309,11 +301,10 @@ void STDMETHODCALLTYPE Dxr11CommandList::OMSetStencilRef(UINT s) {
 void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState(ID3D12PipelineState* p) {
     // Our stand-in is not a real pipeline state and must never reach the
     // driver. Remember it; Dispatch is where it does its work.
-    if (auto* rq = Dxr11RayQueryPso::From(p)) {
-        m_rqPso = rq;
-        return;
-    }
-    m_rqPso = nullptr;
+    // Remember the lowered query, then bind the carrier as usual. It is a
+    // real pipeline state and binding it is harmless: Dispatch replaces the
+    // work with SetPipelineState1 and DispatchRays anyway.
+    m_rqPso = Dxr11RayQueryPso::From(p);
     if (m_gfx.pso) m_gfx.pso->Release();
     m_gfx.pso = p; if (p) p->AddRef();
     FWD(SetPipelineState(p));

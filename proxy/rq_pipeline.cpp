@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "proxy_log.h"
+#include "rq_stub_cs.h"
 #include "shader_dump.h"
 #include "rewriter/dxc_host.h"
 #include "rewriter/ll_model.h"
@@ -10,6 +11,8 @@
 
 #include "as_tracker.h"
 
+#include <map>
+#include <mutex>
 #include <cstring>
 #include <new>
 #include <string>
@@ -63,6 +66,9 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
 }  // namespace
 
 Dxr11RayQueryPso::~Dxr11RayQueryPso() {
+    // Before anything else: the carrier is releasing us, so nothing may find
+    // us through it again.
+    UnregisterCarrier(this);
     for (ID3D12Resource* r : m_retired) r->Release();
     if (m_sbt) m_sbt->Release();
     if (m_localRootSig) m_localRootSig->Release();
@@ -70,15 +76,34 @@ Dxr11RayQueryPso::~Dxr11RayQueryPso() {
     if (m_rootSig) m_rootSig->Release();
 }
 
-Dxr11RayQueryPso* Dxr11RayQueryPso::From(ID3D12PipelineState* p) {
-    if (!p) return nullptr;
-    Dxr11RayQueryPso* self = nullptr;
-    if (SUCCEEDED(p->QueryInterface(IID_Dxr11RayQueryPso, reinterpret_cast<void**>(&self))))
-        return self;   // QueryInterface does not AddRef for the private IID
-    return nullptr;
+// carrier pipeline state -> the lowered query attached to it.
+//
+// GetPrivateData would answer this too, but it AddRefs on every call and
+// SetPipelineState runs per draw. The carrier owns the query object, so the
+// entry is removed from the query's own destructor and can never outlive it.
+static std::mutex g_carrierLock;
+static std::map<ID3D12PipelineState*, Dxr11RayQueryPso*> g_carriers;
+
+void Dxr11RayQueryPso::RegisterCarrier(ID3D12PipelineState* carrier,
+                                       Dxr11RayQueryPso* self) {
+    std::lock_guard<std::mutex> g(g_carrierLock);
+    g_carriers[carrier] = self;
 }
 
-Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
+void Dxr11RayQueryPso::UnregisterCarrier(Dxr11RayQueryPso* self) {
+    std::lock_guard<std::mutex> g(g_carrierLock);
+    for (auto it = g_carriers.begin(); it != g_carriers.end(); ++it)
+        if (it->second == self) { g_carriers.erase(it); return; }
+}
+
+Dxr11RayQueryPso* Dxr11RayQueryPso::From(ID3D12PipelineState* p) {
+    if (!p) return nullptr;
+    std::lock_guard<std::mutex> g(g_carrierLock);
+    auto it = g_carriers.find(p);
+    return it == g_carriers.end() ? nullptr : it->second;
+}
+
+ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
         std::string* why) {
     if (!dev || !desc || !desc->CS.pShaderBytecode) {
@@ -363,7 +388,37 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
              x.needsBoth ? ", with a generated any-hit AND intersection shader"
                  : x.hasIntersection ? ", with a generated intersection shader"
                  : (x.hasAnyHit ? ", with a generated any-hit shader" : ""));
-    return self;
+    // The object the application holds is a REAL pipeline state: its own root
+    // signature, and a compute shader that does nothing. It is never executed.
+    // Dispatch is intercepted and replaced by SetPipelineState1 plus
+    // DispatchRays, so what the carrier's shader contains has never mattered.
+    // What matters is that D3D12 made it, so every call the application makes
+    // on it is handled by D3D12 rather than by guesswork here.
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+    cd.pRootSignature = desc->pRootSignature;
+    cd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
+    cd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
+    cd.NodeMask = desc->NodeMask;
+    cd.Flags = desc->Flags;
+    ID3D12PipelineState* carrier = nullptr;
+    const HRESULT chr = dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&carrier));
+    if (FAILED(chr) || !carrier) {
+        char cbuf[96];
+        std::snprintf(cbuf, sizeof(cbuf),
+                      "cannot create the carrier pipeline state (hr=0x%08X)",
+                      static_cast<unsigned>(chr));
+        if (why) *why = cbuf;
+        self->Release();
+        return nullptr;
+    }
+
+    // The carrier OWNS us. When the application releases its last reference
+    // D3D12 releases the private data interface, our destructor runs, and the
+    // registry entry goes with it.
+    RegisterCarrier(carrier, self);
+    carrier->SetPrivateDataInterface(IID_Dxr11RayQueryPso, self);
+    self->Release();
+    return carrier;
 }
 
 bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,

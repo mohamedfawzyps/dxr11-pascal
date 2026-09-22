@@ -399,7 +399,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
             // Fall through and lower normally if even that failed.
         }
         std::string why;
-        if (auto* pso = Dxr11RayQueryPso::TryCreate(m_real, pDesc, &why)) {
+        if (ID3D12PipelineState* pso = Dxr11RayQueryPso::TryCreate(m_real, pDesc, &why)) {
             *ppPipelineState = pso;
             return S_OK;
         }
@@ -423,10 +423,12 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_CO
     // pInitialState is a PIPELINE STATE and may be one of our stand-ins, which
     // is not a real D3D12 object. Handing it to the real device means the
     // driver dereferences something it did not make. See Dxr11CommandList::Reset.
+    // pInitialState is forwarded unchanged: a carrier is a real pipeline
+    // state. It is only looked up so the wrapper starts out knowing which
+    // lowered query the list is bound to.
     Dxr11RayQueryPso* rq = Dxr11RayQueryPso::From(pInitialState);
     HRESULT hr = m_real->CreateCommandList(nodeMask, type, pCommandAllocator,
-                                           rq ? nullptr : pInitialState,
-                                           riid, ppCommandList);
+                                           pInitialState, riid, ppCommandList);
     if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) {
         WrapList(riid, ppCommandList);
         // Carry the stand-in onto the wrapper, so a list created with one and
@@ -649,7 +651,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_
             if (SUCCEEDED(shr)) return shr;
         }
         std::string why;
-        if (auto* pso = Dxr11RayQueryPso::TryCreate(m_real, &cd, &why)) {
+        if (ID3D12PipelineState* pso = Dxr11RayQueryPso::TryCreate(m_real, &cd, &why)) {
             *ppPipelineState = pso;
             return S_OK;
         }
