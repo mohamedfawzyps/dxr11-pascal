@@ -295,9 +295,10 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
 }
 
 // Every shader dumped from one run, created in sequence and kept ALIVE.
-int RunDir(ID3D12Device5* dev, const std::string& dir) {
+int RunDir(ID3D12Device5* dev, const std::string& dir, int repeat) {
     std::vector<Built> held;
     int failed = 0;
+  for (int pass = 0; pass < repeat; ++pass)
     for (int i = 0; i < 64; ++i) {
         char stem[64];
         sprintf_s(stem, "lowered_%03d", i);
@@ -342,11 +343,15 @@ int main(int argc, char** argv) {
     }
 
     bool warp = false;
+    int repeat = 1;
     std::string dir, libPath, rsPath;
     for (int i = 1; i < argc; ++i) {
         if (_stricmp(argv[i], "warp") == 0) warp = true;
         else if (_stricmp(argv[i], "hw") == 0) warp = false;
         else if (_stricmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
+        // The game creates ours alongside a couple of hundred of its own.
+        // Seven at a time is not the same test.
+        else if (_stricmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (libPath.empty()) libPath = argv[i];
         else rsPath = argv[i];
     }
@@ -378,7 +383,7 @@ int main(int argc, char** argv) {
 
     int rc;
     if (!dir.empty()) {
-        rc = RunDir(dev, dir);
+        rc = RunDir(dev, dir, repeat);
     } else {
         Built b = BuildOne(dev, libPath, rsPath, false);
         const HRESULT removed = dev->GetDeviceRemovedReason();
