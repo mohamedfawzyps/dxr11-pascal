@@ -180,40 +180,48 @@ void Dxr11RayQueryPhaseNote(const char* what, const char* detail) {
              (detail && *detail) ? ": " : "", (detail && *detail) ? detail : "");
 }
 
+// rqlimit: cap how many state objects actually get BUILT.
+//
+// It used to count every shader that reached TryCreate, and that measured the
+// wrong thing. The first shader Unreal happens to create is not the first one
+// that LOWERS: with `rqlimit = 1` the whole budget went to a shader the
+// rewriter then refused for loop isolation, so nothing was built and the run
+// answered nothing. It cost two runs before the log was readable enough to
+// show it.
+//
+// Counted after the rewrite instead, so a refused shader does not spend the
+// budget and "rqlimit = N" means what it says: at most N state objects.
+static bool RayQueryLimitReached(std::string* why) {
+    static int s_limit = -2;
+    static LONG s_built = 0;
+    if (s_limit == -2) {
+        const cfg::Text t = cfg::GetText("DXR_TIER11_RQLIMIT", "rqlimit");
+        s_limit = t.value.empty() ? -1 : _wtoi(t.value.c_str());
+        if (s_limit >= 0)
+            ProxyLog("[dxr-tier-11-proxy-log] rqlimit = %d (from %s): at most %d "
+                     "RayQuery shaders will have a state object built for them. "
+                     "Shaders the rewriter refuses do not count against it. This is "
+                     "a BISECT for a driver crash, not something to leave set.\n",
+                     s_limit, t.source, s_limit);
+    }
+    if (s_limit < 0) return false;
+    const LONG n = InterlockedIncrement(&s_built) - 1;
+    if (n < s_limit) return false;
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  "rqlimit = %d reached; this shader DID lower but is the %ld-th to "
+                  "do so, and is being forwarded on purpose",
+                  s_limit, static_cast<long>(n));
+    *why = buf;
+    return true;
+}
+
 ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
         std::string* why) {
     if (!dev || !desc || !desc->CS.pShaderBytecode) {
         *why = "no compute shader bytecode";
         return nullptr;
-    }
-
-    // A bisect, not a setting. See rq_pipeline.h.
-    {
-        static LONG s_seen = 0;
-        static int s_limit = -2;
-        static LONG s_logged = 0;
-        if (s_limit == -2) {
-            const cfg::Text t = cfg::GetText("DXR_TIER11_RQLIMIT", "rqlimit");
-            s_limit = t.value.empty() ? -1 : _wtoi(t.value.c_str());
-            if (s_limit >= 0)
-                ProxyLog("[dxr-tier-11-proxy-log] rqlimit = %d (from %s): only the first "
-                         "%d RayQuery shaders will be substituted, the rest are forwarded "
-                         "unchanged. This is a BISECT for a driver crash, not something to "
-                         "leave set.\n", s_limit, t.source, s_limit);
-        }
-        if (s_limit >= 0) {
-            const LONG n = InterlockedIncrement(&s_seen) - 1;
-            if (n >= s_limit) {
-                char buf[128];
-                std::snprintf(buf, sizeof(buf),
-                              "rqlimit = %d reached; this is RayQuery shader %ld and is "
-                              "being forwarded on purpose", s_limit, static_cast<long>(n));
-                *why = buf;
-                InterlockedIncrement(&s_logged);
-                return nullptr;
-            }
-        }
     }
 
     // --- rewrite ------------------------------------------------------------
@@ -241,6 +249,10 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         Dxr11RayQueryPhaseNote("rewritten, nothing built", nullptr);
         return MakeCarrier(dev, desc, nullptr, false, why);
     }
+
+    // A bisect, not a setting. Here, after the rewrite and before anything is
+    // built, so the budget is spent only on shaders that actually lower.
+    if (RayQueryLimitReached(why)) return nullptr;
 
     // Before CreateStateObject, deliberately. A library that lowers cleanly
     // and then kills the driver is exactly the case worth having on disk, and

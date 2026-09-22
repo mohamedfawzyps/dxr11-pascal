@@ -17,6 +17,35 @@ build.
 
 ---
 
+## 0.36.2 (2026-09-22)
+
+### rqlimit counted the wrong thing, and burned two runs doing it
+
+`rqlimit = N` was meant to cap how many state objects exist, so the crash
+could be bisected by count. It counted every shader that REACHED `TryCreate`
+instead. Those are not the same set, because the first shader Unreal creates
+is not the first one that lowers. With `rqlimit = 1` the entire budget went to
+a shader the rewriter then refused for loop isolation, so **zero** state
+objects were built and the run measured nothing. That happened twice, and only
+became visible once 0.36.1 made the phase path log at all.
+
+The gate now sits after the rewrite and before anything is built, so a refused
+shader does not spend the budget and `rqlimit = N` means what it says.
+
+**The shape of this mistake is the one the brief keeps recording**: a knob that
+looks like it measures the thing, measures something adjacent, and the test
+passes without failing. A run that built nothing is indistinguishable from a
+run that built something harmless, unless the log says which.
+
+### What the readable log showed
+
+163 RayQuery shaders in Escher's frontend alone. Of the ones actually
+attempted, exactly one refusal, and it was loop isolation reading `%v119`. The
+real refusal rate is still unknown, because `rqlimit` forwarded the other 162
+before the rewriter saw them.
+
+---
+
 ## 0.36.1 (2026-09-22)
 
 ### A phase made every outcome silent, and it cost a run

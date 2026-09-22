@@ -1256,6 +1256,25 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   The brief already says: when you change what the product DOES, re-ask what
   each test is still measuring.
 
+  **AND THE REPEAT BUILT NOTHING EITHER, FOR A SECOND, DIFFERENT REASON.** With
+  0.36.1 logging every outcome, the rerun read: 163 RayQuery shaders, 162
+  refused by `rqlimit`, one refused by the rewriter, and **zero state objects
+  built**. `rqlimit` counted shaders that REACHED the rewriter rather than
+  shaders that LOWERED, and those are not the same set, because the first
+  shader Unreal creates is not the first one that lowers. The whole budget went
+  to a shader the rewriter then refused for loop isolation on `%v119`. Fixed in
+  0.36.2: the gate sits after the rewrite, so `rqlimit = N` means at most N
+  state objects.
+
+  **Three runs asked "does one state object kill it" and none of them built
+  one.** The lesson is not about `rqlimit`. It is that a bisect knob has to be
+  shown to move the thing it names, and none of these did, because the log
+  could not report what the knob actually did until it was made to.
+
+  **One real number came out of it:** Escher's frontend alone creates **163
+  RayQuery shaders**. The genuine refusal rate is still unknown, because 162 of
+  them were forwarded before the rewriter ever saw them.
+
   **THE SHADER DUMP HAS NOTHING TO DO WITH IT, AND THE "PERFECT CORRELATION"
   WAS AN ARTEFACT OF NOT READING THE LOG.** `shader dumping is ON` appears
   ZERO times across every run in the log. Dumping was never enabled in any of

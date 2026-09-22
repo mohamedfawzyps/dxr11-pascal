@@ -1,4 +1,4 @@
-// The shim's version, in one place.
+﻿// The shim's version, in one place.
 //
 // It is logged on attach for a practical reason: a bug report about this
 // project arrives as a log file, and the first thing anyone needs to know is
@@ -14,5 +14,5 @@
 // Keep all three in step with the tag and with CHANGELOG.md.
 #pragma once
 
-#define DXR_TIER11_VERSION       "0.36.1"
-#define DXR_TIER11_VERSION_COMMA 0, 36, 1, 0
+#define DXR_TIER11_VERSION       "0.36.2"
+#define DXR_TIER11_VERSION_COMMA 0, 36, 2, 0
