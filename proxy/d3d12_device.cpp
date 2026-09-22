@@ -17,6 +17,7 @@
 #include "command_signature.h"
 #include "dxil_scan.h"
 #include "rq_pipeline.h"
+#include "rq_stub_cs.h"
 #include "res_tracker.h"
 #include "config.h"
 #include "rewriter/dxc_host.h"
@@ -341,6 +342,22 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandQueue(const D3D12_COMMAND_QU
 }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** ppCommandAllocator) { FWD(CreateCommandAllocator(type, riid, ppCommandAllocator)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) { FWD(CreateGraphicsPipelineState(pDesc, riid, ppPipelineState)); }
+// One read, cached. A diagnostic that re-reads a setting per shader would show
+// up in the log as noise and in the profile as a file open per pipeline.
+bool Dxr11WantRayQueryStub() {
+    static int s = -1;
+    if (s < 0) {
+        const cfg::Text t = cfg::GetText("DXR_TIER11_RQSTUB", "rqstub");
+        s = (!t.value.empty() && t.value != L"0") ? 1 : 0;
+        if (s)
+            ProxyLog("[dxr-tier-11-proxy-log] rqstub = 1 (from %s): every RayQuery "
+                     "shader becomes a do-nothing compute PSO. Ray tracing stays "
+                     "enabled and produces nothing. This is a bisect, not a setting.\n",
+                     t.source);
+    }
+    return s != 0;
+}
+
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) {
     // The main path: RayQuery lives in compute shaders far more often than
     // anywhere else, because that is where a DXR 1.1 engine puts it.
@@ -355,6 +372,31 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
         Dxr11ContainerUsesRayQuery(pDesc->CS.pShaderBytecode,
                                    (SIZE_T)pDesc->CS.BytecodeLength) &&
         ppPipelineState && riid == __uuidof(ID3D12PipelineState)) {
+        // rqstub: enable ray tracing, lower NOTHING.
+        //
+        // nowrap = 1 runs the game, but it also makes Unreal see Tier 1.0 and
+        // switch ray tracing off entirely, so it cannot tell "the translation
+        // is at fault" from "no ray tracing happened". rqlimit = 0 cannot
+        // either, because a forwarded RayQuery shader is fatal in Unreal.
+        //
+        // This substitutes a REAL compute pipeline state that does nothing.
+        // The application is satisfied, ray tracing stays on, its own DXR 1.0
+        // pipelines and acceleration structure builds still run, and this shim
+        // lowers not one shader. What crashes then is not the lowering.
+        if (Dxr11WantRayQueryStub()) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *pDesc;
+            sd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
+            sd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
+            sd.CachedPSO = {};
+            const HRESULT shr = m_real->CreateComputePipelineState(
+                &sd, riid, ppPipelineState);
+            ProxyLog("[dxr-tier-11-proxy-log] rqstub: RayQuery shader replaced by a "
+                     "do-nothing compute PSO (hr=0x%08X). Nothing is lowered and "
+                     "nothing is traced; this is a diagnostic.\n",
+                     static_cast<unsigned>(shr));
+            if (SUCCEEDED(shr)) return shr;
+            // Fall through and lower normally if even that failed.
+        }
         std::string why;
         if (auto* pso = Dxr11RayQueryPso::TryCreate(m_real, pDesc, &why)) {
             *ppPipelineState = pso;
@@ -583,6 +625,21 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_
         // The cached blob is deliberately NOT carried over. It was produced for
         // the original compute shader, and what gets created here is a state
         // object built from a rewritten library.
+        // rqstub applies HERE above all: this is the path Unreal uses, so a
+        // diagnostic that only covered the struct form would not touch a
+        // single one of its shaders. See CreateComputePipelineState.
+        if (Dxr11WantRayQueryStub()) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC sd = cd;
+            sd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
+            sd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
+            const HRESULT shr = m_real->CreateComputePipelineState(
+                &sd, riid, ppPipelineState);
+            ProxyLog("[dxr-tier-11-proxy-log] rqstub: RayQuery shader replaced by a "
+                     "do-nothing compute PSO (hr=0x%08X). Nothing is lowered and "
+                     "nothing is traced; this is a diagnostic.\n",
+                     static_cast<unsigned>(shr));
+            if (SUCCEEDED(shr)) return shr;
+        }
         std::string why;
         if (auto* pso = Dxr11RayQueryPso::TryCreate(m_real, &cd, &why)) {
             *ppPipelineState = pso;

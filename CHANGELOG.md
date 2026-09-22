@@ -17,6 +17,55 @@ build.
 
 ---
 
+## 0.32.0 (2026-09-22)
+
+### nowrap = 1 runs the game, and that narrows it without settling it
+
+Six versions and four real defects into chasing the GPU crash, the control this
+brief documents was finally run. **`nowrap = 1` runs normally: no GPU crash.**
+
+So nothing the driver does on its own account is killing it. But that is less
+than it looks like, and saying so matters more than the result. `nowrap = 1`
+hands over the real device, so Unreal sees Tier 1.0 and switches ray tracing
+off entirely. "No crash" is therefore consistent with two different stories:
+
+- this shim's translation is at fault, or
+- ray tracing simply did not happen.
+
+`rqlimit = 0` cannot separate them either: a forwarded RayQuery shader is a
+fatal error in Unreal, so that run ends before the interesting part.
+
+### rqstub, which separates them
+
+    rqstub = 1
+
+Every RayQuery shader becomes a REAL compute pipeline state that does nothing.
+The application is satisfied and carries on, Tier 1.1 is still claimed, ray
+tracing stays enabled, **Unreal's own DXR 1.0 pipelines and acceleration
+structure builds still run**, and this shim lowers not one shader.
+
+- **Still crashes** the cause is Unreal driving ray tracing on Pascal, not
+  anything translated here, and this project cannot fix it.
+- **Runs** the cause is in what the lowering produces or in how it is
+  dispatched, with everything else held constant.
+
+It is applied on BOTH pipeline creation paths. The stream form is the one that
+matters, because that is the only one Unreal uses; a diagnostic that covered
+only the struct form would not have touched a single shader in the game.
+
+`proxy/rq_stub_cs.h` is a signed container for
+`[numthreads(1,1,1)] void main() {}`, generated once with dxc and checked in,
+because the proxy has an assembler and a signer but no HLSL compiler and adding
+one for four instructions is not worth it. A shader with no resources is
+compatible with any root signature, so it stands in for whatever was being
+created.
+
+Measured: with `rqstub = 1` the dispatch suite reports DIVERGE on every case,
+which is what "a pipeline that does nothing" should look like, and with it off
+all 23 pass.
+
+---
+
 ## 0.31.0 (2026-09-22)
 
 ### The stand-in PSO was reaching the driver through three other doors
