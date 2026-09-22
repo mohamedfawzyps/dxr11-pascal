@@ -1374,6 +1374,64 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   removes the device. Nothing left to vary except what that device has
   already been asked to do.
 
+  **THE MEMORY IDEA IS DEAD, IN ONE RUN, WHICH IS WHAT IT WAS FOR.**
+
+      video memory before CreateStateObject: LOCAL usage 520 MB of budget 7299 MB (7%)
+      video memory before CreateStateObject: SYSTEM usage 100 MB of budget 9423 MB
+
+  Seven percent. Not pressure, not close to it.
+
+  **TWO MORE DEAD, BOTH CHEAP.** 336 state objects built across 8 threads, 48
+  of them the suspect, device alive: driver concurrency among our own builds
+  is not it. And no NVAPI shader extension markers in any of the seven
+  containers, so the driver's extension pattern matching is not involved
+  either, which would have explained the offline/in-game split neatly and does
+  not.
+
+  **THE SHADER, READ FROM THE ENGINE SOURCE.**
+  `Engine/Shaders/Private/RayTracing/RayTracingDebug.usf`,
+  `RAY_TRACING_ENTRY_RAYGEN_OR_INLINE(RayTracingDebugMain)`, the
+  `RAYTRACING_DEBUG_INLINE` arm, which is `#define`d to `COMPUTESHADER`. Three
+  things worth having:
+  - **It is the ray tracing DEBUG VISUALISATION pass.** Nothing a game renders
+    normally depends on it. That matters more than any diagnostic below.
+  - Its ray flags are computed at RUNTIME, `CULL_BACK_FACING_TRIANGLES` plus
+    `FORCE_OPAQUE` or `FORCE_NON_OPAQUE` chosen by `VisualizationMode`. The
+    rewriter supports that since the `RayFlags` work.
+  - It is big because of what happens AFTER the trace: `GetInstanceSceneData`,
+    Nanite triangle attribute loading through
+    `InstanceContributionToHitGroupIndex` and `GeometryIndex`, and a
+    world-to-object matrix. That is the 13132 bytes and the
+    `recordconstants=1`.
+  - CAVEAT: the local clone is UE 5.7 NvRTX and Escher is 5.8.2, so the
+    permutation that shipped may differ in detail.
+
+  **AND THERE IS EXACTLY ONE STRUCTURAL FEATURE THAT SEPARATES THE SUSPECT
+  FROM ALL SIX HARMLESS SHADERS.** Every one of the seven was disassembled and
+  compared:
+
+      lowered_000    487 ll-lines   heapHandles= 7   bufferUpdateCounter=0
+      lowered_001    366             2                                   0
+      lowered_002    375             2                                   0
+      lowered_003    411             5                                   0
+      lowered_004    645             6                                   0
+      lowered_005    645             6                                   0
+      SUSPECT       2001            16                                   4
+
+  Bindless is NOT the discriminator: all seven use `createHandleFromHeap`, the
+  suspect just uses more. **`dx.op.bufferUpdateCounter` (70) is**, four
+  `(uav,inc)` increments in the body that becomes the RAYGEN, and zero in
+  every shader that is fine. That is a UAV counter allocation, the
+  `IncrementCounter`/`Append` idiom, ending up inside a DXR 1.0 raygen on
+  Pascal's emulated path.
+
+  **STATED HONESTLY: this is a correlation, not a demonstrated cause.** The
+  same library still builds offline, so the counter alone is not sufficient.
+  But it is the first thing in this whole investigation that cleanly
+  separates the shader that kills the device from the six that do not, and it
+  is actionable: refusing a RayQuery shader whose loop-hosting body updates a
+  UAV counter would be a principled refusal with a reason, not a hack.
+
   **261 of Unreal's own DXR state objects are alive when the call is made**,
   counted from the log. Memory is the first thing about a loaded game that an
   empty probe cannot reproduce, and a driver that cannot allocate while
