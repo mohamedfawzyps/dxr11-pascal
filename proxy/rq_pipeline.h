@@ -88,6 +88,9 @@ public:
 
 private:
     Dxr11RayQueryPso() = default;
+
+    // Creation order, used only by the rqdispatch bisect below.
+    int m_index = 0;
     ~Dxr11RayQueryPso();
 
     // (Re)build the shader table so that each record matches the geometry

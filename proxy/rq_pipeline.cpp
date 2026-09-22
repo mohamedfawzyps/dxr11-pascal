@@ -340,6 +340,11 @@ Dxr11RayQueryPso* Dxr11RayQueryPso::TryCreate(
     if (InterlockedCompareExchange(&onceVer, 1, 0) == 0)
         ProxyLog("[dxr-tier-11-proxy-log] rewriter using %s\n", dxch::Versions());
 
+    {
+        static LONG s_next = 0;
+        self->m_index = static_cast<int>(InterlockedIncrement(&s_next) - 1);
+    }
+
     ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader lowered and ready: "
              "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
              static_cast<size_t>(desc->CS.BytecodeLength), lib.size(),
@@ -489,6 +494,40 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                  static_cast<unsigned>(recordKinds.size()), rejecting,
                  (m_servesTri && m_servesProc) ? "both kinds"
                      : m_servesProc ? "procedural hits" : "triangle hits");
+    }
+
+    // rqdispatch: build everything, execute only the first N pipelines.
+    //
+    // This is the bisect that rqlimit should have been. rqlimit forwards the
+    // shaders it skips, and THIS PROJECT ALREADY KNEW that Unreal turns a
+    // forwarded RayQuery shader into `Shader compilation failures are Fatal`.
+    // So rqlimit = 0 killed the game at the first shader, long before the
+    // point where the driver had been dying, and proved almost nothing.
+    //
+    // Skipping the DISPATCH instead keeps every state object built and every
+    // pipeline handed over, so the application is happy and runs. What changes
+    // is only whether the GPU is asked to execute the lowered work. That
+    // separates "the driver cannot compile our libraries" from "the driver
+    // cannot execute our rays", which is the split that matters and the one
+    // nothing so far has tested.
+    {
+        static int s_limit = -2;
+        if (s_limit == -2) {
+            const cfg::Text t = cfg::GetText("DXR_TIER11_RQDISPATCH", "rqdispatch");
+            s_limit = t.value.empty() ? -1 : _wtoi(t.value.c_str());
+            if (s_limit >= 0)
+                ProxyLog("[dxr-tier-11-proxy-log] rqdispatch = %d (from %s): lowered "
+                         "pipelines are still built, but only the first %d will actually "
+                         "dispatch. Rendering will be WRONG. This is a bisect for a driver "
+                         "crash, not something to leave set.\n", s_limit, t.source, s_limit);
+        }
+        if (s_limit >= 0 && m_index >= s_limit) {
+            static LONG s_said = 0;
+            if (InterlockedCompareExchange(&s_said, 1, 0) == 0)
+                ProxyLog("[dxr-tier-11-proxy-log] rqdispatch: pipeline %d and beyond are "
+                         "built but NOT dispatched\n", m_index);
+            return;
+        }
     }
 
     D3D12_DISPATCH_RAYS_DESC d = m_desc;

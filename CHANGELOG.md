@@ -17,6 +17,54 @@ build.
 
 ---
 
+## 0.29.0 (2026-09-22)
+
+### The GPU crash is ours, and rqlimit was the wrong instrument
+
+`rqlimit = 0` changed the failure from `Fatal error!` with a GPU crash dump to
+
+    LowLevelFatalError [PipelineStateCache.cpp:730]
+    Shader compilation failures are Fatal.
+
+which is Unreal reacting to the driver rejecting a forwarded RayQuery shader.
+**No GPU crash.** So the device removal is caused by this shim's substitution,
+not by something the game does on its own.
+
+But that is nearly all it establishes, and rqlimit cannot establish more.
+Unreal dies at the FIRST forwarded shader, long before the point where the
+driver had been dying, so every setting between 0 and "all" ends the run early
+for a reason that has nothing to do with the crash being chased.
+
+**This project had already written that down**: "In Unreal, a refusal is a
+crash." A bisect built on refusing was never going to work, and the note
+explaining why was in CLAUDE.md before the bisect was written.
+
+### rqdispatch, which is the bisect rqlimit should have been
+
+    rqdispatch = 0    build every lowered pipeline, dispatch NONE of them
+    rqdispatch = 3    dispatch only the first three, counted in creation order
+    absent            dispatch all of them, the normal behaviour
+
+Every state object is still created and every pipeline still handed to the
+application, so nothing is refused and the game runs. What changes is only
+whether the GPU is asked to execute the lowered work.
+
+That splits the crash in two, and it is the split nothing so far has tested:
+
+- crash survives `rqdispatch = 0`  the driver cannot COMPILE one of the
+                                   libraries, and the dump already has all
+                                   seven of them
+- crash disappears                 the driver cannot EXECUTE one of the
+                                   dispatches, and the index narrows it
+
+Rendering is wrong while it is set, which is the point, and it says so.
+
+Measured both ways: with `rqdispatch = 0` the dispatch suite reports DIVERGE
+rather than failing, which is what "built but never run" should look like, and
+unset all 23 cases pass.
+
+---
+
 ## 0.28.0 (2026-09-22)
 
 ### rqlimit, a bisect for the driver crash
