@@ -155,6 +155,8 @@ static ID3D12PipelineState* MakeCarrier(ID3D12Device5* dev,
 // carrier, so memory and driver objects match the real run. What it does not
 // do is register the carrier, so no dispatch is ever substituted and the
 // pipeline does nothing. Rendering will be wrong, exactly as under rqstub.
+int Dxr11RayQueryPhase();
+
 static int RayQueryPhase() {
     static int s = -2;
     if (s == -2) {
@@ -167,6 +169,8 @@ static int RayQueryPhase() {
     }
     return s;
 }
+int Dxr11RayQueryPhase() { return RayQueryPhase(); }
+
 ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
         std::string* why) {

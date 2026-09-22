@@ -30,6 +30,18 @@
 // {7E3B1C42-9A54-4D18-8F60-2C71B0A4E9D3}
 extern const GUID IID_Dxr11RayQueryPso;
 
+// The rqphase bisect, exposed so a REFUSED shader can be given a do-nothing
+// pipeline too while a phase is set.
+//
+// Without that the phases are not comparable. rqphase = 1 ended with Unreal's
+// "Shader compilation failures are Fatal" rather than a GPU crash, which looked
+// like the rewrite being exonerated and was not: a forwarded refusal kills an
+// Unreal run early, so that phase may never have reached the point where the
+// driver was dying. rqlimit = 0 had the identical flaw.
+//
+// -1 when unset.
+int Dxr11RayQueryPhase();
+
 class Dxr11RayQueryPso : public ID3D12PipelineState {
 public:
     // Build everything a lowered RayQuery compute shader needs to run, or

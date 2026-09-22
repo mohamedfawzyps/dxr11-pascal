@@ -405,6 +405,18 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateComputePipelineState(const D3D12_CO
         }
         // Refusing is not failing. Forward the original and let the driver
         // give the application its own error, with our reason in the log.
+        // While a phase is set, a refusal gets a do-nothing pipeline too.
+        // Otherwise the phases are not comparable: Unreal turns a forwarded
+        // RayQuery shader into a fatal error, so a run ends early for a reason
+        // that has nothing to do with the crash being bisected.
+        if (Dxr11RayQueryPhase() >= 0) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *pDesc;
+            sd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
+            sd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
+            sd.CachedPSO = {};
+            if (SUCCEEDED(m_real->CreateComputePipelineState(&sd, riid, ppPipelineState)))
+                return S_OK;
+        }
         ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader NOT lowered: %s\n"
                  "[dxr-tier-11-proxy-log]   forwarding unchanged; the driver will reject it\n",
                  why.c_str());
@@ -654,6 +666,18 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineState(const D3D12_PIPELINE_
         if (ID3D12PipelineState* pso = Dxr11RayQueryPso::TryCreate(m_real, &cd, &why)) {
             *ppPipelineState = pso;
             return S_OK;
+        }
+        // While a phase is set, a refusal gets a do-nothing pipeline too.
+        // Otherwise the phases are not comparable: Unreal turns a forwarded
+        // RayQuery shader into a fatal error, so a run ends early for a reason
+        // that has nothing to do with the crash being bisected.
+        if (Dxr11RayQueryPhase() >= 0) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC sd = cd;
+            sd.CS.pShaderBytecode = rqstub::kNullComputeDxil;
+            sd.CS.BytecodeLength = rqstub::kNullComputeDxilSize;
+            sd.CachedPSO = {};
+            if (SUCCEEDED(m_real->CreateComputePipelineState(&sd, riid, ppPipelineState)))
+                return S_OK;
         }
         ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader NOT lowered: %s\n"
                  "[dxr-tier-11-proxy-log]   forwarding unchanged; the driver will reject it\n",

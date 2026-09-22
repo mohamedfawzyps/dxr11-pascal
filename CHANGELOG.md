@@ -17,6 +17,46 @@ build.
 
 ---
 
+## 0.36.0 (2026-09-22)
+
+### rqphase = 1 did not exonerate anything, and the experiment was at fault
+
+That run ended with
+
+    LowLevelFatalError [PipelineStateCache.cpp:730]
+    Shader compilation failures are Fatal.
+
+rather than a GPU crash, which looks like the DXIL rewrite being cleared. It is
+not. A forwarded RayQuery shader is fatal in Unreal, so the run ended early, at
+a point that has nothing to do with the crash being bisected. **`rqlimit = 0`
+had the identical flaw and it was written down at the time.** Making the same
+mistake twice in one investigation is worth recording more than the fix is.
+
+While a phase is set, a REFUSED shader now gets a do-nothing pipeline as well.
+Every phase then runs the game equally far, and the only variable is how much
+of the lowering happened.
+
+### The second executable is a launcher, not a second renderer
+
+`C:\DW\Escher\Escher.exe` is 176 KB of `BootstrapPackagedGame`: it
+`CreateProcess`es `Escher\Binaries\Win64\UE5_Frontend_UI-Win64-Shipping.exe`
+and imports neither d3d12 nor dxgi. The shim is beside the right binary.
+Checked rather than assumed, because "the other exe" would have invalidated
+every run so far.
+
+### The game's own D3D12 runtime makes no difference either
+
+Every offline test used the OS runtime, 10.0.26100; the game loads
+`D3D12Core.dll 1.618.5.0` from its own `Binaries\Win64\D3D12\x64`. `sotest` now
+exports `D3D12SDKVersion` and `D3D12SDKPath`, loads that exact DLL and prints
+which one it got.
+
+All seven libraries still build and are held with the device alive. So the
+state object is not the cause on any runtime, at any count, on any number of
+threads.
+
+---
+
 ## 0.35.0 (2026-09-22)
 
 ### DRED says the GPU was executing nothing
