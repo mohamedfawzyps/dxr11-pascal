@@ -17,6 +17,52 @@ build.
 
 ---
 
+## 0.33.0 (2026-09-22)
+
+### rqstub RUNS the game, so the cause is ours
+
+With every RayQuery shader replaced by a do-nothing compute pipeline, and
+everything else unchanged, **the game runs.** Tier 1.1 still claimed, ray
+tracing still enabled, Unreal's own DXR 1.0 pipelines and acceleration
+structure builds still happening. No GPU crash.
+
+So it is not Unreal driving ray tracing on Pascal. It is something this shim
+produces or hands over.
+
+The lighting going white and the hues shifting under `rqstub = 1` is the stub
+working: the RayQuery passes write nothing, so the lighting reads empty
+buffers. Not a rendering bug, and not evidence of one.
+
+### StorePipeline was the last unguarded door
+
+`Dxr11RayQueryPso` is an `ID3D12PipelineState` that is not a real D3D12 object.
+0.31.0 closed `Reset`, `ClearState` and `CreateCommandList`. One more call can
+carry one to the runtime, and it does not look like a pipeline call at all:
+
+    ID3D12PipelineLibrary::StorePipeline(name, pPipelineState)
+
+An engine with a PSO cache asks the runtime to SERIALIZE a pipeline state so it
+can be reloaded next launch. Unreal has exactly that machinery, in
+`PipelineStateCache.cpp`, **which is the file its fatal error named from the
+very first engine run.** Handing it an object D3D12 did not create means
+reading a vtable and fields that are not there.
+
+`CreatePipelineLibrary` was forwarded untouched, so the application held a real
+library and could store anything in it. It is now wrapped, for this one method.
+Everything else forwards; nothing is cached, rewritten or inspected here.
+
+A declined store returns S_OK. The application believes it cached the pipeline,
+the next launch misses on that name, and it creates it again, which is the
+ordinary cache-miss path and one this shim already serves.
+
+### Not claimed
+
+That this IS the crash. It is the last place a stand-in can reach the runtime,
+and the coincidence with the named file is suggestive, but the run decides.
+What IS established, and was not before: the cause is on this side of the line.
+
+---
+
 ## 0.32.0 (2026-09-22)
 
 ### nowrap = 1 runs the game, and that narrows it without settling it

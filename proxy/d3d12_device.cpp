@@ -16,6 +16,7 @@
 #include "d3d12_command_list.h"
 #include "command_signature.h"
 #include "dxil_scan.h"
+#include "d3d12_pipeline_library.h"
 #include "rq_pipeline.h"
 #include "rq_stub_cs.h"
 #include "res_tracker.h"
@@ -598,7 +599,14 @@ LUID STDMETHODCALLTYPE Dxr11Device::GetAdapterLuid() { FWD(GetAdapterLuid()); }
 
 // --- ID3D12Device1 ----------------------------------------------------------
 
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineLibrary(const void* pLibraryBlob, SIZE_T BlobLength, REFIID riid, void** ppPipelineLibrary) { FWD(CreatePipelineLibrary(pLibraryBlob, BlobLength, riid, ppPipelineLibrary)); }
+// Wrapped only so StorePipeline can decline a lowered RayQuery pipeline. See
+// d3d12_pipeline_library.h for why that call is the dangerous one.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePipelineLibrary(const void* pLibraryBlob, SIZE_T BlobLength, REFIID riid, void** ppPipelineLibrary) {
+    const HRESULT hr = m_real->CreatePipelineLibrary(pLibraryBlob, BlobLength, riid, ppPipelineLibrary);
+    if (m_tier11 && SUCCEEDED(hr) && ppPipelineLibrary)
+        Dxr11WrapPipelineLibrary(riid, ppPipelineLibrary);
+    return hr;
+}
 HRESULT STDMETHODCALLTYPE Dxr11Device::SetEventOnMultipleFenceCompletion(ID3D12Fence* const* ppFences, const UINT64* pFenceValues, UINT NumFences, D3D12_MULTIPLE_FENCE_WAIT_FLAGS Flags, HANDLE hEvent) { FWD(SetEventOnMultipleFenceCompletion(ppFences, pFenceValues, NumFences, Flags, hEvent)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::SetResidencyPriority(UINT NumObjects, ID3D12Pageable* const* ppObjects, const D3D12_RESIDENCY_PRIORITY* pPriorities) { FWD(SetResidencyPriority(NumObjects, ppObjects, pPriorities)); }
 
