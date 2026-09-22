@@ -1239,7 +1239,8 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       rqphase = 1       + rewrite the DXIL, throw it away        RUNS
       rqphase = 2       + CreateStateObject                      CRASHES x2
       rqphase = 2, rqlimit = 1   exactly ONE state object built  RUNS, clean exit
-      rqphase = 2, rqlimit = 4   the first FOUR to lower         next run
+      rqphase = 2, rqlimit = 4   four state objects built       RUNS, clean exit
+      rqphase = 2, rqlimit = 6   the first SIX to lower         next run
       (unset)           + shader table + dispatch                CRASHES
 
   **ONE STATE OBJECT DOES NOT KILL THE DEVICE, AND THAT IS THE FIRST REAL
@@ -1261,6 +1262,20 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
 
   So "unlimited at phase 2" means seven state objects, and the crash lives in
   2..7. That is two or three runs of bisect, not an open-ended search.
+
+  **FOUR DO NOT KILL IT EITHER.** Same configuration with `rqlimit = 4`: four
+  `state object BUILT` lines, clean `end:` marker. So the crash is the 5th,
+  6th or 7th of the seven, and it is now a choice between three named shaders
+  rather than a property of the call.
+
+  **THE SET OF SEVEN IS STABLE, WHICH THIS BISECT DEPENDS ON AND NOBODY HAD
+  CHECKED.** Unreal creates compute PSOs on worker threads, so "the first N to
+  lower" could in principle be a different N each run. Two things say it is
+  not: the refusal composition came back identical, 120 / 35 / 7 / 1, and the
+  first shader to lower dumped byte-for-byte identical in both runs, 5144
+  bytes with the same generated shape. The `lowered_*.in.dxil` files are the
+  instrument for this: hash them every run and the ordering is checkable
+  rather than assumed.
 
   **The refusal composition is itself new**, because every previous count was
   taken with 162 shaders forwarded unexamined. The 120 and the 35 are the two
