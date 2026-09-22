@@ -45,6 +45,19 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
+// Opt in to the Agility SDK, so this probe runs on the SAME D3D12 runtime the
+// game does.
+//
+// Every offline test until now used the OS runtime, 10.0.26100. The game loads
+// D3D12Core.dll 1.618.5.0 out of its own Binaries\Win64\D3D12\x64. That is a
+// different implementation of CreateStateObject sitting on the same driver,
+// and it was never the thing being tested. `sotest --agility` copies nothing
+// and assumes phase5out\D3D12\x64\D3D12Core.dll is in place.
+//
+// These must be exported from the EXE and are read before main runs, which is
+// why they are here rather than behind a flag.
+extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 618; }
+extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\x64\\"; }
 namespace {
 
 // Must match kPayloadBytes in rq_lower.cpp and rq_pipeline.cpp. A state object
@@ -434,6 +447,12 @@ int main(int argc, char** argv) {
     }
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
     dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+    {
+        HMODULE core = GetModuleHandleW(L"D3D12Core.dll");
+        wchar_t corePath[MAX_PATH] = L"(not loaded)";
+        if (core) GetModuleFileNameW(core, corePath, MAX_PATH);
+        std::wprintf(L"D3D12Core: %s\n", corePath);
+    }
     std::printf("raytracing tier %u\n\n",
                 static_cast<unsigned>(o5.RaytracingTier) / 10);
 
