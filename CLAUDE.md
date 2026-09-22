@@ -1268,6 +1268,50 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - Standing aside is still the right behaviour. The failure was in reading
     the result, not in the shim.
 
+- **THE CreateStateObject CRASH IS GONE, AND THE FAILURE MOVED THIRTEEN
+  SECONDS LATER.** First run of 0.36.6 with no `rqlimit` and no `rqonly`, so
+  every shader that lowers gets a state object:
+
+      DXC:     dxcompiler 1.10.2605.37, dxil 1.10.2605.37     (checked first)
+      163 RayQuery shaders seen
+      6   state object BUILT
+      1   REFUSED: Proceed loop body has a side effect (dx.op.bufferUpdateCounter, opcode 70)
+
+  Exactly the predicted shape. The device survived every one of those builds,
+  where the same configuration before the refusal built seven and died on the
+  seventh. **That is the fix working, in the game, on the thing it was written
+  for.**
+
+  **What killed it instead is a DIFFERENT failure with a different error
+  code.** The run reached acceleration structure building and rendering, ran
+  for 19 seconds against about 6 before, and then:
+
+      D3D12 ERROR #921: ID3D12CommandList::Close: An ID3D12Resource object was
+                        deleted prior to closing the command list
+      D3D12 ERROR #921: ... same resource, at ExecuteCommandLists
+      D3D12 ERROR #232: RemoveDevice ... DXGI_ERROR_DEVICE_HUNG, TDR triggered
+
+  `DEVICE_HUNG` is a timeout, not `DRIVER_INTERNAL_ERROR`. Both #921s name one
+  resource, in the middle of UNREAL's own `BuildRaytracingAccelerationStructure`
+  calls, and nothing the shim records sits near them: this scene took the
+  upload-heap read path, so the shim recorded no copy into any list.
+
+  **INFERRED, not established, and the shape of the experiment says to suspect
+  it**: at `rqphase = 2` nothing lowered is ever dispatched, so 157 shaders get
+  do-nothing pipelines and the engine then runs for 19 seconds consuming
+  whatever was in those targets. An unwritten buffer read back as an indirect
+  dispatch argument or a loop bound is an ordinary way to hang a GPU. The old
+  crash at 6 seconds was masking whatever this is.
+
+  **So the phase diagnostic has reached its limit.** It was built to answer
+  "does building a state object kill the device", it answered that, and
+  running the engine for 19 seconds on stubbed output is not a configuration
+  worth debugging. The next step is the real path, with lowered shaders
+  actually dispatching, and that needs the refusal question decided first:
+  Unreal treats a forwarded refusal as fatal, so the 157 the rewriter still
+  refuses would need do-nothing pipelines OUTSIDE a phase. That is a product
+  decision, and this brief argues both sides of it already.
+
 - **THE GPU CRASH BISECT, as far as it has got.** Each row is a real run of a
   shipping UE 5.8.2 game on the GTX 1070. `rqstub` and `rqphase` are in
   proxy/rq_pipeline.cpp and the example ini.
@@ -1281,6 +1325,8 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
       rqphase = 2, rqlimit = 6   six state objects built        RUNS, clean exit
       rqphase = 2, rqlimit = 7   all seven, the suspect last    CRASHES
       rqphase = 2, rqonly  = 6   ONLY the suspect, NOTHING else  CRASHES
+      rqphase = 2, 0.36.6       suspect REFUSED, six built      no longer crashes,
+                                                                hangs later instead
       (unset)           + shader table + dispatch                CRASHES
 
   **ONE STATE OBJECT DOES NOT KILL THE DEVICE, AND THAT IS THE FIRST REAL
