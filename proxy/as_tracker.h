@@ -121,15 +121,30 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                    const D3D12_RAYTRACING_INSTANCE_DESC* descs, UINT count);
 
 // A GPU copy of those descriptions, recorded into the application's own list
-// but not readable until it has run. Expensive path.
+// but not readable until it has run. Expensive path. `owner` is the list that
+// recorded the copy: only ITS submission may stamp the read, see AfterSubmit.
 void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
-                          ID3D12Resource* readback, UINT count);
+                          ID3D12Resource* readback, UINT count,
+                          const void* owner);
 
-// Called by the queue hook after every submission. Stamps anything pending
-// with a fence signalled on `queue`, and parses anything the GPU is already
-// past. Never blocks: the cost of reading the instance data is one fence
-// signal, and the answer arrives a submission late rather than stalling for it.
-void AfterSubmit(ID3D12CommandQueue* queue);
+// Called by the queue hook after every submission, with the lists it carried
+// (the application's pointers, wrapped or not). Stamps the reads those lists
+// recorded with a fence signalled on `queue`, and parses anything the GPU is
+// already past. Never blocks: the answer arrives a submission late rather than
+// stalling for it.
+//
+// ONLY the submitted lists' reads are stamped. Applications record on several
+// threads, so a read recorded into a list that is still OPEN must not be
+// stamped by some other thread's submission: the fence would pass, the shim
+// would drop the readback buffer, and the open list would then reference a
+// deleted resource. Its Close fails with E_INVALIDARG, which Unreal makes
+// fatal. That is what 0.38.0 and earlier did.
+void AfterSubmit(ID3D12CommandQueue* queue,
+                 ID3D12CommandList* const* lists, UINT count);
+
+// The list was reset or destroyed. Reads it recorded and never submitted will
+// never run, so they are dropped. Stamped reads are left alone.
+void DropUnsubmitted(const void* owner);
 
 // What is known about the top-level structure at this address.
 TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);

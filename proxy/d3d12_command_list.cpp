@@ -133,6 +133,7 @@ Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
 }
 
 Dxr11CommandList::~Dxr11CommandList() {
+    astrack::DropUnsubmitted(this);
     m_bindings.ReleaseAll();
     m_gfx.ReleaseAll();
     if (m_real10) m_real10->Release();
@@ -219,6 +220,8 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Close() {
 // stale. It also clears all binding state, which is exactly why a split has to
 // replay it.
 HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) {
+    // A copy recorded before this Reset and never submitted will never run.
+    astrack::DropUnsubmitted(this);
     m_segments.clear();
     m_openPendings.clear();
     m_bindings.ReleaseAll();
@@ -689,7 +692,7 @@ void Dxr11CommandList::CaptureInstances(
     m_real->ResourceBarrier(1, &back);
 
     astrack::NotePendingInstances(desc->DestAccelerationStructureData,
-                                  readback.Get(), in.NumDescs);
+                                  readback.Get(), in.NumDescs, this);
 }
 
 bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {

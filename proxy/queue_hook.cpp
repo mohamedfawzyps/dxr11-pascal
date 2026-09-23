@@ -69,7 +69,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         // Any top-level instance data copied out during this recording can now
         // be stamped with a fence, and anything stamped earlier read. Returns
         // immediately when there is nothing pending, which is the normal case.
-        astrack::AfterSubmit(self);
+        astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
         return;
     }
 
@@ -82,7 +82,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         ID3D12CommandList* one[] = { out[i] };
         g_original(self, 1, one);
     }
-    astrack::AfterSubmit(self);
+    astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
 }
 
 bool PatchSlot(void** vtable, size_t index, void* replacement, void** outOriginal) {

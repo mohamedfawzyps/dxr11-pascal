@@ -1,4 +1,5 @@
 #include "as_tracker.h"
+#include "d3d12_command_list.h"
 
 #include "proxy_log.h"
 #include "res_tracker.h"
@@ -23,14 +24,23 @@ struct PendingRead {
     D3D12_GPU_VIRTUAL_ADDRESS tlas = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     UINT   count = 0;
-    UINT64 fenceValue = 0;   // 0 until a submission stamps it
+    const void* owner = nullptr;           // the list that recorded the copy
+    ID3D12CommandQueue* queue = nullptr;   // set when stamped
+    UINT64 fenceValue = 0;                 // 0 until its list is submitted
 };
 std::vector<PendingRead> g_pending;
 
-// One fence for all of it, created from the first readback buffer's device.
+// One fence PER QUEUE. A single fence signalled on several queues is not
+// ordered: a fast queue can reach value 6 while a slow one has not reached 5,
+// and the slow queue's copy would then be read and freed while it runs.
 // Single adapter is assumed, which is true of everything this shim targets.
-Microsoft::WRL::ComPtr<ID3D12Fence> g_fence;
-UINT64 g_fenceValue = 0;
+// The queue pointer holds no reference, like the resource tracker, and is
+// only compared.
+struct QueueFence {
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    UINT64 value = 0;
+};
+std::map<ID3D12CommandQueue*, QueueFence> g_fences;
 
 // Fills in a TlasInfo from the descriptions themselves. Caller holds g_lock,
 // because this reads g_blas to learn what each instance points at.
@@ -245,45 +255,79 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
 }
 
 void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
-                          ID3D12Resource* readback, UINT count) {
-    if (!tlas || !readback || !count) return;
+                          ID3D12Resource* readback, UINT count,
+                          const void* owner) {
+    if (!tlas || !readback || !count || !owner) return;
     PendingRead pr;
     pr.tlas = tlas;
     pr.readback = readback;
     pr.count = count;
+    pr.owner = owner;
     std::lock_guard<std::mutex> g(g_lock);
     g_pending.push_back(pr);
 }
 
-void AfterSubmit(ID3D12CommandQueue* queue) {
+void DropUnsubmitted(const void* owner) {
+    if (!owner) return;
+    std::lock_guard<std::mutex> g(g_lock);
+    if (g_pending.empty()) return;
+    std::vector<PendingRead> still;
+    for (PendingRead& pr : g_pending)
+        if (pr.fenceValue != 0 || pr.owner != owner) still.push_back(pr);
+    g_pending.swap(still);
+}
+
+namespace {
+bool Submitted(const void* owner, ID3D12CommandList* const* lists, UINT count) {
+    for (UINT i = 0; i < count; ++i)
+        if (static_cast<const void*>(Dxr11CommandList::From(lists[i])) == owner)
+            return true;
+    return false;
+}
+}  // namespace
+
+void AfterSubmit(ID3D12CommandQueue* queue,
+                 ID3D12CommandList* const* lists, UINT count) {
     if (!queue) return;
     std::lock_guard<std::mutex> g(g_lock);
     if (g_pending.empty()) return;
 
-    // Stamp everything recorded but not yet submitted. One signal covers them
-    // all, because they all went out on or before this submission.
-    bool anyUnstamped = false;
+    // Stamp the reads recorded by the lists in THIS submission, and nothing
+    // else. See the header for what stamping an open list's read did.
+    bool anyToStamp = false;
     for (const PendingRead& pr : g_pending)
-        if (pr.fenceValue == 0) { anyUnstamped = true; break; }
-    if (anyUnstamped) {
-        if (!g_fence) {
-            Microsoft::WRL::ComPtr<ID3D12Device> dev;
-            if (SUCCEEDED(g_pending.front().readback->GetDevice(IID_PPV_ARGS(&dev))))
-                dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
+        if (pr.fenceValue == 0 && Submitted(pr.owner, lists, count)) {
+            anyToStamp = true;
+            break;
         }
-        if (g_fence && SUCCEEDED(queue->Signal(g_fence.Get(), g_fenceValue + 1))) {
-            ++g_fenceValue;
+    if (anyToStamp) {
+        QueueFence& qf = g_fences[queue];
+        if (!qf.fence) {
+            Microsoft::WRL::ComPtr<ID3D12Device> dev;
+            if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))))
+                dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&qf.fence));
+        }
+        if (qf.fence && SUCCEEDED(queue->Signal(qf.fence.Get(), qf.value + 1))) {
+            ++qf.value;
             for (PendingRead& pr : g_pending)
-                if (pr.fenceValue == 0) pr.fenceValue = g_fenceValue;
+                if (pr.fenceValue == 0 && Submitted(pr.owner, lists, count)) {
+                    pr.queue = queue;
+                    pr.fenceValue = qf.value;
+                }
         }
     }
 
-    // Parse whatever the GPU is already past. Nothing waits.
-    if (!g_fence) return;
-    const UINT64 done = g_fence->GetCompletedValue();
+    // Parse whatever the GPU is already past, judged on the queue each read
+    // went out on. Nothing waits.
     std::vector<PendingRead> still;
     for (PendingRead& pr : g_pending) {
-        if (pr.fenceValue == 0 || pr.fenceValue > done) { still.push_back(pr); continue; }
+        if (pr.fenceValue == 0) { still.push_back(pr); continue; }
+        auto it = g_fences.find(pr.queue);
+        if (it == g_fences.end() || !it->second.fence ||
+            it->second.fence->GetCompletedValue() < pr.fenceValue) {
+            still.push_back(pr);
+            continue;
+        }
         const SIZE_T bytes =
             static_cast<SIZE_T>(pr.count) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
         void* p = nullptr;

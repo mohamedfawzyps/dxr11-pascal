@@ -24,6 +24,41 @@ not.
 
 ---
 
+## 0.38.1
+
+- **Fixed: a command list could fail to `Close` with `E_INVALIDARG`, which
+  Unreal makes fatal.** One Escher run in five died on "hr failed at
+  D3D12CommandList.cpp:244 with error E_INVALIDARG", which is
+  `FD3D12CommandList::Close`, on the RHI thread, 18 seconds in.
+- The cause was this shim. When a top-level build reads GPU-written instance
+  data, the shim records a copy into a readback buffer it owns, then reads the
+  copy once a fence it signals after a submission has passed, and drops the
+  buffer. It stamped EVERY pending copy on EVERY submission, on the stated
+  assumption that anything recorded had gone out by then. With several
+  threads recording, that is false: another thread's submission passed the
+  fence, the shim parsed a buffer the GPU had not written yet, and released
+  a resource that a still-open list referenced.
+- It also parsed garbage. Reproduced offline, the old DLL read "max
+  contribution 0, geometry reached: none" for a scene whose truth is
+  contribution 1 with both kinds, then the device was removed.
+- Now a copy is stamped only by the submission that carries the list that
+  recorded it, a list that is reset or destroyed unsubmitted drops its copies,
+  and each queue has its own fence, because one fence signalled on several
+  queues is not ordered.
+- Almost certainly also the `#921 resource deleted prior to closing the
+  command list` and `DEVICE_HUNG` of the 0.36.6 run, which named a resource
+  in the middle of Unreal's acceleration structure builds. Inferred, not
+  re-run.
+- **New test: `tier11probe hw -openlist`.** It keeps the list holding the
+  top-level build open while two other submissions run to completion, then
+  closes it. The 0.38.0 DLL is killed by it (0xC0000409; under `-debug` the
+  device is removed), 0.38.1 passes, clean under the debug layer, and reads
+  the right instance data. Implies `-gpuinst`.
+- The DLL deployed as 0.38.0 logged itself as 0.37.0: it was built before the
+  version number was bumped. Its code was 0.38.0. Deployment now checks the
+  version resource of the copied files, not only that their hashes match the
+  build.
+
 ## 0.38.0
 
 - **`SV_GroupID`, `SV_GroupThreadID` and `SV_GroupIndex` now lower.** 24 of

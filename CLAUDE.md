@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.38.0.
+proxy/version.h, and is currently 0.38.1.
 
 ## Current position (2026-09-23)
 
@@ -33,6 +33,18 @@ What now stops the rest, 129 refusals, and the composition is the signal:
          refused separately.
      24  loop isolation, a rawBufferLoad or textureLoad in the chain.
       1  assembler: use of undefined value.
+
+**0.38.1 FIXED A SHIM CRASH THAT 0.38.0 RUNS HIT 1 IN 5.** Five Escher runs
+at 0.38.0 (54 to 58 built, GroupId refusals gone as predicted); run 2 died
+on Unreal's `FD3D12CommandList::Close` returning `E_INVALIDARG`, from the
+crash report, not the shim log. The shim freed its TLAS instance readback
+buffer on ANY submission, including one from another thread while the list
+holding the copy was still open, and parsed the buffer before the GPU had
+written it. Now stamped per recording list, one fence per queue.
+`tier11probe hw -openlist` reproduces it offline: 0.38.0 dies, 0.38.1 passes.
+Probably also the 0.36.6 `#921` + `DEVICE_HUNG` run. **Where the shim keeps a
+resource alive across submissions, "recorded" is not "submitted" when an
+application records on several threads.**
 
 **GroupId: DONE in 0.38.0**, the 24 above. `SV_GroupID`, `SV_GroupThreadID`
 and `SV_GroupIndex` are rebuilt from `DispatchRaysIndex` and numthreads, which
@@ -2520,7 +2532,9 @@ Dev machine (Windows x64), everything under `C:\DW`:
   in to measure the shim instead. `tier11probe.exe [warp|hw]` runs the three
   feature probes, and takes `-debug` for the debug layer, `-gfxsplit` for
   graphics state across a split, `-batchsplit` for dispatch batching and its
-  control, `-time` and `-pipeline` for the split cost, and `-gpuinst` to put
+  control, `-time` and `-pipeline` for the split cost, `-openlist` for a
+  readback recorded into a list that stays open across other submissions,
+  and `-gpuinst` to put
   the TLAS instance descriptions in GPU-only memory so the shim has to copy
   them out instead of mapping them.
   `build_rewriter.bat` builds the C++ rewriter and `phase5out\dxrw.exe`,

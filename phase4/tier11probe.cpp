@@ -90,6 +90,13 @@ static bool g_batchSplit = false;
 // builds them in a compute pass would. The shim can then no longer just
 // map them, and has to copy them out and read them after a submission.
 static bool g_gpuInst = false;
+// -openlist: while the list holding the top-level build is still OPEN, submit
+// other lists on the same queue and let the GPU finish them. That is what an
+// engine recording on several threads does all the time. The shim copies GPU
+// instance data out through a readback buffer it owns, and up to 0.38.0 it
+// stamped and then freed that buffer on ANY submission, so this list closed
+// with E_INVALIDARG: it referenced a deleted resource. Implies -gpuinst.
+static bool g_openList = false;
 static int g_filler = 4;
 static int g_frames = 60;
 static uint32_t g_rayCount = 1u << 20;   // 1M rays, enough that Pascal does real work
@@ -415,6 +422,40 @@ static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
     desc.DestAccelerationStructureData = result->GetGPUVirtualAddress();
     g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
     UavBarrier(g.list.Get(), result.Get());
+    if (g_openList && inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+        // Two unrelated submissions while g.list stays open, each waited on,
+        // so a shim that stamps on any submission sees its fence pass and
+        // releases the buffer the open list still references.
+        ComPtr<ID3D12CommandAllocator> a2;
+        ComPtr<ID3D12GraphicsCommandList> l2;
+        HR(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&a2)), "openlist allocator");
+        HR(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a2.Get(),
+            nullptr, IID_PPV_ARGS(&l2)), "openlist list");
+        for (int k = 0; k < 2; ++k) {
+            HR(l2->Close(), "openlist other Close");
+            ID3D12CommandList* other[] = { l2.Get() };
+            g.queue->ExecuteCommandLists(1, other);
+            HR(g.queue->Signal(g.fence.Get(), ++g.fenceVal), "openlist Signal");
+            HR(g.fence->SetEventOnCompletion(g.fenceVal, g.evt), "openlist wait");
+            WaitForSingleObject(g.evt, INFINITE);
+            HR(a2->Reset(), "openlist allocator Reset");
+            HR(l2->Reset(a2.Get(), nullptr), "openlist list Reset");
+        }
+        const HRESULT hr = g.list->Close();
+        std::printf("   -openlist: two other submissions ran while the build's list was open;\n"
+                    "              its Close returned hr=0x%08X (%s)\n",
+                    (unsigned)hr, SUCCEEDED(hr) ? "PASS" : "FAIL, the shim freed a buffer it still used");
+        if (FAILED(hr)) Throw("Close after -openlist", hr);
+        ID3D12CommandList* lists[] = { g.list.Get() };
+        g.queue->ExecuteCommandLists(1, lists);
+        HR(g.queue->Signal(g.fence.Get(), ++g.fenceVal), "queue Signal");
+        HR(g.fence->SetEventOnCompletion(g.fenceVal, g.evt), "SetEventOnCompletion");
+        WaitForSingleObject(g.evt, INFINITE);
+        HR(g.alloc->Reset(), "allocator Reset");
+        HR(g.list->Reset(g.alloc.Get(), nullptr), "cmdlist Reset");
+        return result;
+    }
     g.flush();
     return result;
 }
@@ -2245,6 +2286,7 @@ int main(int argc, char** argv) {
             else if (std::strcmp(argv[i], "-gfxsplit") == 0) g_gfxSplit = true;
             else if (std::strcmp(argv[i], "-batchsplit") == 0) g_batchSplit = true;
             else if (std::strcmp(argv[i], "-gpuinst") == 0) g_gpuInst = true;
+            else if (std::strcmp(argv[i], "-openlist") == 0) g_gpuInst = g_openList = true;
             else if (std::strcmp(argv[i], "-filler") == 0 && i + 1 < argc) g_filler = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-frames") == 0 && i + 1 < argc) g_frames = std::atoi(argv[++i]);
             else if (std::strcmp(argv[i], "-rays") == 0 && i + 1 < argc) g_rayCount = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
