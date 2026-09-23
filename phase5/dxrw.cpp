@@ -2,21 +2,52 @@
 //
 //   dxrw lower <in.ll> <out.ll>        lower a RayQuery module
 //   dxrw analyze <in.ll>               print what the analysis found
-//   dxrw rewrite <in.dxil> <out.dxil>  the WHOLE path a proxy would take:
-//                                      container in, signed container out
+//   dxrw rewrite <in.dxil> <out.dxil> [g:c,...]
+//                                      the WHOLE path a proxy would take:
+//                                      container in, signed container out,
+//                                      record constants baked for the given
+//                                      (geometry, contribution) pairs, 0:0 by
+//                                      default, exactly as at pipeline creation
+//   dxrw bake <lowered.ll> <out.ll> <g:c,...>
+//                                      bake record constants into hit shader
+//                                      copies, see proxy/rewriter/rq_bake.h
 //
 // The port's correctness bar is BYTE-IDENTICAL output to
 // phase5/rewriter/dxrewrite.py on every case in the regression. That is a far
 // stronger oracle than "it renders correctly", and it is why this exists.
 #define _CRT_SECURE_NO_WARNINGS
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "../proxy/rewriter/ll_model.h"
 #include "../proxy/rewriter/rq_analyze.h"
 #include "../proxy/rewriter/rq_lower.h"
+#include "../proxy/rewriter/rq_bake.h"
 #include "../proxy/rewriter/dxc_host.h"
+
+// "g:c,g:c" -> pairs. False on anything malformed, which the Python rejects
+// too, so the two refuse the same inputs.
+static bool ParsePairs(const std::string& s, std::vector<rq::RecordPair>* out) {
+    out->clear();
+    size_t b = 0;
+    for (;;) {
+        const size_t e = s.find(',', b);
+        const std::string item = s.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        const size_t colon = item.find(':');
+        if (colon == std::string::npos || colon == 0 || colon + 1 >= item.size()) return false;
+        char* end = nullptr;
+        const unsigned long g = std::strtoul(item.c_str(), &end, 10);
+        if (end != item.c_str() + colon) return false;
+        const unsigned long c = std::strtoul(item.c_str() + colon + 1, &end, 10);
+        if (*end != '\0') return false;
+        out->push_back({ static_cast<uint32_t>(g), static_cast<uint32_t>(c) });
+        if (e == std::string::npos) break;
+        b = e + 1;
+    }
+    return true;
+}
 
 static bool ReadAll(const char* path, std::string& out) {
     FILE* f = std::fopen(path, "rb");
@@ -83,18 +114,30 @@ int main(int argc, char** argv) {
         std::string err;
         if (!dxch::Available(&err)) { std::printf("DXC unavailable: %s\n", err.c_str()); return 1; }
 
-        struct Ctx { int pattern = 0; std::string desc; };
+        struct Ctx { int pattern = 0; std::string desc; std::vector<rq::RecordPair> pairs; };
         Ctx ctx;
+        ctx.pairs = { { 0u, 0u } };
+        if (argc >= 5 && !ParsePairs(argv[4], &ctx.pairs)) {
+            std::printf("bad pair list %s, expected g:c,g:c,...\n", argv[4]);
+            return 1;
+        }
         auto xform = [](const std::string& in, std::string* out, std::string* why,
                         void* c) -> bool {
+            Ctx* x = static_cast<Ctx*>(c);
             llm::Module m(llm::Normalize(in));
             auto a = rq::Analyze(m);
             if (!a.ok) { *why = a.error; return false; }
             auto l = rq::Lower(m, a.query);
             if (!l.ok) { *why = l.error; return false; }
-            static_cast<Ctx*>(c)->pattern = a.query.patternNum;
-            static_cast<Ctx*>(c)->desc = a.query.patternDesc;
+            x->pattern = a.query.patternNum;
+            x->desc = a.query.patternDesc;
             *out = l.text;
+            // The proxy never emits a record READ: see rq_bake.h.
+            if (a.query.needsRecordConstants) {
+                auto b = rq::Bake(l.text, x->pairs);
+                if (!b.ok) { *why = b.error; return false; }
+                *out = b.text;
+            }
             return true;
         };
         std::vector<uint8_t> outBytes;
@@ -109,6 +152,22 @@ int main(int argc, char** argv) {
                     ctx.desc.c_str());
         return 0;
     }
-    std::printf("usage:\n  dxrw lower <in.ll> <out.ll>\n  dxrw analyze <in.ll>\n");
+    if (argc >= 5 && std::string(argv[1]) == "bake") {
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        std::vector<rq::RecordPair> pairs;
+        if (!ParsePairs(argv[4], &pairs)) {
+            std::fprintf(stderr, "REFUSED: bad pair list %s\n", argv[4]);
+            return 2;
+        }
+        auto b = rq::Bake(raw, pairs);
+        if (!b.ok) { std::fprintf(stderr, "REFUSED: %s\n", b.error.c_str()); return 2; }
+        if (!WriteAll(argv[3], b.text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
+        std::printf("baked %s -> %s (%s)\n", argv[2], argv[3], argv[4]);
+        return 0;
+    }
+    std::printf("usage:\n  dxrw lower <in.ll> <out.ll>\n  dxrw analyze <in.ll>\n"
+                "  dxrw rewrite <in.dxil> <out.dxil> [g:c,...]\n"
+                "  dxrw bake <lowered.ll> <out.ll> <g:c,...>\n");
     return 1;
 }

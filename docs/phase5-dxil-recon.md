@@ -1857,6 +1857,22 @@ and only hit records grow to 64.
 Four accessors, one mechanism, and 120 of the 157 refusals a real Unreal
 session produced.
 
+**SUPERSEDED IN 0.37.0, and the SFI0 gate was not the whole story.** The
+container is valid and D3D12 accepts it, but on the GTX 1070 a hit shader that
+READS a cbuffer bound by a local root signature makes the driver access-violate
+inside `CreateStateObject`, intermittently, on a cold compile. A root CBV
+descriptor instead of root constants does not help, and neither does a
+different register space. See `phase5/cases/driver-crash/README.md`.
+
+`lower()` still emits the read, because lowering is per shader and the numbers
+are per scene. A separate pass, `phase5/rewriter/bake.py` and
+`proxy/rewriter/rq_bake.cpp`, then replaces every read with an immediate and
+emits one copy of the hit shaders per (geometry, contribution) pair. The shim
+builds one hit group per pair and points each record at the copy carrying its
+numbers, so records are back to 32 bytes and there is no local root signature
+at all. The pairs are not known when the pipeline is created, so the shim bakes
+`(0, 0)` then and bakes again at the first dispatch that needs more.
+
 The test had to exist before the feature could be believed. Every scene in this
 project had ONE geometry per structure, so every correct answer was 0 and a
 lowering that dropped the index entirely would have passed. `raytest --geom`

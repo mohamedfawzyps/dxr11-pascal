@@ -120,7 +120,7 @@ $cases = @(
     # and with it geometry 1. The gap MOVES, so neither accessor can be a
     # constant and both have to be right.
     @{ name = 'geom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom');
-       desc = 'GeometryIndex, from a local root signature constant in the record' },
+       desc = 'GeometryIndex, baked into the hit shader copy its record points at' },
     # RayFlags (195), read BOTH inside the Proceed loop and outside it, which
     # take different routes: dx.op.rayFlags in the generated any-hit, where it
     # is legal, and a folded constant in the raygen, where it is not. A
@@ -174,7 +174,17 @@ $cases = @(
     @{ name = 'param'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_param.hlsl');
        desc = 'loop body reads a cbuffer threshold and a ray-index value from outside' },
     @{ name = 'geomcontrib'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib');
-       desc = 'the same, with a nonzero contribution, so the record index is contribution + geometry' }
+       desc = 'the same, with a nonzero contribution, so the record index is contribution + geometry' },
+    # The record constants are BAKED into a copy of the hit shaders per pair,
+    # because a hit shader reading a local root signature crashes the Pascal
+    # driver (phase5/cases/driver-crash/). `geom` only copies AnyHit and
+    # ClosestHit; this copies all four, and needs a triangle AND a procedural
+    # hit group per pair. Every commit is gated on the contribution the record
+    # reports, so a record pointing at the wrong copy loses its whole instance:
+    # measured, with every record forced onto copy 0, 7396 mismatches, which
+    # is exactly the procedural hit count.
+    @{ name = 'bothgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_bothgeom.hlsl', '--mixed', '--contrib');
+       desc = 'both kinds, each commit gated on its baked contribution, four hit shaders copied per pair' }
 )
 
 $failed = 0

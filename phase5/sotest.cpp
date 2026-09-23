@@ -89,6 +89,10 @@ struct Shape {
     bool intersection = false;
     bool both = false;
     bool recordConstants = false;
+    // How many copies of the hit shaders the library carries, one per baked
+    // (geometry, contribution) pair, exported as <name>_<k>. 0 for a library
+    // written before 0.37.0 or one that reads no record constant.
+    UINT baked = 0;
     bool known = false;
 };
 
@@ -130,14 +134,17 @@ Shape ReadShape(const std::string& libPath) {
     const size_t n = fread(line, 1, sizeof(line) - 1, f);
     fclose(f);
     if (n == 0) return s;
-    int a = 0, i = 0, b = 0, r = 0;
-    if (sscanf_s(line, "anyhit=%d intersection=%d both=%d recordconstants=%d",
-                 &a, &i, &b, &r) != 4)
+    int a = 0, i = 0, b = 0, r = 0, k = 0;
+    const int got = sscanf_s(line,
+                             "anyhit=%d intersection=%d both=%d recordconstants=%d baked=%d",
+                             &a, &i, &b, &r, &k);
+    if (got < 4)
         return s;
     s.anyhit = a != 0;
     s.intersection = i != 0;
     s.both = b != 0;
     s.recordConstants = r != 0;
+    s.baked = got == 5 && k > 0 ? static_cast<UINT>(k) : 0;
     s.known = true;
     return s;
 }
@@ -253,33 +260,68 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     D3D12_GLOBAL_ROOT_SIGNATURE grs{};
     grs.pGlobalRootSignature = out.globalRs;
 
-    // SOTEST_HITGROUPS=N builds N hit groups from AnyHit_i / ClosestHit_i,
-    // the shape the baked-constants fix would produce, and skips the local
-    // root signature entirely. See phase5/cases/driver-crash/README.md.
-    const UINT baked = BakedHitGroups();
-    std::vector<std::wstring> bakedNames, bakedAh, bakedCh;
-    std::vector<D3D12_HIT_GROUP_DESC> bakedDescs(baked);
+    // A BAKED library (shim 0.37.0 on, `baked=N` in the shape) carries N
+    // copies of its hit shaders, <name>_<k>, one per (geometry, contribution)
+    // pair, and no local root signature: the same state object the shim
+    // builds, see BuildStateObject in proxy/rq_pipeline.cpp. SOTEST_HITGROUPS=N
+    // forces that for a library whose shape file predates the field, which is
+    // how the stubs in phase5/cases/driver-crash/ were measured.
+    const UINT baked = shape.baked ? shape.baked : BakedHitGroups();
+    std::vector<std::wstring> bn;   // per copy: group, closest, any, isect, group proc, closest proc
+    bn.reserve(baked * 6);
     for (UINT i = 0; i < baked; ++i) {
-        bakedNames.push_back(L"HitGroup_" + std::to_wstring(i));
-        bakedAh.push_back(L"AnyHit_" + std::to_wstring(i));
-        bakedCh.push_back(L"ClosestHit_" + std::to_wstring(i));
+        const std::wstring s = L"_" + std::to_wstring(i);
+        bn.push_back(L"HitGroup" + s);
+        bn.push_back(L"ClosestHit" + s);
+        bn.push_back(L"AnyHit" + s);
+        bn.push_back(L"Isect" + s);
+        bn.push_back(L"HitGroupProc" + s);
+        bn.push_back(L"ClosestHitProc" + s);
     }
+    std::vector<D3D12_HIT_GROUP_DESC> bakedDescs;
     for (UINT i = 0; i < baked; ++i) {
-        bakedDescs[i].HitGroupExport = bakedNames[i].c_str();
-        bakedDescs[i].Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-        bakedDescs[i].AnyHitShaderImport = bakedAh[i].c_str();
-        bakedDescs[i].ClosestHitShaderImport = bakedCh[i].c_str();
+        const std::wstring* nm = &bn[i * 6];
+        D3D12_HIT_GROUP_DESC g{};
+        g.HitGroupExport = nm[0].c_str();
+        g.ClosestHitShaderImport = nm[1].c_str();
+        if (shape.both) {
+            g.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+            g.AnyHitShaderImport = nm[2].c_str();
+            bakedDescs.push_back(g);
+            D3D12_HIT_GROUP_DESC p{};
+            p.HitGroupExport = nm[4].c_str();
+            p.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+            p.IntersectionShaderImport = nm[3].c_str();
+            p.ClosestHitShaderImport = nm[5].c_str();
+            bakedDescs.push_back(p);
+        } else if (shape.intersection) {
+            g.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+            g.IntersectionShaderImport = nm[3].c_str();
+            bakedDescs.push_back(g);
+        } else {
+            g.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+            if (shape.anyhit) g.AnyHitShaderImport = nm[2].c_str();
+            bakedDescs.push_back(g);
+        }
     }
+    if (!quiet && baked)
+        std::printf("  baked: %u cop%s of the hit shaders, no local root signature\n",
+                    baked, baked == 1 ? "y" : "ies");
 
-    std::vector<D3D12_STATE_SUBOBJECT> subs(16 + baked);
+    std::vector<D3D12_STATE_SUBOBJECT> subs(16 + bakedDescs.size());
     UINT n = 0;
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc };
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
-    if (shape.both) subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
+    // The unsuffixed groups only exist in a library that was not baked. The
+    // SOTEST_HITGROUPS stubs are the exception: they kept the originals, and
+    // building them too is what those measurements did.
+    if (!shape.baked) {
+        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
+        if (shape.both) subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
+    }
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc };
-    for (UINT i = 0; i < baked; ++i)
-        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &bakedDescs[i] };
+    for (auto& g : bakedDescs)
+        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &g };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc };
     if (out.globalRs)

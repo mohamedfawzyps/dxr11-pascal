@@ -10,9 +10,14 @@
 #include "rewriter/ll_model.h"
 #include "rewriter/rq_analyze.h"
 #include "rewriter/rq_lower.h"
+#include "rewriter/rq_bake.h"
+
+// Defined below, next to the rest of the crash instrumentation.
+static void LogVideoMemory(ID3D12Device5* dev, const char* when);
 
 #include "as_tracker.h"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <cstring>
@@ -39,11 +44,28 @@ struct Xform {
     bool hasIntersection = false;
     bool needsBoth = false;
     // Does the shader ask what geometry or what instance contribution it hit?
-    // Only then does the state object get a local root signature and only then
-    // do hit records grow. Both cost something on every scene.
+    // Only then are the hit shaders baked, one copy per pair below.
     bool needsRecordConstants = false;
     int threads[3] = { 1, 1, 1 };
+    // IN: the (geometryIndex, contribution) pairs to bake. At pipeline
+    // creation the scene is unknown and this is the single pair (0, 0), which
+    // is what the old local root signature table held before the first
+    // dispatch too.
+    std::vector<rq::RecordPair> pairs{ { 0u, 0u } };
 };
+
+// What the shim decided about this shader, in one line, so sotest can rebuild
+// the same state object instead of inferring it from the bytes. `baked` is how
+// many copies of the hit shaders the library carries, 0 when none.
+std::string ShapeLine(const Xform& f) {
+    char b[192];
+    std::snprintf(b, sizeof(b),
+                  "anyhit=%d intersection=%d both=%d recordconstants=%d baked=%u\n",
+                  f.hasAnyHit ? 1 : 0, f.hasIntersection ? 1 : 0,
+                  f.needsBoth ? 1 : 0, f.needsRecordConstants ? 1 : 0,
+                  f.needsRecordConstants ? static_cast<unsigned>(f.pairs.size()) : 0u);
+    return std::string(b);
+}
 
 bool DoLower(const std::string& in, std::string* out, std::string* why, void* ctx) {
     Xform* x = static_cast<Xform*>(ctx);
@@ -62,6 +84,190 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     x->needsBoth = a.query.NeedsBoth();
     x->needsRecordConstants = a.query.needsRecordConstants;
     *out = l.text;
+    // Never hand the driver a hit shader that READS the record: bake it in.
+    if (x->needsRecordConstants) {
+        auto b = rq::Bake(l.text, x->pairs);
+        if (!b.ok) { *why = b.error; return false; }
+        *out = b.text;
+    }
+    return true;
+}
+
+// Everything the table needs from one state object.
+struct Built {
+    ID3D12StateObject* so = nullptr;
+    uint8_t idRay[32]{}, idMiss[32]{}, idNullTri[32]{}, idNullProc[32]{};
+    std::vector<std::array<uint8_t, 32>> idHit, idHitProc;
+};
+
+// Build the state object for a lowered (and, with record constants, baked)
+// library, and read back every identifier the table needs.
+//
+// The application's compute root signature becomes the GLOBAL root signature,
+// which is what makes its existing bindings work unchanged. There is NO local
+// root signature: the record constants are baked into the hit shaders.
+bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
+                      const Xform& x, ID3D12RootSignature* globalRs,
+                      Built* out, std::string* why) {
+    const size_t copies = x.needsRecordConstants ? x.pairs.size() : 1;
+    auto Name = [&](const wchar_t* base, size_t k) {
+        std::wstring n = base;
+        if (x.needsRecordConstants) n += L"_" + std::to_wstring(k);
+        return n;
+    };
+
+    D3D12_DXIL_LIBRARY_DESC libDesc{};
+    libDesc.DXILLibrary.pShaderBytecode = lib.data();
+    libDesc.DXILLibrary.BytecodeLength = lib.size();
+
+    // A hit group is one TYPE, taking an intersection shader where the other
+    // takes an any-hit. A shader that commits both kinds therefore needs TWO,
+    // each with its own closest-hit, because one reports committed status 1
+    // and the other 2. With record constants there is one of each PER PAIR.
+    //
+    // The names live in vectors that are fully built before any descriptor
+    // points into them, so nothing reallocates under a pointer.
+    std::vector<std::wstring> names;
+    names.reserve(copies * 6);
+    std::vector<D3D12_HIT_GROUP_DESC> hgs(copies), hgProcs(x.needsBoth ? copies : 0);
+    for (size_t k = 0; k < copies; ++k) {
+        names.push_back(Name(L"HitGroup", k));
+        names.push_back(Name(L"ClosestHit", k));
+        names.push_back(Name(L"AnyHit", k));
+        names.push_back(Name(L"Isect", k));
+        names.push_back(Name(L"HitGroupProc", k));
+        names.push_back(Name(L"ClosestHitProc", k));
+    }
+    for (size_t k = 0; k < copies; ++k) {
+        const std::wstring* n = &names[k * 6];
+        D3D12_HIT_GROUP_DESC& hg = hgs[k];
+        hg.HitGroupExport = n[0].c_str();
+        hg.ClosestHitShaderImport = n[1].c_str();
+        if (x.needsBoth) {
+            hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+            hg.AnyHitShaderImport = n[2].c_str();
+            D3D12_HIT_GROUP_DESC& hp = hgProcs[k];
+            hp.HitGroupExport = n[4].c_str();
+            hp.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+            hp.IntersectionShaderImport = n[3].c_str();
+            hp.ClosestHitShaderImport = n[5].c_str();
+        } else if (x.hasIntersection) {
+            hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+            hg.IntersectionShaderImport = n[3].c_str();
+        } else {
+            hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+            if (x.hasAnyHit) hg.AnyHitShaderImport = n[2].c_str();
+        }
+    }
+
+    D3D12_RAYTRACING_SHADER_CONFIG sc{};
+    sc.MaxPayloadSizeInBytes = kPayloadBytes;
+    sc.MaxAttributeSizeInBytes = kAttrBytes;
+
+    // Inline queries do not recurse, so one level is all a lowered shader can
+    // ever need. The brief says as much.
+    D3D12_RAYTRACING_PIPELINE_CONFIG pc{};
+    pc.MaxTraceRecursionDepth = 1;
+
+    D3D12_GLOBAL_ROOT_SIGNATURE grs{};
+    grs.pGlobalRootSignature = globalRs;
+
+    // Two more hit groups that never commit, one of each type. Which one a
+    // scene needs is not knowable here, so both exist and the table picks.
+    // A TRIANGLES group whose any-hit always ignores sees every triangle
+    // candidate and rejects it; a PROCEDURAL group whose intersection shader
+    // returns reports nothing. Neither carries a closest-hit, because neither
+    // can ever reach one, and neither reads the record, so neither is copied.
+    D3D12_HIT_GROUP_DESC hgNullTri{};
+    hgNullTri.HitGroupExport = L"HitGroupNullTri";
+    hgNullTri.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+    hgNullTri.AnyHitShaderImport = L"AnyHitNull";
+
+    D3D12_HIT_GROUP_DESC hgNullProc{};
+    hgNullProc.HitGroupExport = L"HitGroupNullProc";
+    hgNullProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+    hgNullProc.IntersectionShaderImport = L"IsectNull";
+
+    std::vector<D3D12_STATE_SUBOBJECT> subs;
+    subs.reserve(8 + hgs.size() + hgProcs.size());
+    subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc });
+    for (size_t k = 0; k < copies; ++k) {
+        subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgs[k] });
+        if (x.needsBoth)
+            subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProcs[k] });
+    }
+    subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri });
+    subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc });
+    subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
+    subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
+    if (grs.pGlobalRootSignature)
+        subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs });
+
+    D3D12_STATE_OBJECT_DESC sod{};
+    sod.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+    sod.NumSubobjects = static_cast<UINT>(subs.size());
+    sod.pSubobjects = subs.data();
+
+    ID3D12StateObject* so = nullptr;
+    // Logged BEFORE the call, and this is not a debug leftover. A generated
+    // library once killed the device inside CreateStateObject, so that call
+    // never returned and never logged a result. Without a line in front of it
+    // the log ends on whatever came before and the call has to be inferred
+    // from an absence. Now the last line in a dead log NAMES the call.
+    LogVideoMemory(dev, "before CreateStateObject");
+    ProxyLog("[dxr-tier-11-proxy-log] about to call CreateStateObject: %zu byte "
+             "library, %u subobjects, %zu hit group cop%s, global root signature "
+             "%p. If this is the last line in the log, that call is where the "
+             "device went.\n",
+             lib.size(), static_cast<unsigned>(subs.size()), copies,
+             copies == 1 ? "y" : "ies", (void*)globalRs);
+    HRESULT hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&so));
+    if (FAILED(hr)) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "CreateStateObject failed (hr=0x%08X)",
+                      static_cast<unsigned>(hr));
+        *why = buf;
+        return false;
+    }
+
+    ID3D12StateObjectProperties* props = nullptr;
+    if (FAILED(so->QueryInterface(IID_PPV_ARGS(&props)))) {
+        so->Release();
+        *why = "no ID3D12StateObjectProperties on the state object";
+        return false;
+    }
+
+    const void* idRay = props->GetShaderIdentifier(L"RayGen");
+    const void* idMiss = props->GetShaderIdentifier(L"Miss");
+    const void* idNullTri = props->GetShaderIdentifier(L"HitGroupNullTri");
+    const void* idNullProc = props->GetShaderIdentifier(L"HitGroupNullProc");
+    bool ok = idRay && idMiss && idNullTri && idNullProc;
+    for (size_t k = 0; ok && k < copies; ++k) {
+        const void* h = props->GetShaderIdentifier(names[k * 6].c_str());
+        if (!h) { ok = false; break; }
+        std::array<uint8_t, 32> a{};
+        std::memcpy(a.data(), h, kIdSize);
+        out->idHit.push_back(a);
+        if (x.needsBoth) {
+            const void* p = props->GetShaderIdentifier(names[k * 6 + 4].c_str());
+            if (!p) { ok = false; break; }
+            std::memcpy(a.data(), p, kIdSize);
+            out->idHitProc.push_back(a);
+        }
+    }
+    if (!ok) {
+        props->Release(); so->Release();
+        out->idHit.clear(); out->idHitProc.clear();
+        *why = "the state object does not export RayGen, Miss, every hit group "
+               "and the two rejecting hit groups";
+        return false;
+    }
+    std::memcpy(out->idRay, idRay, kIdSize);
+    std::memcpy(out->idMiss, idMiss, kIdSize);
+    std::memcpy(out->idNullTri, idNullTri, kIdSize);
+    std::memcpy(out->idNullProc, idNullProc, kIdSize);
+    props->Release();
+    out->so = so;
     return true;
 }
 
@@ -72,8 +278,8 @@ Dxr11RayQueryPso::~Dxr11RayQueryPso() {
     // us through it again.
     UnregisterCarrier(this);
     for (ID3D12Resource* r : m_retired) r->Release();
+    for (ID3D12StateObject* s : m_retiredSo) s->Release();
     if (m_sbt) m_sbt->Release();
-    if (m_localRootSig) m_localRootSig->Release();
     if (m_so) m_so->Release();
     if (m_rootSig) m_rootSig->Release();
 }
@@ -309,16 +515,6 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
 
     // --- rewrite ------------------------------------------------------------
     Xform x;
-    // What the shim decided about this shader, in one line, so sotest can
-    // rebuild the same state object instead of inferring it from the bytes.
-    auto ShapeLine = [](const Xform& f) {
-        char b[160];
-        std::snprintf(b, sizeof(b),
-                      "anyhit=%d intersection=%d both=%d recordconstants=%d\n",
-                      f.hasAnyHit ? 1 : 0, f.hasIntersection ? 1 : 0,
-                      f.needsBoth ? 1 : 0, f.needsRecordConstants ? 1 : 0);
-        return std::string(b);
-    };
     std::vector<uint8_t> lib;
     std::string err;
     if (!dxch::RewriteContainer(desc->CS.pShaderBytecode,
@@ -346,208 +542,41 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
                     ShapeLine(x).c_str());
 
     // --- state object -------------------------------------------------------
-    // The application's compute root signature becomes the GLOBAL root
-    // signature, which is what makes its existing bindings work unchanged.
-    D3D12_DXIL_LIBRARY_DESC libDesc{};
-    libDesc.DXILLibrary.pShaderBytecode = lib.data();
-    libDesc.DXILLibrary.BytecodeLength = lib.size();
-
-    // A hit group is one TYPE, taking an intersection shader where the other
-    // takes an any-hit. A shader that commits both kinds therefore needs TWO,
-    // each with its own closest-hit, because one reports committed status 1
-    // and the other 2.
-    D3D12_HIT_GROUP_DESC hg{};
-    hg.HitGroupExport = L"HitGroup";
-    hg.ClosestHitShaderImport = L"ClosestHit";
-    if (x.needsBoth) {
-        hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-        hg.AnyHitShaderImport = L"AnyHit";
-    } else if (x.hasIntersection) {
-        hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
-        hg.IntersectionShaderImport = L"Isect";
-    } else {
-        hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-        if (x.hasAnyHit) hg.AnyHitShaderImport = L"AnyHit";
-    }
-
-    D3D12_HIT_GROUP_DESC hgProc{};
-    hgProc.HitGroupExport = L"HitGroupProc";
-    hgProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
-    hgProc.IntersectionShaderImport = L"Isect";
-    hgProc.ClosestHitShaderImport = L"ClosestHitProc";
-
-    D3D12_RAYTRACING_SHADER_CONFIG sc{};
-    sc.MaxPayloadSizeInBytes = kPayloadBytes;
-    sc.MaxAttributeSizeInBytes = kAttrBytes;
-
-    // Inline queries do not recurse, so one level is all a lowered shader can
-    // ever need. The brief says as much.
-    D3D12_RAYTRACING_PIPELINE_CONFIG pc{};
-    pc.MaxTraceRecursionDepth = 1;
-
-    D3D12_GLOBAL_ROOT_SIGNATURE grs{};
-    grs.pGlobalRootSignature = desc->pRootSignature;
-
-    // Two more hit groups that never commit, one of each type. Which one a
-    // scene needs is not knowable here, so both exist and the table picks.
-    // A TRIANGLES group whose any-hit always ignores sees every triangle
-    // candidate and rejects it; a PROCEDURAL group whose intersection shader
-    // returns reports nothing. Neither carries a closest-hit, because neither
-    // can ever reach one.
-    D3D12_HIT_GROUP_DESC hgNullTri{};
-    hgNullTri.HitGroupExport = L"HitGroupNullTri";
-    hgNullTri.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-    hgNullTri.AnyHitShaderImport = L"AnyHitNull";
-
-    D3D12_HIT_GROUP_DESC hgNullProc{};
-    hgNullProc.HitGroupExport = L"HitGroupNullProc";
-    hgNullProc.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
-    hgNullProc.IntersectionShaderImport = L"IsectNull";
-
-    // The local root signature, when the shader asks what it hit.
-    //
-    // Two root constants at b0, space1: the geometry index and the instance
-    // contribution. space1 keeps them clear of anything the application's own
-    // global root signature binds, which the shim must not disturb.
-    //
-    // Associated with the HIT GROUPS only, never made the default. A default
-    // local root signature would apply to the raygen and miss records too, and
-    // those would then need room for arguments they never read.
-    ID3D12RootSignature* localRs = nullptr;
-    D3D12_LOCAL_ROOT_SIGNATURE lrs{};
-    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc{};
-    const wchar_t* hitExports[4] = {};
-    UINT hitExportCount = 0;
-    if (x.needsRecordConstants) {
-        D3D12_ROOT_PARAMETER rp{};
-        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        rp.Constants.ShaderRegister = 0;
-        rp.Constants.RegisterSpace = 1;
-        rp.Constants.Num32BitValues = 2;
-
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 1;
-        rsd.pParameters = &rp;
-        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
-
-        ID3DBlob* blob = nullptr;
-        ID3DBlob* err = nullptr;
-        HRESULT rhr = D3D12SerializeRootSignature(
-            &rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &err);
-        if (SUCCEEDED(rhr))
-            rhr = dev->CreateRootSignature(0, blob->GetBufferPointer(),
-                                           blob->GetBufferSize(),
-                                           IID_PPV_ARGS(&localRs));
-        if (blob) blob->Release();
-        if (err) err->Release();
-        if (FAILED(rhr) || !localRs) {
-            if (why) *why = "cannot create the local root signature that carries "
-                            "the geometry index";
-            return nullptr;
-        }
-        lrs.pLocalRootSignature = localRs;
-
-        hitExports[hitExportCount++] = L"HitGroup";
-        if (x.needsBoth) hitExports[hitExportCount++] = L"HitGroupProc";
-        hitExports[hitExportCount++] = L"HitGroupNullTri";
-        hitExports[hitExportCount++] = L"HitGroupNullProc";
-        assoc.NumExports = hitExportCount;
-        assoc.pExports = hitExports;
-    }
-
-    D3D12_STATE_SUBOBJECT subs[11]{};
-    UINT n = 0;
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc };
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
-    if (x.needsBoth)
-        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri };
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc };
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc };
-    subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc };
-    if (grs.pGlobalRootSignature)
-        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs };
-    if (x.needsRecordConstants) {
-        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lrs };
-        // The association has to point at the SUBOBJECT, so it is filled in
-        // only once that subobject has its final address in the array.
-        assoc.pSubobjectToAssociate = &subs[n - 1];
-        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
-                      &assoc };
-    }
-
-    D3D12_STATE_OBJECT_DESC sod{};
-    sod.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
-    sod.NumSubobjects = n;
-    sod.pSubobjects = subs;
-
-    ID3D12StateObject* so = nullptr;
-    // Logged BEFORE the call, and this is not a debug leftover. One specific
-    // generated library kills the device inside CreateStateObject, so that
-    // call never returns and never logs a result. Without a line in front of
-    // it the log ends on whatever came before and the call has to be inferred
-    // from an absence. Now the last line in a dead log NAMES the call.
-    LogVideoMemory(dev, "before CreateStateObject");
-    ProxyLog("[dxr-tier-11-proxy-log] about to call CreateStateObject: %zu byte "
-             "library, %u subobjects, global root signature %p. If this is the "
-             "last line in the log, that call is where the device went.\n",
-             lib.size(), static_cast<unsigned>(n), (void*)desc->pRootSignature);
-    HRESULT hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&so));
-    if (FAILED(hr)) {
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "CreateStateObject failed (hr=0x%08X)",
-                      static_cast<unsigned>(hr));
-        *why = buf;
+    Built b;
+    if (!BuildStateObject(dev, lib, x, desc->pRootSignature, &b, why))
         return nullptr;
-    }
-
-    ID3D12StateObjectProperties* props = nullptr;
-    if (FAILED(so->QueryInterface(IID_PPV_ARGS(&props)))) {
-        so->Release();
-        *why = "no ID3D12StateObjectProperties on the state object";
-        return nullptr;
-    }
-
-    // --- shader table -------------------------------------------------------
-    const void* idRay = props->GetShaderIdentifier(L"RayGen");
-    const void* idMiss = props->GetShaderIdentifier(L"Miss");
-    const void* idHit = props->GetShaderIdentifier(L"HitGroup");
-    const void* idNullTri = props->GetShaderIdentifier(L"HitGroupNullTri");
-    const void* idNullProc = props->GetShaderIdentifier(L"HitGroupNullProc");
-    const void* idHitProc =
-        x.needsBoth ? props->GetShaderIdentifier(L"HitGroupProc") : nullptr;
-    if (!idRay || !idMiss || !idHit || !idNullTri || !idNullProc ||
-        (x.needsBoth && !idHitProc)) {
-        props->Release(); so->Release();
-        *why = "the state object does not export RayGen, Miss, HitGroup and the "
-               "two rejecting hit groups";
-        return nullptr;
-    }
 
     auto* self = new (std::nothrow) Dxr11RayQueryPso();
     if (!self) {
-        props->Release(); so->Release();
+        b.so->Release();
         *why = "out of memory";
         return nullptr;
     }
     self->m_dev = dev;
-    self->m_so = so;
+    self->m_so = b.so;
     self->m_rootSig = desc->pRootSignature;
     if (self->m_rootSig) self->m_rootSig->AddRef();
     for (int i = 0; i < 3; ++i) self->m_threads[i] = static_cast<UINT>(x.threads[i]);
     // A both-kinds shader serves both; otherwise exactly one.
     self->m_servesProc = x.hasIntersection;
-    self->m_localRootSig = localRs;   // owned now, released in the destructor
-    self->m_recordConstants = x.needsRecordConstants;
     self->m_servesTri = x.needsBoth || !x.hasIntersection;
-    std::memcpy(self->m_idRay, idRay, kIdSize);
-    std::memcpy(self->m_idMiss, idMiss, kIdSize);
-    std::memcpy(self->m_idHit, idHit, kIdSize);
-    std::memcpy(self->m_idNullTri, idNullTri, kIdSize);
-    std::memcpy(self->m_idNullProc, idNullProc, kIdSize);
-    if (idHitProc) std::memcpy(self->m_idHitProc, idHitProc, kIdSize);
-    props->Release();
+    self->m_hasAnyHit = x.hasAnyHit;
+    self->m_hasIntersection = x.hasIntersection;
+    self->m_needsBoth = x.needsBoth;
+    self->m_recordConstants = x.needsRecordConstants;
+    if (x.needsRecordConstants) {
+        // A pair the scene needs and this state object lacks means lowering
+        // again at dispatch, from the shader as the application gave it.
+        const auto* p = static_cast<const uint8_t*>(desc->CS.pShaderBytecode);
+        self->m_input.assign(p, p + desc->CS.BytecodeLength);
+        self->m_pairs = x.pairs;
+    }
+    std::memcpy(self->m_idRay, b.idRay, kIdSize);
+    std::memcpy(self->m_idMiss, b.idMiss, kIdSize);
+    std::memcpy(self->m_idNullTri, b.idNullTri, kIdSize);
+    std::memcpy(self->m_idNullProc, b.idNullProc, kIdSize);
+    self->m_idHit = b.idHit;
+    self->m_idHitProc = b.idHitProc;
 
     if (RayQueryPhase() == 2) {
         Dxr11RayQueryPhaseNote("lowered, state object BUILT", nullptr);
@@ -559,7 +588,7 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     // the scene needs is not knowable here; the first dispatch rebuilds the
     // table once it is.
     if (!self->BuildTable(std::vector<uint8_t>(),
-                          std::vector<astrack::RecordConstants>(), why)) {
+                          std::vector<rq::RecordPair>(), why)) {
         self->Release();
         return nullptr;
     }
@@ -594,21 +623,35 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
 }
 
 bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
-                                  const std::vector<astrack::RecordConstants>& consts,
+                                  const std::vector<rq::RecordPair>& recPairs,
                                   std::string* why) {
     const UINT hitRecords =
         kinds.empty() ? 1u : static_cast<UINT>(kinds.size());
 
+    // Which baked hit group copy each record points at. Every pair a record
+    // needs must already be in m_pairs; the caller rebakes first.
+    std::vector<size_t> copyOf(hitRecords, 0);
+    if (m_recordConstants) {
+        for (UINT i = 0; i < hitRecords; ++i) {
+            const rq::RecordPair p = i < recPairs.size() ? recPairs[i] : rq::RecordPair{};
+            const auto it = std::find(m_pairs.begin(), m_pairs.end(), p);
+            if (it == m_pairs.end()) {
+                if (why) *why = "a record needs a (geometry, contribution) pair the "
+                                "state object was not baked with";
+                return false;
+            }
+            copyOf[i] = static_cast<size_t>(it - m_pairs.begin());
+        }
+    }
+
     // raygen, then miss, then the hit group records, each TABLE aligned to 64
     // and each RECORD to 32.
     //
-    // A hit record carries the identifier and, when the shader asks what it
-    // hit, two root constants after it: the geometry index and the instance
-    // contribution. 32 + 8 rounds to 64, so a record doubles. The raygen and
-    // miss records are unaffected, because the local root signature is
-    // associated with the hit groups only.
-    const UINT argBytes = m_recordConstants ? 8u : 0u;
-    const UINT stride = AlignUp(kIdSize + argBytes, kRecAlign);
+    // A record is the identifier and nothing else. What it tells the hit
+    // shader, its geometry index and instance contribution, is baked into the
+    // hit group it points at, because READING a local root signature from a
+    // hit shader crashes the Pascal driver. See proxy/rewriter/rq_bake.h.
+    const UINT stride = AlignUp(kIdSize, kRecAlign);
     const UINT slot = AlignUp(stride, kTableAlign);
     const UINT hitBytes = AlignUp(stride * hitRecords, kTableAlign);
     const UINT64 size = static_cast<UINT64>(slot) * 2 + hitBytes;
@@ -651,36 +694,34 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
         // reached by the kind it serves, by both when it serves only one, or
         // by nothing at all. A slot reached by BOTH when the shader serves
         // both is unservable and was refused before this call.
-        const void* id = m_idHit;
+        //
+        // "The shader's own hit group" is the copy baked with THIS record's
+        // pair: that is how the record tells the shader what it hit. Nothing
+        // in DXR 1.0 can ask, which is the whole reason these accessors were
+        // refused before the shim owned the table.
+        const size_t k = copyOf[i];
+        const void* own = m_idHit[k].data();
+        const void* id = own;
         if (proc && !tri) {
             // Procedural only: the real procedural group if there is one, and
             // otherwise a procedural record that reports nothing, so the
             // geometry is traversed with a record of the right TYPE.
-            id = m_servesProc ? (m_servesTri ? m_idHitProc : m_idHit)
+            id = m_servesProc ? (m_servesTri ? m_idHitProc[k].data() : own)
                               : m_idNullProc;
         } else if (tri && !proc) {
             // Triangles only. m_idHit is already the triangle group whenever
             // the shader serves triangles at all.
-            id = m_servesTri ? m_idHit : m_idNullTri;
+            id = m_servesTri ? own : m_idNullTri;
         }
         uint8_t* rec = p + 2 * slot + i * stride;
         std::memcpy(rec, id, kIdSize);
-
-        // What this record is, told to the shader that runs from it. Nothing
-        // in DXR 1.0 can ask, which is the whole reason these two accessors
-        // were refused before the shim owned the table.
-        if (m_recordConstants) {
-            const astrack::RecordConstants rc =
-                i < consts.size() ? consts[i] : astrack::RecordConstants{};
-            const UINT words[2] = { rc.geometryIndex, rc.instanceContribution };
-            std::memcpy(rec + kIdSize, words, sizeof(words));
-        }
     }
     sbt->Unmap(0, nullptr);
 
     if (m_sbt) m_retired.push_back(m_sbt);   // may still be in flight
     m_sbt = sbt;
     m_kinds = kinds;
+    m_recPairs = recPairs;
 
     const D3D12_GPU_VIRTUAL_ADDRESS base = sbt->GetGPUVirtualAddress();
     m_desc.RayGenerationShaderRecord.StartAddress = base + 0 * slot;
@@ -698,20 +739,61 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                                       UINT gx, UINT gy, UINT gz,
                                       const std::vector<uint8_t>& recordKinds) {
     if (!cl) return;
+
+    // Command lists are recorded on several threads and this can rebuild both
+    // the table and the state object, so the whole decision is made under one
+    // lock and what is recorded afterwards is a snapshot of its outcome.
+    ID3D12StateObject* so = nullptr;
+    D3D12_DISPATCH_RAYS_DESC d{};
+    {
+    std::lock_guard<std::mutex> guard(m_lock);
+
     // Read once here rather than inside BuildTable, so the table and the kinds
-    // it was built from come from the same moment.
-    const std::vector<astrack::RecordConstants> consts =
-        m_recordConstants ? astrack::RecordConstantsTable()
-                          : std::vector<astrack::RecordConstants>();
+    // it was built from come from the same moment. One pair per record: the
+    // geometry index and instance contribution a hit on that record reports.
+    std::vector<rq::RecordPair> recPairs;
+    if (m_recordConstants && !recordKinds.empty()) {
+        const std::vector<astrack::RecordConstants> consts = astrack::RecordConstantsTable();
+        recPairs.resize(recordKinds.size());
+        for (size_t i = 0; i < recPairs.size() && i < consts.size(); ++i)
+            recPairs[i] = { consts[i].geometryIndex, consts[i].instanceContribution };
+    }
+
+    // A record whose pair has no baked hit group means lowering again. The set
+    // only grows, like the table, so a scene needing fewer keeps what it has
+    // and a scene that flips back and forth does not rebake every time.
+    if (m_recordConstants) {
+        std::vector<rq::RecordPair> grown = m_pairs;
+        for (const auto& p : recPairs)
+            if (std::find(grown.begin(), grown.end(), p) == grown.end()) grown.push_back(p);
+        if (grown.size() != m_pairs.size()) {
+            const size_t had = m_pairs.size();
+            const DWORD t0 = GetTickCount();
+            std::string why;
+            if (!Rebake(grown, &why)) {
+                ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch SKIPPED: the "
+                         "scene needs %zu (geometry, contribution) pairs and the hit "
+                         "shaders could not be rebaked for them (%s).\n",
+                         grown.size(), why.c_str());
+                return;
+            }
+            ProxyLog("[dxr-tier-11-proxy-log] hit shaders rebaked for the scene: %zu -> "
+                     "%zu (geometry, contribution) pairs, %lu ms, one hit group per "
+                     "pair and no local root signature.\n",
+                     had, grown.size(), static_cast<unsigned long>(GetTickCount() - t0));
+            m_kinds.clear();   // the identifiers moved, so the table must follow
+        }
+    }
 
     // Rebuild when the scene's layout is not what the table was built for,
     // which is the normal case the first time: the acceleration structures did
     // not exist when the pipeline was created. A changed layout can mean more
-    // records OR the same number with different types in them.
-    if (!recordKinds.empty() && recordKinds != m_kinds) {
+    // records OR the same number with different types in them, or, with
+    // record constants, records carrying different numbers.
+    if (!recordKinds.empty() && (recordKinds != m_kinds || recPairs != m_recPairs)) {
         const size_t had = m_kinds.size();
         std::string why;
-        if (!BuildTable(recordKinds, consts, &why)) {
+        if (!BuildTable(recordKinds, recPairs, &why)) {
             ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch SKIPPED: the scene "
                      "needs %u hit group records and the table could not be "
                      "rebuilt (%s).\n",
@@ -733,6 +815,12 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                  (m_servesTri && m_servesProc) ? "both kinds"
                      : m_servesProc ? "procedural hits" : "triangle hits");
     }
+
+    // The state object and the table this dispatch uses, as one consistent
+    // pair. A later rebake retires both rather than releasing them.
+    so = m_so;
+    d = m_desc;
+    }   // m_lock
 
     // rqdispatch: build everything, execute only the first N pipelines.
     //
@@ -768,7 +856,6 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
         }
     }
 
-    D3D12_DISPATCH_RAYS_DESC d = m_desc;
     // Dispatch counts thread GROUPS; DispatchRays counts RAYS. The lowered
     // raygen reads DispatchRaysIndex where the original read
     // SV_DispatchThreadID, which is the global thread id, so the ray grid is
@@ -777,8 +864,41 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
     d.Width = gx * m_threads[0];
     d.Height = gy * m_threads[1];
     d.Depth = gz * m_threads[2];
-    cl->SetPipelineState1(m_so);
+    cl->SetPipelineState1(so);
     cl->DispatchRays(&d);
+}
+
+bool Dxr11RayQueryPso::Rebake(const std::vector<rq::RecordPair>& pairs,
+                              std::string* why) {
+    if (m_input.empty()) {
+        *why = "the original shader was not kept, so it cannot be lowered again";
+        return false;
+    }
+    Xform x;
+    x.pairs = pairs;
+    std::vector<uint8_t> lib;
+    std::string err;
+    if (!dxch::RewriteContainer(m_input.data(), m_input.size(), DoLower, &x, &lib, &err)) {
+        *why = err;
+        return false;
+    }
+    // Dumped like the first build, and for the same reason: a library that
+    // lowers and then kills the driver is the one worth having on disk.
+    shdump::Lowered(m_input.data(), m_input.size(), lib.data(), lib.size(),
+                    m_rootSig, ShapeLine(x).c_str());
+    Built b;
+    if (!BuildStateObject(m_dev, lib, x, m_rootSig, &b, why)) return false;
+
+    if (m_so) m_retiredSo.push_back(m_so);   // may still be in flight
+    m_so = b.so;
+    m_pairs = pairs;
+    std::memcpy(m_idRay, b.idRay, kIdSize);
+    std::memcpy(m_idMiss, b.idMiss, kIdSize);
+    std::memcpy(m_idNullTri, b.idNullTri, kIdSize);
+    std::memcpy(m_idNullProc, b.idNullProc, kIdSize);
+    m_idHit = b.idHit;
+    m_idHitProc = b.idHitProc;
+    return true;
 }
 
 // --- IUnknown ---------------------------------------------------------------

@@ -1,12 +1,20 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.26.0.
+proxy/version.h, and is currently 0.37.0.
 
-## Current position (2026-09-22)
+## Current position (2026-09-23)
+
+**THE ESCHER GPU CRASH HAS A CAUSE AND A FIX (0.37.0), NOT YET RUN IN THE
+GAME.** A hit shader reading a local root signature cbuffer crashes the Pascal
+driver inside `CreateStateObject`. That was how the shim delivered
+`GeometryIndex` and `InstanceContributionToHitGroupIndex`; they are now baked
+into a copy of the hit shaders per (geometry, contribution) pair. The fifteen
+Unreal libraries that crashed are 0 of 225 offline. The next step is an Escher
+run. See the driver crash entry below.
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
-GTX 1070 and produces bit-exact output against WARP. 23 render cases, 0
+GTX 1070 and produces bit-exact output against WARP. 24 render cases, 0
 mismatches, plus four gates. Run `.\tools\run_dispatch_test.ps1`.
 
 The premise held: Pascal already traces rays, and only the Tier 1.1 API surface
@@ -885,6 +893,12 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   `createHandleForLib` (160) on it, then `cbufferLoadLegacy` (59). The same
   synthesis it already does for `@rq_uav0`.
 
+  **SUPERSEDED IN 0.37.0: the local root signature below is gone.** A hit
+  shader reading it crashes the Pascal driver, so the values are baked into a
+  copy of the hit shaders per pair instead. The per-record pairs, the table
+  sizing and the collision refusal still hold; the delivery changed. See the
+  driver crash entry.
+
   How it is built: per-record (geometryIndex, instanceContribution) from the
   instance data, with the table sized by `max(contribution + geometryCount)` and
   a REFUSAL when two different pairs collide on one record, because one record
@@ -1536,8 +1550,47 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   drop the local root signature entirely. That removes the fatal construct
   rather than dodging it, and it needs no driver cooperation. The cost is one
   hit group and one pair of hit shaders per distinct pair, against a real
-  Escher scene that wanted 27 records, and a larger library to compile. NOT yet
-  built, and the record-constant mechanism stays the default until it is.
+  Escher scene that wanted 27 records, and a larger library to compile.
+
+  **BUILT IN 0.37.0, AND THE UNREAL LIBRARIES THAT CRASHED ARE CLEAN.** A new
+  pass, `phase5/rewriter/bake.py` and `proxy/rewriter/rq_bake.cpp`, held
+  byte-identical, runs AFTER `lower()`: every record read becomes
+  `add i32 0, <value>`, every hit shader the module defines (`AnyHit`,
+  `ClosestHit`, `Isect`, `ClosestHitProc`) is emitted once per pair as
+  `<name>_<k>`, and the record's type, global, resource record and dead
+  declarations are removed. It refuses its own output if a record read
+  survives. `lower()` did not change, so nothing that reads no record moved by
+  a byte.
+
+  **A separate pass, because the pairs are per SCENE and lowering is per
+  SHADER.** The acceleration structures do not exist when a pipeline is
+  created, so the shim bakes `(0, 0)` then, which is exactly what the old table
+  held before the first dispatch, keeps the original DXIL, and at the first
+  dispatch needing a pair it lacks it lowers again, builds a new state object
+  and retires the old one. The pair set only grows, like the table. Measured on
+  `geomcontrib`: 1 to 5 pairs, 47 ms, 11 subobjects.
+
+  Measured, cache cleared before every trial:
+
+      the 15 Unreal libraries that read record constants    0 of 225
+        (each was 30 to 80 percent before)
+      crash.out.dxil, as it always was                       10 of 15
+      crash_baked.out.dxil, the same shader through 0.37.0    0 of 15
+      a real Unreal shader baked with 27 pairs               0 of 15
+
+  **The render tests say the baking is RIGHT, not only survivable.** All 24
+  dispatch cases bit-exact against WARP, including a new `bothgeom`, which
+  gates every commit on the contribution its record reports so all four hit
+  shaders are copied and the pipeline builds a triangle and a procedural
+  group per pair. The sensitivity check was run, not assumed: forcing every
+  record onto copy 0 makes `geom` and `geomcontrib` diverge by 4624 and
+  `bothgeom` by 7396, exactly the procedural hit count. The per-record copy
+  choice carries the result.
+
+  Two things this brief should not have to rediscover. A dispatch can now
+  rebuild the state object, so `DispatchAsRays` takes a per-pipeline lock and
+  records from a snapshot; Unreal records on several threads. And the Escher
+  run is still the test that matters: everything above is offline.
 
   **THE PREVIOUS BISECT MEASURED NOTHING, AND THE REASON IS WORTH MORE THAN
   THE RESULT IT DESTROYED.** `sotest` resolves the shape file with

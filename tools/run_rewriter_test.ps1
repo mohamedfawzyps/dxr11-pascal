@@ -168,6 +168,48 @@ foreach ($c in $cases) {
     Remove-Item "rw_${n}_a.bin", "rw_${n}_b.bin" -ErrorAction SilentlyContinue
 }
 
+# Baked record constants. A hit shader READING a local root signature crashes
+# the Pascal driver inside CreateStateObject (phase5/cases/driver-crash/), so
+# GeometryIndex and InstanceContributionToHitGroupIndex are baked into one copy
+# of the hit shaders per (geometry, contribution) pair instead. See
+# proxy/rewriter/rq_bake.h.
+#
+# Three checks per case: the Python and the C++ bake byte-identically, the
+# result assembles and validates, and NO record read survives, which is the
+# property the whole pass exists for. Rendering is the dispatch suite's job,
+# because only there do the pairs come from a real scene.
+Write-Host ''
+Write-Host '=== baked record constants ==='
+$bakes = @(
+    @{ name = 'geom';     src = 'phase5\cases\rayquery_geom.ll';     pairs = '0:0,1:0,2:0,3:0' },
+    @{ name = 'geomc';    src = 'phase5\cases\rayquery_geom.ll';     pairs = '0:0,0:2,1:2,2:2,3:2' },
+    @{ name = 'bothgeom'; src = 'phase5\cases\rayquery_bothgeom.ll'; pairs = '0:0,0:1' }
+)
+foreach ($b in $bakes) {
+    $n = "bake_$($b.name)"
+    if (-not (Test-Path $b.src)) { Write-Host "  $n : SKIPPED, $($b.src) missing"; $failed++; continue }
+    & python phase5\rewriter\dxrewrite.py lower $b.src "phase5\out\$n.low.ll" | Out-Null
+    & python phase5\rewriter\dxrewrite.py bake "phase5\out\$n.low.ll" "phase5\out\$n.ll" $b.pairs | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  $n : Python bake REFUSED"; $failed++; continue }
+    New-Item -ItemType Directory -Force 'phase5\outcpp' | Out-Null
+    & .\phase5out\dxrw.exe bake "phase5\out\$n.low.ll" "phase5\outcpp\$n.ll" $b.pairs | Out-Null
+    $py = [IO.File]::ReadAllBytes((Resolve-Path "phase5\out\$n.ll"))
+    $cp = [IO.File]::ReadAllBytes((Resolve-Path "phase5\outcpp\$n.ll"))
+    $same = ($py.Length -eq $cp.Length) -and (-not (Compare-Object $py $cp -SyncWindow 0))
+    $asm = & .\phase5out\dxilrt.exe asm "phase5\out\$n.ll" "phase5\out\$n.dxil" 2>&1
+    $valid = $LASTEXITCODE -eq 0
+    $left = Select-String -Path "phase5\out\$n.ll" -Pattern 'rq_record|%rq\.cbr' |
+            Where-Object { $_.Line.TrimStart() -notmatch '^;' }
+    $copies = ($b.pairs -split ',').Count
+    if ($same -and $valid -and -not $left) {
+        Write-Host "  $n : PASS ($copies copies, byte-identical, validates, no record read)"
+    } else {
+        Write-Host "  $n : FAIL (identical=$same validates=$valid record reads left=$(@($left).Count))"
+        if (-not $valid) { $asm | Select-Object -Last 4 | ForEach-Object { "    $_" } }
+        $failed++
+    }
+}
+
 Write-Host ''
 Write-Host '=== refusal checks ==='
 & python phase5\rewriter\test_reject.py

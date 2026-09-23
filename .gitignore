@@ -6,6 +6,10 @@ build/
 
 raytest.exe
 *.bin
+# ...except the root signatures beside the vendored driver crash libraries. A
+# DXR state object does not build without its global root signature, so
+# without these the repro in that folder cannot be run from a clone at all.
+!phase5/cases/driver-crash/*.rs.bin
 D3D12/
 
 d3d12.dll

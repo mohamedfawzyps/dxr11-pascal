@@ -77,3 +77,21 @@ fix would produce, with a distinct immediate per copy so nothing folds.
 
 27 is what a real Escher scene asked for. No ceiling reached; the cost is
 roughly linear, about 34 ms per extra pair of hit shaders on a cold compile.
+
+## The fix, built in 0.37.0
+
+The record constants are baked into one copy of the hit shaders per
+(geometry, contribution) pair, and the local root signature is gone. See
+`proxy/rewriter/rq_bake.h`.
+
+    phase5out\sotest.exe crash_baked.out.dxil crash_baked.rs.bin hw
+
+`crash_baked` is `crash.in.dxil` through `dxrw rewrite`, which bakes the pair
+(0, 0) exactly as the shim does at pipeline creation.
+
+    crash.out.dxil         as it always was        10 of 15 SEGFAULT
+    crash_baked.out.dxil   the same shader, baked   0 of 15
+
+Measured in one session, cache cleared before every trial. Across the fifteen
+Unreal libraries from one Escher run that read record constants, baked: 0 of
+225. One of them baked with 27 pairs, what Escher's scene asked for: 0 of 15.

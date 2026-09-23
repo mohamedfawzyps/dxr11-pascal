@@ -17,6 +17,52 @@ build.
 
 ---
 
+## 0.37.0
+
+- **The GPU crash is fixed, at its cause.** A hit shader READING a cbuffer bound
+  by a local root signature makes the Pascal driver access-violate inside
+  `CreateStateObject`, intermittently, on a cold compile. That read was how
+  the shim delivered `GeometryIndex` and `InstanceContributionToHitGroupIndex`
+  to the hit shaders. It is gone.
+- **New pass: baking.** `phase5/rewriter/bake.py` and
+  `proxy/rewriter/rq_bake.cpp`, byte-identical, take the lowered text and a
+  list of (geometryIndex, instanceContribution) pairs, replace every record
+  read with an immediate, and emit one copy of every hit shader per pair
+  (`AnyHit_k`, `ClosestHit_k`, `Isect_k`, `ClosestHitProc_k`). The record
+  type, its global, its resource record and any declaration left unused go
+  with it, and the pass refuses its own output if a record read survives.
+  `lower()` is unchanged, so nothing that reads no record moves by a byte.
+- **The pipeline bakes twice.** The pairs belong to the scene and the scene
+  does not exist when the pipeline is created, so the shim bakes `(0, 0)`
+  there, which is what the old table held before the first dispatch too. The
+  first dispatch that needs a pair it lacks lowers the shader again from the
+  original bytes, builds a new state object with one hit group per pair, and
+  retires the old one. The pair set only grows, like the table.
+- **No local root signature, and hit records are 32 bytes again.** Each record
+  points at the hit group copy carrying its own pair.
+- Dispatch is now serialised per pipeline under a lock, because a dispatch can
+  rebuild both the table and the state object and command lists are recorded
+  on several threads.
+- `dxrw rewrite` bakes as the proxy does, `0:0` by default or a given list;
+  `dxrw bake` and `dxrewrite.py bake` expose the pass. The shape file the
+  shim dumps gains `baked=N`, and `sotest` builds a baked library the way the
+  shim does.
+- Measured, NVIDIA cache cleared before every trial: the fifteen Unreal
+  libraries from an Escher run that read record constants crashed at 30 to 80
+  percent before, and are **0 of 225** baked. The vendored crasher is 10 of 15
+  as it was and 0 of 15 baked, side by side. A real Unreal shader baked with
+  27 pairs, what Escher's scene asked for, is 0 of 15.
+- New dispatch case `bothgeom`: both kinds, every commit gated on the
+  contribution the record reports, so all four hit shaders are copied and
+  the pipeline builds a triangle and a procedural group per pair. With every
+  record forced onto copy 0 it diverges by 7396, exactly the procedural hit
+  count; `geom` and `geomcontrib` diverge by 4624 under the same forcing. The
+  per-record copy choice carries the result.
+- The rewriter suite gains a bake section: Python and C++ byte-identical, the
+  result validates, and no record read survives, on three pair lists.
+
+---
+
 ## 0.36.7
 
 - **`createHandleFromHeap` (218) joins the recomputable list**, which closes the
