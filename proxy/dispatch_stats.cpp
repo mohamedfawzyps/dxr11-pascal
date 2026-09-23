@@ -23,7 +23,8 @@ void Line(const uint64_t* c, const char* when, const std::string& live) {
     ProxyLog("[dxr-tier-11-proxy-log] stats%s: lowered dispatches DRAWN %llu (%llu indirect), "
              "REFUSED %llu (two live structures disagree %llu, one structure disagrees %llu, "
              "procedural collapse %llu), table unbuildable %llu, held back %llu, indirect "
-             "with zero groups %llu; tables built %llu, reused %llu; top-level reads: new "
+             "with zero groups %llu; tables built %llu (into a spare %llu), reused %llu, "
+             "buffers freed %llu; top-level reads: new "
              "%llu, changed %llu, unchanged %llu%s%s\n",
              when,
              (unsigned long long)c[kDrawn], (unsigned long long)c[kIndirect],
@@ -31,7 +32,8 @@ void Line(const uint64_t* c, const char* when, const std::string& live) {
              (unsigned long long)c[kRefusedOneTlas], (unsigned long long)c[kRefusedProcedural],
              (unsigned long long)c[kSkippedTable], (unsigned long long)c[kHeldBack],
              (unsigned long long)c[kIndirectEmpty],
-             (unsigned long long)c[kTableNew], (unsigned long long)c[kTableCached],
+             (unsigned long long)c[kTableNew], (unsigned long long)c[kTableRecycled],
+             (unsigned long long)c[kTableCached], (unsigned long long)c[kTableFreed],
              (unsigned long long)c[kTlasNew], (unsigned long long)c[kTlasChanged],
              (unsigned long long)c[kTlasSame],
              live.empty() ? "" : "; live: ", live.c_str());

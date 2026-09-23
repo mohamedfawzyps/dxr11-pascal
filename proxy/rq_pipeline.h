@@ -115,7 +115,8 @@ public:
     // a slot can go from holding the real hit group to holding a rejecting one
     // without the count moving at all.
     void DispatchAsRays(ID3D12GraphicsCommandList4* cl, UINT gx, UINT gy, UINT gz,
-                        const std::vector<uint8_t>& recordKinds);
+                        const std::vector<uint8_t>& recordKinds,
+                        const void* owner);
 
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override;
@@ -166,8 +167,6 @@ private:
     ID3D12RootSignature* m_localRs = nullptr;   // owned; null without record data
     // What the current table's records point at, one pair per record.
     std::vector<rq::RecordPair> m_recPairs;
-    // Held until the pipeline dies for the same reason as m_retired.
-    std::vector<ID3D12StateObject*> m_retiredSo;
     // A dispatch can rebuild the table, and command lists are recorded on
     // several threads.
     std::mutex m_lock;
@@ -178,8 +177,8 @@ private:
     // Tables already built, per scene layout, OWNING their buffers; m_sbt
     // points into one of them. An engine can alternate between two layouts
     // every frame, and Escher did: 0.39.1 built a new table on every flip,
-    // 1095 in one run, and freed none. Evicted and rebaked-away tables go to
-    // m_retired, since a dispatch may still be using them.
+    // 1095 in one run, and freed none. Evicted tables go to m_spare, since a
+    // dispatch may still be using them.
     struct CachedTable {
         std::vector<uint8_t> kinds;
         std::vector<rq::RecordPair> pairs;
@@ -187,11 +186,12 @@ private:
         D3D12_DISPATCH_RAYS_DESC desc{};
     };
     std::vector<CachedTable> m_tables;
-    // Tables replaced by a growth. A dispatch recorded against the old one may
-    // still be in flight, and nothing here knows when it lands, so they are
-    // held until the pipeline itself dies. Growth is monotonic and rare, so
-    // this stays a handful of small buffers.
-    std::vector<ID3D12Resource*> m_retired;
+    // Evicted tables. A dispatch recorded against one may still be in flight,
+    // so each is reused or released only once gpuhold says nothing can read
+    // it any more. Until 0.40.2 they were held until the pipeline died, and
+    // Escher's open world, a new layout nearly every frame, piled up about
+    // 3 GB of them in 7 minutes.
+    std::vector<ID3D12Resource*> m_spare;
     // Which geometry kinds the lowered shader actually commits. Both can be
     // true, and that is the case with two real hit groups.
     bool m_servesTri = false;

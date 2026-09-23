@@ -22,6 +22,8 @@ enum Counter {
     kHeldBack,            // rqdispatch held it back on purpose
     kTableNew,            // a table built for a layout not seen before
     kTableCached,         // a table taken from the per-pipeline cache
+    kTableRecycled,       // a new table written into an idle spare buffer
+    kTableFreed,          // a spare buffer released
     kTlasNew,             // instance data read for a new address
     kTlasChanged,         // re-read, and the layout changed
     kTlasSame,            // re-read, and nothing changed

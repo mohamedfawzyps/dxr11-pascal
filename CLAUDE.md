@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.40.1.
+proxy/version.h, and is currently 0.40.2.
 
 ## Current position (2026-09-23)
 
@@ -57,6 +57,20 @@ open world against 19 and 27 record tables while that scene reaches record
 dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
+
+**0.40.1 IN THE GAME: THE LOWERED PASSES DRAW, AND THE TABLES LEAKED
+(2026-09-23).** Same route, clean. 25477 lowered dispatches DRAWN, every one
+of them INDIRECT (so without the 0.39.0 emulation none would draw), 178
+refused in two bursts of a few seconds when Unreal moved its top-level
+structure to a new address and the old one was still inside the 64-build
+live window. But 10137 shader tables were built in 7 minutes, a new layout
+nearly every frame, and 0.40.1 kept every evicted one until the pipeline
+died: about 3 GB. 0.40.2 frees them through `proxy/gpu_hold`, see the
+CHANGELOG. **Two rules from building it: a table is idle only when every list
+that recorded it has been Reset or destroyed AND its fence has passed, because
+a closed list can be executed again; and anything holding a D3D12 object must
+not be a static destroyed at DLL unload, or the process crashes at exit
+(0xC0000409, intermittent, depends on unload order).**
 
 **0.40.0 IN THE GAME: A FULL SESSION, NO CRASH, AND THE LAG IS GONE
 (2026-09-23).** Menu, open world, cinematic, ray tracing and MegaLights
@@ -3065,6 +3079,11 @@ anything.
 - `--both` makes the harness build TWO hit groups and a two-record hit table,
   for a library that commits both kinds. Only the `--lib` path needs it; the
   proxy builds its own.
+- `--churn N`, with `--geom`, records N more record layouts after the real
+  dispatch in the same unsubmitted list, so its shader table is evicted
+  before anything runs; `--churnflush` submits after each. With
+  `DXR_TIER11_NOHOLD=1` the shim treats every table as idle and `churn` must
+  DIVERGE, which the suite checks.
 - `--table` binds a four-entry UAV descriptor table with the real output at
   slot 2 and decoys at 0, 1 and 3, so a shader that resolves the wrong index
   writes nowhere visible. **Both** sides honour it now; until dynamic indexing

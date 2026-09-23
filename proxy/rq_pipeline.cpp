@@ -1,6 +1,7 @@
 #include "rq_pipeline.h"
 
 #include "dispatch_stats.h"
+#include "gpu_hold.h"
 
 #include "config.h"
 
@@ -325,8 +326,7 @@ Dxr11RayQueryPso::~Dxr11RayQueryPso() {
     // Before anything else: the carrier is releasing us, so nothing may find
     // us through it again.
     UnregisterCarrier(this);
-    for (ID3D12Resource* r : m_retired) r->Release();
-    for (ID3D12StateObject* s : m_retiredSo) s->Release();
+    for (ID3D12Resource* r : m_spare) r->Release();
     for (CachedTable& t : m_tables) t.sbt->Release();   // m_sbt is one of these
     if (m_localRs) m_localRs->Release();
     if (m_so) m_so->Release();
@@ -702,8 +702,13 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     // open world that is what hung the GPU. A padded record produces no hit:
     // missing for a frame, never undefined and never another record's answer.
     // Past kMinRecords, or twice what is known, it is still undefined.
+    //
+    // Rounded up to a multiple of kMinRecords so that tables for nearby
+    // layouts are the same SIZE, and a spare one can be reused rather than a
+    // new buffer created for every frame's layout.
     const UINT kMinRecords = 4096;
-    const UINT tableRecords = hitRecords * 2 > kMinRecords ? hitRecords * 2 : kMinRecords;
+    const UINT tableRecords =
+        AlignUp(hitRecords * 2 > kMinRecords ? hitRecords * 2 : kMinRecords, kMinRecords);
 
     std::vector<size_t> copyOf(hitRecords, 0);   // one hit group copy now
 
@@ -730,8 +735,16 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
+    // A spare of the right size that nothing can still read, or a new one.
     ID3D12Resource* sbt = nullptr;
-    if (FAILED(m_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+    for (size_t i = 0; i < m_spare.size(); ++i) {
+        if (m_spare[i]->GetDesc().Width != size || gpuhold::Busy(m_spare[i])) continue;
+        sbt = m_spare[i];
+        m_spare.erase(m_spare.begin() + i);
+        dstats::Add(dstats::kTableRecycled);
+        break;
+    }
+    if (!sbt && FAILED(m_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&sbt)))) {
         if (why) *why = "cannot create the shader table buffer";
         return false;
@@ -832,15 +845,29 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     m_tables.push_back(t);
     const size_t kMaxCachedTables = 8;
     if (m_tables.size() > kMaxCachedTables) {
-        m_retired.push_back(m_tables.front().sbt);   // may still be in flight
+        m_spare.push_back(m_tables.front().sbt);   // may still be in flight
         m_tables.erase(m_tables.begin());
+    }
+    // Keep a few idle spares for reuse and release the rest. A busy one is
+    // kept however many there are: something may still read it.
+    const size_t kIdleSpares = 4;
+    size_t idle = 0;
+    for (size_t i = 0; i < m_spare.size();) {
+        if (!gpuhold::Busy(m_spare[i]) && ++idle > kIdleSpares) {
+            m_spare[i]->Release();
+            m_spare.erase(m_spare.begin() + i);
+            dstats::Add(dstats::kTableFreed);
+            continue;
+        }
+        ++i;
     }
     return true;
 }
 
 void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                                       UINT gx, UINT gy, UINT gz,
-                                      const std::vector<uint8_t>& recordKinds) {
+                                      const std::vector<uint8_t>& recordKinds,
+                                      const void* owner) {
     if (!cl) return;
 
     // Command lists are recorded on several threads and this can rebuild both
@@ -904,9 +931,11 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
     }
 
     // The state object and the table this dispatch uses, as one consistent
-    // pair. A later rebake retires both rather than releasing them.
+    // pair. The use is registered before the lock is released, so no other
+    // thread can find the table idle and overwrite it in between.
     so = m_so;
     d = m_desc;
+    gpuhold::Use(m_sbt, owner);
     }   // m_lock
 
     // rqdispatch: build everything, execute only the first N pipelines.

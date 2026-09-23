@@ -219,7 +219,19 @@ $cases = @(
     # poisoned, the table padding alone still matches, since this shader bakes
     # no record data and pads with its own record.
     @{ name = 'rebuild'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi', '--contrib', '--rebuild');
-       desc = 'top-level structure rebuilt in place with new contributions between dispatches' }
+       desc = 'top-level structure rebuilt in place with new contributions between dispatches' },
+    # A new record layout after the real dispatch, twelve times, in the SAME
+    # list before it is submitted, so the real dispatch's table is evicted from
+    # the shim's cache while nothing has run. 0.40.1 kept every evicted table
+    # until the pipeline died, about 3 GB in Escher's open world; 0.40.2 reuses
+    # and frees them, and must never do so while a list that reads one can
+    # still run. The gate below turns that check off and must diverge.
+    @{ name = 'churn'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--churn', '12');
+       desc = 'twelve more record layouts recorded after the real dispatch, before submitting' },
+    # The same, submitted and waited for after every layout, so evicted tables
+    # become idle and the reuse path actually runs.
+    @{ name = 'churnflush'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--churn', '20', '--churnflush');
+       desc = 'twenty more record layouts, each submitted, so shader table buffers are reused' }
 )
 
 $failed = 0
@@ -257,6 +269,27 @@ $env:DXR_TIER11 = ''
 # A non-zero exit is the EXPECTED outcome in the off cases, so stop 'Stop'
 # aborting.
 $ErrorActionPreference = 'Continue'
+
+Write-Host ''
+Write-Host '=== a shader table still in flight is never reused ==='
+# DXR_TIER11_NOHOLD=1 makes the shim treat every evicted table as idle. The
+# churn case must then DIVERGE: if it still matched, it could not see a table
+# reused too early and its pass above would mean nothing.
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--churn', '12')
+& .\raytest.exe warp rayquery alpha dp_hold_a.bin @x | Out-Null
+$env:DXR_TIER11_NOHOLD = '1'
+& .\raytest.exe hw rayquery alpha dp_hold_b.bin @x | Out-Null
+$env:DXR_TIER11_NOHOLD = $null
+$env:DXR_TIER11 = ''
+$diff = & .\raytest.exe diff dp_hold_a.bin dp_hold_b.bin 2>&1
+Remove-Item dp_hold_a.bin, dp_hold_b.bin -ErrorAction SilentlyContinue
+if ($diff -match 'RESULT: DIVERGE') {
+    Write-Host '  diverges with the check off, so the churn case can see it'
+} else {
+    Write-Host '  NOT SENSITIVE: churn matched with in-flight tables reused'
+    $failed++
+}
 
 Write-Host ''
 Write-Host '=== tier 1.1 is on by default ==='

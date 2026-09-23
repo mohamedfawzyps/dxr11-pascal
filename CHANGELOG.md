@@ -24,7 +24,37 @@ not.
 
 ---
 
-## 0.40.1
+## 0.40.2
+
+- **Old shader tables are freed.** A lowered pipeline builds a new table
+  whenever the scene's record layout changes, which in Escher's open world is
+  almost every frame, and kept every evicted one until the pipeline died:
+  10137 tables in 7 minutes at 0.40.1, about 3 GB of upload heap by the end,
+  by the code's arithmetic. New `proxy/gpu_hold.{h,cpp}` records which command
+  list uses which table, stamps the use with a per-queue fence when the list
+  is submitted, and ends it only when the list can never run again (Reset or
+  destroyed) AND the fence has passed. An evicted table is reused for the next
+  layout of the same size once idle, and idle spares beyond four are released.
+  Table sizes are rounded up to a multiple of 4096 records so that nearby
+  layouts share a size.
+- `raytest --churn N`, with `--geom`: after the real dispatch, in the same
+  unsubmitted list, N more layouts and dispatches into a decoy, so the real
+  dispatch's table is evicted before anything has run. `--churnflush` submits
+  after each layout so the reuse path runs. Cases `churn` and `churnflush`,
+  both bit-exact against WARP; 13 of 21 tables went into reused buffers in
+  `churnflush`. A new gate runs `churn` with `DXR_TIER11_NOHOLD=1`, a test-only
+  switch that makes every table look idle, and requires DIVERGE: it gives
+  13872 hit/miss mismatches, every hit.
+- **A crash at process exit, found and fixed before it shipped.** The first
+  build kept its per-queue fences in a static map, released when the DLL
+  unloaded, by which time D3D12 may already have been unloaded: `raytest`
+  exited with 0xC0000409 on 4 of 6 runs, which the suite reported as 15 to 19
+  failed hardware runs, a different set each time. The state is now allocated
+  once and never destroyed; 8 of 8 clean, suite 32 of 32. `as_tracker` keeps
+  its own fences and readbacks the same way and has not been seen to crash,
+  but it is the same pattern.
+- Stats line: `tables built N (into a spare R), reused C, buffers freed F`.
+
 
 - **Counters for lowered dispatches.** One `stats:` line every 10 seconds
   while a count moves, and one `stats at exit:` line: dispatches DRAWN (and

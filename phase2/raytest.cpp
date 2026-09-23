@@ -307,6 +307,18 @@ static bool g_indirect = false;
 // data once per address keeps the first answer: a one-record table, and every
 // hit on the second instance lands past its end.
 static bool g_rebuild = false;
+// --churn N, with --geom: after the real dispatch, in the SAME command list and
+// before anything is submitted, rebuild the top-level structure N times, each
+// with a different contribution, and dispatch into a decoy after each. Every
+// layout gets its own shader table, so the real dispatch's table is pushed out
+// of the shim's cache while the list that reads it has not even run. If the
+// shim reused an evicted table before the GPU was done with it, the real
+// dispatch would read another layout's pairs. Only the real output is
+// compared, and WARP runs the same churn, so it stays the ground truth.
+static int g_churn = 0;
+// --churnflush, with --churn: submit and wait after EVERY layout instead, so
+// the evicted tables become idle and the shim's reuse and release path runs.
+static bool g_churnFlush = false;
 static bool g_indirectUp = false;
 // Create the compute PSO through CreatePipelineState, the pipeline STREAM
 // form, instead of CreateComputePipelineState. Unreal uses the stream form
@@ -736,6 +748,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
+    if (g_churn) { s.inst = instBuf; s.instCount = 1; }
     return s;
 }
 
@@ -991,6 +1004,66 @@ static ComPtr<ID3D12RootSignature> MakeRootSigTable(ID3D12Device* dev) {
 }
 
 // ---------------------------------------------------------------------------
+// --churn: see g_churn. Everything it creates goes into `keep`, alive until
+// the list has been flushed.
+static void Churn(Gpu& g, Scene& s, ID3D12PipelineState* pso, ID3D12RootSignature* rs,
+                  D3D12_GPU_VIRTUAL_ADDRESS cb, D3D12_GPU_VIRTUAL_ADDRESS mask,
+                  UINT64 outBytes, UINT gx, UINT gy,
+                  std::vector<ComPtr<ID3D12Resource>>& keep) {
+    D3D12_RAYTRACING_INSTANCE_DESC inst{};
+    D3D12_RANGE none{ 0, 0 };
+    void* p = nullptr;
+    HR(s.inst->Map(0, nullptr, &p), "map inst for churn");
+    std::memcpy(&inst, p, sizeof(inst));
+    s.inst->Unmap(0, &none);
+
+    auto decoy = CreateBuffer(g.device.Get(), outBytes, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    keep.push_back(decoy);
+    const UINT base = inst.InstanceContributionToHitGroupIndex;
+    for (int k = 1; k <= g_churn; ++k) {
+        inst.InstanceContributionToHitGroupIndex = base + (UINT)k;
+        auto ib = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+        HR(ib->Map(0, &none, &p), "map churn inst");
+        std::memcpy(p, &inst, sizeof(inst));
+        ib->Unmap(0, nullptr);
+        keep.push_back(ib);
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+        ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        ti.NumDescs = 1; ti.InstanceDescs = ib->GetGPUVirtualAddress();
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+        g.device->GetRaytracingAccelerationStructurePrebuildInfo(&ti, &info);
+        auto scratch = CreateBuffer(g.device.Get(), info.ScratchDataSizeInBytes,
+            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        keep.push_back(scratch);
+
+        // The previous dispatch read the structure; this build overwrites it.
+        UavBarrier(g.list.Get(), s.tlas.Get());
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
+        desc.Inputs = ti;
+        desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        desc.DestAccelerationStructureData = s.tlas->GetGPUVirtualAddress();
+        g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+        UavBarrier(g.list.Get(), s.tlas.Get());
+
+        BindRoots(g.list.Get(), rs, cb, s.tlas->GetGPUVirtualAddress(),
+                  decoy->GetGPUVirtualAddress(), mask);
+        g.list->Dispatch(gx, gy, 1);
+        UavBarrier(g.list.Get(), decoy.Get());
+        if (g_churnFlush) {
+            g.flush();
+            g.list->SetPipelineState(pso);
+        }
+    }
+    std::printf("        %d more layouts recorded after the real dispatch, %s\n", g_churn,
+                g_churnFlush ? "each submitted and waited for" : "before submitting");
+}
+
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
     // --table has to reach this side too, or a shader written against a
@@ -1113,6 +1186,10 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     if (!g_indirect && !g_indirectUp) {
         g.list->Dispatch(gx, gy, 1);
         UavBarrier(g.list.Get(), out);
+        std::vector<ComPtr<ID3D12Resource>> keep;
+        if (g_churn && s.inst && !g_table)
+            Churn(g, const_cast<Scene&>(s), pso.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
+                  mask->GetGPUVirtualAddress(), out->GetDesc().Width, gx, gy, keep);
         g.flush();
         return;
     }
@@ -1576,6 +1653,18 @@ int main(int argc, char** argv) {
                 g_stream = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--churnflush") == 0) {
+                g_churnFlush = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--churn") == 0 && i + 1 < argc) {
+                g_churn = std::atoi(argv[i + 1]);
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
                 continue;
             }
             if (std::strcmp(argv[i], "--rebuild") == 0) {

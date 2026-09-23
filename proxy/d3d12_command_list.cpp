@@ -13,6 +13,7 @@
 #include "res_tracker.h"
 #include "group_count.h"
 #include "dispatch_stats.h"
+#include "gpu_hold.h"
 
 #include <windows.h>
 #include <cstring>
@@ -136,6 +137,7 @@ Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
 
 Dxr11CommandList::~Dxr11CommandList() {
     astrack::DropUnsubmitted(this);
+    gpuhold::Detach(this);
     m_bindings.ReleaseAll();
     m_gfx.ReleaseAll();
     if (m_real10) m_real10->Release();
@@ -222,8 +224,10 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Close() {
 // stale. It also clears all binding state, which is exactly why a split has to
 // replay it.
 HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) {
-    // A copy recorded before this Reset and never submitted will never run.
+    // A copy recorded before this Reset and never submitted will never run,
+    // and nothing recorded before it can run again.
     astrack::DropUnsubmitted(this);
+    gpuhold::Detach(this);
     m_segments.clear();
     m_openPendings.clear();
     m_bindings.ReleaseAll();
@@ -280,7 +284,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         // What geometry reaches each hit group record index, read from the
         // instance descriptions. Empty until a top-level structure has been
         // seen, which is the right answer for a scene that has none.
-        m_rqPso->DispatchAsRays(m_real, x, y, z, astrack::RecordKinds());
+        m_rqPso->DispatchAsRays(m_real, x, y, z, astrack::RecordKinds(), this);
         return;
     }
     FWD(Dispatch(x, y, z));
@@ -980,13 +984,17 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             if (pend.rq) dstats::Add(dstats::kIndirect);
             if (pend.rq)
                 pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
-                                        astrack::RecordKinds());
+                                        astrack::RecordKinds(), slot->list.Get());
             else
                 slot->list->DispatchRays(&desc);
-            if (FAILED(slot->list->Close())) continue;
+            if (FAILED(slot->list->Close())) {
+                gpuhold::Detach(slot->list.Get());   // never submitted
+                continue;
+            }
 
             ID3D12CommandList* d[] = { slot->list.Get() };
             submit(queue, 1, d);
+            gpuhold::SubmittedOnce(queue, slot->list.Get());
 
             // Signal WITHOUT waiting. This is only lifetime bookkeeping, so the
             // CPU carries on and the pool reclaims the list later.
