@@ -1508,6 +1508,27 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   cbuffer bound through the LOCAL ROOT SIGNATURE at all, from a hit shader.**
   Whatever backs the binding, the driver takes the same path and dies on it.
 
+  **THE FIX SHAPE IS MEASURED AND IT WORKS.** Before building it into both
+  rewriters, the two risks were tested on a stub: whether a library carrying a
+  hit group per record compiles at all on this driver, and whether its SIZE
+  brings the crash back by another route. Neither does. `sotest` takes
+  `SOTEST_HITGROUPS=N`, which builds N hit groups from `AnyHit_i` /
+  `ClosestHit_i` and skips the local root signature entirely, and
+  `phase5/cases/driver-crash/` carries the generated libraries.
+
+      N=0   record reads removed, one hit group   1525 ms cold   0 of 10
+      N=27  27 baked hit groups,  61856 bytes     2285 ms cold   0 of 20
+      N=64  64 baked hit groups, 107388 bytes     3730 ms cold   0 of 15
+
+  27 is what a real Escher scene asked for. 64 is well past it, 34 and 71
+  subobjects respectively, and nothing degrades: no ceiling was reached and the
+  cost is roughly linear, about 34 ms per extra pair of hit shaders on a cold
+  compile. Each copy bakes a DISTINCT immediate so the driver cannot fold them
+  into one.
+
+  So the remaining work is engineering in the rewriter and the shader table,
+  not another unknown about the driver.
+
   **What that leaves as a fix.** The shim knows the (geometryIndex,
   instanceContribution) pair for every record it writes, so the values can be
   BAKED IN as immediates instead of read: emit one hit group per distinct pair,

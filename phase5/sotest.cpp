@@ -92,6 +92,15 @@ struct Shape {
     bool known = false;
 };
 
+UINT BakedHitGroups() {
+    char* v = nullptr;
+    size_t n = 0;
+    if (_dupenv_s(&v, &n, "SOTEST_HITGROUPS") != 0 || !v) return 0;
+    const int g = atoi(v);
+    free(v);
+    return g > 0 ? (UINT)g : 0;
+}
+
 UINT LocalSpace() {
     char* v = nullptr;
     size_t n = 0;
@@ -244,13 +253,33 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     D3D12_GLOBAL_ROOT_SIGNATURE grs{};
     grs.pGlobalRootSignature = out.globalRs;
 
-    D3D12_STATE_SUBOBJECT subs[11]{};
+    // SOTEST_HITGROUPS=N builds N hit groups from AnyHit_i / ClosestHit_i,
+    // the shape the baked-constants fix would produce, and skips the local
+    // root signature entirely. See phase5/cases/driver-crash/README.md.
+    const UINT baked = BakedHitGroups();
+    std::vector<std::wstring> bakedNames, bakedAh, bakedCh;
+    std::vector<D3D12_HIT_GROUP_DESC> bakedDescs(baked);
+    for (UINT i = 0; i < baked; ++i) {
+        bakedNames.push_back(L"HitGroup_" + std::to_wstring(i));
+        bakedAh.push_back(L"AnyHit_" + std::to_wstring(i));
+        bakedCh.push_back(L"ClosestHit_" + std::to_wstring(i));
+    }
+    for (UINT i = 0; i < baked; ++i) {
+        bakedDescs[i].HitGroupExport = bakedNames[i].c_str();
+        bakedDescs[i].Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        bakedDescs[i].AnyHitShaderImport = bakedAh[i].c_str();
+        bakedDescs[i].ClosestHitShaderImport = bakedCh[i].c_str();
+    }
+
+    std::vector<D3D12_STATE_SUBOBJECT> subs(16 + baked);
     UINT n = 0;
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg };
     if (shape.both) subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullProc };
+    for (UINT i = 0; i < baked; ++i)
+        subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &bakedDescs[i] };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc };
     subs[n++] = { D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc };
     if (out.globalRs)
@@ -260,7 +289,7 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc{};
     const wchar_t* hitExports[4] = {};
     UINT hitExportCount = 0;
-    if (shape.recordConstants) {
+    if (shape.recordConstants && baked == 0) {
         // SOTEST_LOCAL_CBV=1 makes the local root signature carry a root CBV
         // DESCRIPTOR instead of root constants. The library is untouched either
         // way: it still reads a cbuffer at b0 space1. Only the parameter type
@@ -319,7 +348,7 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     D3D12_STATE_OBJECT_DESC sod{};
     sod.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
     sod.NumSubobjects = n;
-    sod.pSubobjects = subs;
+    sod.pSubobjects = subs.data();
 
     if (!quiet) {
         std::printf("calling CreateStateObject with %u subobjects...\n", n);

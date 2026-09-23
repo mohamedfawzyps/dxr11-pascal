@@ -62,3 +62,18 @@ library is untouched by either, so each is a one-variable test.
 
 Not the parameter type, not the register space. Reading a cbuffer bound
 through the local root signature from a hit shader is the whole of it.
+
+## The fix shape, measured
+
+`SOTEST_HITGROUPS=N` builds N hit groups from `AnyHit_i` / `ClosestHit_i` and
+skips the local root signature entirely. That is the shape the baked-constants
+fix would produce, with a distinct immediate per copy so nothing folds.
+
+    SOTEST_HITGROUPS=27 phase5out\sotest.exe bake27.out.dxil bake27.rs.bin hw
+    SOTEST_HITGROUPS=64 phase5out\sotest.exe bake64.out.dxil bake64.rs.bin hw
+
+    N=27   61856 bytes, 34 subobjects   2285 ms cold   0 of 20
+    N=64  107388 bytes, 71 subobjects   3730 ms cold   0 of 15
+
+27 is what a real Escher scene asked for. No ceiling reached; the cost is
+roughly linear, about 34 ms per extra pair of hit shaders on a cold compile.
