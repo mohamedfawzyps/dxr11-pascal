@@ -848,18 +848,24 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
         m_spare.push_back(m_tables.front().sbt);   // may still be in flight
         m_tables.erase(m_tables.begin());
     }
-    // Keep a few idle spares for reuse and release the rest. A busy one is
-    // kept however many there are: something may still read it.
+    // Keep the NEWEST few idle spares of the size just built, which is the
+    // size the next table most likely needs, and release every other idle
+    // one. 0.40.2 kept the OLDEST four whatever their size: in Escher those
+    // were the menu's smaller tables, which never fit the open world's, so
+    // every open-world table was a new buffer and the ones that would have
+    // fitted were freed. A busy one is kept however many there are: something
+    // may still read it.
     const size_t kIdleSpares = 4;
-    size_t idle = 0;
-    for (size_t i = 0; i < m_spare.size();) {
-        if (!gpuhold::Busy(m_spare[i]) && ++idle > kIdleSpares) {
-            m_spare[i]->Release();
-            m_spare.erase(m_spare.begin() + i);
-            dstats::Add(dstats::kTableFreed);
+    size_t kept = 0;
+    for (size_t i = m_spare.size(); i-- > 0;) {
+        if (gpuhold::Busy(m_spare[i])) continue;
+        if (m_spare[i]->GetDesc().Width == size && kept < kIdleSpares) {
+            ++kept;
             continue;
         }
-        ++i;
+        m_spare[i]->Release();
+        m_spare.erase(m_spare.begin() + i);
+        dstats::Add(dstats::kTableFreed);
     }
     return true;
 }

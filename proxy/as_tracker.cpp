@@ -28,12 +28,36 @@ const UINT64 kRereadEvery = 8;
 UINT64 g_tlasSerial = 0;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_lastBuilt;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_lastAsked;
+// Per address: the build that FIRST wrote it, and how many builds have.
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_firstBuilt;
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_buildCount;
+
+// A structure is SUPERSEDED once another one that did not exist at its last
+// build has been built this many times without it being rebuilt. That is an
+// engine moving its scene to a new buffer: Escher did it twice a session, and
+// for the ~64 builds until the old one aged out, both counted, disagreed
+// about records, and every lowered dispatch was refused. Two structures an
+// engine keeps alive together are both rebuilt, so neither supersedes the
+// other. The cost: a structure built once and traced forever stops counting
+// after a newer one has four builds, where the window alone gave it 64.
+const UINT64 kSupersedeBuilds = 4;
 
 // Caller holds g_lock.
 bool LiveLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     auto it = g_lastBuilt.find(tlas);
     if (it == g_lastBuilt.end()) return true;
-    return it->second + kLiveWindow >= g_tlasSerial;
+    if (it->second + kLiveWindow < g_tlasSerial) return false;
+    // Only structures whose instance data has been read can supersede: one
+    // the shim knows nothing about must not take a known scene's place.
+    for (const auto& kv : g_tlas) {
+        if (kv.first == tlas || !kv.second.valid) continue;
+        auto first = g_firstBuilt.find(kv.first);
+        auto count = g_buildCount.find(kv.first);
+        if (first != g_firstBuilt.end() && count != g_buildCount.end() &&
+            first->second > it->second && count->second >= kSupersedeBuilds)
+            return false;
+    }
+    return true;
 }
 // Top-level builds since this structure was last rebuilt. A lookup, never
 // operator[]: inserting an entry would change what LiveLocked answers.
@@ -212,6 +236,8 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
         std::lock_guard<std::mutex> g(g_lock);
         ++g_summary.tlasCount;
         g_lastBuilt[desc->DestAccelerationStructureData] = ++g_tlasSerial;
+        g_firstBuilt.emplace(desc->DestAccelerationStructureData, g_tlasSerial);
+        ++g_buildCount[desc->DestAccelerationStructureData];
         if (src.resource) ++g_summary.tlasResolved;
         if (!g_summary.sawTopLevel) {
             g_summary.sawTopLevel = true;

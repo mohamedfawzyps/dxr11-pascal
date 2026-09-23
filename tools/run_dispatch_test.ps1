@@ -231,7 +231,14 @@ $cases = @(
     # The same, submitted and waited for after every layout, so evicted tables
     # become idle and the reuse path actually runs.
     @{ name = 'churnflush'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--churn', '20', '--churnflush');
-       desc = 'twenty more record layouts, each submitted, so shader table buffers are reused' }
+       desc = 'twenty more record layouts, each submitted, so shader table buffers are reused' },
+    # The scene moves to a new top-level structure with a different layout and
+    # the old one is never built again, as Unreal does when its structure
+    # outgrows its buffer. 0.40.2 kept the old one live for 64 builds, the two
+    # disagreed about records, and the dispatch was refused: 9248 hit/miss
+    # mismatches here, two bursts of refusals per Escher session.
+    @{ name = 'move'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--move');
+       desc = 'top-level structure moved to a new address with a different layout' }
 )
 
 $failed = 0

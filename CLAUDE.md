@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.40.2.
+proxy/version.h, and is currently 0.40.3.
 
 ## Current position (2026-09-23)
 
@@ -57,6 +57,18 @@ open world against 19 and 27 record tables while that scene reaches record
 dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
+
+**0.40.2 IN THE GAME: THE LEAK IS FIXED, TWO LEFTOVERS FIXED IN 0.40.3
+(2026-09-23).** Same route, clean: 21123 drawn, 7105 tables built, 5859
+freed, about 74 buffers alive at exit against 10137. But spare reuse stopped
+when the open world loaded, because the trim kept the oldest spares, which
+were the menu's size; and 59 dispatches were refused when Unreal moved its
+scene structure. 0.40.3 keeps the newest spares of the current size and
+treats a structure as SUPERSEDED once a newer one has 4 builds without it.
+**Every offline table was one size, which is why the harness missed the
+first: a cache or pool test needs inputs that change the key it is keyed
+on.** `--churnflush` now jumps size halfway, and `--move` reproduces the
+second.
 
 **0.40.1 IN THE GAME: THE LOWERED PASSES DRAW, AND THE TABLES LEAKED
 (2026-09-23).** Same route, clean. 25477 lowered dispatches DRAWN, every one
@@ -3083,7 +3095,11 @@ anything.
   dispatch in the same unsubmitted list, so its shader table is evicted
   before anything runs; `--churnflush` submits after each. With
   `DXR_TIER11_NOHOLD=1` the shim treats every table as idle and `churn` must
-  DIVERGE, which the suite checks.
+  DIVERGE, which the suite checks. With `--churnflush` the second half of the
+  layouts needs a bigger table, so spares of the old size must give way.
+- `--move`, with `--geom --contrib`, moves the scene to a new top-level
+  structure at a new address with a different layout, built 4 times, as
+  Unreal does when its structure outgrows its buffer.
 - `--table` binds a four-entry UAV descriptor table with the real output at
   slot 2 and decoys at 0, 1 and 3, so a shader that resolves the wrong index
   writes nowhere visible. **Both** sides honour it now; until dynamic indexing

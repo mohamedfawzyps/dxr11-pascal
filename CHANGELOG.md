@@ -24,7 +24,30 @@ not.
 
 ---
 
-## 0.40.2
+## 0.40.3
+
+- **Spare shader tables are reused in the open world too.** 0.40.2 in Escher
+  freed the leak (7105 tables built, 5859 freed), but reuse stopped at 1169
+  once the open world loaded: the idle-spare trim kept the OLDEST four, which
+  were the menu's smaller tables and never fit, and freed the newer ones that
+  did. It now keeps the newest idle spares of the size just built and frees
+  the rest. `raytest --churnflush` jumps to a bigger table halfway through to
+  show it: at 40 layouts, 0.40.2 put 13 of 41 tables into a spare and freed
+  17, 0.40.3 puts 24 and frees 9.
+- **A structure the scene moved away from stops counting.** Unreal moves its
+  top-level structure to a new buffer when it outgrows the old one; the old
+  one stayed live for 64 builds, the two disagreed about records, and every
+  lowered dispatch was refused meanwhile (59 and 178 in the last two Escher
+  runs). Now a structure is SUPERSEDED once another one, first built after its
+  last build and with read instance data, has been built 4 times without it.
+  Two structures an engine keeps alive together are both rebuilt and neither
+  supersedes the other. The cost: a structure built once and traced forever
+  stops counting after 4 builds of a newer one, not 64.
+- `raytest --move`, with `--geom --contrib`: dispatch, then build the scene
+  at a new address with the contribution one higher, 4 times, and dispatch
+  again. Case `move`: 0.40.2 refuses and diverges by 9248 hit/miss
+  mismatches, 0.40.3 matches. Dispatch suite 33 of 33 plus 5 gates.
+
 
 - **Old shader tables are freed.** A lowered pipeline builds a new table
   whenever the scene's record layout changes, which in Escher's open world is

@@ -319,6 +319,14 @@ static int g_churn = 0;
 // --churnflush, with --churn: submit and wait after EVERY layout instead, so
 // the evicted tables become idle and the shim's reuse and release path runs.
 static bool g_churnFlush = false;
+// --move, with --geom --contrib: dispatch against the scene, then build it
+// again at a NEW address with the contribution one higher, as Unreal does
+// when its top-level structure outgrows its buffer, rebuild it there three
+// more times, and dispatch against the new one. Only the second result is
+// compared. The old structure is never built again, so it must stop counting
+// as live; while it does count, the two disagree about records and the shim
+// refuses, which draws nothing.
+static bool g_move = false;
 static bool g_indirectUp = false;
 // Create the compute PSO through CreatePipelineState, the pipeline STREAM
 // form, instead of CreateComputePipelineState. Unreal uses the stream form
@@ -748,7 +756,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
-    if (g_churn) { s.inst = instBuf; s.instCount = 1; }
+    if (g_churn || g_move) { s.inst = instBuf; s.instCount = 1; }
     return s;
 }
 
@@ -831,6 +839,50 @@ static void RebuildTlasInPlace(Gpu& g, Scene& s) {
     g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
     UavBarrier(g.list.Get(), s.tlas.Get());
     g.flush();
+}
+
+// --move: see g_move. The new structure replaces s.tlas, and its instance
+// buffer replaces s.inst.
+static void MoveTlas(Gpu& g, Scene& s) {
+    D3D12_RAYTRACING_INSTANCE_DESC inst{};
+    D3D12_RANGE none{ 0, 0 };
+    void* p = nullptr;
+    HR(s.inst->Map(0, nullptr, &p), "map inst for move");
+    std::memcpy(&inst, p, sizeof(inst));
+    s.inst->Unmap(0, &none);
+    inst.InstanceContributionToHitGroupIndex += 1;
+    auto ib = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(ib->Map(0, &none, &p), "map moved inst");
+    std::memcpy(p, &inst, sizeof(inst));
+    ib->Unmap(0, nullptr);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = 1; ti.InstanceDescs = ib->GetGPUVirtualAddress();
+    // Four builds at the new address, one per submission, like four frames.
+    ComPtr<ID3D12Resource> moved;
+    for (int i = 0; i < 4; ++i) {
+        if (!moved) moved = BuildAS(g, ti);
+        else {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+            g.device->GetRaytracingAccelerationStructurePrebuildInfo(&ti, &info);
+            auto scratch = CreateBuffer(g.device.Get(), info.ScratchDataSizeInBytes,
+                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
+            desc.Inputs = ti;
+            desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+            desc.DestAccelerationStructureData = moved->GetGPUVirtualAddress();
+            g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+            UavBarrier(g.list.Get(), moved.Get());
+            g.flush();
+        }
+    }
+    s.tlas = moved;
+    s.inst = ib;
 }
 
 static Scene BuildScene(Gpu& g, bool opaque) {
@@ -1022,7 +1074,10 @@ static void Churn(Gpu& g, Scene& s, ID3D12PipelineState* pso, ID3D12RootSignatur
     keep.push_back(decoy);
     const UINT base = inst.InstanceContributionToHitGroupIndex;
     for (int k = 1; k <= g_churn; ++k) {
-        inst.InstanceContributionToHitGroupIndex = base + (UINT)k;
+        // With --churnflush the second half jumps past 2048 records, which is
+        // a bigger table, so spares of the old size have to give way to the new.
+        const UINT jump = (g_churnFlush && k > g_churn / 2) ? 2100u : 0u;
+        inst.InstanceContributionToHitGroupIndex = base + (UINT)k + jump;
         auto ib = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
             D3D12_RESOURCE_STATE_GENERIC_READ);
         HR(ib->Map(0, &none, &p), "map churn inst");
@@ -1169,6 +1224,14 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     }
     };
     start();
+    if (g_move && s.inst) {
+        g.list->Dispatch((kWidth + 7) / 8, (kHeight + 7) / 8, 1);
+        UavBarrier(g.list.Get(), out);
+        g.flush();
+        MoveTlas(g, const_cast<Scene&>(s));
+        std::printf("        top-level structure MOVED to a new address and built there 4 times\n");
+        start();
+    }
     if (g_rebuild && s.inst) {
         // Dispatch against the all-zeros scene first, so the shim learns it
         // and builds its table for it. Then rebuild in place and go again.
@@ -1651,6 +1714,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--stream") == 0) {
                 g_stream = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--move") == 0) {
+                g_move = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

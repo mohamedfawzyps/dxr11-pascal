@@ -203,9 +203,12 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
 std::string DescribeLive();
 
 // Only LIVE structures count below: ones rebuilt within the last kLiveWindow
-// top-level builds. A structure an engine stopped rebuilding, the menu's after
-// a level load, stops counting, so its records can neither collide with the
-// new scene's nor lend it their constants. An application that builds one
+// top-level builds, and not SUPERSEDED: replaced by a structure first built
+// after its last build and since built four times. A structure an engine
+// stopped rebuilding, the menu's after a level load or the old buffer after
+// the scene moves to a bigger one, stops counting, so its records can neither
+// collide with the new scene's nor lend it their constants. An application
+// that builds one
 // structure once and never again keeps it live for as long as it builds
 // nothing else, which covers a static scene.
 //

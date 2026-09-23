@@ -56,7 +56,7 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 32 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
+- 33 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
   sensitivity gate
 - 14 rewriter cases, each byte-identical between the Python reference and the
   C++ port, on both the `.ll` path and the DXIL container path, plus 17
