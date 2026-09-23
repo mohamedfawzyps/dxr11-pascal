@@ -197,6 +197,11 @@ bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap);
 // may not be covered.
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
 
+// The live top-level structures in one line, for the periodic stats line:
+// address, instances, records, and how many top-level builds ago each was
+// last rebuilt. Up to eight.
+std::string DescribeLive();
+
 // Only LIVE structures count below: ones rebuilt within the last kLiveWindow
 // top-level builds. A structure an engine stopped rebuilding, the menu's after
 // a level load, stops counting, so its records can neither collide with the

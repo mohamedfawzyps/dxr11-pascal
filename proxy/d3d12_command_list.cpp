@@ -12,6 +12,7 @@
 #include "as_tracker.h"
 #include "res_tracker.h"
 #include "group_count.h"
+#include "dispatch_stats.h"
 
 #include <windows.h>
 #include <cstring>
@@ -919,6 +920,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 groupcount::Capture cap; cap.readback = pend.readback;
                 if (!groupcount::Read(cap, groups) ||
                     !groups[0] || !groups[1] || !groups[2]) {
+                    dstats::Add(dstats::kIndirectEmpty);
                     static LONG onceEmpty = 0;
                     if (InterlockedCompareExchange(&onceEmpty, 1, 0) == 0)
                         ProxyLog("[dxr-tier-11-proxy-log] split: an indirect compute dispatch "
@@ -975,6 +977,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             }
 
             pend.bindings.Replay(slot->list.Get());
+            if (pend.rq) dstats::Add(dstats::kIndirect);
             if (pend.rq)
                 pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
                                         astrack::RecordKinds());

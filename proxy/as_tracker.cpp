@@ -1,12 +1,15 @@
 #include "as_tracker.h"
 #include "d3d12_command_list.h"
+#include "dispatch_stats.h"
 
 #include "proxy_log.h"
 #include "res_tracker.h"
 
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -31,6 +34,12 @@ bool LiveLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     auto it = g_lastBuilt.find(tlas);
     if (it == g_lastBuilt.end()) return true;
     return it->second + kLiveWindow >= g_tlasSerial;
+}
+// Top-level builds since this structure was last rebuilt. A lookup, never
+// operator[]: inserting an entry would change what LiveLocked answers.
+unsigned long long AgoLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
+    auto it = g_lastBuilt.find(tlas);
+    return it == g_lastBuilt.end() ? 0ull : g_tlasSerial - it->second;
 }
 Summary g_summary;
 
@@ -136,6 +145,11 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                      prev->second.recordCount, t.recordCount,
                      prev->second.maxContribution, t.maxContribution);
     }
+    if (isNew) dstats::Add(dstats::kTlasNew);
+    else if (prev->second.recordCount != t.recordCount ||
+             prev->second.instanceCount != t.instanceCount ||
+             prev->second.maxContribution != t.maxContribution) dstats::Add(dstats::kTlasChanged);
+    else dstats::Add(dstats::kTlasSame);
     g_tlas[tlas] = t;
     if (!isNew) return;
 
@@ -419,10 +433,12 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
     {
         std::lock_guard<std::mutex> g(g_lock);
         std::vector<RecordConstants> merged;
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> from;   // which structure set merged[i]
         for (const auto& kv : g_tlas) {
             const TlasInfo& t = kv.second;
             if (!t.valid || !LiveLocked(kv.first)) continue;
             if (t.constantsConflict) {
+                dstats::Add(dstats::kRefusedOneTlas);
                 if (why)
                     *why = "two instances put different (contribution, geometry) "
                            "pairs on hit group record " +
@@ -434,14 +450,40 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
             // Two LIVE structures disagreeing about a record is the same
             // conflict. Merging them first-read-wins would bake one of them
             // wrongly and say nothing.
-            if (merged.size() < t.constants.size()) merged.resize(t.constants.size());
+            if (merged.size() < t.constants.size()) {
+                merged.resize(t.constants.size());
+                from.resize(t.constants.size(), 0);
+            }
             for (size_t i = 0; i < t.constants.size(); ++i) {
                 const RecordConstants& a = t.constants[i];
                 RecordConstants& m = merged[i];
                 if (!a.assigned) continue;
-                if (!m.assigned) { m = a; continue; }
+                if (!m.assigned) { m = a; from[i] = kv.first; continue; }
                 if (m.geometryIndex != a.geometryIndex ||
                     m.instanceContribution != a.instanceContribution) {
+                    dstats::Add(dstats::kRefusedCrossLive);
+                    // Which two, once per pair of addresses: whether they are
+                    // one scene double-buffered or two different scenes decides
+                    // the fix, and the refusal line alone cannot say.
+                    static std::set<std::pair<D3D12_GPU_VIRTUAL_ADDRESS,
+                                              D3D12_GPU_VIRTUAL_ADDRESS>> s_seen;
+                    const auto key = std::minmax(from[i], kv.first);
+                    if (s_seen.size() < 8 && s_seen.insert(key).second) {
+                        const TlasInfo& o = g_tlas[from[i]];
+                        ProxyLog("[dxr-tier-11-proxy-log] conflict: record %u is (contribution "
+                                 "%u, geometry %u) in 0x%llX (%u instances, %u records, "
+                                 "built %llu top-level builds ago) and (%u, %u) in 0x%llX "
+                                 "(%u instances, %u records, built %llu ago)\n",
+                                 static_cast<unsigned>(i),
+                                 m.instanceContribution, m.geometryIndex,
+                                 static_cast<unsigned long long>(from[i]),
+                                 o.instanceCount, o.recordCount,
+                                 AgoLocked(from[i]),
+                                 a.instanceContribution, a.geometryIndex,
+                                 static_cast<unsigned long long>(kv.first),
+                                 t.instanceCount, t.recordCount,
+                                 AgoLocked(kv.first));
+                    }
                     if (why)
                         *why = "two live top-level structures put different "
                                "(contribution, geometry) pairs on hit group record " +
@@ -465,6 +507,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
         if (!t.valid || !LiveLocked(kv.first)) continue;
         for (size_t i = 0; i < t.reach.size(); ++i) {
             if ((t.reach[i] & kReachTriangles) && (t.reach[i] & kReachProcedural)) {
+                dstats::Add(dstats::kRefusedProcedural);
                 if (why)
                     *why = "this shader commits procedural hits, and the scene "
                            "routes BOTH triangle and procedural geometry to the "
@@ -498,6 +541,24 @@ std::vector<uint8_t> RecordKinds() {
         if (!t.valid || !LiveLocked(kv.first)) continue;
         if (out.size() < t.reach.size()) out.resize(t.reach.size(), kReachNone);
         for (size_t i = 0; i < t.reach.size(); ++i) out[i] |= t.reach[i];
+    }
+    return out;
+}
+
+std::string DescribeLive() {
+    std::lock_guard<std::mutex> g(g_lock);
+    std::string out;
+    int n = 0;
+    for (const auto& kv : g_tlas) {
+        if (!kv.second.valid || !LiveLocked(kv.first)) continue;
+        if (++n > 8) { out += " ..."; break; }
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s0x%llX %u inst %u rec built %llu ago",
+                 out.empty() ? "" : ", ",
+                 static_cast<unsigned long long>(kv.first),
+                 kv.second.instanceCount, kv.second.recordCount,
+                 AgoLocked(kv.first));
+        out += buf;
     }
     return out;
 }

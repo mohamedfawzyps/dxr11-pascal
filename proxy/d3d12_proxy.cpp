@@ -33,6 +33,7 @@
 #include "dllinfo.h"
 #include "rewriter/dxc_host.h"
 #include "d3d12_device.h"
+#include "dispatch_stats.h"
 
 // --- real system d3d12.dll -------------------------------------------------
 static HMODULE RealD3D12() {
@@ -368,7 +369,9 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
         //
         // Nothing else happens on detach. During process teardown the loader
         // lock is held and other DLLs may already be gone, so this stays to one
-        // formatted line and no cleanup.
+        // formatted line and no cleanup. The stats line is the one exception:
+        // it reads atomics and takes no lock of its own.
+        dstats::Final();
         ProxyLog("[dxr-tier-11-proxy-log] ========================= end: %s (pid %lu) "
                  "=========================\n",
                  ProxyHostExeName(), (unsigned long)GetCurrentProcessId());

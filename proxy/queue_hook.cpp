@@ -4,6 +4,7 @@
 #include "proxy_log.h"
 #include "d3d12_command_list.h"
 #include "as_tracker.h"
+#include "dispatch_stats.h"
 
 #include <windows.h>
 #include <vector>
@@ -70,6 +71,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         // be stamped with a fence, and anything stamped earlier read. Returns
         // immediately when there is nothing pending, which is the normal case.
         astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
+        dstats::Tick(astrack::DescribeLive);
         return;
     }
 
@@ -83,6 +85,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         g_original(self, 1, one);
     }
     astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
+    dstats::Tick(astrack::DescribeLive);
 }
 
 bool PatchSlot(void** vtable, size_t index, void* replacement, void** outOriginal) {

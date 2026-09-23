@@ -1,5 +1,7 @@
 #include "rq_pipeline.h"
 
+#include "dispatch_stats.h"
+
 #include "config.h"
 
 #include <dxgi1_4.h>
@@ -878,8 +880,10 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                      "needs %u hit group records and the table could not be "
                      "rebuilt (%s).\n",
                      static_cast<unsigned>(recordKinds.size()), why.c_str());
+            dstats::Add(dstats::kSkippedTable);
             return;
         }
+        dstats::Add(wasCached ? dstats::kTableCached : dstats::kTableNew);
         static LONG s_logged = 0;
         if (!wasCached && InterlockedIncrement(&s_logged) <= 32) {
         UINT rejecting = 0;
@@ -935,6 +939,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
             if (InterlockedCompareExchange(&s_said, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] rqdispatch: pipeline %d and beyond are "
                          "built but NOT dispatched\n", m_index);
+            dstats::Add(dstats::kHeldBack);
             return;
         }
     }
@@ -949,6 +954,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
     d.Depth = gz * m_threads[2];
     cl->SetPipelineState1(so);
     cl->DispatchRays(&d);
+    dstats::Add(dstats::kDrawn);
 }
 
 // --- IUnknown ---------------------------------------------------------------

@@ -24,6 +24,25 @@ not.
 
 ---
 
+## 0.40.1
+
+- **Counters for lowered dispatches.** One `stats:` line every 10 seconds
+  while a count moves, and one `stats at exit:` line: dispatches DRAWN (and
+  how many indirect), REFUSED by reason, tables built and reused, top-level
+  reads new, changed and unchanged, and the live top-level structures with
+  how many builds ago each was rebuilt. Each distinct pair of live structures
+  that disagree about a record gets one `conflict:` line naming both.
+- Why: the 0.40.0 Escher run refused a lowered dispatch in the open world for
+  two live top-level structures (271 and 270 instances) disagreeing about
+  record 2068, and could not say how often. The refusal logs once, the table
+  line stops at 32 and the re-read line at 8, and all three were spent before
+  the open world loaded. A counter cannot be spent.
+- No behaviour change: dispatch suite 30 of 30 plus gates. The `conflict:`
+  line is not exercised offline; no harness scene has two live structures
+  that disagree.
+
+---
+
 ## 0.40.0
 
 - **THE DRIVER CRASH'S REAL CAUSE: AN UNANNOTATED HANDLE, NOT A CBUFFER.**

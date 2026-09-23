@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.40.0.
+proxy/version.h, and is currently 0.40.1.
 
 ## Current position (2026-09-23)
 
@@ -57,6 +57,23 @@ open world against 19 and 27 record tables while that scene reaches record
 dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
+
+**0.40.0 IN THE GAME: A FULL SESSION, NO CRASH, AND THE LAG IS GONE
+(2026-09-23).** Menu, open world, cinematic, ray tracing and MegaLights
+toggled repeatedly. 54 lowered, 50 of them reading records through the
+annotated local root SRV, every `CreateStateObject` of 277 hr=0, 108 refused,
+no SKIPPED, no rebake. The user saw ray traced shadows produce a visible
+result and the menu stutter of 0.39.2 disappear; that the stutter was the
+rebakes is INFERRED. What the log could NOT say: how many open-world lowered
+dispatches drew. One was refused for two LIVE top-level structures, 271 and
+270 instances, putting different pairs on record 2068, and every line that
+would count it was logged once or capped. 0.40.1 adds counters, a `stats:`
+line every 10 s. **Two things to keep: a rate-limited log line is not a
+measurement, and `run_dispatch_test.ps1` DELETES `%TEMP%`'s log, which
+destroyed this run's log; the Escher ini now sets `log` beside the game.**
+If the conflict is common, the fix is choosing the structure per dispatch,
+and the `conflict:` line says whether the two are one scene double-buffered
+or two scenes.
 
 **0.40.0: THE DRIVER CRASH WAS AN UNANNOTATED HANDLE, AND THE BAKE IS GONE.**
 Every entry below that says a hit shader READING a cbuffer through the local
