@@ -93,6 +93,9 @@ struct Shape {
     // (geometry, contribution) pair, exported as <name>_<k>. 0 for a library
     // written before 0.37.0 or one that reads no record constant.
     UINT baked = 0;
+    // `recordsrv=1` (shim 0.40.0 on): the record is read through a local root
+    // SRV at t0, so that is the local root signature to build.
+    bool recordSrv = false;
     bool known = false;
 };
 
@@ -145,6 +148,7 @@ Shape ReadShape(const std::string& libPath) {
     s.both = b != 0;
     s.recordConstants = r != 0;
     s.baked = got == 5 && k > 0 ? static_cast<UINT>(k) : 0;
+    s.recordSrv = std::strstr(line, "recordsrv=1") != nullptr;
     s.known = true;
     return s;
 }
@@ -337,10 +341,18 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
         // way: it still reads a cbuffer at b0 space1. Only the parameter type
         // moves, which is what makes this a one-variable test of the driver
         // crash. See phase5/cases/driver-crash/README.md.
+        // SOTEST_LOCAL_SRV=1 makes it a root SRV at t0 of that space, for a
+        // library that reads its record through a RAW BUFFER instead of a
+        // cbuffer (phase5/cases/driver-crash/make_localsrv.py).
         const bool localCbv = EnvFlag("SOTEST_LOCAL_CBV");
+        const bool localSrv = shape.recordSrv || EnvFlag("SOTEST_LOCAL_SRV");
         D3D12_ROOT_PARAMETER rp{};
         rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        if (localCbv) {
+        if (localSrv) {
+            rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rp.Descriptor.ShaderRegister = 0;
+            rp.Descriptor.RegisterSpace = LocalSpace();
+        } else if (localCbv) {
             rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             rp.Descriptor.ShaderRegister = 0;
             rp.Descriptor.RegisterSpace = LocalSpace();
@@ -352,7 +364,8 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
         }
         if (!quiet)
             std::printf("  local root signature: %s\n",
-                        localCbv ? "root CBV descriptor" : "root constants");
+                        localSrv ? "root SRV descriptor"
+                        : localCbv ? "root CBV descriptor" : "root constants");
 
         D3D12_ROOT_SIGNATURE_DESC rsd{};
         rsd.NumParameters = 1;

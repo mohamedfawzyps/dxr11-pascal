@@ -175,43 +175,48 @@ foreach ($c in $cases) {
     Remove-Item "rw_${n}_a.bin", "rw_${n}_b.bin" -ErrorAction SilentlyContinue
 }
 
-# Baked record constants. A hit shader READING a local root signature crashes
-# the Pascal driver inside CreateStateObject (phase5/cases/driver-crash/), so
-# GeometryIndex and InstanceContributionToHitGroupIndex are baked into one copy
-# of the hit shaders per (geometry, contribution) pair instead. See
-# proxy/rewriter/rq_bake.h.
+# Record data through a LOCAL ROOT SRV. A hit shader reading a CBUFFER through
+# the local root signature crashes the Pascal driver inside CreateStateObject
+# (phase5/cases/driver-crash/, 9 of 15 cold compiles); the same library
+# reading through a local root SRV was 0 of 30. So GeometryIndex and
+# InstanceContributionToHitGroupIndex are read with rawBufferLoad from a raw
+# buffer at t0, space1.
 #
-# Three checks per case: the Python and the C++ bake byte-identically, the
-# result assembles and validates, and NO record read survives, which is the
-# property the whole pass exists for. Rendering is the dispatch suite's job,
-# because only there do the pairs come from a real scene.
+# Three checks per case: the Python and the C++ lower byte-identically, the
+# result validates, and every record read is a rawBufferLoad with NO cbuffer
+# load of the record left, which is the property the change exists for.
+# Rendering is the dispatch suite's job, because only there does the shim
+# build records from a real scene.
 Write-Host ''
-Write-Host '=== baked record constants ==='
-$bakes = @(
-    @{ name = 'geom';     src = 'phase5\cases\rayquery_geom.ll';     pairs = '0:0,1:0,2:0,3:0' },
-    @{ name = 'geomc';    src = 'phase5\cases\rayquery_geom.ll';     pairs = '0:0,0:2,1:2,2:2,3:2' },
-    @{ name = 'bothgeom'; src = 'phase5\cases\rayquery_bothgeom.ll'; pairs = '0:0,0:1' }
+Write-Host '=== record data through a local root SRV ==='
+$recs = @(
+    @{ name = 'geom';     src = 'phase5\cases\rayquery_geom.ll' },
+    @{ name = 'bothgeom'; src = 'phase5\cases\rayquery_bothgeom.ll' },
+    @{ name = 'geomsm66'; src = 'phase5\cases\rayquery_geom_sm66.ll' }
 )
-foreach ($b in $bakes) {
-    $n = "bake_$($b.name)"
-    if (-not (Test-Path $b.src)) { Write-Host "  $n : SKIPPED, $($b.src) missing"; $failed++; continue }
-    & python phase5\rewriter\dxrewrite.py lower $b.src "phase5\out\$n.low.ll" | Out-Null
-    & python phase5\rewriter\dxrewrite.py bake "phase5\out\$n.low.ll" "phase5\out\$n.ll" $b.pairs | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Host "  $n : Python bake REFUSED"; $failed++; continue }
+foreach ($r in $recs) {
+    $n = "rec_$($r.name)"
+    if (-not (Test-Path $r.src)) { Write-Host "  $n : SKIPPED, $($r.src) missing"; $failed++; continue }
+    & python phase5\rewriter\dxrewrite.py lower $r.src "phase5\out\$n.ll" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  $n : Python lower REFUSED"; $failed++; continue }
     New-Item -ItemType Directory -Force 'phase5\outcpp' | Out-Null
-    & .\phase5out\dxrw.exe bake "phase5\out\$n.low.ll" "phase5\outcpp\$n.ll" $b.pairs | Out-Null
+    & .\phase5out\dxrw.exe lower $r.src "phase5\outcpp\$n.ll" | Out-Null
     $py = [IO.File]::ReadAllBytes((Resolve-Path "phase5\out\$n.ll"))
     $cp = [IO.File]::ReadAllBytes((Resolve-Path "phase5\outcpp\$n.ll"))
     $same = ($py.Length -eq $cp.Length) -and (-not (Compare-Object $py $cp -SyncWindow 0))
     $asm = & .\phase5out\dxilrt.exe asm "phase5\out\$n.ll" "phase5\out\$n.dxil" 2>&1
     $valid = $LASTEXITCODE -eq 0
-    $left = Select-String -Path "phase5\out\$n.ll" -Pattern 'rq_record|%rq\.cbr' |
-            Where-Object { $_.Line.TrimStart() -notmatch '^;' }
-    $copies = ($b.pairs -split ',').Count
-    if ($same -and $valid -and -not $left) {
-        Write-Host "  $n : PASS ($copies copies, byte-identical, validates, no record read)"
+    $raw = @(Select-String -Path "phase5\out\$n.ll" -Pattern 'rawBufferLoad\.i32\(i32 139, %dx\.types\.Handle %rq\.cbh').Count
+    $cb = @(Select-String -Path "phase5\out\$n.ll" -Pattern 'cbufferLoadLegacy[^\n]*%rq\.cbh').Count
+    # At 6.6 every record read must go through an ANNOTATED handle: a bare
+    # createHandleForLib on a local root signature resource crashes the driver.
+    $ann = @(Select-String -Path "phase5\out\$n.ll" -Pattern 'annotateHandle\(i32 216, %dx\.types\.Handle %rq\.cbh\w+\.lib, %dx\.types\.ResourceProperties \{ i32 11, i32 0 \}').Count
+    $is66 = @(Select-String -Path $r.src -Pattern '!"cs", i32 6, i32 6').Count -gt 0
+    if ($is66 -and $ann -ne $raw) { $raw = 0 }
+    if ($same -and $valid -and $raw -gt 0 -and $cb -eq 0) {
+        Write-Host "  $n : PASS ($raw record reads, all rawBufferLoad$(if ($is66) { ', all annotated' }), byte-identical, validates)"
     } else {
-        Write-Host "  $n : FAIL (identical=$same validates=$valid record reads left=$(@($left).Count))"
+        Write-Host "  $n : FAIL (identical=$same validates=$valid raw reads=$raw cbuffer reads=$cb)"
         if (-not $valid) { $asm | Select-Object -Last 4 | ForEach-Object { "    $_" } }
         $failed++
     }

@@ -1005,7 +1005,12 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         hlsl = fromFile.c_str();
         std::printf("        compute shader from %s\n", g_csFile);
     }
-    ComPtr<IDxcBlob> cs = dxc.compile(hlsl, L"main", L"cs_6_5");
+    // A shader file named *sm66* is compiled at 6.6, which is what Unreal
+    // uses. Until 0.40.0 everything here was 6.5, so the dispatch suite's
+    // `sm66` case ran a 6.5 shader and the 6.6 form never reached the proxy.
+    const bool sm66 = g_csFile && std::strstr(g_csFile, "sm66");
+    ComPtr<IDxcBlob> cs = dxc.compile(hlsl, L"main", sm66 ? L"cs_6_6" : L"cs_6_5");
+    if (sm66) std::printf("        compiled at cs_6_6\n");
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = rs.Get();
     pd.CS.pShaderBytecode = cs->GetBufferPointer();

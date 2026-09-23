@@ -330,12 +330,13 @@ call is where the device went.
 
 One cause is known and fixed. Up to 0.36.x the shim passed each hit group
 record's geometry index and instance contribution through a local root
-signature, and on Pascal a hit shader READING a local root signature makes the
-driver crash inside `CreateStateObject`, intermittently, and only when NVIDIA's
-shader cache does not already hold the result. From 0.37.0 those values are
-baked into a copy of the hit shaders per record instead, and the log line says
-how many copies each build carries. If you see this on 0.37.0 or later it is a
-different cause: turn `dump` on, and the library that was being built is on
+signature, and the handle it made for that resource was not ANNOTATED, which
+Shader Model 6.6 requires. On Pascal that makes the driver crash inside
+`CreateStateObject`, intermittently, and only when NVIDIA's shader cache does
+not already hold the result. 0.37.0 to 0.39.x worked around it by baking the
+values into copies of the hit shaders; 0.40.0 annotates the handle and reads
+the record again. If you see this on 0.40.0 or later it is a different
+cause: turn `dump` on, and the library that was being built is on
 disk as `lowered_NNN.*` and can be rebuilt on its own with `sotest`, see
 `phase5/cases/driver-crash/README.md`. Because the crash can depend on the
 cache, one clean run of a library proves little; clear

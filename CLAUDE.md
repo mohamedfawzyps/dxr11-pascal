@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.39.2.
+proxy/version.h, and is currently 0.40.0.
 
 ## Current position (2026-09-23)
 
@@ -57,6 +57,22 @@ open world against 19 and 27 record tables while that scene reaches record
 dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
+
+**0.40.0: THE DRIVER CRASH WAS AN UNANNOTATED HANDLE, AND THE BAKE IS GONE.**
+Every entry below that says a hit shader READING a cbuffer through the local
+root signature crashes the driver is WRONG about the cause. At Shader Model
+6.6 a `createHandleForLib` must be followed by `annotateHandle`; the lowering
+did not do that for its own record resource. One variable at a time, cold
+cache: cbuffer unannotated 9/15 vs annotated 0/15, raw buffer unannotated
+10/15 vs annotated 0/15. Now each hit record carries an 8-byte local root SRV
+pointing at its own pair, read with `rawBufferLoad` through an annotated
+handle: no copies, no cap. 60 of 60 record-reading Unreal libraries from the
+last run, lowered fresh, clean on one cold compile each. The method error:
+a hand-made variant copied from DXC changed two things at once, and was
+believed. **When a variant is copied from a compiler's output, diff it against
+the original and list EVERY difference before crediting any one of them.**
+Also: `raytest` had compiled every shader at 6.5, so no 6.6 shader had ever
+been through the proxy; `*sm66*` files now compile at 6.6.
 
 **0.39.2 IN THE GAME: A FULL SESSION, NO CRASH (2026-09-23).** 4 min 9 s, clean
 end marker, no device removal, no crash report: menu, open world, the

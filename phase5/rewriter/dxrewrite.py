@@ -3,7 +3,6 @@
 
     python phase5/rewriter/dxrewrite.py analyze <in.ll>
     python phase5/rewriter/dxrewrite.py lower   <in.ll> <out.ll>
-    python phase5/rewriter/dxrewrite.py bake    <lowered.ll> <out.ll> <g:c,g:c,...>
 
 Prints what the analysis found, so it can be checked against the hand
 lowerings in phase5/hand before any transform is built on top of it. Nothing
@@ -90,31 +89,11 @@ def cmd_lower(src, dst):
     return 0
 
 
-def cmd_bake(src, dst, pairs):
-    import bake
-    text = io.open(src, encoding='utf-8').read()
-    try:
-        parsed = bake.parse_pairs(pairs)
-    except ValueError:
-        sys.stderr.write('REFUSED: bad pair list %s\n' % pairs)
-        return 2
-    try:
-        out = bake.bake(text, parsed)
-    except bake.BakeError as e:
-        sys.stderr.write('REFUSED: %s\n' % e)
-        return 2
-    io.open(dst, 'w', encoding='utf-8', newline='\n').write(out)
-    print('baked %s -> %s (%s)' % (src, dst, pairs))
-    return 0
-
-
 def main(argv):
     if len(argv) >= 3 and argv[1] == 'analyze':
         return cmd_analyze(argv[2])
     if len(argv) >= 4 and argv[1] == 'lower':
         return cmd_lower(argv[2], argv[3])
-    if len(argv) >= 5 and argv[1] == 'bake':
-        return cmd_bake(argv[2], argv[3], argv[4])
     print(__doc__)
     return 1
 

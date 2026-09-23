@@ -52,13 +52,36 @@ PAYLOAD_FIELD = {
 # The record's own two numbers, and how the generated shaders reach them.
 #
 # Not a dx.op call like everything else in CH_SOURCE: there is no intrinsic for
-# either, which is exactly why they were refused. They come out of a cbuffer
-# bound by a LOCAL root signature, so the value is per hit-group-record and the
-# shim chose it when it built the table.
+# either, which is exactly why they were refused. They come out of a RAW BUFFER
+# bound by a LOCAL root signature root SRV at t0, space1, so the value is per
+# hit-group-record and the shim chose it when it built the table.
+#
+# In a Shader Model 6.6 module the handle MUST be annotated, and that is what
+# the Pascal driver crash always was. A 6.6 library whose hit shader reaches a
+# LOCAL root signature resource through a bare createHandleForLib, with no
+# annotateHandle after it, crashes the driver inside CreateStateObject on
+# about half of all cold compiles. Measured one variable at a time on the
+# vendored Unreal library (phase5/cases/driver-crash/):
+#
+#     cbuffer record, unannotated (0.36.x)   9 of 15     annotated   0 of 15
+#     raw buffer record, unannotated         10 of 15    annotated   0 of 15
+#
+# So it was never the cbuffer, and never reading the local root signature as
+# such: 0.37.0 to 0.39.x baked the values in to avoid a read that only needed
+# annotating. The raw buffer stays because it is built and tested, and each
+# record carries its own pair with no cap on distinct pairs.
+#
+# Shapes copied from DXC, phase5/cases/reference/lib_localsrv_ref.hlsl: at
+# lib_6_6 a %dx.types.Handle global, createHandleForLib on it, annotateHandle
+# as a raw buffer (kind 11); at lib_6_5, which has no annotateHandle, the
+# struct global and a bare createHandleForLib.
 RECORD_TYPE = '%rq_record'
 RECORD_GLOBAL = '@rq_record'
 RECORD_HANDLE_FN = 'dx.op.createHandleForLib.rq_record'
-CBRET = '%dx.types.CBufRet.i32'
+RESRET = '%dx.types.ResRet.i32'
+# Shader flag for raw and structured buffers. The validator requires it once a
+# module reads one, and Unreal's modules declare it clear.
+RAW_BUFFER_FLAG = 0x10
 # Which word of the record each accessor reads.
 RECORD_WORD = {
     rq.CANDIDATE_GEOMETRY_INDEX: 0,
@@ -68,22 +91,44 @@ RECORD_WORD = {
 }
 
 
-def _record_read(tag, word, result):
+def _is_sm66(text):
+    """Shader Model 6.6 or later, where every handle is annotated."""
+    m = re.search(r'^!\d+ = !\{!"(?:cs|lib)", i32 (\d+), i32 (\d+)\}', text, re.M)
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (6, 6)
+
+
+def _record_read(tag, word, result, sm66=False):
     """The four lines that pull one word out of the hit group record.
 
     Emitted per use rather than hoisted. The handle and the load are pure and
     the driver folds the duplicates; hoisting them by hand would mean finding a
     place to put them that dominates every use, which is a CFG question this
     pass has no reason to ask."""
-    return [
-        '  %%rq.cbv%s = load %s, %s* %s, align 4'
-        % (tag, RECORD_TYPE, RECORD_TYPE, RECORD_GLOBAL),
-        '  %%rq.cbh%s = call %%dx.types.Handle @%s(i32 160, %s %%rq.cbv%s)'
-        '  ; CreateHandleForLib(Resource)' % (tag, RECORD_HANDLE_FN, RECORD_TYPE, tag),
-        '  %%rq.cbr%s = call %s @dx.op.cbufferLoadLegacy.i32(i32 59, '
-        '%%dx.types.Handle %%rq.cbh%s, i32 0)  ; CBufferLoadLegacy(handle,regIndex)'
-        % (tag, CBRET, tag),
-        '  %s = extractvalue %s %%rq.cbr%s, %d' % (result, CBRET, tag, word),
+    if sm66:
+        handle = [
+            '  %%rq.cbv%s = load %s, %s* %s, align 4'
+            % (tag, HANDLE_TYPE, HANDLE_TYPE, RECORD_GLOBAL),
+            '  %%rq.cbh%s.lib = call %s @dx.op.createHandleForLib.dx.types.Handle'
+            '(i32 160, %s %%rq.cbv%s)  ; CreateHandleForLib(Resource)'
+            % (tag, HANDLE_TYPE, HANDLE_TYPE, tag),
+            '  %%rq.cbh%s = call %s @dx.op.annotateHandle(i32 216, %s %%rq.cbh%s.lib, '
+            '%%dx.types.ResourceProperties { i32 11, i32 0 })'
+            '  ; AnnotateHandle(res,props)  resource: ByteAddressBuffer'
+            % (tag, HANDLE_TYPE, HANDLE_TYPE, tag),
+        ]
+    else:
+        handle = [
+            '  %%rq.cbv%s = load %s, %s* %s, align 4'
+            % (tag, RECORD_TYPE, RECORD_TYPE, RECORD_GLOBAL),
+            '  %%rq.cbh%s = call %%dx.types.Handle @%s(i32 160, %s %%rq.cbv%s)'
+            '  ; CreateHandleForLib(Resource)' % (tag, RECORD_HANDLE_FN, RECORD_TYPE, tag),
+        ]
+    return handle + [
+        '  %%rq.cbr%s = call %s @dx.op.rawBufferLoad.i32(i32 139, '
+        '%%dx.types.Handle %%rq.cbh%s, i32 0, i32 undef, i8 3, i32 4)'
+        '  ; RawBufferLoad(srv,index,elementOffset,mask,alignment)'
+        % (tag, RESRET, tag),
+        '  %s = extractvalue %s %%rq.cbr%s, %d' % (result, RESRET, tag, word),
     ]
 
 # RayQuery -> DXR 1.0, for accessors read in the ANY-HIT shader. Measured from
@@ -217,6 +262,8 @@ def lower(module, q, exports=None):
 
     binding = _uses_binding(module)
     binds = _binding_map(text, md) if binding else None
+    # How the record handle is written; see RECORD_TYPE.
+    q.record_sm66 = _is_sm66(text)
     globals_ = _plan_globals(table)
     _edit_resources(module, q, edits, table, globals_, binds)
     _edit_ray_index(module, q, edits)
@@ -226,7 +273,8 @@ def lower(module, q, exports=None):
     edits[fn.index] = 'define void @%s() #RQNW {' % exports['raygen']
 
     out = render(module, edits)
-    out = _add_types_and_globals(out, globals_, q.needs_record_constants, binding)
+    out = _add_types_and_globals(out, globals_, q.needs_record_constants, binding,
+                                 q.record_sm66)
     out = _swap_declarations(out, q, globals_, binding)
     out = _append_shaders(out, module, q, exports, table, globals_, binds)
     out = _rewrite_metadata(out, md, table, globals_, q, exports, binding)
@@ -1072,18 +1120,21 @@ def _edit_committed(q, edits):
 
 # --- generated text --------------------------------------------------------
 
-def _add_types_and_globals(text, globals_, needs_record=False, binding=False):
+def _add_types_and_globals(text, globals_, needs_record=False, binding=False,
+                           sm66=False):
     decls = ['%s = type %s' % (PAYLOAD, PAYLOAD_TYPE),
              '%s = type { <2 x float> }' % ATTRS, '']
     if needs_record:
-        # Two words, matching the two root constants the shim puts in every hit
-        # group record. Declared here even when the original shader had no
-        # cbuffer of its own, which is why CBufRet is added conditionally too.
-        decls.insert(2, '%s = type { i32, i32 }' % RECORD_TYPE)
-        if ('%s = type' % CBRET) not in text:
-            decls.insert(3, '%s = type { i32, i32, i32, i32 }' % CBRET)
+        # The raw buffer's element type, as DXC declares a ByteAddressBuffer.
+        # ResRet is added only when the application's module lacks it.
+        decls.insert(decls.index(''), '%s = type { i32 }' % RECORD_TYPE)
+        if ('%s = type' % RESRET) not in text:
+            decls.insert(decls.index(''), '%s = type { i32, i32, i32, i32, i32 }' % RESRET)
+        if sm66 and '%dx.types.ResourceProperties = type' not in text:
+            decls.insert(decls.index(''), '%dx.types.ResourceProperties = type { i32, i32 }')
+        # At 6.6 the global holds a HANDLE and the record bitcasts it, as DXC's.
         decls.append('%s = external constant %s, align 4'
-                     % (RECORD_GLOBAL, RECORD_TYPE))
+                     % (RECORD_GLOBAL, HANDLE_TYPE if sm66 else RECORD_TYPE))
     seen = set()
     for sym, gty, elem, _ in globals_.values():
         if sym in seen:
@@ -1162,17 +1213,28 @@ def _swap_declarations(text, q, globals_, binding=False):
 
     # The record read. Both are nounwind readonly, copied from DXC output.
     #
-    # cbufferLoadLegacy may ALREADY be declared, because the application's own
-    # shader very likely has a cbuffer of its own; declaring it twice is as much
-    # an error as declaring it unused.
-    if q.needs_record_constants:
+    # rawBufferLoad may ALREADY be declared, because the application's own
+    # shader may read a raw buffer of its own; declaring it twice is as much an
+    # error as declaring it unused.
+    if q.needs_record_constants and q.record_sm66:
+        # The binding form declares this overload itself, further down.
+        if not binding and '@dx.op.createHandleForLib.dx.types.Handle(' not in text:
+            new += ['', '; Function Attrs: nounwind readonly',
+                    'declare %s @dx.op.createHandleForLib.dx.types.Handle'
+                    '(i32, %s) #RQRO' % (HANDLE_TYPE, HANDLE_TYPE)]
+        if '@dx.op.annotateHandle(' not in text:
+            new += ['', '; Function Attrs: nounwind readnone',
+                    'declare %s @dx.op.annotateHandle(i32, %s, '
+                    '%%dx.types.ResourceProperties) #RQNONE' % (HANDLE_TYPE, HANDLE_TYPE)]
+    elif q.needs_record_constants:
         new += ['', '; Function Attrs: nounwind readonly',
                 'declare %%dx.types.Handle @%s(i32, %s) #RQRO'
                 % (RECORD_HANDLE_FN, RECORD_TYPE)]
-        if '@dx.op.cbufferLoadLegacy.i32(' not in text:
+    if q.needs_record_constants:
+        if '@dx.op.rawBufferLoad.i32(' not in text:
             new += ['', '; Function Attrs: nounwind readonly',
-                    'declare %s @dx.op.cbufferLoadLegacy.i32'
-                    '(i32, %%dx.types.Handle, i32) #RQRO' % CBRET]
+                    'declare %s @dx.op.rawBufferLoad.i32'
+                    '(i32, %%dx.types.Handle, i32, i32, i8, i32) #RQRO' % RESRET]
     if q.needs_intersection:
         new += ['', '; Function Attrs: nounwind',
                 'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #RQNW'
@@ -1232,14 +1294,14 @@ def _closesthit(name, status, q):
         ch.append('  store %s %%id%d, %s* %%pi%d, align 4' % (ty, idx, ty, idx))
 
     # The record's two numbers, when the shader asked for either. Both are
-    # stored whenever either is read: one cbuffer load answers both, so
-    # splitting them would cost a branch and save nothing.
+    # stored whenever either is read: one load answers both, so splitting
+    # them would cost a branch and save nothing.
     if q.needs_record_constants:
-        ch += _record_read('g', 0, '%rq.geo')
+        ch += _record_read('g', 0, '%rq.geo', q.record_sm66)
         ch.append('  %%rq.gp = getelementptr inbounds %s, %s* %%p, i32 0, i32 5'
                   % (PAYLOAD, PAYLOAD))
         ch.append('  store i32 %rq.geo, i32* %rq.gp, align 4')
-        ch.append('  %%rq.con = extractvalue %s %%rq.cbrg, 1' % CBRET)
+        ch.append('  %%rq.con = extractvalue %s %%rq.cbrg, 1' % RESRET)
         ch.append('  %%rq.cp = getelementptr inbounds %s, %s* %%p, i32 0, i32 10'
                   % (PAYLOAD, PAYLOAD))
         ch.append('  store i32 %rq.con, i32* %rq.cp, align 4')
@@ -1422,7 +1484,8 @@ def _intersection(module, q, exports, table, globals_, binds=None):
             if i.dxop in RECORD_WORD:
                 # The record answers, because nothing in the shader can. The
                 # local root signature bound this record's own constants.
-                out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result)
+                out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result,
+                                    q.record_sm66)
                 continue
             if i.dxop in CANDIDATE_MAP:
                 ty, callee, op, extra = CANDIDATE_MAP[i.dxop]
@@ -1564,7 +1627,8 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
             if i.dxop in RECORD_WORD:
                 # The record answers, because nothing in the shader can. The
                 # local root signature bound this record's own constants.
-                out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result)
+                out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result,
+                                    q.record_sm66)
                 continue
             if i.dxop in CANDIDATE_MAP:
                 # Same operands as the RayQuery form, minus the query handle.
@@ -1635,23 +1699,26 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
 
     nodes = []
 
-    # The record cbuffer, added to whatever the application already had.
+    # The record SRV, added to whatever the application already had.
     #
-    # Shape copied from DXC, not invented: a cbuffer record is
-    # {id, global, name, space, lowerBound, rangeSize, sizeInBytes, extra}.
-    # space 1 keeps it clear of anything the application's own global root
-    # signature binds, which the shim must not disturb. See
-    # phase5/cases/reference/lib_localroot_ref.hlsl.
+    # Shape copied from DXC, not invented: an SRV record is
+    # {id, global, name, space, lowerBound, rangeSize, kind, sampleCount,
+    # extra}, and kind 11 is a raw buffer. space 1 keeps it clear of anything
+    # the application's own global root signature binds, which the shim must
+    # not disturb. See phase5/cases/reference/lib_localsrv_ref.hlsl.
     if q.needs_record_constants:
         groups = [g.strip() for g in md[int(res)].split(',')]
         while len(groups) < 4:
             groups.append('null')
         have = []
-        if groups[2] != 'null':
-            have = [x.strip() for x in md[int(groups[2][1:])].split(',')]
-        rec = node('i32 %d, %s* %s, !"rq_record", i32 1, i32 0, i32 1, i32 8, null'
-                   % (len(have), RECORD_TYPE, RECORD_GLOBAL))
-        groups[2] = '!%d' % node(', '.join(have + ['!%d' % rec]))
+        if groups[0] != 'null':
+            have = [x.strip() for x in md[int(groups[0][1:])].split(',')]
+        gref = ('%s* bitcast (%s* %s to %s*)'
+                % (RECORD_TYPE, HANDLE_TYPE, RECORD_GLOBAL, RECORD_TYPE)
+                if q.record_sm66 else '%s* %s' % (RECORD_TYPE, RECORD_GLOBAL))
+        rec = node('i32 %d, %s, !"rq_record", i32 1, i32 0, i32 1, i32 11, i32 0, null'
+                   % (len(have), gref))
+        groups[0] = '!%d' % node(', '.join(have + ['!%d' % rec]))
         # Rewritten in place, so !dx.resources keeps pointing at the same node
         # and nothing else has to learn a new id.
         text = re.sub(r'^!%s = !\{.*\}\s*$' % res,
@@ -1694,7 +1761,9 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
     # Entry points: a resource-only record, then one per export. Tags are
     # 8 shader kind, 6 payload bytes, 7 attribute bytes, 5 auto binding space.
     zero = node('i32 0')
-    flags = node('i32 0, i64 %d' % (_module_flags(text, md) & ~RT11_SHADER_FLAG))
+    flags = node('i32 0, i64 %d'
+                 % ((_module_flags(text, md) & ~RT11_SHADER_FLAG)
+                    | (RAW_BUFFER_FLAG if q.needs_record_constants else 0)))
     eps = [node('null, !"", null, !%s, !%d' % (res, flags))]
 
     def entry(name, sig, kind, payload, attrs):

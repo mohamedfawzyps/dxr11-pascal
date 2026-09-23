@@ -56,10 +56,10 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 29 end-to-end render cases, all bit-exact, plus 4 refusal gates
+- 30 end-to-end render cases, all bit-exact, plus 4 refusal gates
 - 14 rewriter cases, each byte-identical between the Python reference and the
   C++ port, on both the `.ll` path and the DXIL container path, plus 17
-  analysis and lowering checks and 3 baking checks
+  analysis and lowering checks and 3 record-read checks
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
   pixel-identical to its no-proxy baseline
 
@@ -152,10 +152,13 @@ them, `Candidate`/`CommittedGeometryIndex` and the two
 `*InstanceContributionToHitGroupIndex` forms, were listed here as permanently
 impossible, and they were, for as long as the application owned the shader
 table. This shim builds it, so it knows those numbers for every record it
-writes. It bakes them into one copy of the hit shaders per distinct pair and
-points each record at its copy. The obvious route, passing them as local root
-signature constants, made the Pascal driver crash inside `CreateStateObject`,
-and was replaced in 0.37.0.
+writes. Each hit group record carries a pointer, a local root signature root
+SRV, to its own (geometry, contribution) pair, and the hit shader reads it.
+The first version of this made the Pascal driver crash inside
+`CreateStateObject`; 0.37.0 to 0.39.x worked around that by compiling a copy
+of the hit shaders per pair, which cannot scale to a real open world. 0.40.0
+found the actual cause, a Shader Model 6.6 resource handle left unannotated,
+and went back to reading the record.
 
 ## Requirements
 

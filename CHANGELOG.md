@@ -24,7 +24,49 @@ not.
 
 ---
 
-## 0.39.2
+## 0.40.0
+
+- **THE DRIVER CRASH'S REAL CAUSE: AN UNANNOTATED HANDLE, NOT A CBUFFER.**
+  Since 0.36.x this project has held that a hit shader READING a cbuffer
+  through the local root signature crashes the Pascal driver inside
+  `CreateStateObject`, and 0.37.0 to 0.39.x baked the record values into
+  copies of the hit shaders to avoid the read. It was the handle. At Shader
+  Model 6.6 DXC follows every `createHandleForLib` with an `annotateHandle`;
+  the lowering did not, for the record resource it adds. Measured one
+  variable at a time on the vendored Unreal shader, cache cleared every
+  trial: cbuffer record unannotated 9 of 15, annotated 0 of 15; raw buffer
+  record unannotated 10 of 15, annotated 0 of 15. The local binding is part
+  of the condition: the old `globalrec` control kept the bare handle, bound it
+  globally, and was clean.
+- **How the wrong answer was reached.** Every earlier variant changed how the
+  record was delivered and none changed how its handle was formed. The first
+  local root SRV variant was then copied from DXC's 6.6 output, which
+  annotates, and read as "a root SRV is safe" at 0 of 30, when it had changed
+  two things. The rewriter's own unannotated SRV output crashing 7 of 15 is
+  what exposed it. See `phase5/cases/driver-crash/README.md`, corrected.
+- **So the bake is gone and each record carries its pair again.** A hit group
+  record is now its identifier plus an 8-byte GPU address, its local root
+  signature ROOT SRV at t0, space1, pointing at its own (geometry,
+  contribution) pair in the same buffer. The hit shader reads it with
+  `rawBufferLoad` through an annotated handle at 6.6, and through DXC's 6.5
+  form, which has no `annotateHandle`, at 6.5. No hit shader copies, no rebake
+  at dispatch, no 256-pair cap: Escher's open world, 383 pairs, was skipped
+  entirely at 0.39.x. The records' pairs, conflicts and live-structure rules
+  are unchanged.
+- Measured: the vendored crash shader through the 0.40.0 rewriter, 0 of 15
+  cold; all 60 record-reading Unreal libraries from the last Escher run,
+  lowered fresh, one cold compile each, 0 of 60. Dispatch suite 30 of 30; the
+  record cases pointed at pair 0 on purpose diverge by the same 4624, 4624
+  and 7396 as the bake's check did. Rewriter suite byte-identical between the
+  Python and the C++, and the 6.6 record read is checked to be annotated.
+- **A harness gap closed: nothing here had ever run a 6.6 shader through the
+  proxy.** `raytest` compiled every `--cs` shader at `cs_6_5`, so the dispatch
+  suite's `sm66` case tested 6.5 under a 6.6 name. A file named `*sm66*` is
+  now compiled at `cs_6_6`, and `geomsm66` is the record case at 6.6.
+- Removed: `phase5/rewriter/bake.py`, `proxy/rewriter/rq_bake.{h,cpp}`, the
+  `bake` subcommands and the rebake path. `sotest` reads `recordsrv=1` from a
+  shape file and builds the local root SRV itself.
+
 
 - **0.39.1 got through the open world; the GPU hang is gone.** Escher, three
   runs: the open world loaded and ran, which it never did at 0.39.0, so the

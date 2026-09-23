@@ -23,10 +23,15 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "as_tracker.h"
-#include "rewriter/rq_bake.h"
+
+namespace rq {
+// A hit group record's (geometryIndex, instanceContribution).
+using RecordPair = std::pair<uint32_t, uint32_t>;
+}
 
 // Private IID, so a pipeline state can be recognised as ours through
 // QueryInterface without ever being confused for a real one.
@@ -143,39 +148,28 @@ private:
     // gets the rejecting group OF THAT KIND, so the geometry is traversed with
     // a record of the correct type and simply produces no hit.
     //
-    // With record constants, each record also points at the hit group copy
-    // BAKED with that record's (geometryIndex, contribution) pair, which must
-    // already be in m_pairs.
+    // With record data, each record also carries a pointer, a local root SRV,
+    // to its own (geometryIndex, contribution) pair in the same buffer.
     bool BuildTable(const std::vector<uint8_t>& kinds,
                     const std::vector<rq::RecordPair>& recPairs,
                     std::string* why);
-
-    // Re-lower the original shader with `pairs` baked in and swap the new
-    // state object in. The old one is retired, not released: a dispatch
-    // recorded against it may still be in flight.
-    bool Rebake(const std::vector<rq::RecordPair>& pairs, std::string* why);
 
     ID3D12Device5* m_dev = nullptr;
     ID3D12StateObject* m_so = nullptr;
     ID3D12RootSignature* m_rootSig = nullptr;   // the app's, kept alive
     // Does the shader ask what geometry or instance contribution it hit? Then
-    // the hit shaders exist once per (geometryIndex, contribution) pair, with
-    // the pair baked in, because a hit shader READING a local root signature
-    // crashes the Pascal driver. See proxy/rewriter/rq_bake.h.
+    // each hit record points at its pair through a LOCAL ROOT SRV, read with
+    // rawBufferLoad. Not a cbuffer: a hit shader reading a cbuffer through the
+    // local root signature crashes the Pascal driver, see
+    // phase5/cases/driver-crash/README.md.
     bool m_recordConstants = false;
-    // The compute shader as the application gave it, kept only when the pairs
-    // can change, because a new pair means lowering it again.
-    std::vector<uint8_t> m_input;
-    // The pairs the current state object carries, in hit group order. Grows
-    // monotonically, like the table: a scene that needs fewer keeps them.
-    std::vector<rq::RecordPair> m_pairs;
+    ID3D12RootSignature* m_localRs = nullptr;   // owned; null without record data
     // What the current table's records point at, one pair per record.
     std::vector<rq::RecordPair> m_recPairs;
-    // State objects replaced by a rebake, held until the pipeline dies for
-    // the same reason as m_retired.
+    // Held until the pipeline dies for the same reason as m_retired.
     std::vector<ID3D12StateObject*> m_retiredSo;
-    // A dispatch can rebuild the table and the state object, and command
-    // lists are recorded on several threads.
+    // A dispatch can rebuild the table, and command lists are recorded on
+    // several threads.
     std::mutex m_lock;
     bool m_hasAnyHit = false;
     bool m_hasIntersection = false;

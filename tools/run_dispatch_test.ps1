@@ -175,6 +175,11 @@ $cases = @(
        desc = 'loop body reads a cbuffer threshold and a ray-index value from outside' },
     @{ name = 'geomcontrib'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib');
        desc = 'the same, with a nonzero contribution, so the record index is contribution + geometry' },
+    # The same at Shader Model 6.6, which is what Unreal uses, and where the
+    # record handle has to be ANNOTATED: a bare createHandleForLib on a local
+    # root signature resource is what crashed the Pascal driver.
+    @{ name = 'geomsm66'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom_sm66.hlsl', '--geom', '--contrib');
+       desc = 'GeometryIndex and contribution at Shader Model 6.6, record handle annotated' },
     # The record constants are BAKED into a copy of the hit shaders per pair,
     # because a hit shader reading a local root signature crashes the Pascal
     # driver (phase5/cases/driver-crash/). `geom` only copies AnyHit and

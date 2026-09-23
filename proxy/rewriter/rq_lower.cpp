@@ -30,13 +30,21 @@ const int kPayloadBytes = 92;
 // The record's own two numbers, and how the generated shaders reach them.
 //
 // Not a dx.op call like everything in kChSource: there is no intrinsic for
-// either, which is exactly why they were refused. They come out of a cbuffer
-// bound by a LOCAL root signature, so the value is per hit-group-record and
-// the shim chose it when it built the table.
+// either, which is exactly why they were refused. They come out of a RAW
+// BUFFER bound by a LOCAL root signature root SRV at t0, space1, so the value
+// is per hit-group-record and the shim chose it when it built the table.
+//
+// In a Shader Model 6.6 module the handle MUST be annotated: a hit shader
+// reaching a LOCAL root signature resource through a bare createHandleForLib
+// is what crashed the Pascal driver, cbuffer or raw buffer alike, and
+// annotating it was 0 of 15 for both. See lower.py and
+// phase5/cases/driver-crash/.
 const char* kRecordType = "%rq_record";
 const char* kRecordGlobal = "@rq_record";
 const char* kRecordHandleFn = "dx.op.createHandleForLib.rq_record";
-const char* kCbRet = "%dx.types.CBufRet.i32";
+const char* kResRet = "%dx.types.ResRet.i32";
+// Shader flag for raw and structured buffers, required once a module reads one.
+const unsigned long long kRawBufferFlag = 0x10ull;
 // HitKind() is an integer; the RayQuery form is a bool.
 const int kHitKindFront = 254;
 
@@ -47,19 +55,48 @@ struct Field { int idx; const char* ty; int align; };
 // place that dominates every use, which is a CFG question this pass has no
 // reason to ask.
 std::vector<std::string> RecordRead(const std::string& tag, int word,
-                                    const std::string& result) {
+                                    const std::string& result, bool sm66) {
     const std::string t = std::string(kRecordType);
-    return {
-        "  %rq.cbv" + tag + " = load " + t + ", " + t + "* " + kRecordGlobal +
-            ", align 4",
-        "  %rq.cbh" + tag + " = call %dx.types.Handle @" + kRecordHandleFn +
-            "(i32 160, " + t + " %rq.cbv" + tag + ")  ; CreateHandleForLib(Resource)",
-        "  %rq.cbr" + tag + " = call " + kCbRet +
-            " @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %rq.cbh" + tag +
-            ", i32 0)  ; CBufferLoadLegacy(handle,regIndex)",
-        "  " + result + " = extractvalue " + kCbRet + " %rq.cbr" + tag + ", " +
+    std::vector<std::string> out;
+    if (sm66) {
+        const std::string h = "%dx.types.Handle";
+        out.push_back("  %rq.cbv" + tag + " = load " + h + ", " + h + "* " +
+                      kRecordGlobal + ", align 4");
+        out.push_back("  %rq.cbh" + tag + ".lib = call " + h +
+                      " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " + h +
+                      " %rq.cbv" + tag + ")  ; CreateHandleForLib(Resource)");
+        out.push_back("  %rq.cbh" + tag + " = call " + h + " @dx.op.annotateHandle(i32 216, " +
+                      h + " %rq.cbh" + tag + ".lib, %dx.types.ResourceProperties "
+                      "{ i32 11, i32 0 })  ; AnnotateHandle(res,props)  resource: ByteAddressBuffer");
+    } else {
+        out.push_back("  %rq.cbv" + tag + " = load " + t + ", " + t + "* " + kRecordGlobal +
+                      ", align 4");
+        out.push_back("  %rq.cbh" + tag + " = call %dx.types.Handle @" + kRecordHandleFn +
+                      "(i32 160, " + t + " %rq.cbv" + tag + ")  ; CreateHandleForLib(Resource)");
+    }
+    const std::vector<std::string> rest = {
+        "  %rq.cbr" + tag + " = call " + kResRet +
+            " @dx.op.rawBufferLoad.i32(i32 139, %dx.types.Handle %rq.cbh" + tag +
+            ", i32 0, i32 undef, i8 3, i32 4)"
+            "  ; RawBufferLoad(srv,index,elementOffset,mask,alignment)",
+        "  " + result + " = extractvalue " + kResRet + " %rq.cbr" + tag + ", " +
             std::to_string(word),
     };
+    out.insert(out.end(), rest.begin(), rest.end());
+    return out;
+}
+
+// Shader Model 6.6 or later, where every handle is annotated.
+bool IsSm66(const std::string& text) {
+    static const std::regex kSm(R"RX(^!\d+ = !\{!"(?:cs|lib)", i32 (\d+), i32 (\d+)\})RX");
+    for (const auto& line : llm::SplitLines(text)) {
+        std::smatch mm;
+        if (std::regex_search(line, mm, kSm)) {
+            const int maj = std::stoi(mm[1].str()), min = std::stoi(mm[2].str());
+            return maj > 6 || (maj == 6 && min >= 6);
+        }
+    }
+    return false;
 }
 
 std::optional<Field> PayloadField(int op) {
@@ -650,6 +687,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     }
 
     const bool binding = UsesBinding(m);
+    // How the record handle is written; see kRecordType.
+    const bool sm66 = IsSm66(text0);
     const std::map<Bind, int> binds = binding ? BindingMap(text0, md)
                                               : std::map<Bind, int>();
 
@@ -1148,17 +1187,20 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         decls.push_back(std::string(kPayload) + " = type " + kPayloadType);
         decls.push_back(std::string(kAttrs) + " = type { <2 x float> }");
         if (q.needsRecordConstants) {
-            // Two words, matching the two root constants the shim puts in every
-            // hit group record. Declared here even when the original shader had
-            // no cbuffer of its own, which is why CBufRet is conditional too.
-            decls.push_back(std::string(kRecordType) + " = type { i32, i32 }");
-            if (out.find(std::string(kCbRet) + " = type") == std::string::npos)
-                decls.push_back(std::string(kCbRet) + " = type { i32, i32, i32, i32 }");
+            // The raw buffer's element type, as DXC declares a ByteAddressBuffer.
+            // ResRet is added only when the application's module lacks it.
+            decls.push_back(std::string(kRecordType) + " = type { i32 }");
+            if (out.find(std::string(kResRet) + " = type") == std::string::npos)
+                decls.push_back(std::string(kResRet) + " = type { i32, i32, i32, i32, i32 }");
+            if (sm66 && out.find("%dx.types.ResourceProperties = type") == std::string::npos)
+                decls.push_back("%dx.types.ResourceProperties = type { i32, i32 }");
         }
         decls.push_back("");
+        // At 6.6 the global holds a HANDLE and the record bitcasts it, as DXC's.
         if (q.needsRecordConstants)
             decls.push_back(std::string(kRecordGlobal) + " = external constant " +
-                            kRecordType + ", align 4");
+                            (sm66 ? std::string(kHandleType) : std::string(kRecordType)) +
+                            ", align 4");
         std::set<std::string> seen;
         for (const auto& g : globals) {
             if (!seen.insert(g.sym).second) continue;
@@ -1256,17 +1298,36 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         addDecl(usedOps.count(kCandidateObjectRayDirection) != 0,
                 "declare float @dx.op.objectRayDirection.f32(i32, i8) #RQNONE");
 
-        if (q.needsRecordConstants) {
+        if (q.needsRecordConstants && sm66) {
+            // The binding form declares this overload itself, further down.
+            if (!binding &&
+                out.find("@dx.op.createHandleForLib.dx.types.Handle(") == std::string::npos) {
+                add.push_back("");
+                add.push_back("; Function Attrs: nounwind readonly");
+                add.push_back(std::string("declare ") + kHandleType +
+                              " @dx.op.createHandleForLib.dx.types.Handle(i32, " +
+                              kHandleType + ") #RQRO");
+            }
+            if (out.find("@dx.op.annotateHandle(") == std::string::npos) {
+                add.push_back("");
+                add.push_back("; Function Attrs: nounwind readnone");
+                add.push_back(std::string("declare ") + kHandleType +
+                              " @dx.op.annotateHandle(i32, " + kHandleType +
+                              ", %dx.types.ResourceProperties) #RQNONE");
+            }
+        } else if (q.needsRecordConstants) {
             add.push_back("");
             add.push_back("; Function Attrs: nounwind readonly");
             add.push_back(std::string("declare %dx.types.Handle @") + kRecordHandleFn +
                           "(i32, " + kRecordType + ") #RQRO");
-            if (out.find("@dx.op.cbufferLoadLegacy.i32(") == std::string::npos) {
+        }
+        if (q.needsRecordConstants) {
+            if (out.find("@dx.op.rawBufferLoad.i32(") == std::string::npos) {
                 add.push_back("");
                 add.push_back("; Function Attrs: nounwind readonly");
-                add.push_back(std::string("declare ") + kCbRet +
-                              " @dx.op.cbufferLoadLegacy.i32"
-                              "(i32, %dx.types.Handle, i32) #RQRO");
+                add.push_back(std::string("declare ") + kResRet +
+                              " @dx.op.rawBufferLoad.i32"
+                              "(i32, %dx.types.Handle, i32, i32, i8, i32) #RQRO");
             }
         }
         if (q.NeedsIntersection()) {
@@ -1431,7 +1492,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         // can. The local root signature bound this record's own
                         // constants.
                         for (const auto& l :
-                             RecordRead(i.result.substr(1), RecordWord(op), i.result))
+                             RecordRead(i.result.substr(1), RecordWord(op), i.result, sm66))
                             is.push_back(l);
                         continue;
                     }
@@ -1609,7 +1670,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         // can. The local root signature bound this record's own
                         // constants.
                         for (const auto& l :
-                             RecordRead(i.result.substr(1), RecordWord(op), i.result))
+                             RecordRead(i.result.substr(1), RecordWord(op), i.result, sm66))
                             ah.push_back(l);
                         continue;
                     }
@@ -1704,14 +1765,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             }
 
             // The record's two numbers, when the shader asked for either.
-            // Both are stored whenever either is read: one cbuffer load answers
-            // both, so splitting them would cost a branch and save nothing.
+            // Both are stored whenever either is read: one load answers both,
+            // so splitting them would cost a branch and save nothing.
             if (q.needsRecordConstants) {
-                for (const auto& l : RecordRead("g", 0, "%rq.geo")) ch.push_back(l);
+                for (const auto& l : RecordRead("g", 0, "%rq.geo", sm66)) ch.push_back(l);
                 ch.push_back(std::string("  %rq.gp = getelementptr inbounds ") +
                              kPayload + ", " + kPayload + "* %p, i32 0, i32 5");
                 ch.push_back("  store i32 %rq.geo, i32* %rq.gp, align 4");
-                ch.push_back(std::string("  %rq.con = extractvalue ") + kCbRet +
+                ch.push_back(std::string("  %rq.con = extractvalue ") + kResRet +
                              " %rq.cbrg, 1");
                 ch.push_back(std::string("  %rq.cp = getelementptr inbounds ") +
                              kPayload + ", " + kPayload + "* %p, i32 0, i32 10");
@@ -1860,29 +1921,32 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             return id;
         };
 
-        // The record cbuffer, added to whatever the application already had.
+        // The record SRV, added to whatever the application already had.
         //
-        // Shape copied from DXC, not invented: a cbuffer record is
-        // {id, global, name, space, lowerBound, rangeSize, sizeInBytes, extra}.
-        // space 1 keeps it clear of anything the application's own global root
-        // signature binds, which the shim must not disturb. See
-        // phase5/cases/reference/lib_localroot_ref.hlsl.
+        // Shape copied from DXC, not invented: an SRV record is
+        // {id, global, name, space, lowerBound, rangeSize, kind, sampleCount,
+        // extra}, and kind 11 is a raw buffer. space 1 keeps it clear of
+        // anything the application's own global root signature binds. See
+        // phase5/cases/reference/lib_localsrv_ref.hlsl.
         if (q.needsRecordConstants) {
             std::vector<std::string> groups;
             for (const auto& g : SplitTop(md.at(std::stoi(resId))))
                 groups.push_back(Trim(g));
             while (groups.size() < 4) groups.push_back("null");
             std::vector<std::string> have;
-            if (groups[2] != "null")
-                for (const auto& x : SplitTop(md.at(std::stoi(groups[2].substr(1)))))
+            if (groups[0] != "null")
+                for (const auto& x : SplitTop(md.at(std::stoi(groups[0].substr(1)))))
                     have.push_back(Trim(x));
-            const int rec = node("i32 " + std::to_string(have.size()) + ", " +
-                                 kRecordType + "* " + kRecordGlobal +
-                                 ", !\"rq_record\", i32 1, i32 0, i32 1, i32 8, null");
+            const std::string gref = sm66
+                ? std::string(kRecordType) + "* bitcast (" + kHandleType + "* " +
+                  kRecordGlobal + " to " + kRecordType + "*)"
+                : std::string(kRecordType) + "* " + kRecordGlobal;
+            const int rec = node("i32 " + std::to_string(have.size()) + ", " + gref +
+                                 ", !\"rq_record\", i32 1, i32 0, i32 1, i32 11, i32 0, null");
             std::string grp;
             for (const auto& h : have) grp += h + ", ";
             grp += "!" + std::to_string(rec);
-            groups[2] = "!" + std::to_string(node(grp));
+            groups[0] = "!" + std::to_string(node(grp));
             std::string all;
             for (size_t i = 0; i < groups.size(); ++i) {
                 if (i) all += ", ";
@@ -1948,7 +2012,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         const int zero = node("i32 0");
         const int flags = node(
             "i32 0, i64 " +
-            std::to_string(ModuleFlags(text0, md) & ~kRt11ShaderFlag));
+            std::to_string((ModuleFlags(text0, md) & ~kRt11ShaderFlag) |
+                           (q.needsRecordConstants ? kRawBufferFlag : 0ull)));
         std::vector<int> eps{ node("null, !\"\", null, !" + resId + ", !" +
                                    std::to_string(flags)) };
 
