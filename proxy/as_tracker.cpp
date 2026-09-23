@@ -17,6 +17,21 @@ namespace {
 std::mutex g_lock;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, BlasInfo> g_blas;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, TlasInfo> g_tlas;
+
+// Every top-level build advances this. Per address: the build that last wrote
+// the structure, and the build at which its instance data was last asked for.
+const UINT64 kLiveWindow = 64;
+const UINT64 kRereadEvery = 8;
+UINT64 g_tlasSerial = 0;
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_lastBuilt;
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_lastAsked;
+
+// Caller holds g_lock.
+bool LiveLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
+    auto it = g_lastBuilt.find(tlas);
+    if (it == g_lastBuilt.end()) return true;
+    return it->second + kLiveWindow >= g_tlasSerial;
+}
 Summary g_summary;
 
 // A recorded copy of a TLAS's instance descriptions, waiting for the GPU.
@@ -105,7 +120,21 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         }
     }
 
-    const bool isNew = g_tlas.find(tlas) == g_tlas.end();
+    auto prev = g_tlas.find(tlas);
+    const bool isNew = prev == g_tlas.end();
+    if (!isNew && (prev->second.recordCount != t.recordCount ||
+                   prev->second.instanceCount != t.instanceCount ||
+                   prev->second.maxContribution != t.maxContribution)) {
+        static int s_changes = 0;
+        if (++s_changes <= 8)
+            ProxyLog("[dxr-tier-11-proxy-log] top-level AS at 0x%llX RE-READ, it changed: "
+                     "%u -> %u instances, %u -> %u hit group records, max contribution "
+                     "%u -> %u.\n",
+                     static_cast<unsigned long long>(tlas),
+                     prev->second.instanceCount, t.instanceCount,
+                     prev->second.recordCount, t.recordCount,
+                     prev->second.maxContribution, t.maxContribution);
+    }
     g_tlas[tlas] = t;
     if (!isNew) return;
 
@@ -167,6 +196,7 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
 
         std::lock_guard<std::mutex> g(g_lock);
         ++g_summary.tlasCount;
+        g_lastBuilt[desc->DestAccelerationStructureData] = ++g_tlasSerial;
         if (src.resource) ++g_summary.tlasResolved;
         if (!g_summary.sawTopLevel) {
             g_summary.sawTopLevel = true;
@@ -347,6 +377,23 @@ void AfterSubmit(ID3D12CommandQueue* queue,
     g_pending.swap(still);
 }
 
+bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (const PendingRead& pr : g_pending)
+        if (pr.tlas == tlas) return false;   // one copy in flight is enough
+    bool want = cheap;
+    if (!want) {
+        auto it = g_tlas.find(tlas);
+        auto asked = g_lastAsked.find(tlas);
+        want = it == g_tlas.end() || !it->second.valid ||
+               it->second.instanceCount != numDescs ||
+               asked == g_lastAsked.end() ||
+               asked->second + kRereadEvery <= g_tlasSerial;
+    }
+    if (want) g_lastAsked[tlas] = g_tlasSerial;
+    return want;
+}
+
 TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address) {
     std::lock_guard<std::mutex> g(g_lock);
     auto it = g_tlas.find(address);
@@ -369,16 +416,37 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
     // question, since it is not conditional on the shader at all.
     {
         std::lock_guard<std::mutex> g(g_lock);
+        std::vector<RecordConstants> merged;
         for (const auto& kv : g_tlas) {
             const TlasInfo& t = kv.second;
-            if (!t.valid || !t.constantsConflict) continue;
-            if (why)
-                *why = "two instances put different (contribution, geometry) "
-                       "pairs on hit group record " +
-                       std::to_string(t.conflictSlot) +
-                       ", so that record cannot carry the geometry index for "
-                       "both. One record answers once";
-            return true;
+            if (!t.valid || !LiveLocked(kv.first)) continue;
+            if (t.constantsConflict) {
+                if (why)
+                    *why = "two instances put different (contribution, geometry) "
+                           "pairs on hit group record " +
+                           std::to_string(t.conflictSlot) +
+                           ", so that record cannot carry the geometry index for "
+                           "both. One record answers once";
+                return true;
+            }
+            // Two LIVE structures disagreeing about a record is the same
+            // conflict. Merging them first-read-wins would bake one of them
+            // wrongly and say nothing.
+            if (merged.size() < t.constants.size()) merged.resize(t.constants.size());
+            for (size_t i = 0; i < t.constants.size(); ++i) {
+                const RecordConstants& a = t.constants[i];
+                RecordConstants& m = merged[i];
+                if (!a.assigned) continue;
+                if (!m.assigned) { m = a; continue; }
+                if (m.geometryIndex != a.geometryIndex ||
+                    m.instanceContribution != a.instanceContribution) {
+                    if (why)
+                        *why = "two live top-level structures put different "
+                               "(contribution, geometry) pairs on hit group record " +
+                               std::to_string(i) + ". One record answers once";
+                    return true;
+                }
+            }
         }
     }
 
@@ -392,7 +460,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
     std::lock_guard<std::mutex> g(g_lock);
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
-        if (!t.valid) continue;
+        if (!t.valid || !LiveLocked(kv.first)) continue;
         for (size_t i = 0; i < t.reach.size(); ++i) {
             if ((t.reach[i] & kReachTriangles) && (t.reach[i] & kReachProcedural)) {
                 if (why)
@@ -412,7 +480,7 @@ std::vector<RecordConstants> RecordConstantsTable() {
     std::vector<RecordConstants> out;
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
-        if (!t.valid) continue;
+        if (!t.valid || !LiveLocked(kv.first)) continue;
         if (out.size() < t.constants.size()) out.resize(t.constants.size());
         for (size_t i = 0; i < t.constants.size(); ++i)
             if (t.constants[i].assigned && !out[i].assigned) out[i] = t.constants[i];
@@ -425,7 +493,7 @@ std::vector<uint8_t> RecordKinds() {
     std::vector<uint8_t> out;
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
-        if (!t.valid) continue;
+        if (!t.valid || !LiveLocked(kv.first)) continue;
         if (out.size() < t.reach.size()) out.resize(t.reach.size(), kReachNone);
         for (size_t i = 0; i < t.reach.size(); ++i) out[i] |= t.reach[i];
     }

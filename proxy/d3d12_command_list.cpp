@@ -671,13 +671,6 @@ void Dxr11CommandList::CaptureInstances(
     const auto& in = desc->Inputs;
     if (!in.NumDescs || !in.InstanceDescs) return;
 
-    // Once per destination address. An engine rebuilds its top-level structure
-    // every frame into the same memory, and re-reading it every frame would be
-    // a copy per frame for an answer that does not change. The cost of that
-    // choice: an application that CHANGES its contributions in place keeps the
-    // first answer. Nothing tested does, and it would be visible here.
-    if (astrack::LookupTlas(desc->DestAccelerationStructureData).valid) return;
-
     if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
         static LONG once = 0;
         if (InterlockedCompareExchange(&once, 1, 0) == 0)
@@ -705,8 +698,16 @@ void Dxr11CommandList::CaptureInstances(
     // no fence, no cost at all.
     D3D12_HEAP_PROPERTIES heap{};
     D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
-    if (SUCCEEDED(src.resource->GetHeapProperties(&heap, &heapFlags)) &&
-        (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK)) {
+    const bool cheap =
+        SUCCEEDED(src.resource->GetHeapProperties(&heap, &heapFlags)) &&
+        (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK);
+
+    // Read again when the structure may have changed. See WantInstances for
+    // what once-per-address did to a level load.
+    if (!astrack::WantInstances(desc->DestAccelerationStructureData, in.NumDescs, cheap))
+        return;
+
+    if (cheap) {
         uint8_t* p = nullptr;
         D3D12_RANGE readRange{ static_cast<SIZE_T>(src.offset),
                                static_cast<SIZE_T>(src.offset + bytes) };
@@ -1078,6 +1079,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchGraph(const D3D12_DISPATCH_GRAP
 
 // See the declaration. The pointer handed back by WrapList is our wrapper, so
 // this is a static rather than a friend reaching into another object.
+void Dxr11CommandList::AdoptAllocator(void* wrappedList, ID3D12CommandAllocator* a) {
+    if (!wrappedList || !a) return;
+    static_cast<Dxr11CommandList*>(
+        static_cast<ID3D12GraphicsCommandList*>(wrappedList))->m_allocator = a;
+}
+
 void Dxr11CommandList::AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq,
                                         ID3D12PipelineState* initial) {
     if (!wrappedList || !rq) return;

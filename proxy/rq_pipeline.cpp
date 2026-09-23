@@ -641,6 +641,15 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     const UINT hitRecords =
         kinds.empty() ? 1u : static_cast<UINT>(kinds.size());
 
+    // PADDED past what is known. The instance data arrives a submission late
+    // on the GPU path, so the scene can reach records the shim has not read
+    // yet, and an index past the end of the table is undefined. In Escher's
+    // open world that is what hung the GPU. A padded record produces no hit:
+    // missing for a frame, never undefined and never another record's answer.
+    // Past kMinRecords, or twice what is known, it is still undefined.
+    const UINT kMinRecords = 4096;
+    const UINT tableRecords = hitRecords * 2 > kMinRecords ? hitRecords * 2 : kMinRecords;
+
     // Which baked hit group copy each record points at. Every pair a record
     // needs must already be in m_pairs; the caller rebakes first.
     std::vector<size_t> copyOf(hitRecords, 0);
@@ -666,7 +675,7 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     // hit shader crashes the Pascal driver. See proxy/rewriter/rq_bake.h.
     const UINT stride = AlignUp(kIdSize, kRecAlign);
     const UINT slot = AlignUp(stride, kTableAlign);
-    const UINT hitBytes = AlignUp(stride * hitRecords, kTableAlign);
+    const UINT hitBytes = AlignUp(stride * tableRecords, kTableAlign);
     const UINT64 size = static_cast<UINT64>(slot) * 2 + hitBytes;
 
     D3D12_HEAP_PROPERTIES hp{};
@@ -726,9 +735,21 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
             // the shader serves triangles at all.
             id = m_servesTri ? own : m_idNullTri;
         }
+        // With baked record data, a record no known instance reaches has no
+        // known pair: it gets the no-hit record rather than copy 0's answer.
+        if (m_recordConstants && !kinds.empty() && reach == astrack::kReachNone)
+            id = m_idNullTri;
         uint8_t* rec = p + 2 * slot + i * stride;
         std::memcpy(rec, id, kIdSize);
     }
+    // The padding. A triangle-only shader with no record data answers the same
+    // on every record, so its padding is its own record and an unknown index
+    // is still right. Otherwise the rejecting triangle record: a triangle gets
+    // IgnoreHit, a procedural primitive finds no intersection shader, and
+    // neither produces a hit.
+    const void* pad = (m_recordConstants || m_servesProc) ? m_idNullTri : m_idHit[0].data();
+    for (UINT i = hitRecords; i < tableRecords; ++i)
+        std::memcpy(p + 2 * slot + i * stride, pad, kIdSize);
     sbt->Unmap(0, nullptr);
 
     if (m_sbt) m_retired.push_back(m_sbt);   // may still be in flight
@@ -743,7 +764,7 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     m_desc.MissShaderTable.SizeInBytes = kIdSize;
     m_desc.MissShaderTable.StrideInBytes = stride;
     m_desc.HitGroupTable.StartAddress = base + 2 * slot;
-    m_desc.HitGroupTable.SizeInBytes = stride * hitRecords;
+    m_desc.HitGroupTable.SizeInBytes = stride * tableRecords;
     m_desc.HitGroupTable.StrideInBytes = stride;
     return true;
 }
@@ -779,6 +800,21 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
         std::vector<rq::RecordPair> grown = m_pairs;
         for (const auto& p : recPairs)
             if (std::find(grown.begin(), grown.end(), p) == grown.end()) grown.push_back(p);
+        // A copy of the hit shaders per pair costs about 34 ms of driver
+        // compile each, measured, and a real open world has thousands of
+        // records. Past kMaxRuntimePairs the dispatch is skipped, said once,
+        // rather than stalling for minutes or drawing with the wrong pairs.
+        const size_t kMaxRuntimePairs = 256;
+        if (grown.size() > kMaxRuntimePairs) {
+            static LONG s_said = 0;
+            if (InterlockedCompareExchange(&s_said, 1, 0) == 0)
+                ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch SKIPPED: the "
+                         "scene needs %zu (geometry, contribution) pairs, over the %zu this "
+                         "shim bakes, one hit shader copy each. Said once; every such "
+                         "dispatch is skipped and draws nothing.\n",
+                         grown.size(), kMaxRuntimePairs);
+            return;
+        }
         if (grown.size() != m_pairs.size()) {
             const size_t had = m_pairs.size();
             const DWORD t0 = GetTickCount();

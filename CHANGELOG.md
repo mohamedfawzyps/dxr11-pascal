@@ -24,7 +24,51 @@ not.
 
 ---
 
-## 0.39.0
+## 0.39.1
+
+- **The first game run with lowered shaders dispatching hung the GPU in the
+  open world, every time.** Escher at 0.39.0, `rqphase = 4`: the main menu ran;
+  loading the open world gave `DXGI_ERROR_DEVICE_HUNG` (0x887A0006) 41 to 48
+  seconds in, four runs of four. Two reports read "Shader compilation failures
+  are Fatal", but that came after: the device was gone, the next
+  `CreateStateObject` failed with 0x887A0005, and that shader was forwarded.
+- **Verified from the log: the dispatches used a table far too small.** The
+  only scene data the shim ever read was the menu's, 6 instances reaching
+  record 26 or 10, so the open world's lowered dispatches used 27 and 19
+  record tables. An earlier run read the open world: 270 instances,
+  contribution up to 1998. An index past the table is undefined in DXR.
+  INFERRED, not proven: that this is what hung the GPU. The alternative is a
+  dispatch simply taking over two seconds in a dense forest on Pascal.
+- **Fixed four ways.**
+  - Instance data is re-read when a structure may have changed. It used to be
+    read once per destination address, so a structure rebuilt in place when a
+    level loads kept its first answer forever. CPU-visible descriptions are now
+    read on every build (free); GPU ones when the instance count changes, every
+    8 builds of that structure, and never while a copy of it is in flight.
+  - Only LIVE structures count, ones rebuilt within the last 64 top-level
+    builds, so the menu's stops counting. Two live structures disagreeing
+    about a record is refused as a conflict, where it used to be merged
+    first-read-wins, which would have baked one of them wrongly and silently.
+  - The hit group table is PADDED to 4096 records or twice what is known. A
+    padded record produces no hit: missing for a frame, never undefined. A
+    triangle-only shader with no record data pads with its own record, which
+    is still the right answer. With baked record data, a record no known
+    instance reaches gets the no-hit record rather than copy 0's answer.
+  - A scene needing more than 256 (geometry, contribution) pairs SKIPS the
+    dispatch, said once, rather than baking hundreds of hit shader copies at
+    about 34 ms each. **This means most lowered passes draw nothing in the
+    open world**: 59 of the 63 shaders that lowered bake record data, and the
+    open world has about 2000 records. Bringing them back needs the
+    contribution read another way, see the brief.
+- **Fixed: a list created open had no allocator recorded**, only `Reset`
+  recorded it, so splitting such a list failed and 0.39.0 skipped some of
+  Unreal's indirect dispatches ("split: no device or allocator").
+- **New case `rebuild`**: `raytest --multi --contrib --rebuild` dispatches
+  against a structure with every contribution 0, rebuilds it IN PLACE with 0
+  and 1, and dispatches again. 0.39.0 gives 9248 of 18496 hits. 0.39.1
+  matches, and the log shows the re-read. With the re-read poisoned it still
+  matches, through the padding alone. Dispatch suite 29 of 29.
+
 
 - **Indirect compute dispatch of a lowered RayQuery pipeline is emulated.**
   Unreal issues most of its Lumen and MegaLights inline passes with

@@ -206,7 +206,15 @@ $cases = @(
     # The record pairs are only known at dispatch, so this one REBAKES inside
     # the queue hook, at submit time, on the thread that submits.
     @{ name = 'indirectgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--indirect');
-       desc = 'indirect dispatch of a shader whose hit shaders are baked per record pair' }
+       desc = 'indirect dispatch of a shader whose hit shaders are baked per record pair' },
+    # The top-level structure is rebuilt IN PLACE with new contributions after
+    # a first dispatch, as an engine does when a level loads. 0.39.0 read each
+    # address once and kept a one-record table: 9248 of 18496 hits, and in
+    # Escher's open world a GPU hang. Measured separately: with the re-read
+    # poisoned, the table padding alone still matches, since this shader bakes
+    # no record data and pads with its own record.
+    @{ name = 'rebuild'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi', '--contrib', '--rebuild');
+       desc = 'top-level structure rebuilt in place with new contributions between dispatches' }
 )
 
 $failed = 0

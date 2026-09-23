@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.39.0.
+proxy/version.h, and is currently 0.39.1.
 
 ## Current position (2026-09-23)
 
@@ -48,6 +48,27 @@ happen 41% of the time anyway, so the offline repro is the evidence and
 these runs only fail to contradict it. **Where the shim keeps a
 resource alive across submissions, "recorded" is not "submitted" when an
 application records on several threads.**
+
+**THE FIRST GAME RUN WITH LOWERED SHADERS DISPATCHING (0.39.0, rqphase = 4):
+MENU FINE, OPEN WORLD HUNG THE GPU, 4 OF 4.** `DXGI_ERROR_DEVICE_HUNG`. The
+shim had read only the menu's scene, once per address, and dispatched in the
+open world against 19 and 27 record tables while that scene reaches record
+~1998: undefined in DXR. Cause INFERRED, not proven; a dispatch over 2 s in a
+dense forest would look the same. 0.39.1 re-reads changed structures, counts
+only live ones, pads the table with no-hit records, and skips a scene needing
+more than 256 baked pairs. See the CHANGELOG.
+
+**AND IT EXPOSED THE BAKE'S LIMIT.** 59 of the 63 shaders that lowered in
+Escher bake record data, one hit shader copy per (geometry, contribution)
+pair, about 34 ms of driver compile each. The menu needs 14 pairs; the open
+world about 2000. So after 0.39.1 those passes draw nothing there. Step 2,
+not started: read the contribution in the hit shader from a per-instance
+buffer indexed by `InstanceIndex()` (DXR 1.0, legal), which the shim fills
+from the instance data it already reads, and bake ONLY the geometry index,
+which has few distinct values. It needs a buffer on the GLOBAL root
+signature, so a root parameter appended to the application's. Measure first
+on a stub: a GLOBAL cbuffer read was 0 of 15 cold where the local one
+crashed, which is promising and not the same thing.
 
 **INDIRECT COMPUTE DISPATCH: DONE in 0.39.0**, the gap described below. The
 group counts are captured by replaying the application's own ExecuteIndirect

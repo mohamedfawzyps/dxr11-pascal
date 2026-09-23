@@ -338,6 +338,11 @@ public:
     // calls SetPipelineState afterwards.
     static void AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq,
                                  ID3D12PipelineState* initial);
+    // A list created OPEN records into the allocator it was created with, and
+    // a split needs that allocator. Only Reset used to record it, so a list
+    // split before its first Reset could not split: 0.39.0 skipped Unreal's
+    // indirect dispatches with "no device or allocator".
+    static void AdoptAllocator(void* wrappedList, ID3D12CommandAllocator* a);
 
 private:
 

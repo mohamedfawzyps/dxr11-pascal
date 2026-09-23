@@ -515,6 +515,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_CO
                                            pInitialState, riid, ppCommandList);
     if (!m_tier11 && SUCCEEDED(hr) && ppCommandList && *ppCommandList) {
         WrapList(riid, ppCommandList);
+        Dxr11CommandList::AdoptAllocator(*ppCommandList, pCommandAllocator);
         // Carry the stand-in onto the wrapper, so a list created with one and
         // dispatched without a further SetPipelineState still works.
         if (rq) Dxr11CommandList::AdoptRayQueryPso(*ppCommandList, rq, pInitialState);

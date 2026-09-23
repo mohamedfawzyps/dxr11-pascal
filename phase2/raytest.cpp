@@ -299,6 +299,14 @@ static bool g_table = false;
 // wrong state is caught by the debug layer. --indirectup puts the same
 // arguments in an upload buffer, the CPU-visible path.
 static bool g_indirect = false;
+// --rebuild, with --multi --contrib: the top-level structure is first built
+// with EVERY contribution 0 and dispatched against, then rebuilt IN PLACE, the
+// same instance buffer and the same destination address, with contributions
+// 0 and 1, and dispatched again. Only the second result is compared. This is
+// what an engine does when a level loads, and a shim that reads the instance
+// data once per address keeps the first answer: a one-record table, and every
+// hit on the second instance lands past its end.
+static bool g_rebuild = false;
 static bool g_indirectUp = false;
 // Create the compute PSO through CreatePipelineState, the pipeline STREAM
 // form, instead of CreateComputePipelineState. Unreal uses the stream form
@@ -499,6 +507,9 @@ struct Scene {
     // triangles and procedural primitives need one structure each.
     ComPtr<ID3D12Resource> vb2;
     ComPtr<ID3D12Resource> blas2;
+    // Only --rebuild keeps these: the instance buffer the TLAS was built from.
+    ComPtr<ID3D12Resource> inst;
+    UINT instCount = 0;
 };
 
 static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
@@ -762,7 +773,8 @@ static Scene BuildSceneMulti(Gpu& g, bool opaque) {
         inst[i].Transform[0][0] = inst[i].Transform[1][1] = inst[i].Transform[2][2] = 1.0f;
         inst[i].Transform[0][3] = (i == 0) ? -0.6f : 0.6f;   // side by side
         inst[i].InstanceMask = 0xFF;
-        if (g_contrib) inst[i].InstanceContributionToHitGroupIndex = (UINT)i;
+        // --rebuild starts from all zeros; the real contributions come later.
+        if (g_contrib && !g_rebuild) inst[i].InstanceContributionToHitGroupIndex = (UINT)i;
         inst[i].AccelerationStructure = s.blas->GetGPUVirtualAddress();
     }
     auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
@@ -776,7 +788,36 @@ static Scene BuildSceneMulti(Gpu& g, bool opaque) {
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = 2; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
+    if (g_rebuild) { s.inst = instBuf; s.instCount = 2; }
     return s;
+}
+
+// --rebuild: give instance i contribution i, then rebuild the top-level
+// structure into the SAME destination from the SAME instance buffer.
+static void RebuildTlasInPlace(Gpu& g, Scene& s) {
+    D3D12_RAYTRACING_INSTANCE_DESC* d = nullptr;
+    D3D12_RANGE none{ 0, 0 };
+    HR(s.inst->Map(0, &none, (void**)&d), "map inst for rebuild");
+    for (UINT i = 0; i < s.instCount; ++i) d[i].InstanceContributionToHitGroupIndex = i;
+    s.inst->Unmap(0, nullptr);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = s.instCount; ti.InstanceDescs = s.inst->GetGPUVirtualAddress();
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+    g.device->GetRaytracingAccelerationStructurePrebuildInfo(&ti, &info);
+    auto scratch = CreateBuffer(g.device.Get(), info.ScratchDataSizeInBytes,
+        D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
+    desc.Inputs = ti;
+    desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    desc.DestAccelerationStructureData = s.tlas->GetGPUVirtualAddress();
+    g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+    UavBarrier(g.list.Get(), s.tlas.Get());
+    g.flush();
 }
 
 static Scene BuildScene(Gpu& g, bool opaque) {
@@ -1029,6 +1070,7 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     // Reset, through ClearState and through CreateCommandList while every test
     // here passed. A GPU crash in a real game, and nothing here could see it.
     // SetPipelineState is still called after, exactly as an engine would.
+    auto start = [&]() {
     HR(g.list->Close(), "cmdlist Close before PSO reset");
     HR(g.list->Reset(g.alloc.Get(), pso.Get()), "cmdlist Reset with the PSO");
 
@@ -1046,6 +1088,18 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
                   s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
                   mask->GetGPUVirtualAddress());
+    }
+    };
+    start();
+    if (g_rebuild && s.inst) {
+        // Dispatch against the all-zeros scene first, so the shim learns it
+        // and builds its table for it. Then rebuild in place and go again.
+        g.list->Dispatch((kWidth + 7) / 8, (kHeight + 7) / 8, 1);
+        UavBarrier(g.list.Get(), out);
+        g.flush();
+        RebuildTlasInPlace(g, const_cast<Scene&>(s));
+        std::printf("        top-level structure rebuilt IN PLACE with new contributions\n");
+        start();
     }
     // Group count sized for the smallest thread group any of these shaders
     // uses. A 16x16 shader then gets more groups than it needs, which is safe
@@ -1515,6 +1569,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--stream") == 0) {
                 g_stream = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--rebuild") == 0) {
+                g_rebuild = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

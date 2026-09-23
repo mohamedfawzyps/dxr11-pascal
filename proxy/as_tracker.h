@@ -149,6 +149,18 @@ void DropUnsubmitted(const void* owner);
 // What is known about the top-level structure at this address.
 TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);
 
+// Should the instance data of this top-level build be read? Called once per
+// build, AFTER NoteBuild. Up to 0.39.0 the answer was "once per destination
+// address", and an engine that rebuilds a structure in place when a level
+// loads kept the FIRST answer forever: the Escher open world dispatched
+// against a 27-record table while reaching record 1998, and the GPU hung.
+//
+// `cheap` is true when the descriptions are CPU-visible, and then the answer
+// is always yes: reading them costs nothing. Otherwise, a GPU copy, it is yes
+// when the structure has not been read, when its instance count changed, or
+// every kRereadEvery builds of it, and never while a copy of it is pending.
+bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap);
+
 // Would the shim's shader table be wrong for the scene as read so far?
 //
 // The shim builds ONE hit group, and the two directions of mismatch between it
@@ -185,6 +197,13 @@ TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);
 // may not be covered.
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
 
+// Only LIVE structures count below: ones rebuilt within the last kLiveWindow
+// top-level builds. A structure an engine stopped rebuilding, the menu's after
+// a level load, stops counting, so its records can neither collide with the
+// new scene's nor lend it their constants. An application that builds one
+// structure once and never again keeps it live for as long as it builds
+// nothing else, which covers a static scene.
+//
 // What reaches each hit group record index, aggregated over every top-level
 // structure read. The result's size is the number of records the table needs;
 // empty means nothing has been read and one record will do.
