@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.38.1.
+proxy/version.h, and is currently 0.39.0.
 
 ## Current position (2026-09-23)
 
@@ -48,6 +48,17 @@ happen 41% of the time anyway, so the offline repro is the evidence and
 these runs only fail to contradict it. **Where the shim keeps a
 resource alive across submissions, "recorded" is not "submitted" when an
 application records on several threads.**
+
+**INDIRECT COMPUTE DISPATCH: DONE in 0.39.0**, the gap described below. The
+group counts are captured by replaying the application's own ExecuteIndirect
+with the shim's `proxy/group_count.hlsl` bound (atomic max of SV_GroupID + 1),
+because a copy needs a barrier on the application's argument buffer with a
+StateBefore the shim cannot know. The existing indirect DispatchRays path
+DOES make that guess (INDIRECT_ARGUMENT); worth revisiting the same way.
+`raytest --indirect` / `--indirectup`, cases `indirect`, `indirectup`,
+`indirectgeom`; 0.38.1 gives 0 hits of 8117, a capture at offset 0 reads the
+3x3x3 decoy. `rqphase = 4` is the full path with refusals still substituted:
+the configuration for the first game run where lowered shaders execute.
 
 **GroupId: DONE in 0.38.0**, the 24 above. `SV_GroupID`, `SV_GroupThreadID`
 and `SV_GroupIndex` are rebuilt from `DispatchRaysIndex` and numthreads, which

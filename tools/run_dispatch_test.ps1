@@ -192,7 +192,21 @@ $cases = @(
     # wrong row stride in the flattening gives 5398. The first version of the
     # gate could not see the row stride at all and passed with it wrong.
     @{ name = 'group'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_group.hlsl');
-       desc = 'SV_GroupID, SV_GroupThreadID and SV_GroupIndex, numthreads(16,8,1)' }
+       desc = 'SV_GroupID, SV_GroupThreadID and SV_GroupIndex, numthreads(16,8,1)' },
+    # ExecuteIndirect with a DISPATCH signature, which is how Unreal issues
+    # most of its Lumen and MegaLights inline passes. Until 0.39.0 the shim
+    # forwarded it and the GPU ran the do-nothing carrier, silently. The
+    # arguments are GPU-written, in a COMBINED read state, at byte 36 among
+    # decoys of 3 groups, so an ignored dispatch draws nothing and a wrong
+    # offset draws a corner.
+    @{ name = 'indirect'; pat = 'alpha'; extra = @('--indirect');
+       desc = 'indirect compute dispatch, group counts read back from the GPU' },
+    @{ name = 'indirectup'; pat = 'opaque'; extra = @('--indirectup');
+       desc = 'indirect compute dispatch from an upload buffer, read at record time' },
+    # The record pairs are only known at dispatch, so this one REBAKES inside
+    # the queue hook, at submit time, on the thread that submits.
+    @{ name = 'indirectgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--indirect');
+       desc = 'indirect dispatch of a shader whose hit shaders are baked per record pair' }
 )
 
 $failed = 0

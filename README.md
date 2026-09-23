@@ -38,6 +38,7 @@ rejected.
 | `RAY_FLAG_SKIP_TRIANGLES` / `SKIP_PROCEDURAL_PRIMITIVES` | Nothing. Measured against WARP: the Tier 1.0 driver already honours them |
 | `AddToStateObject` | `CreateStateObject` caches the subobjects, additions rebuild a whole new state object |
 | Indirect `DispatchRays` | The command list is split at the dispatch, the argument buffer is read back, real `DispatchRays` calls are issued |
+| Indirect dispatch of a `RayQuery` compute shader | The same split. The group counts are captured by replaying the application's own `ExecuteIndirect` with a tiny shader of the shim's |
 | Inline ray tracing (`RayQuery`) | The DXIL is rewritten into a DXR 1.0 library, with generated any-hit, intersection, closest-hit and miss shaders |
 
 There is a second, separate proxy, `dxgi.dll`, which is not a Tier 1.1 feature
@@ -55,7 +56,7 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 25 end-to-end render cases, all bit-exact, plus 4 refusal gates
+- 28 end-to-end render cases, all bit-exact, plus 4 refusal gates
 - 14 rewriter cases, each byte-identical between the Python reference and the
   C++ port, on both the `.ll` path and the DXIL container path, plus 17
   analysis and lowering checks and 3 baking checks
@@ -70,11 +71,11 @@ game's GPU crash during pipeline creation was traced to this shim, and fixed.
 treats a shader the shim refuses as fatal. See
 [Notes for Unreal](docs/usage.md#9-notes-for-unreal) for where it stands.
 
-**Known gap, and it is silent:** a lowered `RayQuery` compute pipeline
-dispatched INDIRECTLY, through `ExecuteIndirect` with a `DISPATCH` signature,
-is not emulated yet. The GPU runs the do-nothing stand-in the application was
-given, so that pass draws nothing, and the log does not say so. Unreal
-dispatches many of its Lumen and MegaLights passes this way.
+A lowered `RayQuery` compute pipeline dispatched INDIRECTLY, through
+`ExecuteIndirect` with a `DISPATCH` signature, is emulated since 0.39.0.
+Unreal dispatches many of its Lumen and MegaLights passes this way, and until
+then those passes silently drew nothing. The group counts are read back from
+the GPU without touching the state of the application's argument buffer.
 
 Tier 1.1 is reported by default. A proxy DLL only sits beside an executable
 because somebody put it there, so the install is the opt-in, and asking for a

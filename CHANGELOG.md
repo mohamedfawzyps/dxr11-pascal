@@ -24,7 +24,49 @@ not.
 
 ---
 
-## 0.38.1
+## 0.39.0
+
+- **Indirect compute dispatch of a lowered RayQuery pipeline is emulated.**
+  Unreal issues most of its Lumen and MegaLights inline passes with
+  `DispatchIndirect`, read from the engine source: `ExecuteIndirect` with a
+  signature of one `DISPATCH` argument, stride 12, no root signature, count 1,
+  no count buffer, into a sub-allocated argument buffer. Until now the shim
+  forwarded it, the GPU ran the do-nothing carrier, and the pass drew nothing
+  with nothing in the log. Measured: the 0.38.1 DLL draws 0 hits where WARP
+  draws 8117.
+- **The group counts are read without touching the application's argument
+  buffer.** Its state is whatever the application's barriers left it in, often
+  `INDIRECT_ARGUMENT` combined with other read states, and a transition with a
+  guessed `StateBefore` corrupts the application's own tracking. So the shim
+  replays the application's own `ExecuteIndirect`, same signature, buffer and
+  offset, with a tiny compute shader of its own bound, `proxy/group_count.hlsl`,
+  where each group records `SV_GroupID + 1` with an atomic max. The buffer is
+  already in the state `ExecuteIndirect` needs, because the application was
+  about to make exactly that call. Everything the capture writes is the
+  shim's. The compute bindings and the pipeline state are then restored.
+- The rest is the indirect `DispatchRays` machinery: the recording is split,
+  the counts are read after the segment runs, and `DispatchRays` with groups
+  times numthreads goes out on a pooled list at submit time. A rebake for new
+  record pairs can happen there too, inside the queue hook.
+- Command signatures holding a `DISPATCH` argument are tagged at creation with
+  private data, so a reused pointer never carries a stale answer. A count
+  buffer, or a signature with other arguments or a root signature, is logged
+  as `NOT EMULATED` and nothing is drawn for it.
+- **A pipeline state given to `Reset`, `ClearState` or `CreateCommandList` is
+  now tracked**, so a split's continuation and the capture can restore it.
+  Before, only `SetPipelineState` was, and a continuation after a split lost a
+  pipeline bound through `Reset`.
+- **`rqphase = 4`** is the full path, dispatch included, with refused shaders
+  still given a do-nothing pipeline, so the shaders that lower can run in an
+  Unreal game while the refusal list is still long. It worked before by
+  accident of the numbering; it is now documented and says so in the log.
+- **Three new dispatch cases, 28 of 28 bit-exact.** `raytest --indirect` puts
+  the arguments in a GPU-written buffer, in a COMBINED read state, at byte 36
+  among decoy counts of 3; `--indirectup` in an upload buffer, read at record
+  time; `indirectgeom` rebakes at submit. Sensitivity, both measured: the old
+  DLL gives 0 hits against 8117; capturing at offset 0 reads the decoy, 3x3x3
+  groups, and diverges. The debug layer reports nothing from the shim.
+
 
 - **Fixed: a command list could fail to `Close` with `E_INVALIDARG`, which
   Unreal makes fatal.** One Escher run in five died on "hr failed at

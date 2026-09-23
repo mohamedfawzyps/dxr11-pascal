@@ -11,6 +11,7 @@
 #include "rq_pipeline.h"
 #include "as_tracker.h"
 #include "res_tracker.h"
+#include "group_count.h"
 
 #include <windows.h>
 #include <cstring>
@@ -241,11 +242,16 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     // The carrier is a real pipeline state, so it is forwarded like any
     // other. All this does now is remember which lowered query it carries.
     m_rqPso = Dxr11RayQueryPso::From(p);
+    // m_gfx was just cleared. The initial state IS the bound pipeline state,
+    // and it has to be restorable after a split or a group count capture.
+    if (p) { m_gfx.pso = p; p->AddRef(); }
     return FWD(Reset(a, p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) {
     WorkBarrier();
     m_rqPso = Dxr11RayQueryPso::From(p);
+    if (m_gfx.pso) m_gfx.pso->Release();
+    m_gfx.pso = p; if (p) p->AddRef();
     FWD(ClearState(p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
@@ -470,6 +476,69 @@ void STDMETHODCALLTYPE Dxr11CommandList::EndEvent() { FWD(EndEvent()); }
 // refuses loudly rather than dispatching something wrong.
 void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature* sig, UINT maxCount, ID3D12Resource* args, UINT64 argOffset, ID3D12Resource* countBuf, UINT64 countOffset) {
     Dxr11CommandSignature* ours = Dxr11CommandSignature::From(sig);
+    if (!ours && m_rqPso) {
+        // A compute DispatchIndirect with a lowered RayQuery pipeline bound.
+        // Forwarding it would run the carrier, which does nothing, silently.
+        // That is how Unreal dispatches most of its Lumen and MegaLights
+        // inline passes. See proxy/group_count.h.
+        UINT stride = 0;
+        const groupcount::Shape shape = groupcount::SignatureShape(sig, &stride);
+        const char* refuse = nullptr;
+        if (shape != groupcount::Shape::kDispatch)
+            refuse = shape == groupcount::Shape::kUnsupported
+                ? "its signature has other arguments or a root signature besides the DISPATCH"
+                : "its signature is not a DISPATCH signature this shim saw created";
+        else if (countBuf) refuse = "a count buffer is not supported";
+        else if (!args) refuse = "the argument buffer is null";
+        if (refuse) {
+            static LONG once = 0;
+            if (InterlockedCompareExchange(&once, 1, 0) == 0)
+                ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect on a lowered RayQuery pipeline "
+                         "NOT EMULATED: %s. Nothing is drawn for it.\n", refuse);
+            return;
+        }
+        if (!stride) stride = (UINT)sizeof(D3D12_DISPATCH_ARGUMENTS);
+
+        D3D12_HEAP_PROPERTIES heap{};
+        D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+        const bool cpuVisible =
+            SUCCEEDED(args->GetHeapProperties(&heap, &heapFlags)) &&
+            (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK);
+        for (UINT i = 0; i < maxCount; ++i) {
+            const UINT64 offset = argOffset + (UINT64)i * stride;
+            if (cpuVisible) {
+                // The arguments exist already: read them and take the direct
+                // path, which is exactly what a Dispatch would do.
+                D3D12_DISPATCH_ARGUMENTS da{};
+                uint8_t* p = nullptr;
+                D3D12_RANGE readRange{ (SIZE_T)offset, (SIZE_T)(offset + sizeof(da)) };
+                if (FAILED(args->Map(0, &readRange, (void**)&p)) || !p) {
+                    ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH) on a lowered "
+                             "RayQuery pipeline: could not map the argument buffer, "
+                             "dispatch SKIPPED\n");
+                    return;
+                }
+                std::memcpy(&da, p + offset, sizeof(da));
+                D3D12_RANGE noWrite{ 0, 0 };
+                args->Unmap(0, &noWrite);
+                static LONG onceCpu = 0;
+                if (InterlockedCompareExchange(&onceCpu, 1, 0) == 0)
+                    ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH) on a lowered "
+                             "RayQuery pipeline -> DispatchRays, %ux%ux%u groups read from a "
+                             "CPU-visible argument buffer at record time\n",
+                             da.ThreadGroupCountX, da.ThreadGroupCountY, da.ThreadGroupCountZ);
+                if (da.ThreadGroupCountX && da.ThreadGroupCountY && da.ThreadGroupCountZ)
+                    Dispatch(da.ThreadGroupCountX, da.ThreadGroupCountY, da.ThreadGroupCountZ);
+                continue;
+            }
+            if (!QueueIndirectCompute(sig, args, offset)) {
+                ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH) on a lowered RayQuery "
+                         "pipeline: group count capture failed, dispatch SKIPPED\n");
+                return;
+            }
+        }
+        return;
+    }
     if (!ours) {
         WorkBarrier();
         FWD(ExecuteIndirect(sig, maxCount, args, argOffset, countBuf, countOffset));
@@ -747,6 +816,38 @@ bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     return true;
 }
 
+bool Dxr11CommandList::QueueIndirectCompute(ID3D12CommandSignature* sig,
+                                            ID3D12Resource* args, UINT64 argOffset) {
+    ID3D12Device5* dev = RealDevice();
+    if (!dev || !m_allocator) {
+        ProxyLog("[dxr-tier-11-proxy-log] split: no device or allocator (was Reset called?)\n");
+        return false;
+    }
+    groupcount::Capture cap;
+    std::string why;
+    if (!groupcount::Record(m_real, dev, sig, args, argOffset, &cap, &why)) {
+        ProxyLog("[dxr-tier-11-proxy-log] group count capture: %s\n", why.c_str());
+        return false;
+    }
+    // The capture replaced the compute root signature, which clears every root
+    // parameter, and the pipeline state. Give the application both back, since
+    // it may record more work into this segment before the split closes.
+    m_bindings.Replay(m_real);
+    if (m_gfx.pso) m_real->SetPipelineState(m_gfx.pso);
+
+    // Queued like an indirect DispatchRays: consecutive ones share a segment
+    // and one sync.
+    Dxr11PendingDispatch pend;
+    pend.readback = cap.readback;
+    pend.counts = cap.counts;
+    pend.rq = m_rqPso;
+    pend.rqRef = static_cast<ID3D12PipelineState*>(m_rqPso);
+    pend.bindings = m_bindings;
+    pend.bindings.Retain();
+    m_openPendings.push_back(pend);
+    return true;
+}
+
 void Dxr11CommandList::FlushQueuedSplit() {
     if (m_openPendings.empty()) return;
     ID3D12Device5* dev = RealDevice();
@@ -825,6 +926,29 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
 
         for (Dxr11PendingDispatch& pend : seg.pendings) {
             D3D12_DISPATCH_RAYS_DESC desc{};
+            UINT groups[3] = { 0, 0, 0 };
+            if (pend.rq) {
+                // An indirect compute dispatch of a lowered pipeline. Zeros are
+                // a legitimately empty dispatch: no group ran, nothing to do.
+                groupcount::Capture cap; cap.readback = pend.readback;
+                if (!groupcount::Read(cap, groups) ||
+                    !groups[0] || !groups[1] || !groups[2]) {
+                    static LONG onceEmpty = 0;
+                    if (InterlockedCompareExchange(&onceEmpty, 1, 0) == 0)
+                        ProxyLog("[dxr-tier-11-proxy-log] split: an indirect compute dispatch "
+                                 "read back as %ux%ux%u groups, so nothing ran for it\n",
+                                 groups[0], groups[1], groups[2]);
+                    continue;
+                }
+                std::string why;
+                if (astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why)) {
+                    static LONG onceWrong = 0;
+                    if (InterlockedCompareExchange(&onceWrong, 1, 0) == 0)
+                        ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
+                                 "Nothing is drawn for it.\n", why.c_str());
+                    continue;
+                }
+            } else {
             void* p = nullptr;
             D3D12_RANGE readAll{ 0, sizeof(desc) };
             if (SUCCEEDED(pend.readback->Map(0, &readAll, &p)) && p) {
@@ -832,7 +956,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 D3D12_RANGE noWrite{ 0, 0 };
                 pend.readback->Unmap(0, &noWrite);
             }
-            if (!desc.Width || !desc.Height || !desc.Depth) {
+            }
+            if (!pend.rq && (!desc.Width || !desc.Height || !desc.Depth)) {
                 ProxyLog("[dxr-tier-11-proxy-log] split: dimensions read back as %ux%ux%u, "
                          "dispatch skipped\n", desc.Width, desc.Height, desc.Depth);
                 continue;
@@ -864,7 +989,11 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             }
 
             pend.bindings.Replay(slot->list.Get());
-            slot->list->DispatchRays(&desc);
+            if (pend.rq)
+                pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
+                                        astrack::RecordKinds());
+            else
+                slot->list->DispatchRays(&desc);
             if (FAILED(slot->list->Close())) continue;
 
             ID3D12CommandList* d[] = { slot->list.Get() };
@@ -876,10 +1005,16 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             queue->Signal(m_fence.Get(), m_fenceValue);
             slot->fenceValue = m_fenceValue;
 
-            static LONG once = 0;
-            if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            static LONG once = 0, onceRq = 0;
+            if (pend.rq) {
+                if (InterlockedCompareExchange(&onceRq, 1, 0) == 0)
+                    ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect(DISPATCH) on a lowered "
+                             "RayQuery pipeline -> DispatchRays, %ux%ux%u groups read back "
+                             "from the GPU\n", groups[0], groups[1], groups[2]);
+            } else if (InterlockedCompareExchange(&once, 1, 0) == 0) {
                 ProxyLog("[dxr-tier-11-proxy-log] split dispatch issued: %ux%ux%u, dimensions "
                          "read back from the GPU\n", desc.Width, desc.Height, desc.Depth);
+            }
         }
         // One line per segment, whatever its size, so a test can tell "two
         // dispatches behind one sync" apart from "one dispatch, twice". Bounded,
@@ -943,8 +1078,13 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchGraph(const D3D12_DISPATCH_GRAP
 
 // See the declaration. The pointer handed back by WrapList is our wrapper, so
 // this is a static rather than a friend reaching into another object.
-void Dxr11CommandList::AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq) {
+void Dxr11CommandList::AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq,
+                                        ID3D12PipelineState* initial) {
     if (!wrappedList || !rq) return;
-    static_cast<Dxr11CommandList*>(
-        static_cast<ID3D12GraphicsCommandList*>(wrappedList))->m_rqPso = rq;
+    Dxr11CommandList* self = static_cast<Dxr11CommandList*>(
+        static_cast<ID3D12GraphicsCommandList*>(wrappedList));
+    self->m_rqPso = rq;
+    // The initial state is the bound pipeline state, and a group count capture
+    // has to be able to restore it.
+    if (initial && !self->m_gfx.pso) { self->m_gfx.pso = initial; initial->AddRef(); }
 }

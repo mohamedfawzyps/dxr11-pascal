@@ -406,11 +406,17 @@ offline with `dxrw rewrite`.
 - **The GPU crash during pipeline creation is fixed in 0.37.0**, see section
   7. The libraries that game produced now build cleanly on a GTX 1070 offline;
   a run of the game itself with 0.37.0 is the next check.
-- **A pass dispatched indirectly does nothing, silently.** Unreal dispatches
-  many Lumen and MegaLights inline passes with a compute `DispatchIndirect`,
-  and the shim emulates only a DIRECT `Dispatch` of a lowered pipeline so far.
-  An indirect one runs the do-nothing stand-in, so that pass draws nothing even
-  though its shader lowered, and nothing in the log says so yet.
+- **Indirect dispatch is emulated since 0.39.0.** Unreal dispatches many
+  Lumen and MegaLights inline passes with a compute `DispatchIndirect`. Before
+  0.39.0 such a pass silently drew nothing even when its shader lowered. The
+  log says `ExecuteIndirect(DISPATCH) on a lowered RayQuery pipeline ->
+  DispatchRays` once when it happens, and `NOT EMULATED` with a reason for a
+  shape it does not handle (a count buffer, or a signature with more than the
+  one `DISPATCH` argument; Unreal uses neither).
+- **`rqphase = 4` runs the shaders that lower.** It is the full path, dispatch
+  included, except that a refused shader gets a do-nothing pipeline rather
+  than being forwarded, so Unreal survives its refusals. What the refused
+  shaders would have drawn is missing.
 - `dxgi.dll` is required, not optional: without it Unreal reads the Pascal
   device id and switches ray tracing off before any of this happens.
 - Expect it to be slow. Pascal traces rays on its shader cores, and Epic's own

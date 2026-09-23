@@ -14,6 +14,7 @@
 #include "state_object_cache.h"
 #include "queue_hook.h"
 #include "d3d12_command_list.h"
+#include "group_count.h"
 #include "command_signature.h"
 #include "dxil_scan.h"
 #include "d3d12_pipeline_library.h"
@@ -516,7 +517,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandList(UINT nodeMask, D3D12_CO
         WrapList(riid, ppCommandList);
         // Carry the stand-in onto the wrapper, so a list created with one and
         // dispatched without a further SetPipelineState still works.
-        if (rq) Dxr11CommandList::AdoptRayQueryPso(*ppCommandList, rq);
+        if (rq) Dxr11CommandList::AdoptRayQueryPso(*ppCommandList, rq, pInitialState);
     }
     return hr;
 }
@@ -659,7 +660,18 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommandSignature(const D3D12_COMMAN
             if (pDesc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS)
                 dispatchRays = true;
     }
-    if (!dispatchRays) FWD(CreateCommandSignature(pDesc, pRootSignature, riid, ppvCommandSignature));
+    if (!dispatchRays) {
+        const HRESULT hr = m_real->CreateCommandSignature(pDesc, pRootSignature, riid,
+                                                          ppvCommandSignature);
+        // A DISPATCH signature is how an indirect compute dispatch arrives, and
+        // with a lowered RayQuery pipeline bound it has to be emulated. Tag it
+        // so ExecuteIndirect knows its shape. See proxy/group_count.h.
+        if (!m_tier11 && SUCCEEDED(hr) && ppvCommandSignature && *ppvCommandSignature &&
+            riid == __uuidof(ID3D12CommandSignature))
+            groupcount::TagSignature(static_cast<ID3D12CommandSignature*>(*ppvCommandSignature),
+                                     pDesc, pRootSignature);
+        return hr;
+    }
 
     // D3D12 requires DISPATCH_RAYS to be the only argument in its signature.
     // Anything else is a shape we have not seen and cannot emulate, so refuse

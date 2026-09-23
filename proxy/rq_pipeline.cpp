@@ -357,7 +357,14 @@ static ID3D12PipelineState* MakeCarrier(ID3D12Device5* dev,
 //   rqphase = 1   rewrite the DXIL, throw it away
 //   rqphase = 2   rewrite, then create the state object
 //   rqphase = 3   rewrite, state object, then build the shader table
+//   rqphase = 4   all of it, dispatch included, as when absent
 //   absent        all of it, the normal behaviour
+//
+// 4 differs from absent in one way only, and it is the reason it exists: a
+// shader the rewriter REFUSES still gets a do-nothing pipeline, as under every
+// phase, where absent forwards it and Unreal makes that fatal. So 4 is how the
+// shaders that DO lower get to run in an Unreal game at all while the refusal
+// list is still long. Rendering from the refused ones is missing, not wrong.
 //
 // A stopped phase still keeps everything it built alive, attached to the
 // carrier, so memory and driver objects match the real run. What it does not
@@ -370,7 +377,13 @@ static int RayQueryPhase() {
     if (s == -2) {
         const cfg::Text t = cfg::GetText("DXR_TIER11_RQPHASE", "rqphase");
         s = t.value.empty() ? -1 : _wtoi(t.value.c_str());
-        if (s >= 0)
+        if (s >= 4)
+            ProxyLog("[dxr-tier-11-proxy-log] rqphase = %d (from %s): the FULL path, "
+                     "lowered shaders are dispatched. Only a REFUSED shader gets a "
+                     "pipeline that does nothing, so an Unreal game survives its "
+                     "refusals. What the refused shaders draw is missing. This is a "
+                     "diagnostic, not a setting.\n", s, t.source);
+        else if (s >= 0)
             ProxyLog("[dxr-tier-11-proxy-log] rqphase = %d (from %s): lowering stops "
                      "after that step and the application gets a pipeline that does "
                      "nothing. This is a bisect, not a setting.\n", s, t.source);

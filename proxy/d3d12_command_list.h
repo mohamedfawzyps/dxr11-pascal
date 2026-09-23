@@ -118,6 +118,13 @@ struct Dxr11PendingDispatch {
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     UINT64        readbackOffset = 0;
     Dxr11Bindings bindings;
+    // Set for an indirect COMPUTE dispatch of a lowered RayQuery pipeline,
+    // where the readback holds three group counts rather than a
+    // D3D12_DISPATCH_RAYS_DESC. `rqRef` holds the reference that keeps `rq`
+    // alive until the dispatch is issued; `counts` is the capture's own UAV.
+    class Dxr11RayQueryPso*                      rq = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState>  rqRef;
+    Microsoft::WRL::ComPtr<ID3D12Resource>       counts;
 };
 
 // A closed segment, followed by the dispatches that could not be recorded until
@@ -299,6 +306,10 @@ private:
     // closing the segment. The close is deferred so that a run of dispatches
     // with no work between them lands in one segment behind one sync.
     bool QueueSplit(ID3D12Resource* args, UINT64 argOffset);
+    // The same, for ExecuteIndirect with a DISPATCH signature while a lowered
+    // RayQuery pipeline is bound. See proxy/group_count.h.
+    bool QueueIndirectCompute(ID3D12CommandSignature* sig, ID3D12Resource* args,
+                              UINT64 argOffset);
     // Gets the instance descriptions of a top-level build to the CPU, so the
     // shader table can know the contributions and the geometry types they
     // reach. Reads them outright when they are in CPU-visible memory;
@@ -325,7 +336,8 @@ public:
     // Set the stand-in on a freshly wrapped list, for the case where the
     // application named it as CreateCommandList's initial state and never
     // calls SetPipelineState afterwards.
-    static void AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq);
+    static void AdoptRayQueryPso(void* wrappedList, Dxr11RayQueryPso* rq,
+                                 ID3D12PipelineState* initial);
 
 private:
 

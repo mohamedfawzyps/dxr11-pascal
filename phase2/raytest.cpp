@@ -289,6 +289,17 @@ static bool g_mixed = false;
 static bool g_both = false;
 
 static bool g_table = false;
+// --indirect: the RayQuery compute shader is dispatched through ExecuteIndirect
+// with a DISPATCH signature, which is how Unreal issues most of its Lumen and
+// MegaLights inline passes. The arguments are written by the GPU, left in a
+// COMBINED read state (INDIRECT_ARGUMENT | NON_PIXEL_SHADER_RESOURCE), and sit
+// at a nonzero offset among decoy values, as a sub-allocation would. So a shim
+// that ignores the dispatch draws nothing, one that reads the wrong offset
+// draws a decoy-sized corner, and one that transitions the buffer from the
+// wrong state is caught by the debug layer. --indirectup puts the same
+// arguments in an upload buffer, the CPU-visible path.
+static bool g_indirect = false;
+static bool g_indirectUp = false;
 // Create the compute PSO through CreatePipelineState, the pipeline STREAM
 // form, instead of CreateComputePipelineState. Unreal uses the stream form
 // for everything, and the shim's substitution used to cover only the struct
@@ -1039,7 +1050,56 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     // Group count sized for the smallest thread group any of these shaders
     // uses. A 16x16 shader then gets more groups than it needs, which is safe
     // because every one of them bounds checks; too FEW groups would not be.
-    g.list->Dispatch((kWidth + 7) / 8, (kHeight + 7) / 8, 1);
+    const UINT gx = (kWidth + 7) / 8, gy = (kHeight + 7) / 8;
+    if (!g_indirect && !g_indirectUp) {
+        g.list->Dispatch(gx, gy, 1);
+        UavBarrier(g.list.Get(), out);
+        g.flush();
+        return;
+    }
+
+    D3D12_INDIRECT_ARGUMENT_DESC ad{};
+    ad.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC sd{};
+    sd.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    sd.NumArgumentDescs = 1;
+    sd.pArgumentDescs = &ad;
+    ComPtr<ID3D12CommandSignature> sig;
+    HR(g.device->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&sig)),
+       "CreateCommandSignature(DISPATCH)");
+
+    // 64 words of decoys, 3 groups each way, with the real arguments at byte 36.
+    const UINT64 kArgOffset = 36;
+    UINT words[64];
+    for (UINT& w : words) w = 3;
+    words[kArgOffset / 4 + 0] = gx;
+    words[kArgOffset / 4 + 1] = gy;
+    words[kArgOffset / 4 + 2] = 1;
+    auto upload = CreateBuffer(g.device.Get(), sizeof(words), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+    HR(upload->Map(0, &none, &p), "map indirect args");
+    std::memcpy(p, words, sizeof(words));
+    upload->Unmap(0, nullptr);
+
+    ComPtr<ID3D12Resource> args = upload;
+    if (g_indirect) {
+        args = CreateBuffer(g.device.Get(), sizeof(words), D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyBufferRegion(args.Get(), 0, upload.Get(), 0, sizeof(words));
+        D3D12_RESOURCE_BARRIER tb{};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = args.Get();
+        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        g.list->ResourceBarrier(1, &tb);
+    }
+    std::printf("        dispatched INDIRECTLY, %ux%ux1 groups at byte %llu of a %s buffer\n",
+                gx, gy, (unsigned long long)kArgOffset,
+                g_indirect ? "GPU-written" : "upload");
+    g.list->ExecuteIndirect(sig.Get(), 1, args.Get(), kArgOffset, nullptr, 0);
     UavBarrier(g.list.Get(), out);
     g.flush();
 }
@@ -1455,6 +1515,13 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--stream") == 0) {
                 g_stream = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--indirect") == 0 ||
+                std::strcmp(argv[i], "--indirectup") == 0) {
+                (argv[i][10] ? g_indirectUp : g_indirect) = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;
