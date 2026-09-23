@@ -5,13 +5,44 @@ proxy/version.h, and is currently 0.37.0.
 
 ## Current position (2026-09-23)
 
-**THE ESCHER GPU CRASH HAS A CAUSE AND A FIX (0.37.0), NOT YET RUN IN THE
-GAME.** A hit shader reading a local root signature cbuffer crashes the Pascal
-driver inside `CreateStateObject`. That was how the shim delivered
-`GeometryIndex` and `InstanceContributionToHitGroupIndex`; they are now baked
-into a copy of the hit shaders per (geometry, contribution) pair. The fifteen
-Unreal libraries that crashed are 0 of 225 offline. The next step is an Escher
-run. See the driver crash entry below.
+**THE ESCHER GPU CRASH IS FIXED, CONFIRMED IN THE GAME (0.37.0).** A hit
+shader reading a local root signature cbuffer crashed the Pascal driver inside
+`CreateStateObject`. That was how the shim delivered `GeometryIndex` and
+`InstanceContributionToHitGroupIndex`; they are now baked into a copy of the
+hit shaders per (geometry, contribution) pair. See the driver crash entry.
+
+The Escher run at `rqphase = 2`, 2026-09-23 14:26, shim 0.37.0 on both DLLs,
+DXC present:
+
+    RayQuery shaders seen                160
+    CreateStateObject called / BUILT     30 / 30, each "1 hit group copy"
+    device removals                      0
+    end marker                           written, clean exit
+    (last run, 0.36.7: died at shader 43 with 12 built)
+
+What now stops the rest, 129 refusals, and the composition is the signal:
+
+     47  Proceed loop body has a side effect (UAV append), the MegaLights and
+         Lumen family. NO_DUPLICATE_ANYHIT_INVOCATION is the route, see the
+         spec entry below.
+     33  "2 concurrent RayQuery objects", known to be a FALSE refusal.
+     24  GroupId / FlattenedThreadIdInGroup read in what becomes the RAYGEN,
+         where neither is legal. NEW at this scale (1 before). Lowerable the
+         way threadId already is: both follow from DispatchRaysIndex and
+         numthreads, provided there is no groupshared or barrier, which is
+         refused separately.
+     24  loop isolation, a rawBufferLoad or textureLoad in the chain.
+      1  assembler: use of undefined value.
+
+The process sat at full CPU for about three minutes, and the shim's end
+marker came at 2 min 54 s, so that was the process's whole life, not
+something after it. The shim's own work, measured offline on this run's
+dumps, is tens of CPU-seconds: 30 state objects compile in 12.8 s cold and
+1.9 s warm, and a rewrite is well under 0.3 s. INFERRED, not established:
+most of the load was the driver recompiling the whole game's pipelines,
+because the bisect cleared NVIDIA's DXCache before every trial and Escher
+started from an almost empty one (it held ~550 MB earlier). A second run
+with a warm cache settles it.
 
 **THE GOAL IS REACHED.** A RayQuery compute shader, unmodified, runs on the
 GTX 1070 and produces bit-exact output against WARP. 24 render cases, 0
