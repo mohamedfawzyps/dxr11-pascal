@@ -1401,6 +1401,13 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   fails about a third of the time on the same input is a race or uninitialised
   memory, not a rejected construct.
 
+  **THE "ONE SHADER FAMILY" READING BELOW IS REFUTED, and it is kept only
+  because the way it failed is instructive: every number in it is n = 10 or
+  less on a failure that is intermittent, so the split it reports is noise.
+  At 20 trials 015 goes from 0 of 10 to 13 of 20, and 011 and 014, called
+  safe here, are 6 and 8 of 10. The real sort is `recordconstants`, see the
+  finding below.**
+
   **AND THE CRASHERS ARE ONE SHADER FAMILY.** All six are MegaLights light
   sampling:
 
@@ -1447,38 +1454,79 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   does not yet distinguish "the driver cannot compile this construct" from
   "these libraries take a path where the race is reachable".
 
-  **THE BISECT RAN, AND ALL THREE LEADS ARE DEAD.** Four variants of
-  `lowered_010`, each assembled and signed, each tested over eight trials with
-  NVIDIA's DXCache cleared before every trial:
+  **THE CAUSE IS FOUND, AND IT IS OURS: A HIT SHADER READING THE LOCAL ROOT
+  SIGNATURE CONSTANTS IS WHAT KILLS THE DRIVER.** Measured on the 1070, the
+  NVIDIA shader cache cleared before every single trial:
 
-      base      untouched                                  8 of 8 CRASH
-      sincos    Sin and Cos replaced by a no-op multiply    8 of 8 CRASH
-      f16       both half-float conversions removed         8 of 8 CRASH
-      both      the two together                            8 of 8 CRASH
-      control   24 dead fadds, semantics unchanged          8 of 8 CRASH
+      base           lowered_010, untouched                 21 of 29 SEGFAULT
+      ahonly         record read in the any-hit only         6 of 15
+      chonly         record read in the closest-hit only     7 of 15
+      globalrec      SAME code, values from a GLOBAL cbuffer 0 of 15
+      norecval       record reads removed                    0 of 10
+      norecread      reads removed, local root sig STILL     0 of 10
+                     built and associated
+      n013           the same edit on lowered_013            0 of 15
+      lowered_013    that library untouched                  8 of 15
 
-  So the feature diff found a family signature and not a cause. The control
-  earns its place: it changes the bytes and therefore the cache key and
-  nothing else, so it proves the variants really were getting cold compiles
-  and that an edit alone neither causes nor cures this.
+  `globalrec` is the control that carries the result. It keeps the downstream
+  code byte for byte, keeps the values dynamic, and changes ONE thing: the
+  cbuffer is the global one at cb0 space0 instead of the record one at cb0
+  space1. It never crashed. So it is not the arithmetic, not the size and not
+  the `rawBufferLoad` those values index.
 
-  **AND THE GENERATED ANY-HIT IS EXONERATED.** Replacing its whole body with
-  `ret void`, 59 lines gone, still crashes 4 of 4 cold. So the fault is in the
-  raygen, which is the transplanted Unreal body, or in the state object
-  structure, and not in the hit shader this project writes. Gutting the
-  closest-hit could not be tested: it fails validation, because the raygen
-  reads payload fields the closest-hit must write.
+  `norecread` is the other half: the local root signature subobject is still
+  created and still associated with the hit groups, and only the READ is gone.
+  Also clean. **Creating the local root signature is fine. Reading from it in
+  a hit shader is what the driver cannot compile.**
 
-  **THE "PROBABILISTIC, WEARS OFF" READING NO LONGER HOLDS, AND I AM NOT
-  REPLACING IT WITH ANOTHER MODEL.** Right now `lowered_010` crashes on every
-  attempt: eight cold trials, then five consecutive attempts with NO clearing
-  in between, thirteen for thirteen. The same library, in the same session
-  earlier, went CRASH CRASH ok ok ok over five consecutive attempts. The only
-  difference is that the cache was 550 MB then and nearly empty now.
-  **So the decay is real but the mechanism is not understood**, and the
-  earlier entry asserting a cache-miss story went further than the evidence.
-  What is solid: on this machine as it stands, the repro is DETERMINISTIC,
-  which is what a bisect needs.
+  **And it sorts all nineteen libraries perfectly.** Sweeping every one with
+  the cache cleared each trial, the four with `recordconstants=0` are
+  **0 of 80 combined** (003, 004, 006, 007, 20 trials each), and every one of
+  the fifteen with `recordconstants=1` crashes given enough trials.
+
+  So this is not a Pascal defect we merely tripped over. **It is the mechanism
+  this project introduced in order to close 120 of Unreal's 158 refusals**:
+  the shim delivers `GeometryIndex` and `InstanceContributionToHitGroupIndex`
+  as local root signature root constants in the shader record, and reading
+  them is what removes the device. The feature that unlocked the most and the
+  bug that blocks everything are the same line of work.
+
+  **THE PREVIOUS BISECT MEASURED NOTHING, AND THE REASON IS WORTH MORE THAN
+  THE RESULT IT DESTROYED.** `sotest` resolves the shape file with
+  `libPath.rfind(".out.dxil")`, so a library named `var_base.dxil` gets no
+  shape, and it refuses BEFORE `CreateStateObject` with exit code 1. The whole
+  variant matrix was named that way. Every "8 of 8 CRASH" was eight shape
+  refusals, identical for a good and a bad library, and `CreateStateObject`
+  was never once called. Retracted in full:
+  - "all three leads are dead" measured nothing, though sin/cos and f16 remain
+    dead for a better reason: they are `BlueNoiseVec2` and `PackLightSample`,
+    read out of the engine source, so that signature was a fingerprint of the
+    shader family and never a construct;
+  - "the generated any-hit is exonerated" measured nothing. The any-hit is in
+    fact one of the two places the fatal read lives;
+  - "the repro is DETERMINISTIC, 13 of 13" measured nothing. It is
+    intermittent, about 40 to 80 percent per cold compile, exactly as the
+    entry above it said. **The "probabilistic, wears off" model was withdrawn
+    on the strength of a broken measurement and is hereby restored.**
+  - the MegaLights family signature was small-n noise. 015 read 0 of 10 and is
+    13 of 20; 011 and 014 were called safe and are 6 and 8 of 10.
+
+  This is the same failure the brief already names twice, in a third place: a
+  probe that fails identically for a good and a bad input measures nothing. It
+  was caught by printing one full run instead of a counter, which is the
+  cheapest check there is and was not done for a whole session.
+
+  **THE HARNESS CONFOUND WAS CHECKED, NOT ASSUMED.** Clearing the cache raises
+  the rate sharply (base 1 of 20 warm against 8 of 10 cold), and the clear is
+  `rm -rf` on files the driver sometimes still holds, so "my own clear corrupts
+  the cache" was a live alternative to "cold compiles crash". It is ruled out
+  by content still mattering under identical clearing: four libraries are 0 of
+  80 while others are 8 of 10, and an edit to one library moves it from 8 of 15
+  to 0 of 15. A corrupting clear would hit everything alike.
+
+  **The intermittency is what makes small n useless here**, and two readings in
+  this investigation were built on n = 10 or less. Treat anything under 15
+  trials as a hint. A variant that reaches zero is the only clean signal.
 
   **The bisect that settles it is now cheap, and one thing makes it cheaper
   than it looks: ANY EDIT IS AUTOMATICALLY A CACHE MISS.** Changing the
@@ -1490,7 +1538,9 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   clear DXCache, sweep, count. That is the procedure any bisect of the library
   has to use, because a single clean run means nothing.
 
-  It is also not size. 53852 bytes builds fine and 16764 crashed.
+  It is also not size, and the numbers that used to say so were a warm
+  cache. With the cache cleared every trial, 53852 bytes crashes 3 of 10
+  and 9360 bytes is 0 of 20. Size tracks nothing; `recordconstants` does.
 
   **AND IT EXPLAINS WHY EVERY EARLIER OFFLINE REPLAY SUCCEEDED.** This brief
   built a whole conclusion on those: "every input is exonerated and the

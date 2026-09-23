@@ -1,55 +1,51 @@
-# An offline reproduction of the CreateStateObject driver crash
+# The driver crash, and what causes it
 
-`crash.out.dxil` is a library this project GENERATED from
-`HardwareRayTraceLightSamplesCS`, a real UE 5.8.2 MegaLights compute shader
-dumped out of a running game. Built with its own root signature on a GTX 1070:
+`CreateStateObject` access-violates inside NVIDIA's Pascal driver. It is
+**intermittent**, roughly 40 to 80 percent per COLD compile, so a single clean
+run proves nothing. Clear `%LOCALAPPDATA%\NVIDIA\DXCache` before every trial
+and take the result over at least 15 of them.
+
+## The cause
+
+**A hit shader reading the cbuffer bound through the LOCAL ROOT SIGNATURE**,
+`cb0, space1`, which is how this shim delivers `GeometryIndex` and
+`InstanceContributionToHitGroupIndex` as shader-record root constants.
+
+Creating and associating the local root signature is fine. Reading from it in
+an any-hit or a closest-hit is what removes the device.
+
+## The files
+
+    crash.*      a generated library that reads the record constants. CRASHES.
+    norecread.*  the same library with only the READS removed. The local root
+                 signature is still built and still associated. CLEAN.
+    globalrec.*  the same library with the same downstream code and the same
+                 dynamic values, read from a GLOBAL cbuffer instead. CLEAN.
+
+`globalrec` is the control that carries the result: identical arithmetic,
+identical `rawBufferLoad` chain, values still dynamic, one difference only.
+
+## Running it
 
     phase5out\sotest.exe crash.out.dxil crash.rs.bin hw
-    calling CreateStateObject with 9 subobjects...
-    Segmentation fault
 
-The NVIDIA driver access-violates INSIDE `CreateStateObject`. No Unreal, no
-other state objects, no memory pressure, no concurrency, 35544 bytes of
-library. D3D12's own validation has nothing to say about it: with the debug
-layer forced on, the only message at the moment of death is the device removal.
+`sotest` finds the shape file by `rfind(".out.dxil")`, so **the library must be
+named `<name>.out.dxil`** with `<name>.shape.txt` beside it. Named anything
+else it refuses before `CreateStateObject` and exits 1, which looks like a
+failure and is not one. A whole session of bisecting was lost to exactly that.
+A real crash is a segmentation fault, exit 139, after the line
+`calling CreateStateObject with 9 subobjects...`.
 
-## IT IS INTERMITTENT, AND THAT IS THE MOST IMPORTANT THING ON THIS PAGE
+## Measured
 
-It does not fail every time, and it WEARS OFF. Measured on nineteen generated
-libraries from one game run, each built alone in its own process:
+    crash / lowered_010  untouched                       21 of 29 SEGFAULT
+    record read in the any-hit only                       6 of 15
+    record read in the closest-hit only                   7 of 15
+    globalrec                                             0 of 15
+    norecread                                             0 of 10
+    the same edit applied to lowered_013                  0 of 15
+    lowered_013 untouched                                 8 of 15
 
-    first time each was ever compiled   5 of 19 crashed
-    sweep again                         1 of 19 crashed, the same one
-    sweep again                         1 of 19
-    sweep again                         none
-    sweep again                         none
-
-The same library that crashed twice then ran ten times in a row without
-complaint. So a single clean run proves NOTHING here, and a bisect that trusts
-one is worthless. Take the result over several fresh sweeps.
-
-INFERRED, not established: this is the driver's shader disk cache. The crash
-looks like it happens while the driver actually COMPILES the library, on a
-cache miss, and stops once an entry exists. The obvious test is to clear
-`%LOCALAPPDATA%\NVIDIA\DXCache` and try again, which has not been run.
-
-Against that inference: the game crashed on the same shader across many
-separate runs, which a warm disk cache should have prevented. So the story is
-not complete.
-
-## Files
-
-- `crash.in.dxil`   the Unreal shader, unmodified, as the game handed it over
-- `crash.out.dxil`  what the rewriter made of it: signed, validated, accepted
-                    by D3D12, and fatal to the driver
-- `crash.rs.bin`    the application's compute root signature, which becomes the
-                    state object's GLOBAL root signature
-- `crash.shape.txt` what the shim decided, so sotest builds the same subobjects
-
-## Why it matters anyway
-
-Every earlier attempt to replay this failure offline SUCCEEDED, which pointed
-at the process context and was a dead end. It only looked that way because the
-one shader being replayed was `RayTracingDebugMainCS`, which is survivable on
-a quiet device. The fault is in something the LIBRARY contains, and iteration
-is now seconds rather than a game launch.
+Across all nineteen libraries from one Escher run, the four with
+`recordconstants=0` are 0 of 80 combined; every one of the fifteen with
+`recordconstants=1` crashes given enough trials.
