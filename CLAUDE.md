@@ -58,6 +58,16 @@ dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
 
+**0.39.2 IN THE GAME: A FULL SESSION, NO CRASH (2026-09-23).** 4 min 9 s, clean
+end marker, no device removal, no crash report: menu, open world, the
+cutscene, and the user flipping ray tracing, RT shadows, MegaLights and
+virtual shadow maps on and off repeatedly. 59 lowered, 109 refused (given
+do-nothing pipelines), 32 tables built (1095 at 0.39.1), 26 rebakes, the
+indirect emulation ran (1542x1x1 groups read back). BUT in the open world
+(273 instances, contribution up to 2196, 383 pairs) the record-constant
+passes are SKIPPED over the 256-pair cap, so surviving is not drawing: step 2
+is what makes those passes render there.
+
 **0.39.1 IN THE GAME: THE OPEN WORLD RAN, THE HANG IS GONE.** The cutscene
 then crashed 3 of 3 on Unreal's `Close` returning `E_INVALIDARG`. Inferred
 cause: the now-repeated instance copy recorded a barrier and a copy on
