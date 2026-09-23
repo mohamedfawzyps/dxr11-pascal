@@ -145,14 +145,17 @@ set DXR_TIER11=0
 
 ### The whole switch list
 
-The shim reads exactly six settings. There are no others.
+The shim reads six settings. It also reads five diagnostics, `rqstub`,
+`rqphase`, `rqlimit`, `rqonly` and `rqdispatch`, which are bisects for chasing
+a crash and make rendering wrong on purpose; they are described at the end of
+[dxr-tier-11.example.ini](../dxr-tier-11.example.ini) and are not part of normal use.
 
 | Setting | Default | Read by | What it does |
 |---|---|---|---|
 | `tier11` / `DXR_TIER11` | **on** | d3d12.dll | report Tier 1.1 and rewrite RayQuery shaders |
 | `nowrap` / `DXR_TIER11_NOWRAP` | off | d3d12.dll | hand the application the real device and translate nothing |
 | `log` / `DXR_TIER11_LOG` | `%TEMP%` | both | where to put the log file |
-| `dump` / `DXR_TIER11_DUMP` | off | d3d12.dll | write refused shaders to a folder, for diagnosis |
+| `dump` / `DXR_TIER11_DUMP` | off | d3d12.dll | write refused and lowered shaders to a folder, for diagnosis and offline replay |
 | `spoof` / `DXR_TIER11_SPOOF` | **on** | dxgi.dll | report a Pascal card under a Turing device id |
 | `spoofid` / `DXR_TIER11_SPOOFID` | `0x1F08` | dxgi.dll | which device id to report |
 
@@ -311,10 +314,32 @@ scene layouts it can only partly serve.
 them into two lists, and the difference matters when you are deciding whether
 to report it: refusals that are facts about DXR 1.0 will not change, and
 refusals that are gaps in the rewriter will. "More than one RayQuery object"
-is the second kind and is the most common one a real game hits.
+is the second kind and is the most common one a real game hits. "Proceed loop
+body has a side effect" is the first kind: DXR lets an any-hit shader run more
+than once for the same candidate, so a UAV write or counter append moved into
+one would not be the same write.
 
 Turn `dump` on and the refused shader is written out as a `.dxil` container
 with a `.txt` saying why, which is what makes a useful bug report.
+
+**The device is removed while shaders are being created**
+(`DXGI_ERROR_DRIVER_INTERNAL_ERROR`, often with no error from the shim at
+all). Look at the last lines of the log. Every state object build is announced
+BEFORE the call, so if the log ends on `about to call CreateStateObject`, that
+call is where the device went.
+
+One cause is known and fixed. Up to 0.36.x the shim passed each hit group
+record's geometry index and instance contribution through a local root
+signature, and on Pascal a hit shader READING a local root signature makes the
+driver crash inside `CreateStateObject`, intermittently, and only when NVIDIA's
+shader cache does not already hold the result. From 0.37.0 those values are
+baked into a copy of the hit shaders per record instead, and the log line says
+how many copies each build carries. If you see this on 0.37.0 or later it is a
+different cause: turn `dump` on, and the library that was being built is on
+disk as `lowered_NNN.*` and can be rebuilt on its own with `sotest`, see
+`phase5/cases/driver-crash/README.md`. Because the crash can depend on the
+cache, one clean run of a library proves little; clear
+`%LOCALAPPDATA%\NVIDIA\DXCache` before each attempt and count.
 
 **Turn the D3D12 debug layer on.** The shim does not switch this itself, and
 it does not need to: `dxcpl.exe`, the DirectX Control Panel, forces the debug
@@ -366,3 +391,22 @@ and signs. Expect some shaders to still be refused, most of them for having
 more than one RayQuery object in an entry point, and the log will name each
 one. `dump = refused-shaders` writes them out so a refusal can be reproduced
 offline with `dxrw rewrite`.
+
+**Where a real Unreal game stands today, stated plainly.**
+
+- **A refused shader ends the game.** The shim forwards a shader it cannot
+  lower, the driver rejects it, and Unreal turns that into
+  `LowLevelFatalError ... Shader compilation failures are Fatal`. So a full
+  run of an Unreal game currently stops at the first refused RayQuery shader.
+  In one UE 5.8.2 game with 163 RayQuery shaders, the last run lowered 19 of
+  the first 43 it reached before the GPU crash stopped it; how many of all 163
+  lower is not yet measured. The diagnostics `rqphase` and `rqstub` keep such
+  a game running by handing refused shaders a pipeline that does nothing,
+  which is useful for testing and renders wrong.
+- **The GPU crash during pipeline creation is fixed in 0.37.0**, see section
+  7. The libraries that game produced now build cleanly on a GTX 1070 offline;
+  a run of the game itself with 0.37.0 is the next check.
+- `dxgi.dll` is required, not optional: without it Unreal reads the Pascal
+  device id and switches ray tracing off before any of this happens.
+- Expect it to be slow. Pascal traces rays on its shader cores, and Epic's own
+  refusal of Pascal most likely exists for that reason.

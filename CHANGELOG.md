@@ -5,15 +5,22 @@
 [Semantic Versioning](https://semver.org/). The major version is the honest
 part:
 
-- **0.x** while the tier flip is opt-in. The refusal list has only ever been
-  exercised against this project's own shaders, so the boundary between "runs"
-  and "refused" is measured but not yet trusted.
+- **0.x** until real software runs through it end to end. A real Unreal
+  shader first lowered in 0.25.0, but no real game has
+  yet run with its RayQuery shaders lowered and dispatching, so the boundary
+  between "runs" and "refused" is measured and not yet trusted.
 - **1.0.0** when real software has run through it and that boundary holds.
   That is a statement about exposure, not about features.
 
 MINOR adds lowering coverage or a feature. PATCH is fixes only. The version is
 compiled into the DLL and logged on attach, so a log file identifies its own
 build.
+
+**Tags.** A release is tagged `vX.Y.Z` on the commit that completes it,
+documentation included. Not every version has one: 0.15.0 through 0.24.0 and
+the patch series 0.36.1 through 0.36.7 were never tagged and exist only as
+commits on `main`. This file is the complete list of versions; `git tag` is
+not.
 
 ---
 
@@ -60,6 +67,26 @@ build.
   per-record copy choice carries the result.
 - The rewriter suite gains a bake section: Python and C++ byte-identical, the
   result validates, and no record read survives, on three pair lists.
+- The driver-crash repro can now be run from a clone. `*.bin` was ignored, so
+  none of the `.rs.bin` root signatures beside the vendored libraries were
+  ever committed, and a DXR state object does not build without one.
+- Documentation brought up to date:
+  - README: the status says plainly that a full Unreal run does not work yet
+    and why, the side-effect refusal from 0.36.6 is listed, and the accessor
+    paragraph describes the baking instead of the local root signature.
+  - docs/usage.md: the five diagnostics are acknowledged instead of "exactly
+    six settings, there are no others", `dump` is described as writing lowered
+    shaders too, there is a troubleshooting entry for the device being removed
+    during pipeline creation, and the Unreal notes state where a real game
+    stands, including that a refused shader is fatal to it.
+  - dxr-tier-11.example.ini: `rqstub`, `rqphase` and `rqonly` were missing,
+    `rqlimit` was described as it worked before 0.36.2, and the whole block had
+    been appended to the end of the `dxgi.dll` section. They now have their
+    own section, with the Unreal caveat stated once at the top.
+  - The Versioning section above no longer says 0.x means the tier flip is
+    opt-in, which stopped being true at 0.10.0, and it records which versions
+    have tags.
+- Tagged `v0.37.0`.
 
 ---
 

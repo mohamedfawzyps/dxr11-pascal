@@ -55,15 +55,20 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 23 end-to-end render cases, all bit-exact, plus 4 refusal gates
+- 24 end-to-end render cases, all bit-exact, plus 4 refusal gates
 - 13 rewriter cases, each byte-identical between the Python reference and the
-  C++ port, on both the `.ll` path and the DXIL container path, plus 15
-  analysis and lowering checks
+  C++ port, on both the `.ll` path and the DXIL container path, plus 17
+  analysis and lowering checks and 3 baking checks
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
   pixel-identical to its no-proxy baseline
 
-A shader taken from a shipping Unreal Engine 5.8.2 game, which nobody here
-wrote, goes DXIL container in and signed container out.
+Shaders taken from a shipping Unreal Engine 5.8.2 game, which nobody here
+wrote, go DXIL container in and signed container out, and the state objects
+built from them survive on a GTX 1070. That last part is new in 0.37.0: the
+game's GPU crash during pipeline creation was traced to this shim, and fixed.
+**A full run of an Unreal game does not work yet**, mainly because Unreal
+treats a shader the shim refuses as fatal. See
+[Notes for Unreal](docs/usage.md#9-notes-for-unreal) for where it stands.
 
 Tier 1.1 is reported by default. A proxy DLL only sits beside an executable
 because somebody put it there, so the install is the opt-in, and asking for a
@@ -120,6 +125,9 @@ Refused because DXR 1.0 offers nothing to lower onto:
 - `groupshared` memory, group barriers or wave intrinsics in the same entry
   point as the query
 - a loop body reading caller locals that do not fit the payload
+- a loop body with a side effect, such as a UAV write or a counter append.
+  DXR allows an any-hit shader to run more than once for the same candidate,
+  and in no defined order, so the write would not be the same write
 - an application routing both triangle and procedural geometry to the same hit
   group record, which no shader table can serve
 
@@ -136,8 +144,11 @@ thing and is said differently in the log:
 them, `Candidate`/`CommittedGeometryIndex` and the two
 `*InstanceContributionToHitGroupIndex` forms, were listed here as permanently
 impossible, and they were, for as long as the application owned the shader
-table. This shim builds it, so each record carries those numbers as local root
-signature constants and the hit shader reads them back.
+table. This shim builds it, so it knows those numbers for every record it
+writes. It bakes them into one copy of the hit shaders per distinct pair and
+points each record at its copy. The obvious route, passing them as local root
+signature constants, made the Pascal driver crash inside `CreateStateObject`,
+and was replaced in 0.37.0.
 
 ## Requirements
 
