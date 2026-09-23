@@ -1447,6 +1447,39 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   does not yet distinguish "the driver cannot compile this construct" from
   "these libraries take a path where the race is reachable".
 
+  **THE BISECT RAN, AND ALL THREE LEADS ARE DEAD.** Four variants of
+  `lowered_010`, each assembled and signed, each tested over eight trials with
+  NVIDIA's DXCache cleared before every trial:
+
+      base      untouched                                  8 of 8 CRASH
+      sincos    Sin and Cos replaced by a no-op multiply    8 of 8 CRASH
+      f16       both half-float conversions removed         8 of 8 CRASH
+      both      the two together                            8 of 8 CRASH
+      control   24 dead fadds, semantics unchanged          8 of 8 CRASH
+
+  So the feature diff found a family signature and not a cause. The control
+  earns its place: it changes the bytes and therefore the cache key and
+  nothing else, so it proves the variants really were getting cold compiles
+  and that an edit alone neither causes nor cures this.
+
+  **AND THE GENERATED ANY-HIT IS EXONERATED.** Replacing its whole body with
+  `ret void`, 59 lines gone, still crashes 4 of 4 cold. So the fault is in the
+  raygen, which is the transplanted Unreal body, or in the state object
+  structure, and not in the hit shader this project writes. Gutting the
+  closest-hit could not be tested: it fails validation, because the raygen
+  reads payload fields the closest-hit must write.
+
+  **THE "PROBABILISTIC, WEARS OFF" READING NO LONGER HOLDS, AND I AM NOT
+  REPLACING IT WITH ANOTHER MODEL.** Right now `lowered_010` crashes on every
+  attempt: eight cold trials, then five consecutive attempts with NO clearing
+  in between, thirteen for thirteen. The same library, in the same session
+  earlier, went CRASH CRASH ok ok ok over five consecutive attempts. The only
+  difference is that the cache was 550 MB then and nearly empty now.
+  **So the decay is real but the mechanism is not understood**, and the
+  earlier entry asserting a cache-miss story went further than the evidence.
+  What is solid: on this machine as it stands, the repro is DETERMINISTIC,
+  which is what a bisect needs.
+
   **The bisect that settles it is now cheap, and one thing makes it cheaper
   than it looks: ANY EDIT IS AUTOMATICALLY A CACHE MISS.** Changing the
   library changes its bytes and therefore its cache key, so a variant gets a
