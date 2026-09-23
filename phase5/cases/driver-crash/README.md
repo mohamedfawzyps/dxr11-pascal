@@ -49,3 +49,16 @@ A real crash is a segmentation fault, exit 139, after the line
 Across all nineteen libraries from one Escher run, the four with
 `recordconstants=0` are 0 of 80 combined; every one of the fifteen with
 `recordconstants=1` crashes given enough trials.
+
+## The two cheap escapes, both dead
+
+`sotest` takes `SOTEST_LOCAL_CBV=1` (a root CBV descriptor instead of root
+constants) and `SOTEST_LOCAL_SPACE=N` (a different register space). The
+library is untouched by either, so each is a one-variable test.
+
+    root constants, space 1    var_base 11/20, lowered_013 9/20, 015 9/20
+    root CBV,       space 1    var_base 13/20, lowered_013 11/20, 015 10/20
+    root constants, space 2    var_base 15/20
+
+Not the parameter type, not the register space. Reading a cbuffer bound
+through the local root signature from a hit shader is the whole of it.

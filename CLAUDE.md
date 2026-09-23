@@ -1491,6 +1491,33 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   them is what removes the device. The feature that unlocked the most and the
   bug that blocks everything are the same line of work.
 
+  **A ROOT CBV DESCRIPTOR DOES NOT HELP, AND NEITHER DOES THE REGISTER
+  SPACE.** Both were the cheap escapes and both are dead. `sotest` now takes
+  `SOTEST_LOCAL_CBV=1`, which makes the local root signature carry a root CBV
+  DESCRIPTOR instead of root constants, and `SOTEST_LOCAL_SPACE=N`, which moves
+  the register space. The library is untouched by either: it still reads a
+  cbuffer at b0, so only the binding moves, which is what makes each a
+  one-variable test.
+
+      root constants, space 1    var_base 11/20, lowered_013 9/20, 015 9/20
+      root CBV,       space 1    var_base 13/20, lowered_013 11/20, 015 10/20
+      root constants, space 2    var_base 15/20
+      no local read at all       0 of 50, see the table above
+
+  So it is not the parameter TYPE and not the register SPACE. **It is reading a
+  cbuffer bound through the LOCAL ROOT SIGNATURE at all, from a hit shader.**
+  Whatever backs the binding, the driver takes the same path and dies on it.
+
+  **What that leaves as a fix.** The shim knows the (geometryIndex,
+  instanceContribution) pair for every record it writes, so the values can be
+  BAKED IN as immediates instead of read: emit one hit group per distinct pair,
+  with the constants folded into copies of the any-hit and the closest-hit, and
+  drop the local root signature entirely. That removes the fatal construct
+  rather than dodging it, and it needs no driver cooperation. The cost is one
+  hit group and one pair of hit shaders per distinct pair, against a real
+  Escher scene that wanted 27 records, and a larger library to compile. NOT yet
+  built, and the record-constant mechanism stays the default until it is.
+
   **THE PREVIOUS BISECT MEASURED NOTHING, AND THE REASON IS WORTH MORE THAN
   THE RESULT IT DESTROYED.** `sotest` resolves the shape file with
   `libPath.rfind(".out.dxil")`, so a library named `var_base.dxil` gets no
