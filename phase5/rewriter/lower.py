@@ -13,7 +13,7 @@ byte.
 
 import re
 
-from dxil import operand_name, render
+from dxil import operand_name, render, split_args
 import rayquery as rq
 
 PAYLOAD = '%struct.Payload'
@@ -219,7 +219,7 @@ def lower(module, q, exports=None):
     binds = _binding_map(text, md) if binding else None
     globals_ = _plan_globals(table)
     _edit_resources(module, q, edits, table, globals_, binds)
-    _edit_ray_index(q, edits)
+    _edit_ray_index(module, q, edits)
     _edit_query(module, q, edits, exports)
 
     fn = q.fn
@@ -518,15 +518,98 @@ def _edit_resources(module, q, edits, table, globals_, binds=None):
         edits[instr.index] = _handle_text(instr, table, globals_, binds)
 
 
-def _edit_ray_index(q, edits):
-    """ThreadId is not legal in a raygen; DispatchRaysIndex replaces it."""
-    for block, instr in q.fn.instrs():
-        if instr.dxop != 93:
+# The compute thread-index ops. None is legal in a ray tracing stage, and a
+# raygen has no thread group at all. But the shim launches exactly
+# groups * numthreads rays, one per thread, so DispatchRaysIndex IS the
+# thread's SV_DispatchThreadID, and the other three follow from it and
+# numthreads:
+#
+#   93  SV_DispatchThreadID.c  = DispatchRaysIndex.c
+#   94  SV_GroupID.c           = DispatchRaysIndex.c / numthreads.c
+#   95  SV_GroupThreadID.c     = DispatchRaysIndex.c % numthreads.c
+#   96  SV_GroupIndex          = (gt.z * ny + gt.y) * nx + gt.x, gt the above
+#
+# Exact, not approximate. What a group actually SHARES, groupshared memory and
+# barriers, is still refused by the analysis; these four are only arithmetic on
+# which thread this is. Unreal's LumenRadianceCacheHardwareRayTracingCS reads
+# 94 and 96 and nothing else of the group, and 24 of one Escher run's refusals
+# were the validator rejecting exactly these in the raygen.
+#
+# The divisors are constants of at least 1, so the division the brief keeps off
+# the recomputable list for fear of hoisting it past a guard cannot divide by
+# zero here.
+GROUP_ID = 94
+THREAD_ID_IN_GROUP = 95
+FLAT_THREAD_ID_IN_GROUP = 96
+_THREAD_OPS = (93, GROUP_ID, THREAD_ID_IN_GROUP, FLAT_THREAD_ID_IN_GROUP)
+
+
+NO_NUMTHREADS = ('the entry point declares no numthreads, so the thread group '
+                 'index cannot be rebuilt')
+
+
+def _numthreads(module):
+    """(nx, ny, nz) from the compute entry point's properties, tag 4.
+
+    Mirrors rq::NumThreads in proxy/rewriter/rq_analyze.cpp, and refuses with
+    one message whatever is missing, because the C++ only answers yes or no."""
+    text = module.text
+    md = _metadata(text)
+    m = re.search(r'!dx\.entryPoints\s*=\s*!\{!(\d+)\}', text)
+    if not m or int(m.group(1)) not in md:
+        raise LowerError(NO_NUMTHREADS)
+    fields = split_args(md[int(m.group(1))])
+    if len(fields) < 5 or not fields[4].startswith('!'):
+        raise LowerError(NO_NUMTHREADS)
+    props = split_args(md.get(int(fields[4][1:]), ''))
+    for i in range(0, len(props) - 1, 2):
+        if props[i] != 'i32 4' or not props[i + 1].startswith('!'):
             continue
-        comp = re.match(r'i32\s+(\d+)', instr.args[1].strip()).group(1)
-        edits[instr.index] = (
-            '  %s = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 %s)'
-            '  ; DispatchRaysIndex(col)' % (instr.result, comp))
+        v = split_args(md.get(int(props[i + 1][1:]), ''))
+        nums = [re.match(r'i32\s+(\d+)$', x) for x in v]
+        if len(v) == 3 and all(nums):
+            return tuple(int(n.group(1)) for n in nums)
+        break
+    raise LowerError(NO_NUMTHREADS)
+
+
+def _thread_index_text(instr, module):
+    """A compute thread-index op, rewritten over DispatchRaysIndex."""
+    r = instr.result
+    tag = r[1:]
+
+    def dri(name, comp):
+        return ('  %s = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 %d)'
+                '  ; DispatchRaysIndex(col)' % (name, comp))
+
+    if instr.dxop in (93, GROUP_ID, THREAD_ID_IN_GROUP):
+        comp = int(re.match(r'i32\s+(\d+)', instr.args[1].strip()).group(1))
+        if comp > 2:
+            raise LowerError('thread index component %d out of range' % comp)
+        if instr.dxop == 93:
+            return dri(r, comp)
+        nt = _numthreads(module)
+        d = '%%rq.dri.%s' % tag
+        op = 'udiv' if instr.dxop == GROUP_ID else 'urem'
+        return '\n'.join([dri(d, comp), '  %s = %s i32 %s, %d' % (r, op, d, nt[comp])])
+
+    nt = _numthreads(module)
+    out = []
+    for c, ax in enumerate('xyz'):
+        out.append(dri('%%rq.dri.%s.%s' % (tag, ax), c))
+        out.append('  %%rq.gt.%s.%s = urem i32 %%rq.dri.%s.%s, %d' % (tag, ax, tag, ax, nt[c]))
+    out.append('  %%rq.gi.%s.a = mul i32 %%rq.gt.%s.z, %d' % (tag, tag, nt[1]))
+    out.append('  %%rq.gi.%s.b = add i32 %%rq.gi.%s.a, %%rq.gt.%s.y' % (tag, tag, tag))
+    out.append('  %%rq.gi.%s.c = mul i32 %%rq.gi.%s.b, %d' % (tag, tag, nt[0]))
+    out.append('  %s = add i32 %%rq.gi.%s.c, %%rq.gt.%s.x' % (r, tag, tag))
+    return '\n'.join(out)
+
+
+def _edit_ray_index(module, q, edits):
+    """No compute thread-index op is legal in a raygen; see _THREAD_OPS."""
+    for block, instr in q.fn.instrs():
+        if instr.dxop in _THREAD_OPS:
+            edits[instr.index] = _thread_index_text(instr, module)
 
 
 def _edit_query(module, q, edits, exports):
@@ -707,7 +790,11 @@ _PURE = {
 # It needs no conversion either, unlike 57 and 217. A heap handle means the
 # same thing in a library as in a compute shader, which the 0.25.0 measurement
 # established, so it is emitted verbatim.
-_PURE_DXOP = {57, 59, 93, ANNOTATE_HANDLE, BIND_HANDLE, HEAP_HANDLE}
+#
+# 94, 95 and 96 are the group forms of 93, and the hit shader rebuilds them
+# from DispatchRaysIndex exactly as the raygen does. See _THREAD_OPS.
+_PURE_DXOP = {57, 59, 93, GROUP_ID, THREAD_ID_IN_GROUP, FLAT_THREAD_ID_IN_GROUP,
+              ANNOTATE_HANDLE, BIND_HANDLE, HEAP_HANDLE}
 
 
 # Every %name an instruction READS, not just its call arguments.
@@ -1018,7 +1105,10 @@ def _swap_declarations(text, q, globals_, binding=False):
     for pat in [r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.rayQuery_[^\n]*\n',
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.allocateRayQuery[^\n]*\n',
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandle\(i32, i8[^\n]*\n',
+                # also removes threadIdInGroup, which shares the prefix
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.threadId[^\n]*\n',
+                r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.groupId[^\n]*\n',
+                r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.flattenedThreadIdInGroup[^\n]*\n',
                 # The 6.6 handle creation is converted away, so its declare
                 # goes too: an unused declare is itself a validation error.
                 r'\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandleFromBinding[^\n]*\n']:
@@ -1030,7 +1120,7 @@ def _swap_declarations(text, q, globals_, binding=False):
     # why this was unconditional; a real Unreal shader that gets its index from
     # somewhere else is what found it.
     new = []
-    if any(i.dxop == 93 for _, i in q.fn.instrs()):
+    if any(i.dxop in _THREAD_OPS for _, i in q.fn.instrs()):
         new += ['', '; Function Attrs: nounwind readnone',
                 'declare i32 @dx.op.dispatchRaysIndex.i32(i32, i8) #RQNONE']
     new += ['', '; Function Attrs: nounwind',
@@ -1299,10 +1389,8 @@ def _intersection(module, q, exports, table, globals_, binds=None):
     for i in _needed_chain(fn, _recomputable(fn, types), used, types, inBody):
         if i.dxop in (57, BIND_HANDLE):
             out.append(_handle_text(i, table, globals_, binds))
-        elif i.dxop == 93:
-            comp = re.match(r'i32\s+(\d+)', i.args[1].strip()).group(1)
-            out.append('  %s = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 %s)'
-                       '  ; DispatchRaysIndex(col)' % (i.result, comp))
+        elif i.dxop in _THREAD_OPS:
+            out.append(_thread_index_text(i, module))
         else:
             out.append(i.line)
 
@@ -1430,10 +1518,8 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
     for i in _needed_chain(fn, _recomputable(fn, types), used, types, inBody):
         if i.dxop in (57, BIND_HANDLE):
             out.append(_handle_text(i, table, globals_, binds))
-        elif i.dxop == 93:
-            comp = re.match(r'i32\s+(\d+)', i.args[1].strip()).group(1)
-            out.append('  %s = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 %s)'
-                       '  ; DispatchRaysIndex(col)' % (i.result, comp))
+        elif i.dxop in _THREAD_OPS:
+            out.append(_thread_index_text(i, module))
         else:
             out.append(i.line)
 

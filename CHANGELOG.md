@@ -24,6 +24,43 @@ not.
 
 ---
 
+## 0.38.0
+
+- **`SV_GroupID`, `SV_GroupThreadID` and `SV_GroupIndex` now lower.** 24 of
+  the 129 refusals from the 0.37.0 Escher run were the validator rejecting
+  `dx.op.groupId` (94) and `dx.op.flattenedThreadIdInGroup` (96) in the
+  raygen, where no compute thread-index op is legal. Read from the engine
+  source first: `LumenRadianceCacheHardwareRayTracingCS` takes `SV_GroupID`
+  and `SV_GroupIndex`, unwraps them into a linear trace index, and has no
+  groupshared memory or barrier in that entry point.
+- The shim launches exactly groups times numthreads rays, one per thread, so
+  `DispatchRaysIndex` IS each thread's `SV_DispatchThreadID`, and the group
+  values follow exactly: `SV_GroupID.c = DRI.c / numthreads.c`,
+  `SV_GroupThreadID.c = DRI.c % numthreads.c`, and `SV_GroupIndex` is those
+  flattened, `(z * ny + y) * nx + x`. Emitted in the raygen and, when the
+  Proceed loop reads them, rebuilt in the generated hit shaders the same way
+  `threadId` already was. What a group SHARES, groupshared and barriers, is
+  still refused. The divisors are constants of at least 1, so recomputing
+  cannot divide by zero.
+- Python and C++, byte-identical, including on the real 115 KB Unreal shader
+  from the dump, which now validates and signs. `lower.py` gains a numthreads
+  reader matching `rq::NumThreads`, and a shader that has none refuses with
+  one message in both.
+- New case `group`, in both suites: `numthreads(16, 8, 1)` so the axes
+  differ, the pixel computed ONLY from the group values, and `SV_GroupIndex`
+  gating the commit inside the loop so the any-hit rebuilds it too. Bit-exact
+  against WARP, 9031 hits.
+- **The first version of that test could not fail, and was caught.** Swapping
+  the axes' group sizes diverged by 5999, but a wrong row stride in the
+  flattening matched WARP exactly: the gate read bit 2 of `SV_GroupIndex`,
+  which comes only from x whatever the stride. It now reads bit 4 XOR bit 2,
+  and the same poisoned build diverges by 5398.
+- NOT yet run in the game, and NOT yet able to render anything there: see the
+  indirect dispatch note in CLAUDE.md. This pass reaches Unreal through a
+  compute `DispatchIndirect`, which the shim does not emulate yet.
+
+---
+
 ## 0.37.0
 
 - **The GPU crash is fixed, at its cause.** A hit shader READING a cbuffer bound

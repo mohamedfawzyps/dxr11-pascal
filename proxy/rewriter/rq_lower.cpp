@@ -300,9 +300,81 @@ bool PureInstruction(const llm::Instr& i) {
 // recomputable, so an index built from a UAV read or a phi still refuses. It
 // needs no conversion either, unlike 57 and 217, because a heap handle means
 // the same thing in a library, so it is emitted verbatim.
+//
+// 94, 95 and 96 are the group forms of 93, and the hit shader rebuilds them
+// from DispatchRaysIndex exactly as the raygen does. See ThreadIndexText.
 bool PureDxOp(int op) {
     return op == 57 || op == 59 || op == 93 ||
+           op == kGroupId || op == kThreadIdInGroup || op == kFlatThreadIdInGroup ||
            op == kAnnotateHandle || op == kBindHandle || op == kHeapHandle;
+}
+
+// The compute thread-index ops. None is legal in a ray tracing stage, and a
+// raygen has no thread group at all. But the shim launches exactly
+// groups * numthreads rays, one per thread, so DispatchRaysIndex IS the
+// thread's SV_DispatchThreadID and the other three follow from it:
+//
+//   93  SV_DispatchThreadID.c  = DispatchRaysIndex.c
+//   94  SV_GroupID.c           = DispatchRaysIndex.c / numthreads.c
+//   95  SV_GroupThreadID.c     = DispatchRaysIndex.c % numthreads.c
+//   96  SV_GroupIndex          = (gt.z * ny + gt.y) * nx + gt.x, gt the above
+//
+// Exact. What a group actually SHARES, groupshared and barriers, is refused by
+// the analysis. The divisors are constants of at least 1, so nothing hoisted
+// can divide by zero. The Python original is _thread_index_text in lower.py.
+bool IsThreadOp(int op) {
+    return op == kThreadId || op == kGroupId || op == kThreadIdInGroup ||
+           op == kFlatThreadIdInGroup;
+}
+
+const char* kNoNumThreads =
+    "the entry point declares no numthreads, so the thread group index cannot "
+    "be rebuilt";
+
+std::string ThreadIndexText(const llm::Instr& i, const llm::Module& m,
+                            std::string* err) {
+    const std::string& r = i.result;
+    const std::string tag = r.substr(1);
+    auto Dri = [](const std::string& name, int comp) {
+        return "  " + name + " = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 " +
+               std::to_string(comp) + ")  ; DispatchRaysIndex(col)";
+    };
+    const int op = i.DxOp();
+    int nt[3] = { 1, 1, 1 };
+
+    if (op == kThreadId || op == kGroupId || op == kThreadIdInGroup) {
+        static const std::regex kCol(R"RX(^i32\s+(\d+))RX");
+        std::smatch cm;
+        const std::string a1 = i.args.size() > 1 ? Trim(i.args[1]) : std::string();
+        const int comp = std::regex_search(a1, cm, kCol) ? std::stoi(cm[1].str()) : 0;
+        if (comp > 2) {
+            *err = "thread index component " + std::to_string(comp) + " out of range";
+            return std::string();
+        }
+        if (op == kThreadId) return Dri(r, comp);
+        if (!NumThreads(m, nt)) { *err = kNoNumThreads; return std::string(); }
+        const std::string d = "%rq.dri." + tag;
+        return Dri(d, comp) + "\n  " + r + " = " +
+               (op == kGroupId ? "udiv" : "urem") + " i32 " + d + ", " +
+               std::to_string(nt[comp]);
+    }
+
+    if (!NumThreads(m, nt)) { *err = kNoNumThreads; return std::string(); }
+    std::string out;
+    const char* axes = "xyz";
+    for (int c = 0; c < 3; ++c) {
+        const std::string ax(1, axes[c]);
+        out += Dri("%rq.dri." + tag + "." + ax, c) + "\n";
+        out += "  %rq.gt." + tag + "." + ax + " = urem i32 %rq.dri." + tag + "." + ax +
+               ", " + std::to_string(nt[c]) + "\n";
+    }
+    out += "  %rq.gi." + tag + ".a = mul i32 %rq.gt." + tag + ".z, " +
+           std::to_string(nt[1]) + "\n";
+    out += "  %rq.gi." + tag + ".b = add i32 %rq.gi." + tag + ".a, %rq.gt." + tag + ".y\n";
+    out += "  %rq.gi." + tag + ".c = mul i32 %rq.gi." + tag + ".b, " +
+           std::to_string(nt[0]) + "\n";
+    out += "  " + r + " = add i32 %rq.gi." + tag + ".c, %rq.gt." + tag + ".x";
+    return out;
 }
 
 std::map<std::string, const llm::Instr*> Recomputable(
@@ -739,17 +811,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 edits[i.index] = t;
             }
 
-    // --- ThreadId is not legal in a raygen ---------------------------------
+    // --- no compute thread-index op is legal in a raygen ---------------------
     for (const auto& b : fn.blocks)
         for (const auto& i : b.instrs)
-            if (i.DxOp() == kThreadId) {
-                static const std::regex kI32(R"(i32\s+(\d+))");
-                std::smatch mm;
-                std::string a1 = Trim(i.args[1]);
-                std::regex_search(a1, mm, kI32);
-                edits[i.index] = "  " + i.result +
-                    " = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 " +
-                    mm[1].str() + ")  ; DispatchRaysIndex(col)";
+            if (IsThreadOp(i.DxOp())) {
+                std::string terr;
+                const std::string t = ThreadIndexText(i, m, &terr);
+                if (!terr.empty()) { r.error = terr; return r; }
+                edits[i.index] = t;
             }
 
     // --- the payload alloca has to be in the entry block --------------------
@@ -1122,7 +1191,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.rayQuery_[^\n]*\n)",
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.allocateRayQuery[^\n]*\n)",
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandle\(i32, i8[^\n]*\n)",
+            // also removes threadIdInGroup, which shares the prefix
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.threadId[^\n]*\n)",
+            R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.groupId[^\n]*\n)",
+            R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.flattenedThreadIdInGroup[^\n]*\n)",
             // The 6.6 handle creation is converted away, so its declare goes
             // too: an unused declare is itself a validation error.
             R"(\n; Function Attrs:[^\n]*\ndeclare [^\n]*@dx\.op\.createHandleFromBinding[^\n]*\n)",
@@ -1135,7 +1207,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         bool usesThreadId = false;
         for (const auto& b : q.fn->blocks)
             for (const auto& i : b.instrs)
-                if (i.DxOp() == kThreadId) usesThreadId = true;
+                if (IsThreadOp(i.DxOp())) usesThreadId = true;
 
         std::vector<std::string> add;
         if (usesThreadId) {
@@ -1316,15 +1388,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     const std::string ht = handleText(i);
                     if (!handleErr.empty()) { r.error = handleErr; return r; }
                     is.push_back(ht);
-                } else if (i.DxOp() == kThreadId) {
-                    static const std::regex kCol(R"RX(i32\s+(\d+))RX");
-                    std::smatch cm;
-                    const std::string a1 = i.args.size() > 1 ? i.args[1] : std::string();
-                    const std::string col =
-                        std::regex_search(a1, cm, kCol) ? cm[1].str() : "0";
-                    is.push_back("  " + i.result +
-                                  " = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 " +
-                                  col + ")  ; DispatchRaysIndex(col)");
+                } else if (IsThreadOp(i.DxOp())) {
+                    std::string terr;
+                    const std::string t = ThreadIndexText(i, m, &terr);
+                    if (!terr.empty()) { r.error = terr; return r; }
+                    is.push_back(t);
                 } else {
                     is.push_back(i.line);
                 }
@@ -1487,15 +1555,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     const std::string ht = handleText(i);
                     if (!handleErr.empty()) { r.error = handleErr; return r; }
                     ah.push_back(ht);
-                } else if (i.DxOp() == kThreadId) {
-                    static const std::regex kCol(R"RX(i32\s+(\d+))RX");
-                    std::smatch cm;
-                    const std::string a1 = i.args.size() > 1 ? i.args[1] : std::string();
-                    const std::string col =
-                        std::regex_search(a1, cm, kCol) ? cm[1].str() : "0";
-                    ah.push_back("  " + i.result +
-                                  " = call i32 @dx.op.dispatchRaysIndex.i32(i32 145, i8 " +
-                                  col + ")  ; DispatchRaysIndex(col)");
+                } else if (IsThreadOp(i.DxOp())) {
+                    std::string terr;
+                    const std::string t = ThreadIndexText(i, m, &terr);
+                    if (!terr.empty()) { r.error = terr; return r; }
+                    ah.push_back(t);
                 } else {
                     ah.push_back(i.line);
                 }

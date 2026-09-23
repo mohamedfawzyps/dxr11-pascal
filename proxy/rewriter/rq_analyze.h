@@ -88,6 +88,11 @@ enum OtherOpcode {
     kCreateHandle = 57,
     kBarrier = 80,
     kThreadId = 93,
+    // The group forms of kThreadId, rebuilt from DispatchRaysIndex and
+    // numthreads by the lowering. See ThreadIndexText in rq_lower.cpp.
+    kGroupId = 94,
+    kThreadIdInGroup = 95,
+    kFlatThreadIdInGroup = 96,
 };
 
 bool IsKnownOpcode(int op);

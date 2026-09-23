@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.37.0.
+proxy/version.h, and is currently 0.38.0.
 
 ## Current position (2026-09-23)
 
@@ -33,6 +33,31 @@ What now stops the rest, 129 refusals, and the composition is the signal:
          refused separately.
      24  loop isolation, a rawBufferLoad or textureLoad in the chain.
       1  assembler: use of undefined value.
+
+**GroupId: DONE in 0.38.0**, the 24 above. `SV_GroupID`, `SV_GroupThreadID`
+and `SV_GroupIndex` are rebuilt from `DispatchRaysIndex` and numthreads, which
+is exact because the shim launches one ray per thread. Case `group` in both
+suites, and the real Unreal shader lowers, validates and signs, byte-identical
+between the Python and the C++. The first test of it could not see a wrong
+row stride and passed with one; the sensitivity check is what found that.
+
+**AND READING ITS SOURCE FOUND A BIGGER GAP: INDIRECT COMPUTE DISPATCH.**
+`LumenRadianceCacheHardwareRayTracingCS` is dispatched through
+`AddLumenRayTracingDispatchIndirect`, which for the inline path is
+`FComputeShaderUtils::AddPass(..., IndirectArgsBuffer, IndirectArgsOffset)`,
+a compute `DispatchIndirect`, in
+`Engine/Source/Runtime/Renderer/Private/Lumen/LumenHardwareRayTracingCommon.h`.
+In D3D12 that is `ExecuteIndirect` with a `DISPATCH` command signature, and
+`Dxr11CommandList::ExecuteIndirect` forwards every signature that is not the
+`DISPATCH_RAYS` stand-in UNCHANGED. With a lowered pipeline bound, the GPU
+therefore runs the CARRIER, the do-nothing compute shader, and nothing is
+drawn and nothing is logged. That is a silently wrong result, the one failure
+this project will not ship, and it has been possible since the carrier
+existed; no test here dispatches a lowered pipeline indirectly. The fix is the
+machinery indirect `DispatchRays` already has: read the group counts back at
+submit time and issue `DispatchRays` with groups times numthreads. Until then
+every indirectly dispatched Lumen and MegaLights inline pass does nothing,
+lowered or not.
 
 The process sat at full CPU for about three minutes, and the shim's end
 marker came at 2 min 54 s, so that was the process's whole life, not

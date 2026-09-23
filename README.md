@@ -55,8 +55,8 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 24 end-to-end render cases, all bit-exact, plus 4 refusal gates
-- 13 rewriter cases, each byte-identical between the Python reference and the
+- 25 end-to-end render cases, all bit-exact, plus 4 refusal gates
+- 14 rewriter cases, each byte-identical between the Python reference and the
   C++ port, on both the `.ll` path and the DXIL container path, plus 17
   analysis and lowering checks and 3 baking checks
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
@@ -69,6 +69,12 @@ game's GPU crash during pipeline creation was traced to this shim, and fixed.
 **A full run of an Unreal game does not work yet**, mainly because Unreal
 treats a shader the shim refuses as fatal. See
 [Notes for Unreal](docs/usage.md#9-notes-for-unreal) for where it stands.
+
+**Known gap, and it is silent:** a lowered `RayQuery` compute pipeline
+dispatched INDIRECTLY, through `ExecuteIndirect` with a `DISPATCH` signature,
+is not emulated yet. The GPU runs the do-nothing stand-in the application was
+given, so that pass draws nothing, and the log does not say so. Unreal
+dispatches many of its Lumen and MegaLights passes this way.
 
 Tier 1.1 is reported by default. A proxy DLL only sits beside an executable
 because somebody put it there, so the install is the opt-in, and asking for a

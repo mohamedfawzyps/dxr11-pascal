@@ -184,7 +184,15 @@ $cases = @(
     # measured, with every record forced onto copy 0, 7396 mismatches, which
     # is exactly the procedural hit count.
     @{ name = 'bothgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_bothgeom.hlsl', '--mixed', '--contrib');
-       desc = 'both kinds, each commit gated on its baked contribution, four hit shaders copied per pair' }
+       desc = 'both kinds, each commit gated on its baked contribution, four hit shaders copied per pair' },
+    # SV_GroupID, SV_GroupThreadID and SV_GroupIndex, which a raygen does not
+    # have; rebuilt from DispatchRaysIndex and numthreads. The pixel comes only
+    # from the group values and SV_GroupIndex gates the commit in the any-hit.
+    # Measured: swapping the axes' group sizes gives 5999 mismatches, and a
+    # wrong row stride in the flattening gives 5398. The first version of the
+    # gate could not see the row stride at all and passed with it wrong.
+    @{ name = 'group'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_group.hlsl');
+       desc = 'SV_GroupID, SV_GroupThreadID and SV_GroupIndex, numthreads(16,8,1)' }
 )
 
 $failed = 0

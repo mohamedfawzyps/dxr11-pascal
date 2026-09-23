@@ -406,6 +406,11 @@ offline with `dxrw rewrite`.
 - **The GPU crash during pipeline creation is fixed in 0.37.0**, see section
   7. The libraries that game produced now build cleanly on a GTX 1070 offline;
   a run of the game itself with 0.37.0 is the next check.
+- **A pass dispatched indirectly does nothing, silently.** Unreal dispatches
+  many Lumen and MegaLights inline passes with a compute `DispatchIndirect`,
+  and the shim emulates only a DIRECT `Dispatch` of a lowered pipeline so far.
+  An indirect one runs the do-nothing stand-in, so that pass draws nothing even
+  though its shader lowered, and nothing in the log says so yet.
 - `dxgi.dll` is required, not optional: without it Unreal reads the Pascal
   device id and switches ray tracing off before any of this happens.
 - Expect it to be slow. Pascal traces rays on its shader cores, and Epic's own

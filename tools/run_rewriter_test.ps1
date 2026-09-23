@@ -66,7 +66,14 @@ $cases = @(
     # module still validates and signs.
     @{ name = 'dynnu'; src = 'phase5\cases\rayquery_dynnu.ll'; pat = 'opaque';
        flags = @('--table');
-       desc = 'dynamic index through NonUniformResourceIndex' }
+       desc = 'dynamic index through NonUniformResourceIndex' },
+    # The thread group ids, rebuilt from DispatchRaysIndex and numthreads in
+    # the raygen AND in the generated any-hit. The TraceRay side launches one
+    # ray per pixel, which is exactly the thread grid, so the same library is
+    # right here as through the proxy.
+    @{ name = 'group'; src = 'phase5\cases\rayquery_group.ll'; pat = 'alpha'; flags = @();
+       gt = @('--cs', 'phase5\cases\rayquery_group.hlsl');
+       desc = 'SV_GroupID, SV_GroupThreadID and SV_GroupIndex, numthreads(16,8,1)' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {
