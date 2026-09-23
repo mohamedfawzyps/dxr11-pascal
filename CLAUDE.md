@@ -42,7 +42,10 @@ buffer on ANY submission, including one from another thread while the list
 holding the copy was still open, and parsed the buffer before the GPU had
 written it. Now stamped per recording list, one fence per queue.
 `tier11probe hw -openlist` reproduces it offline: 0.38.0 dies, 0.38.1 passes.
-Probably also the 0.36.6 `#921` + `DEVICE_HUNG` run. **Where the shim keeps a
+Probably also the 0.36.6 `#921` + `DEVICE_HUNG` run. In the game at 0.38.1: 4 runs of 4 clean, each 162 seen, 55 built, 107
+refused, 28 to 58 s, both DLLs 0.38.1. At the old 1 in 5 rate, 4 clean runs
+happen 41% of the time anyway, so the offline repro is the evidence and
+these runs only fail to contradict it. **Where the shim keeps a
 resource alive across submissions, "recorded" is not "submitted" when an
 application records on several threads.**
 
