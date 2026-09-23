@@ -24,7 +24,45 @@ not.
 
 ---
 
-## 0.39.1
+## 0.39.2
+
+- **0.39.1 got through the open world; the GPU hang is gone.** Escher, three
+  runs: the open world loaded and ran, which it never did at 0.39.0, so the
+  out-of-range table was the hang. The log shows the re-reads and the skip:
+  the open world's cutscene scene needs 383 to 392 baked pairs.
+- **Then the cutscene crashed, 3 of 3, on Unreal's command list `Close`
+  returning `E_INVALIDARG`** (D3D12CommandList.cpp:244, RHI thread), 68 to
+  110 seconds in, not a device removal.
+- **Likely cause, INFERRED: the instance data copy.** 0.39.1 made it
+  repeat, every 8 builds instead of once, and it worked by looking Unreal's
+  instance buffer up BY ADDRESS in the resource tracker, which holds no
+  references, then recording a barrier and a copy on whatever it found.
+  During streaming that can be a resource Unreal already freed, and a list
+  referencing a deleted resource fails `Close` with exactly this error: the
+  0.38.0 crash was the same symptom from a freed buffer of the shim's own.
+- **Now the copy never names Unreal's resource.** A ROOT SRV takes a bare
+  GPU address, so a small shader of the shim's, `proxy/instance_copy.hlsl`,
+  reads the instance descriptions from the very address the build was given,
+  into buffers the shim owns. Nothing is looked up and nothing is
+  transitioned: DXR requires the instance buffer in
+  `NON_PIXEL_SHADER_RESOURCE` at the build, which is the state a shader read
+  needs. The same principle as the group count capture in 0.39.0. The
+  compute bindings are restored afterwards, the pipeline the application
+  bound LAST last, since a state object and a pipeline state replace each
+  other.
+- The resource tracker records each buffer's heap type at creation, so
+  choosing the upload-heap path no longer calls into a resource that may
+  have been freed.
+- **Fixed: shader tables rebuilt on every frame.** One of Escher's
+  structures alternates between two layouts every frame (max contribution 14
+  and 30), and 0.39.1 built a new table on each flip and freed none: 1095 in
+  one run. Tables are now cached per layout, eight per pipeline, and a rebake
+  retires the cache.
+- Verified: dispatch suite 29 of 29; the Phase 4 probe with GPU-only
+  instances reads the right answer through the new copy (2 instances,
+  contribution 1, both kinds), clean under the debug layer apart from the
+  probe's own creation warnings.
+
 
 - **The first game run with lowered shaders dispatching hung the GPU in the
   open world, every time.** Escher at 0.39.0, `rqphase = 4`: the main menu ran;

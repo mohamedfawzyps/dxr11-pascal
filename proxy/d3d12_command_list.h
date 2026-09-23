@@ -321,6 +321,8 @@ private:
     void FlushQueuedSplit();
     // True when a dispatch is queued and the caller is about to record work.
     void WorkBarrier() { if (!m_openPendings.empty()) FlushQueuedSplit(); }
+    // After a capture borrowed the compute bindings: put them back.
+    void RestoreComputeAfterCapture();
     ID3D12Device5* RealDevice();
 
     ID3D12GraphicsCommandList4* m_real;
@@ -331,6 +333,9 @@ private:
     // the application holds the reference, and it must outlive its own
     // Dispatch calls for any pipeline state, ours included.
     Dxr11RayQueryPso* m_rqPso = nullptr;
+    // Whether SetPipelineState1 came after the last SetPipelineState, so a
+    // capture restores the one the application bound last.
+    bool m_lastBoundStateObject = false;
 
 public:
     // Set the stand-in on a freshly wrapped list, for the case where the

@@ -245,6 +245,7 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     // m_gfx was just cleared. The initial state IS the bound pipeline state,
     // and it has to be restorable after a split or a group count capture.
     if (p) { m_gfx.pso = p; p->AddRef(); }
+    m_lastBoundStateObject = false;
     return FWD(Reset(a, p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) {
@@ -252,6 +253,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) {
     m_rqPso = Dxr11RayQueryPso::From(p);
     if (m_gfx.pso) m_gfx.pso->Release();
     m_gfx.pso = p; if (p) p->AddRef();
+    m_lastBoundStateObject = false;
     FWD(ClearState(p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
@@ -316,6 +318,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState(ID3D12PipelineState* p
     m_rqPso = Dxr11RayQueryPso::From(p);
     if (m_gfx.pso) m_gfx.pso->Release();
     m_gfx.pso = p; if (p) p->AddRef();
+    m_lastBoundStateObject = false;
     FWD(SetPipelineState(p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) { WorkBarrier(); FWD(ResourceBarrier(n, b)); }
@@ -637,6 +640,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s)
     if (m_bindings.stateObject) m_bindings.stateObject->Release();
     m_bindings.stateObject = s;
     if (s) s->AddRef();
+    m_lastBoundStateObject = true;
     FWD(SetPipelineState1(s));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) { WorkBarrier(); FWD(DispatchRays(d)); }
@@ -680,27 +684,12 @@ void Dxr11CommandList::CaptureInstances(
         return;
     }
 
+    // Upload-heap descriptions are read in place, at record time, for free. The
+    // heap type was recorded when the resource was created, so deciding this
+    // calls into nothing that may since have been freed.
     const restrack::Found src = restrack::Find(in.InstanceDescs);
-    if (!src.resource) {
-        static LONG once = 0;
-        if (InterlockedCompareExchange(&once, 1, 0) == 0)
-            ProxyLog("[dxr-tier-11-proxy-log] top-level AS: instance buffer at 0x%llX is not "
-                     "a tracked resource, so its descriptions cannot be read.\n",
-                     static_cast<unsigned long long>(in.InstanceDescs));
-        return;
-    }
-
-    const UINT64 bytes =
-        static_cast<UINT64>(in.NumDescs) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
-
-    // The cheap case, and the common one: the application wrote the descriptions
-    // from the CPU into an upload buffer, so they can simply be read. No copy,
-    // no fence, no cost at all.
-    D3D12_HEAP_PROPERTIES heap{};
-    D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
-    const bool cheap =
-        SUCCEEDED(src.resource->GetHeapProperties(&heap, &heapFlags)) &&
-        (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK);
+    const bool cheap = src.resource &&
+        (src.heap == D3D12_HEAP_TYPE_UPLOAD || src.heap == D3D12_HEAP_TYPE_READBACK);
 
     // Read again when the structure may have changed. See WantInstances for
     // what once-per-address did to a level load.
@@ -708,6 +697,8 @@ void Dxr11CommandList::CaptureInstances(
         return;
 
     if (cheap) {
+        const UINT64 bytes =
+            static_cast<UINT64>(in.NumDescs) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
         uint8_t* p = nullptr;
         D3D12_RANGE readRange{ static_cast<SIZE_T>(src.offset),
                                static_cast<SIZE_T>(src.offset + bytes) };
@@ -722,47 +713,42 @@ void Dxr11CommandList::CaptureInstances(
         return;
     }
 
-    // The expensive case: the descriptions were produced on the GPU, so they do
-    // not exist yet. Copy them out and let the queue hook read them once the
-    // submission has run. Same shape as the indirect dispatch readback, minus
-    // the stall: nothing needs this answer the instant it is recorded.
+    // Produced on the GPU, so they do not exist yet. Copy them out by ADDRESS,
+    // through a root SRV, into buffers the shim owns, and let the queue hook
+    // read them once the submission has run. No resource is looked up and
+    // none is transitioned: 0.39.1 recorded a barrier and a copy on whatever
+    // the tracker held at that address, which during a level load can be a
+    // resource the application already freed, and the list then failed Close
+    // with E_INVALIDARG. See proxy/instance_copy.hlsl.
     ID3D12Device5* dev = RealDevice();
     if (!dev) return;
-
-    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = bytes;
-    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
-    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) {
-        ProxyLog("[dxr-tier-11-proxy-log] top-level AS: could not create the instance "
-                 "readback buffer.\n");
+    groupcount::Capture cap;
+    std::string why;
+    const UINT dwords = in.NumDescs *
+        static_cast<UINT>(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) / sizeof(UINT));
+    if (!groupcount::RecordRawCopy(m_real, dev, in.InstanceDescs, dwords, &cap, &why)) {
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            ProxyLog("[dxr-tier-11-proxy-log] top-level AS: instance copy not recorded: %s\n",
+                     why.c_str());
         return;
     }
-
-    // DXR requires the instance buffer to be in NON_PIXEL_SHADER_RESOURCE at the
-    // build, so that is the state it is in here and the state to put it back to.
-    D3D12_RESOURCE_BARRIER toCopy{};
-    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toCopy.Transition.pResource = src.resource;
-    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    m_real->ResourceBarrier(1, &toCopy);
-
-    m_real->CopyBufferRegion(readback.Get(), 0, src.resource, src.offset, bytes);
-
-    D3D12_RESOURCE_BARRIER back = toCopy;
-    back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    back.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_real->ResourceBarrier(1, &back);
-
+    RestoreComputeAfterCapture();
     astrack::NotePendingInstances(desc->DestAccelerationStructureData,
-                                  readback.Get(), in.NumDescs, this);
+                                  cap.readback.Get(), in.NumDescs, this, cap.counts.Get());
+}
+
+void Dxr11CommandList::RestoreComputeAfterCapture() {
+    // A capture replaced the compute root signature, which clears every root
+    // parameter, and the pipeline. Give the application both back, the
+    // pipeline it bound LAST last, since a state object and a pipeline state
+    // replace each other.
+    m_bindings.Replay(m_real);
+    if (m_lastBoundStateObject) {
+        if (m_bindings.stateObject) m_real->SetPipelineState1(m_bindings.stateObject);
+    } else if (m_gfx.pso) {
+        m_real->SetPipelineState(m_gfx.pso);
+    }
 }
 
 bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
@@ -833,8 +819,7 @@ bool Dxr11CommandList::QueueIndirectCompute(ID3D12CommandSignature* sig,
     // The capture replaced the compute root signature, which clears every root
     // parameter, and the pipeline state. Give the application both back, since
     // it may record more work into this segment before the split closes.
-    m_bindings.Replay(m_real);
-    if (m_gfx.pso) m_real->SetPipelineState(m_gfx.pso);
+    RestoreComputeAfterCapture();
 
     // Queued like an indirect DispatchRays: consecutive ones share a segment
     // and one sync.

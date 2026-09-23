@@ -9,6 +9,7 @@ namespace {
 struct Entry {
     UINT64 size = 0;
     ID3D12Resource* resource = nullptr;
+    D3D12_HEAP_TYPE heap = D3D12_HEAP_TYPE_DEFAULT;
 };
 
 std::mutex g_lock;
@@ -25,8 +26,13 @@ void Note(ID3D12Resource* resource) {
     const D3D12_GPU_VIRTUAL_ADDRESS va = resource->GetGPUVirtualAddress();
     if (!va) return;   // an upload-only resource with no GPU address
 
+    D3D12_HEAP_PROPERTIES hp{};
+    D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
+    const D3D12_HEAP_TYPE heap =
+        SUCCEEDED(resource->GetHeapProperties(&hp, &hf)) ? hp.Type : D3D12_HEAP_TYPE_DEFAULT;
+
     std::lock_guard<std::mutex> g(g_lock);
-    g_buffers[va] = Entry{ desc.Width, resource };   // replaces on address reuse
+    g_buffers[va] = Entry{ desc.Width, resource, heap };   // replaces on address reuse
 }
 
 Found Find(D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -40,6 +46,7 @@ Found Find(D3D12_GPU_VIRTUAL_ADDRESS address) {
     Found f;
     f.resource = it->second.resource;
     f.offset = address - it->first;
+    f.heap = it->second.heap;
     return f;
 }
 

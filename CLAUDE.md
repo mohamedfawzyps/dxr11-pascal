@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.39.1.
+proxy/version.h, and is currently 0.39.2.
 
 ## Current position (2026-09-23)
 
@@ -57,6 +57,17 @@ open world against 19 and 27 record tables while that scene reaches record
 dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
+
+**0.39.1 IN THE GAME: THE OPEN WORLD RAN, THE HANG IS GONE.** The cutscene
+then crashed 3 of 3 on Unreal's `Close` returning `E_INVALIDARG`. Inferred
+cause: the now-repeated instance copy recorded a barrier and a copy on
+whatever the no-reference resource tracker held at the instance address,
+which during streaming can be freed. 0.39.2 copies BY ADDRESS through a root
+SRV with the shim's own shader and never names the application's resource.
+**The rule this makes three times now (group counts, instance copy, and the
+0.38.1 readback lifetime): never record a command on a resource the shim does
+not hold a reference to.** Next instrument if Close still fails: one run with
+the debug layer forced by dxcpl; the shim relays it into its log.
 
 **AND IT EXPOSED THE BAKE'S LIMIT.** 59 of the 63 shaders that lowered in
 Escher bake record data, one hit shader copy per (geometry, contribution)

@@ -125,7 +125,7 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
 // recorded the copy: only ITS submission may stamp the read, see AfterSubmit.
 void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                           ID3D12Resource* readback, UINT count,
-                          const void* owner);
+                          const void* owner, ID3D12Resource* keepAlive = nullptr);
 
 // Called by the queue hook after every submission, with the lists it carried
 // (the application's pointers, wrapped or not). Stamps the reads those lists

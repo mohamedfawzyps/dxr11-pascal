@@ -181,6 +181,18 @@ private:
     bool m_hasIntersection = false;
     bool m_needsBoth = false;
     ID3D12Resource* m_sbt = nullptr;            // raygen, miss, hit, one buffer
+    // Tables already built, per scene layout, OWNING their buffers; m_sbt
+    // points into one of them. An engine can alternate between two layouts
+    // every frame, and Escher did: 0.39.1 built a new table on every flip,
+    // 1095 in one run, and freed none. Evicted and rebaked-away tables go to
+    // m_retired, since a dispatch may still be using them.
+    struct CachedTable {
+        std::vector<uint8_t> kinds;
+        std::vector<rq::RecordPair> pairs;
+        ID3D12Resource* sbt = nullptr;
+        D3D12_DISPATCH_RAYS_DESC desc{};
+    };
+    std::vector<CachedTable> m_tables;
     // Tables replaced by a growth. A dispatch recorded against the old one may
     // still be in flight, and nothing here knows when it lands, so they are
     // held until the pipeline itself dies. Growth is monotonic and rare, so

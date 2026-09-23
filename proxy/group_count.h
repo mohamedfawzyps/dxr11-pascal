@@ -59,4 +59,14 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev,
 // read. Zeros mean a zero-sized dispatch, where no group ran.
 bool Read(const Capture& c, UINT counts[3]);
 
+// The same principle for a top-level build's instance descriptions: copy
+// `dwords` 32-bit words from the GPU address `src` into buffers the shim owns,
+// through a ROOT SRV, which takes a bare address. No resource is looked up and
+// none is transitioned. See proxy/instance_copy.hlsl. Replaces the compute
+// root signature and pipeline state; the CALLER restores them. `out->readback`
+// holds the words once the list has executed.
+bool RecordRawCopy(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev,
+                   D3D12_GPU_VIRTUAL_ADDRESS src, UINT dwords,
+                   Capture* out, std::string* why);
+
 }  // namespace groupcount

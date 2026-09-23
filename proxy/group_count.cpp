@@ -1,5 +1,6 @@
 #include "group_count.h"
 #include "group_count_cs.h"
+#include "instance_copy_cs.h"
 
 #include <cstring>
 #include <mutex>
@@ -26,40 +27,41 @@ struct Pipeline {
     ComPtr<ID3D12PipelineState> pso;
 };
 std::mutex g_lock;
-Pipeline g_pipe;
+Pipeline g_pipe, g_copyPipe;
 
-bool GetPipeline(ID3D12Device* dev, Pipeline* out, std::string* why) {
+bool GetPipeline(ID3D12Device* dev, Pipeline* slot, const void* cs, size_t size,
+                 Pipeline* out, std::string* why) {
     std::lock_guard<std::mutex> g(g_lock);
-    if (g_pipe.device != dev || !g_pipe.pso) {
+    if (slot->device != dev || !slot->pso) {
         Pipeline p;
         p.device = dev;
-        HRESULT hr = dev->CreateRootSignature(0, g_groupCountCS, sizeof(g_groupCountCS),
-                                              IID_PPV_ARGS(&p.rs));
+        HRESULT hr = dev->CreateRootSignature(0, cs, size, IID_PPV_ARGS(&p.rs));
         if (FAILED(hr)) {
-            if (why) *why = "could not create the group count root signature";
+            if (why) *why = "could not create a capture root signature";
             return false;
         }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = p.rs.Get();
-        pd.CS.pShaderBytecode = g_groupCountCS;
-        pd.CS.BytecodeLength = sizeof(g_groupCountCS);
+        pd.CS.pShaderBytecode = cs;
+        pd.CS.BytecodeLength = size;
         hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&p.pso));
         if (FAILED(hr)) {
-            if (why) *why = "could not create the group count pipeline";
+            if (why) *why = "could not create a capture pipeline";
             return false;
         }
-        g_pipe = p;
+        *slot = p;
     }
-    *out = g_pipe;
+    *out = *slot;
     return true;
 }
 
 ComPtr<ID3D12Resource> Buffer(ID3D12Device* dev, D3D12_HEAP_TYPE type,
-                              D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+                              D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                              UINT64 width = 3 * sizeof(UINT)) {
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = type;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = 3 * sizeof(UINT);
+    rd.Width = width;
     rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -106,7 +108,8 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev,
             Capture* out, std::string* why) {
     if (!cl || !dev || !sig || !args || !out) return false;
     Pipeline p;
-    if (!GetPipeline(dev, &p, why)) return false;
+    if (!GetPipeline(dev, &g_pipe, g_groupCountCS, sizeof(g_groupCountCS), &p, why))
+        return false;
 
     Capture c;
     c.counts = Buffer(dev, D3D12_HEAP_TYPE_DEFAULT,
@@ -138,6 +141,54 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev,
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->ResourceBarrier(1, &b);
     cl->CopyBufferRegion(c.readback.Get(), 0, c.counts.Get(), 0, 3 * sizeof(UINT));
+
+    *out = c;
+    return true;
+}
+
+bool RecordRawCopy(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev,
+                   D3D12_GPU_VIRTUAL_ADDRESS src, UINT dwords,
+                   Capture* out, std::string* why) {
+    if (!cl || !dev || !src || !dwords || !out) return false;
+    const UINT groups = (dwords + 63) / 64;
+    if (groups > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION) {
+        if (why) *why = "too many instance descriptions to copy in one dispatch";
+        return false;
+    }
+    Pipeline p;
+    if (!GetPipeline(dev, &g_copyPipe, g_instanceCopyCS, sizeof(g_instanceCopyCS), &p, why))
+        return false;
+
+    const UINT64 bytes = static_cast<UINT64>(dwords) * sizeof(UINT);
+    Capture c;
+    c.counts = Buffer(dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                      D3D12_RESOURCE_STATE_COMMON, bytes);
+    c.readback = Buffer(dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                        D3D12_RESOURCE_STATE_COPY_DEST, bytes);
+    if (!c.counts || !c.readback) {
+        if (why) *why = "could not create the instance copy buffers";
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = c.counts.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cl->ResourceBarrier(1, &b);
+
+    cl->SetComputeRootSignature(p.rs.Get());
+    cl->SetPipelineState(p.pso.Get());
+    cl->SetComputeRoot32BitConstant(0, dwords, 0);
+    cl->SetComputeRootShaderResourceView(1, src);
+    cl->SetComputeRootUnorderedAccessView(2, c.counts->GetGPUVirtualAddress());
+    cl->Dispatch(groups, 1, 1);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+    cl->CopyBufferRegion(c.readback.Get(), 0, c.counts.Get(), 0, bytes);
 
     *out = c;
     return true;

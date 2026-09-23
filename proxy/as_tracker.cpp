@@ -38,6 +38,7 @@ Summary g_summary;
 struct PendingRead {
     D3D12_GPU_VIRTUAL_ADDRESS tlas = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    Microsoft::WRL::ComPtr<ID3D12Resource> keepAlive;   // the copy's own UAV
     UINT   count = 0;
     const void* owner = nullptr;           // the list that recorded the copy
     ID3D12CommandQueue* queue = nullptr;   // set when stamped
@@ -286,11 +287,12 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
 
 void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                           ID3D12Resource* readback, UINT count,
-                          const void* owner) {
+                          const void* owner, ID3D12Resource* keepAlive) {
     if (!tlas || !readback || !count || !owner) return;
     PendingRead pr;
     pr.tlas = tlas;
     pr.readback = readback;
+    pr.keepAlive = keepAlive;
     pr.count = count;
     pr.owner = owner;
     std::lock_guard<std::mutex> g(g_lock);

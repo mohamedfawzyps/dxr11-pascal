@@ -279,7 +279,7 @@ Dxr11RayQueryPso::~Dxr11RayQueryPso() {
     UnregisterCarrier(this);
     for (ID3D12Resource* r : m_retired) r->Release();
     for (ID3D12StateObject* s : m_retiredSo) s->Release();
-    if (m_sbt) m_sbt->Release();
+    for (CachedTable& t : m_tables) t.sbt->Release();   // m_sbt is one of these
     if (m_so) m_so->Release();
     if (m_rootSig) m_rootSig->Release();
 }
@@ -638,6 +638,18 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
 bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
                                   const std::vector<rq::RecordPair>& recPairs,
                                   std::string* why) {
+    // Built for this exact layout before? The identifiers only change on a
+    // rebake, which empties the cache.
+    for (const CachedTable& t : m_tables) {
+        if (t.kinds == kinds && t.pairs == recPairs) {
+            m_sbt = t.sbt;
+            m_kinds = kinds;
+            m_recPairs = recPairs;
+            m_desc = t.desc;
+            return true;
+        }
+    }
+
     const UINT hitRecords =
         kinds.empty() ? 1u : static_cast<UINT>(kinds.size());
 
@@ -752,7 +764,6 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
         std::memcpy(p + 2 * slot + i * stride, pad, kIdSize);
     sbt->Unmap(0, nullptr);
 
-    if (m_sbt) m_retired.push_back(m_sbt);   // may still be in flight
     m_sbt = sbt;
     m_kinds = kinds;
     m_recPairs = recPairs;
@@ -766,6 +777,18 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     m_desc.HitGroupTable.StartAddress = base + 2 * slot;
     m_desc.HitGroupTable.SizeInBytes = stride * tableRecords;
     m_desc.HitGroupTable.StrideInBytes = stride;
+
+    CachedTable t;
+    t.kinds = kinds;
+    t.pairs = recPairs;
+    t.sbt = sbt;
+    t.desc = m_desc;
+    m_tables.push_back(t);
+    const size_t kMaxCachedTables = 8;
+    if (m_tables.size() > kMaxCachedTables) {
+        m_retired.push_back(m_tables.front().sbt);   // may still be in flight
+        m_tables.erase(m_tables.begin());
+    }
     return true;
 }
 
@@ -831,6 +854,8 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                      "pair and no local root signature.\n",
                      had, grown.size(), static_cast<unsigned long>(GetTickCount() - t0));
             m_kinds.clear();   // the identifiers moved, so the table must follow
+            for (CachedTable& t : m_tables) m_retired.push_back(t.sbt);
+            m_tables.clear();
         }
     }
 
@@ -841,6 +866,11 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
     // record constants, records carrying different numbers.
     if (!recordKinds.empty() && (recordKinds != m_kinds || recPairs != m_recPairs)) {
         const size_t had = m_kinds.size();
+        const bool wasCached = [&] {
+            for (const CachedTable& t : m_tables)
+                if (t.kinds == recordKinds && t.pairs == recPairs) return true;
+            return false;
+        }();
         std::string why;
         if (!BuildTable(recordKinds, recPairs, &why)) {
             ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch SKIPPED: the scene "
@@ -849,6 +879,8 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                      static_cast<unsigned>(recordKinds.size()), why.c_str());
             return;
         }
+        static LONG s_logged = 0;
+        if (!wasCached && InterlockedIncrement(&s_logged) <= 32) {
         UINT rejecting = 0;
         for (uint8_t k : recordKinds) {
             const bool tri = (k & astrack::kReachTriangles) != 0;
@@ -863,6 +895,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                  static_cast<unsigned>(recordKinds.size()), rejecting,
                  (m_servesTri && m_servesProc) ? "both kinds"
                      : m_servesProc ? "procedural hits" : "triangle hits");
+        }
     }
 
     // The state object and the table this dispatch uses, as one consistent

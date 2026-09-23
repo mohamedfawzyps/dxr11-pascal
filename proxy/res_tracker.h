@@ -32,6 +32,9 @@ void Note(ID3D12Resource* resource);
 struct Found {
     ID3D12Resource* resource = nullptr;
     UINT64 offset = 0;          // of `address` within the resource
+    // Recorded at creation, so asking never calls into a resource that may
+    // since have been freed: the tracker holds no reference.
+    D3D12_HEAP_TYPE heap = D3D12_HEAP_TYPE_DEFAULT;
 };
 
 // The resource containing this address, or an empty Found.
