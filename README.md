@@ -52,6 +52,47 @@ The fourth is the real work. A `RayQuery` compute shader is lowered so that the
 `Proceed()` loop body becomes an any-hit shader, or an intersection shader, or
 both, and the committed accessors travel in the ray payload.
 
+## Scope
+
+**Every ray tracing feature an application uses is emulated; nothing is
+switched off.** Where the shim does not yet handle something, the stopgap is
+named in the log and in the release notes: a refused shader gets a pipeline
+that does nothing, and that pass draws nothing. A capability is reported
+unsupported only where the application's own fallback draws the same image,
+shown from its source.
+
+Done: RayQuery (all 25 accessors Unreal uses), indirect `DispatchRays`,
+`AddToStateObject`, the new ray flags, and every RayQuery shader in the Unreal
+game used for testing. Next, in order:
+
+1. NVIDIA cluster operations (RTX Mega Geometry), which Unreal uses to ray
+   trace Nanite at full detail
+2. spheres and linear swept spheres
+3. opacity micromaps, NVAPI's form and DXR 1.2's. A 2-state micromap decides
+   opacity without running the any-hit shader, so it can draw differently from
+   the alpha test; emulating it means reproducing the micromap lookup
+4. Shader Model 6.9 and DXR 1.2, fully, whether or not an application asks for
+   them yet. They include Shader Execution Reordering, so they are claimed only
+   once that is complete, see below
+5. DLSS, including Ray Reconstruction, last. It needs tensor cores, which
+   Pascal lacks; how to emulate it, and whether NVIDIA's license allows running
+   its networks another way, are open
+
+**Shader Execution Reordering: full SER or none.** Read from Unreal's source: Lumen hit lighting, ray traced
+translucency, the path tracer and NvRTX's RTXDI passes each choose between an
+SER and a non-SER version of the same pass, from what NVIDIA's driver reports
+through NVAPI. The shim passes that question through, and the driver says no
+on Pascal. The SER version traces, regroups threads, then runs the hit shader;
+the other makes one `TraceRay` call with the same ray and payload. Same hit,
+same shader, same image. Reordering only changes which threads run side by
+side. So today nothing is lost. The shim will not tell an application SER
+works until all of it is emulated and verified, because a half-done SER would
+move Unreal onto a path that could lose ray tracing. The reordering itself
+gets measured first: Pascal has no hardware for it, and a software version
+adds a spill and a sort to speed up the part that is not Pascal's bottleneck,
+so it may be slower. If it is faster, it goes in; if slower, that is a
+decision made on the numbers.
+
 ## Status
 
 Verified on a GTX 1070, with WARP as the oracle for every result:

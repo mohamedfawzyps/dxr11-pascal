@@ -13,19 +13,91 @@ narrower scope statement further down this brief. Consequences:
   capability reported unsupported so the engine falls back, is a STOPGAP, not
   an end state. Each one is named in every report, with what it costs.
 - Easy cases first, the hardest later. The order is a schedule, not a filter.
-- ONE exception, decided by the user: a feature that is purely an
-  ACCELERATION with no visual difference is not emulated, because emulating it
-  can only be slower than not doing it. Shader Execution Reordering is the
-  case. Stays reported unsupported.
-- NOW IN SCOPE, previously written off below as out of scope: NVAPI's ray
-  tracing extensions that change what is drawn. Cluster operations (RTX Mega
-  Geometry: Unreal ray traces Nanite at full detail through them, and against
-  fallback meshes without), and the sphere and linear swept sphere geometry
-  types. Opacity micromaps are to be ASSESSED: an acceleration if Unreal's
-  any-hit fallback draws the same, in scope if not.
-- The order agreed on 2026-09-24: the 24 MegaLights loop-isolation shaders
-  (done, 0.42.0), then the 33 two-query shaders (done, 0.43.0), then cluster
-  operations.
+- A capability may be reported unsupported ONLY where the application's
+  fallback draws the same image. That has to be shown from the application's
+  source, not assumed. SER is the one case so far, and only until it is
+  complete, see below.
+
+**The order**, agreed 2026-09-24, extended the same day:
+
+1. The 24 MegaLights loop-isolation shaders. DONE, 0.42.0.
+2. The 33 two-query shaders. DONE, 0.43.0.
+3. **NVIDIA cluster operations** (RTX Mega Geometry). Unreal ray traces Nanite
+   at full detail through them, and against fallback meshes without.
+4. **Spheres and linear swept spheres**, NVAPI geometry types.
+5. **Opacity micromaps (OMM)**, emulated, in both forms: NVAPI's, which is
+   what Unreal uses (`WindowsD3D12Device.cpp:1717`, gated by
+   `r.RayTracing.Geometry.OpacityMicromaps.Enable`, checking
+   `NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_OMM_SUPPORT`), and the
+   DXR 1.2 one. Not skippable as an "acceleration": a 2-state micromap DECIDES
+   opacity per micro-triangle without running the any-hit, so it can draw a
+   different edge than the alpha test does. Exact emulation means reproducing
+   the micromap lookup, not falling back to the any-hit.
+6. **Shader Model 6.9 and DXR 1.2, fully supported**, whether or not an
+   application asks yet. The NvRTX 5.7 clone does not: its
+   `FindHighestShaderModel` stops at 6.7 (`WindowsD3D12Device.cpp:195`) and
+   its D3D12 RHI names no 6.9. Escher's 5.8.2 is not checked. The DXC here
+   (1.10.2605) compiles `lib_6_9`. SER is part of 6.9 and DXR 1.2, so neither
+   is claimed before SER is complete, see below.
+   The full 6.9 feature list is to be read off DXC and the spec before any
+   design, not recalled.
+7. **DLSS, including Ray Reconstruction and the latest versions. LAST.** See
+   the DLSS note below.
+
+**SER (Shader Execution Reordering): FULL SER OR NOTHING, decided by the
+user 2026-09-24.** Verified from Unreal's source the same day:
+
+- Who asks: Lumen reflections, screen probe gather and radiance cache, only in
+  hit lighting mode; ray traced translucency (primary rays); the path tracer;
+  NvRTX's RTXDI indirect lighting and hair. Each picks between an SER and a
+  non-SER PERMUTATION of the same pass (`RAY_TRACING_USE_SER`,
+  `PATH_TRACER_USE_SER`, `FReorderExecutionDim`).
+- How it is decided: `WindowsD3D12Device.cpp:1619` asks NVIDIA's driver
+  through NVAPI (`NV_EXTN_OP_HIT_OBJECT_REORDER_THREAD`, then the thread
+  reordering caps). The shim does not answer; it forwards NVAPI untouched and
+  the driver says no for the 1070. Unreal logs "NVIDIA Shader Execution
+  Reordering NOT supported!".
+- What "no" costs: nothing drawn. The SER form is `NvTraceRayHitObject`,
+  `NvReorderThread`, `NvInvokeHitObject`; the other is one `TraceRay` with
+  the same arguments and payload (`LumenHardwareRayTracingPlatformCommon.ush:28`,
+  `PathTracingCore.ush:525`). Same ray, same hit, same hit shader. Reordering
+  changes only which threads run side by side.
+- One scheduling difference: NvRTX's one-pass Lumen hit lighting
+  (`r.Lumen.Reflections.HardwareRayTracing.HitLighting.OnePass`) requires
+  SER; without it Unreal runs its standard two-pass hit lighting. Reflections
+  are drawn either way.
+- **The rule: nothing tells an application SER works until ALL of it is
+  emulated and verified.** The trace, the invoke (running the hit shader for
+  a hit found earlier, which DXR 1.0 has no call for: the hard part), and the
+  rest of the HitObject API, in NVAPI's `NvHitObject` form and SM 6.9's.
+  Until then the driver's "no" stands and Unreal keeps its plain `TraceRay`
+  path, which draws the same image. A half-done SER claimed as supported
+  would move Unreal onto a path that loses ray tracing. That is the risk
+  this rule exists for.
+- **The reordering: MEASURE FIRST, decided by the user.** Pascal has no unit
+  to regroup threads mid-shader and DXR 1.0 has no call for it. A software
+  version is a split into trace, spill every live value, sort, then shade,
+  which needs the invoke above or a second trace. It speeds up shading
+  coherence, not traversal, and traversal is the costliest thing Pascal does,
+  so INFERRED, not measured, that it is slower on the 1070. Build a
+  prototype, time it on the 1070 against the same pass without it. FASTER:
+  it goes in. SLOWER: bring the numbers to the user, who decides. Never a
+  no-op by default.
+
+**DLSS, the last item. Open questions to settle before any work:**
+
+- DLSS runs through NVIDIA's NGX runtime, the `nvngx_dlss*.dll` a game ships,
+  which declines on GPUs without tensor cores. Its networks run on tensor
+  cores; on Pascal that math would run on the ordinary cores in FP32 (GP104's
+  FP16 rate is a small fraction of FP32). Slow is acceptable here.
+- The networks are NVIDIA's and live inside their DLLs. Running them any other
+  way means extracting them, and the DLSS SDK license has to be read on that
+  point first. Not checked yet.
+- Putting a different upscaler or denoiser behind the DLSS interface avoids
+  that, but draws a different image, so under the premise it would be a named
+  stopgap, not the emulation.
+- Ray Reconstruction replaces Unreal's denoisers; without it Unreal draws its
+  own denoising, a different image, which is why it is in scope.
 
 ## Current position (2026-09-23)
 
@@ -2669,7 +2741,7 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
     README documents dropping Agility SDK 1.619 at configure time, which drops
     it to DXR 1.1. A DXR 1.1 requirement is the TARGET, not a cost. DXR 1.2,
     SM 6.9, SER and OMM are the genuinely out-of-scope parts. [SUPERSEDED
-    2026-09-24 by the Scope section at the top: only SER stays out.]
+    2026-09-24 by the Scope section at the top: all are in scope.]
 
   Next action. **Not a feature: exposure.** Run real software through it, until
   the refusal list is trusted. All three defects named above are now fixed, and
