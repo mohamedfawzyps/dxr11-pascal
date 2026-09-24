@@ -24,8 +24,12 @@ narrower scope statement further down this brief. Consequences:
 2. The 33 two-query shaders. DONE, 0.43.0.
 3. **NVIDIA cluster operations** (RTX Mega Geometry). Unreal ray traces Nanite
    at full detail through them, and against fallback meshes without.
-4. **Spheres and linear swept spheres**, NVAPI geometry types.
-5. **Opacity micromaps (OMM)**, emulated, in both forms: NVAPI's, which is
+4. **Shader Execution Reordering, full.** Measured faster where shading
+   diverges (docs/ser-test.md), so it is built: the whole HitObject API in
+   NVAPI's form, and the reordering in software, applied where shading
+   diverges. Claimed to Unreal only once complete, see SER below.
+5. **Spheres and linear swept spheres**, NVAPI geometry types.
+6. **Opacity micromaps (OMM)**, emulated, in both forms: NVAPI's, which is
    what Unreal uses (`WindowsD3D12Device.cpp:1717`, gated by
    `r.RayTracing.Geometry.OpacityMicromaps.Enable`, checking
    `NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_OMM_SUPPORT`), and the
@@ -33,7 +37,7 @@ narrower scope statement further down this brief. Consequences:
    opacity per micro-triangle without running the any-hit, so it can draw a
    different edge than the alpha test does. Exact emulation means reproducing
    the micromap lookup, not falling back to the any-hit.
-6. **Shader Model 6.9 and DXR 1.2, fully supported**, whether or not an
+7. **Shader Model 6.9 and DXR 1.2, fully supported**, whether or not an
    application asks yet. The NvRTX 5.7 clone does not: its
    `FindHighestShaderModel` stops at 6.7 (`WindowsD3D12Device.cpp:195`) and
    its D3D12 RHI names no 6.9. Escher's 5.8.2 is not checked. The DXC here
@@ -41,7 +45,7 @@ narrower scope statement further down this brief. Consequences:
    is claimed before SER is complete, see below.
    The full 6.9 feature list is to be read off DXC and the spec before any
    design, not recalled.
-7. **DLSS, including Ray Reconstruction and the latest versions. LAST.** See
+8. **DLSS, including Ray Reconstruction and the latest versions. LAST.** See
    the DLSS note below.
 
 **SER (Shader Execution Reordering): FULL SER OR NOTHING, decided by the
@@ -77,12 +81,24 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 - **The reordering: MEASURE FIRST, decided by the user.** Pascal has no unit
   to regroup threads mid-shader and DXR 1.0 has no call for it. A software
   version is a split into trace, spill every live value, sort, then shade,
-  which needs the invoke above or a second trace. It speeds up shading
-  coherence, not traversal, and traversal is the costliest thing Pascal does,
-  so INFERRED, not measured, that it is slower on the 1070. Build a
-  prototype, time it on the 1070 against the same pass without it. FASTER:
-  it goes in. SLOWER: bring the numbers to the user, who decides. Never a
-  no-op by default.
+  which needs the invoke above or a second trace. FASTER: it goes in.
+  SLOWER: bring the numbers to the user, who decides. Never a no-op by
+  default.
+- **MEASURED 2026-09-24, and the inference that it would be slower was
+  WRONG.** `bench/sertest.cpp`, see docs/ser-test.md: 1M rays on the 1070,
+  plain TraceRay against trace, spill 32 bytes, counting sort, shade through
+  `CallShader`. All three draw the identical image, checked every
+  configuration. With 32 materials mixed per warp, reordering is 1.3x faster
+  at light shading and 8x to 18x at heavy shading, because Pascal's DXR
+  runs divergent closest-hits one after another: plain went from 5.3 ms with
+  the materials in patches to 137 ms mixed, same work. With the materials
+  already in patches it is 1.3x to 2x SLOWER, the trace, spill and sort for
+  nothing; with 8 materials and light shading, slightly slower too. So the
+  sort pays exactly when shading diverges, and a real emulation should be able
+  to skip it when it does not. The traversal worry was misplaced: the record
+  trace is 2 to 4 ms of it. Not measured: Unreal's own shaders, a spill the
+  size of Unreal's payload and live state, and the continuation (the raygen's
+  code after the invoke running in a later pass), which is the hard part.
 
 **DLSS, the last item. Open questions to settle before any work:**
 

@@ -67,14 +67,16 @@ game used for testing. Next, in order:
 
 1. NVIDIA cluster operations (RTX Mega Geometry), which Unreal uses to ray
    trace Nanite at full detail
-2. spheres and linear swept spheres
-3. opacity micromaps, NVAPI's form and DXR 1.2's. A 2-state micromap decides
+2. Shader Execution Reordering, fully: measured faster on the GTX 1070 where
+   shading diverges, see below
+3. spheres and linear swept spheres
+4. opacity micromaps, NVAPI's form and DXR 1.2's. A 2-state micromap decides
    opacity without running the any-hit shader, so it can draw differently from
    the alpha test; emulating it means reproducing the micromap lookup
-4. Shader Model 6.9 and DXR 1.2, fully, whether or not an application asks for
+5. Shader Model 6.9 and DXR 1.2, fully, whether or not an application asks for
    them yet. They include Shader Execution Reordering, so they are claimed only
    once that is complete, see below
-5. DLSS, including Ray Reconstruction, last. It needs tensor cores, which
+6. DLSS, including Ray Reconstruction, last. It needs tensor cores, which
    Pascal lacks; how to emulate it, and whether NVIDIA's license allows running
    its networks another way, are open
 
@@ -88,10 +90,13 @@ same shader, same image. Reordering only changes which threads run side by
 side. So today nothing is lost. The shim will not tell an application SER
 works until all of it is emulated and verified, because a half-done SER would
 move Unreal onto a path that could lose ray tracing. The reordering itself
-gets measured first: Pascal has no hardware for it, and a software version
-adds a spill and a sort to speed up the part that is not Pascal's bottleneck,
-so it may be slower. If it is faster, it goes in; if slower, that is a
-decision made on the numbers.
+was measured on the GTX 1070 with a software version (trace, spill, sort by
+material, then shade), `bench/sertest.cpp`, see
+[docs/ser-test.md](docs/ser-test.md). Where materials are mixed it is 1.3x to
+18x faster than plain `TraceRay`, the more so the heavier the shading, because
+Pascal runs divergent hit shaders one after another. Where they are already
+grouped it is up to 2x slower. So it is worth building, applied where shading
+diverges.
 
 ## Status
 
