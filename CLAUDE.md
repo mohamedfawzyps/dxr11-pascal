@@ -26,9 +26,22 @@ then cluster operations, then Tier 1.2.
 3. **Finish Tier 1.1**, easiest first. Reporting 1.1 promises all of it.
    Escher hits none of these today, every one of its shaders lowers, so they
    are for correctness, not for anything visible there.
-   a. **`GeometryIndex()` in the APPLICATION's own DXR shaders.** Tier 1.1
-      (SFI0 0x2000000; `CreateStateObject` returns E_INVALIDARG on the 1070).
-      Solved only inside the shaders the shim generates. Never tested.
+   a. **`GeometryIndex()` in the APPLICATION's own DXR shaders.** Tier 1.1:
+      opcode 213, needs lib_6_5 (DXC refuses it at 6.3), sets SFI0 bit 20,
+      the SAME bit as RayQuery (the "0x2000000" elsewhere in this brief is
+      the module's shader flags, a different numbering). So today the shim
+      logs such a library as "RayQuery", forwards it, and the driver fails
+      the whole `CreateStateObject`. Solved only inside the shaders the shim
+      generates. In Unreal it is ONE shader: `RayTracingCommon.ush` bans
+      `GeometryIndex()` everywhere except `RayTracingDebugMainCHS`, the ray
+      tracing debug view's closest-hit. `D3D12RayTracing.cpp:759` says a
+      failed pipeline "will be fatal when it's actually needed for
+      rendering", so opening that view in Escher is INFERRED to crash today.
+      Design constraint found reading the harness: a DXR 1.0 hit shader
+      cannot tell which geometry it serves except through WHICH RECORD it
+      runs from, and `raytest`'s own TraceRay passes a geometry multiplier of
+      0, so every geometry lands on one record. See the design in the
+      CHANGELOG entry when built.
    b. **`D3D12_RAYTRACING_PIPELINE_CONFIG1` flags**, SKIP_TRIANGLES and
       SKIP_PROCEDURAL_PRIMITIVES for a whole pipeline. Today only cached for
       AddToStateObject; never run on the 1070.
@@ -139,6 +152,22 @@ user 2026-09-24.** Verified from Unreal's source the same day:
   own denoising, a different image, which is why it is in scope.
 
 ## Current position (2026-09-23)
+
+**0.44.0: `GeometryIndex()` IN AN APPLICATION'S OWN HIT SHADERS WORKS FOR THE
+COMMON LAYOUTS (Tier 1.1 item a, first part).** Read becomes a constant at
+b0 space 0x7FFF0000, appended to the local root signature of the hit groups
+that read it; DispatchRays uses the shim's copy of the hit group table with
+each record's geometry index written in (`proxy/geom_index_so`,
+`proxy/geom_table.hlsl`). `gitest.exe`: 5 of 7 layouts bit-exact against WARP
+at 6.5 and 6.6, poison check diverges. Remaining for item a, in order:
+EXISTING_COLLECTION (Unreal's way, so Escher's debug view), then the shim's own
+table layout for records several geometries reach (with a TLAS copy carrying
+shim contributions), then descriptor-table TLAS binding, runtime TraceRay
+arguments, indirect DispatchRays, the first dispatch before instance data is
+read (wait once), and associations from inside a library. **A root SRV bound
+at the dispatch that is a known top-level structure is THE scene; aggregating
+over every live one made a test run in one process refuse layouts that were
+fine.**
 
 **0.43.0: THE 33 TWO-QUERY SHADERS LOWER, AND EVERY SHADER BOTH ESCHER DUMPS
 HOLD NOW LOWERS: 246 OF 246.** Lumen screen probe gather (16), radiosity (8),

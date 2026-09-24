@@ -16,6 +16,7 @@
 
 #include "../proxy/rewriter/ll_model.h"
 #include "../proxy/rewriter/nvapi_fold.h"
+#include "../proxy/rewriter/geom_index.h"
 #include "../proxy/rewriter/rq_analyze.h"
 #include "../proxy/rewriter/rq_lower.h"
 #include "../proxy/rewriter/dxc_host.h"
@@ -66,6 +67,23 @@ int main(int argc, char** argv) {
             std::printf("   rotated Proceed loop   : none\n");
         std::printf("   PATTERN                : %d, %s\n", q.patternNum,
                     q.patternDesc.c_str());
+        return 0;
+    }
+    if (argc >= 4 && std::string(argv[1]) == "geomidx") {
+        // GeometryIndex() in an application's DXR 1.0 library, the C++ half
+        // of phase5/rewriter/geomidx.py.
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        std::string text, why;
+        std::vector<std::string> fns;
+        if (!rq::LowerGeometryIndex(llm::Normalize(raw), &text, &fns, &why)) {
+            std::printf("UNSUPPORTED: %s\n", why.c_str());
+            return 2;
+        }
+        if (!WriteAll(argv[3], text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
+        std::string list;
+        for (const auto& f : fns) list += (list.empty() ? "" : ", ") + f;
+        std::printf("GeometryIndex() read in: %s\n", list.empty() ? "nothing" : list.c_str());
         return 0;
     }
     if (argc >= 4 && std::string(argv[1]) == "lower") {

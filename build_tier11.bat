@@ -1,0 +1,36 @@
+@echo off
+setlocal
+rem Build the Tier 1.1 completion tests (tier11\*.cpp) with MSVC.
+rem
+rem   build_tier11.bat [path\to\agility]
+rem
+rem Output: gitest.exe in the REPOSITORY ROOT, beside the proxy d3d12.dll,
+rem dxcompiler.dll and dxil.dll, so the hardware half runs through the shim
+rem the way a game would. The WARP half runs through it too; the shim stands
+rem aside on a device that already reports Tier 1.1.
+
+set "DXC=%DXC_SDK_DIR%"
+if "%DXC%"=="" set "DXC=C:\DW\DXC"
+set "AGILITY=%~1"
+if "%AGILITY%"=="" set "AGILITY=%AGILITY_SDK_DIR%"
+if "%AGILITY%"=="" set "AGILITY=C:\DW\microsoft.direct3d.d3d12.1.619.5"
+if not exist "%AGILITY%\build\native\include\d3d12.h" (
+  echo d3d12.h not found under "%AGILITY%\build\native\include".
+  exit /b 1
+)
+
+call "%~dp0setup_msvc.bat" || exit /b 1
+
+set "OBJ=%~dp0obj\tier11"
+if not exist "%OBJ%" mkdir "%OBJ%"
+
+cl /nologo /EHsc /std:c++17 /O2 /W4 ^
+   /I "%AGILITY%\build\native\include" /I "%DXC%\inc" ^
+   /Fo:"%OBJ%\\" ^
+   "%~dp0tier11\gitest.cpp" /Fe:"%~dp0gitest.exe" ^
+   /link d3d12.lib dxgi.lib user32.lib /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
+echo.
+echo Built gitest.exe
+echo Run:  gitest.exe [--sm66] [layout ...]

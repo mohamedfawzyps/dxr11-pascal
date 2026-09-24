@@ -24,6 +24,53 @@ not.
 
 ---
 
+## 0.44.0
+
+Tier 1.1 completion, item a, first part: **`GeometryIndex()` in an
+application's OWN DXR 1.0 hit shaders.** Tier 1.1: the GTX 1070's driver
+rejected the whole `CreateStateObject`. In Unreal it is one shader, the ray
+tracing debug view's closest-hit (`RayTracingDebugMainCHS`), and a failed
+pipeline there is fatal once used, so opening that view was inferred to crash.
+
+- **Found on the way:** `GeometryIndex()` sets SFI0 bit 20, the SAME bit as
+  RayQuery, so the shim logged such a library as "RayQuery". The message now
+  names both.
+- **How:** a DXR 1.0 hit shader can only tell geometries apart by WHICH RECORD
+  it runs from. So each `GeometryIndex()` read becomes one 32-bit constant at
+  `b0, space 0x7FFF0000` (`phase5/rewriter/geomidx.py`, C++ port
+  `proxy/rewriter/geom_index.cpp`, byte-identical, shapes read off DXC in
+  `phase5/cases/reference/lib_shimgeom_ref.hlsl`). At `CreateStateObject` the
+  shim appends that constant to the local root signature of every hit group
+  whose shaders read it, re-associated to exactly those exports, so the
+  application's own local arguments keep their offsets (`proxy/geom_index_so`).
+  At `DispatchRays` a small compute pass (`proxy/geom_table.hlsl`) copies the
+  application's hit group table into the shim's own buffer and writes each
+  record's geometry index into it, worked out from the instances and the
+  TraceRay arguments read from the libraries. The application's table is
+  never written. Root signature blobs are now kept on every root signature
+  object, so a local one can be extended.
+- **When the dispatch binds its top-level structure as a root SRV, only that
+  structure counts**; otherwise every live one does, which can only find more
+  collisions.
+- **Measured:** `tier11\gitest.exe` (`build_tier11.bat`) is a small DXR 1.0
+  application with seven shader table layouts, run on WARP and through the
+  shim on the 1070. Five match WARP bit for bit at lib_6_5 and lib_6_6:
+  one record per geometry (Unreal's layout), two interleaved ray types, two
+  instances sharing a structure, an any-hit that reads it and changes which
+  surface is hit, and two local root signature layouts in one table. The
+  application's own record data arrives intact in all. With
+  `DXR_TIER11_GI_POISON=1` all five DIVERGE. Dispatch suite 36 of 36,
+  rewriter checks 45 of 45 plus the new byte-identity check.
+- **Not built yet, each logged as NOT DRAWN or REFUSED with the reason, never
+  drawn wrong:** a layout where one record is reached by several geometries
+  (the two remaining test layouts, a TraceRay multiplier of 0), hit groups in
+  an `EXISTING_COLLECTION` (how Unreal builds pipelines, so Escher's debug
+  view still does not work), a top-level structure bound through a descriptor
+  table while several are live, TraceRay arguments computed at run time, an
+  indirect DispatchRays of such a pipeline, the first dispatch before the
+  scene's instance data has been read, and local root signatures associated
+  from inside a library.
+
 ## 0.43.0
 
 - **Several RayQuery objects in one entry point lower.** 33 of Escher's

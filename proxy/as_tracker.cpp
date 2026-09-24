@@ -134,6 +134,7 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         if (bits & kReachProcedural) t.anyProcedural = true;
 
         const UINT geoms = geometriesOf(d[i].AccelerationStructure);
+        t.classes.emplace_back(ic, geoms);
         for (UINT gi = 0; gi < geoms; ++gi) {
             const UINT slot = ic + gi;
             if (slot >= t.recordCount) break;
@@ -153,6 +154,9 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
             }
         }
     }
+
+    std::sort(t.classes.begin(), t.classes.end());
+    t.classes.erase(std::unique(t.classes.begin(), t.classes.end()), t.classes.end());
 
     auto prev = g_tlas.find(tlas);
     const bool isNew = prev == g_tlas.end();
@@ -592,6 +596,39 @@ std::vector<RecordConstants> RecordConstantsTable() {
         if (out.size() < t.constants.size()) out.resize(t.constants.size());
         for (size_t i = 0; i < t.constants.size(); ++i)
             if (t.constants[i].assigned && !out[i].assigned) out[i] = t.constants[i];
+    }
+    return out;
+}
+
+std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& traceArgs,
+                                    UINT records,
+                                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound,
+                                    bool* read) {
+    std::lock_guard<std::mutex> g(g_lock);
+    std::vector<int32_t> out(records, -1);
+    *read = false;
+    bool anyBound = false;
+    for (auto a : bound) {
+        auto it = g_tlas.find(a);
+        if (it != g_tlas.end() && it->second.valid) anyBound = true;
+    }
+    for (const auto& kv : g_tlas) {
+        const TlasInfo& t = kv.second;
+        if (!t.valid) continue;
+        if (anyBound ? std::find(bound.begin(), bound.end(), kv.first) == bound.end()
+                     : !LiveLocked(kv.first))
+            continue;
+        *read = true;
+        for (const auto& c : t.classes)
+            for (UINT gi = 0; gi < c.second; ++gi)
+                for (const auto& rm : traceArgs) {
+                    const UINT64 idx = (UINT64)(rm.first & 15) + (UINT64)(rm.second & 15) * gi +
+                                       c.first;
+                    if (idx >= records) continue;
+                    int32_t& l = out[(size_t)idx];
+                    if (l == -1) l = (int32_t)gi;
+                    else if (l != (int32_t)gi) l = -2;
+                }
     }
     return out;
 }

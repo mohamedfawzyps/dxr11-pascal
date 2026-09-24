@@ -133,7 +133,34 @@ struct TlasInfo {
     // the table carry a record of the right TYPE at each slot rather than one
     // record everywhere.
     std::vector<uint8_t> reach;
+    // Every distinct (InstanceContributionToHitGroupIndex, geometry count)
+    // the instances carry, sorted. What an APPLICATION's own table needs to
+    // answer GeometryIndex(), for whatever TraceRay arguments it uses; see
+    // GeometryLabels.
+    std::vector<std::pair<UINT, UINT>> classes;
 };
+
+// GeometryIndex() in an application's own hit shaders: which geometry index a
+// hit on each of the first `records` records of its hit group table has, when
+// its TraceRay calls use these (RayContributionToHitGroupIndex,
+// MultiplierForGeometryContributionToHitGroupIndex) pairs, low 4 bits each as
+// DXR uses them. Over every live top-level structure read so far.
+//
+//   >= 0  that geometry index
+//   -1    nothing reaches the record
+//   -2    two different geometry indices reach it: one record cannot answer
+//         both, and the application's layout has to be replaced
+//
+// When one of `bound` (the root SRV addresses the dispatch has bound) is a
+// top-level structure that has been read, only the bound ones count: that IS
+// the scene being traced. Otherwise, a structure bound through a descriptor
+// table, every live one does, which can only find MORE collisions.
+//
+// `*read` is false when no top-level structure has been read at all.
+std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& traceArgs,
+                                    UINT records,
+                                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound,
+                                    bool* read);
 
 // The instance descriptions of a top-level build, read from CPU-visible memory
 // at record time. Cheap path: no copy, no sync.

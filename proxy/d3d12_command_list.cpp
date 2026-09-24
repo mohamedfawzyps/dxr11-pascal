@@ -6,6 +6,7 @@
 // to unwrap, which is a preview of the work the queue hook does.
 
 #include "d3d12_command_list.h"
+#include "geom_index_so.h"
 #include "proxy_log.h"
 #include "command_signature.h"
 #include "rq_pipeline.h"
@@ -661,7 +662,41 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s)
     m_lastBoundStateObject = true;
     FWD(SetPipelineState1(s));
 }
-void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) { WorkBarrier(); FWD(DispatchRays(d)); }
+// A pipeline whose hit shaders read GeometryIndex() dispatches against the
+// shim's copy of the hit group table, which carries each record's geometry
+// index; see proxy/geom_index_so.h. A dispatch that copy cannot serve is NOT
+// recorded, and says so: drawing it against the application's table would
+// run hit shaders with no geometry index at all.
+void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) {
+    WorkBarrier();
+    std::shared_ptr<gidx::Info> gi = d ? gidx::Get(m_bindings.stateObject) : nullptr;
+    if (!gi) { FWD(DispatchRays(d)); return; }
+    ID3D12Device5* dev = RealDevice();
+    D3D12_DISPATCH_RAYS_DESC mine = *d;
+    std::string why;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
+    for (const auto& r : m_bindings.roots)
+        if (r.kind == Dxr11RootParam::SRV && r.address) srvs.push_back(r.address);
+    if (!dev || !gidx::RecordTable(m_real, dev, *gi, d->HitGroupTable, &mine.HitGroupTable,
+                                   srvs, this, &why)) {
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 16)
+            ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch NOT DRAWN: %s\n",
+                     why.empty() ? "no device" : why.c_str());
+        RestoreComputeAfterCapture();
+        return;
+    }
+    RestoreComputeAfterCapture();
+    static LONG first = 0;
+    if (InterlockedCompareExchange(&first, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first dispatch against the shim's "
+                 "table, %llu records at stride %llu (the application's: stride %llu)\n",
+                 (unsigned long long)(mine.HitGroupTable.SizeInBytes /
+                                      mine.HitGroupTable.StrideInBytes),
+                 (unsigned long long)mine.HitGroupTable.StrideInBytes,
+                 (unsigned long long)d->HitGroupTable.StrideInBytes);
+    m_real->DispatchRays(&mine);
+}
 
 // --- ID3D12GraphicsCommandList5 / 6 -----------------------------------------
 // Only reachable when QueryInterface handed the interface out, which it does

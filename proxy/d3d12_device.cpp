@@ -24,6 +24,7 @@
 #include "res_tracker.h"
 #include "config.h"
 #include "rewriter/dxc_host.h"
+#include "geom_index_so.h"
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
@@ -52,7 +53,8 @@ static void NoteRayQuery(bool tier11, const char* where, const void* code, SIZE_
     if (!code || !size || !Dxr11ContainerUsesRayQuery(code, size)) return;
     static LONG once = 0;
     if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
-    ProxyLog("[dxr-tier-11-proxy-log] %s: shader USES RAYQUERY (SFI0 bit 20), %zu bytes.\n",
+    ProxyLog("[dxr-tier-11-proxy-log] %s: shader uses a Tier 1.1 shader feature (SFI0 bit 20: "
+             "RayQuery, or GeometryIndex() in a ray tracing library), %zu bytes.\n",
              where, (size_t)size);
     ProxyLog("[dxr-tier-11-proxy-log]   tier reported to the app is %s. On Tier 1.0 with "
              "DXR_TIER11=1 this is lowered and run; otherwise it is "
@@ -594,8 +596,16 @@ UINT STDMETHODCALLTYPE Dxr11Device::GetDescriptorHandleIncrementSize(D3D12_DESCR
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateRootSignature(UINT nodeMask, const void* pBlobWithRootSignature, SIZE_T blobLengthInBytes, REFIID riid, void** ppvRootSignature) {
     const HRESULT hr = m_real->CreateRootSignature(nodeMask, pBlobWithRootSignature, blobLengthInBytes, riid, ppvRootSignature);
     if (SUCCEEDED(hr) && ppvRootSignature && *ppvRootSignature)
+    {
         shdump::NoteRootSignature(*ppvRootSignature, pBlobWithRootSignature,
                                   static_cast<size_t>(blobLengthInBytes));
+        // Kept on the object, so a LOCAL one can be extended for GeometryIndex().
+        ID3D12RootSignature* rs = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvRootSignature)->QueryInterface(IID_PPV_ARGS(&rs))) && rs) {
+            gidx::NoteRootSignature(rs, pBlobWithRootSignature, static_cast<size_t>(blobLengthInBytes));
+            rs->Release();
+        }
+    }
     return hr;
 }
 void STDMETHODCALLTYPE Dxr11Device::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateConstantBufferView(pDesc, DestDescriptor)); }
@@ -861,7 +871,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
             wantsAdditions = (c->Flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) != 0;
         }
     }
-    if (!wantsAdditions) FWD(CreateStateObject(pDesc, riid, ppStateObject));
+    if (!wantsAdditions) return CreateStateObjectReal(pDesc, riid, ppStateObject);
 
     auto* store = new (std::nothrow) StateObjectStore();
     if (!store) return E_OUTOFMEMORY;
@@ -871,12 +881,12 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
         ProxyLog("[dxr-tier-11-proxy-log] CreateStateObject: cannot cache subobjects (%s); "
                  "additions will not work for this object\n", why.c_str());
         delete store;
-        FWD(CreateStateObject(pDesc, riid, ppStateObject));
+        return CreateStateObjectReal(pDesc, riid, ppStateObject);
     }
     store->StripAdditionsFlag();
 
     D3D12_STATE_OBJECT_DESC stripped = store->Desc(pDesc->Type);
-    HRESULT hr = m_real->CreateStateObject(&stripped, riid, ppStateObject);
+    HRESULT hr = CreateStateObjectReal(&stripped, riid, ppStateObject);
     ProxyLog("[dxr-tier-11-proxy-log] CreateStateObject: stripped ALLOW_STATE_OBJECT_ADDITIONS, "
              "%u subobjects cached, hr=0x%08lx\n",
              (unsigned)store->Count(), (unsigned long)hr);
@@ -893,6 +903,34 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
     }
     return hr;
 }
+// Every Tier 1.0 CreateStateObject goes through here. A library reading
+// GeometryIndex() is rewritten and its hit groups' local root signatures
+// extended; see proxy/geom_index_so.h. Anything else is created as asked.
+HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d, REFIID riid,
+                                           void** pp) {
+    gidx::Transformed t;
+    std::string why;
+    const auto o = gidx::Transform(m_real, *d, &t, &why);
+    if (o == gidx::Outcome::kRefused) {
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 16)
+            ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() REFUSED: %s. The state object is "
+                     "forwarded unchanged and the driver will reject it.\n", why.c_str());
+    }
+    if (o != gidx::Outcome::kTransformed) return m_real->CreateStateObject(d, riid, pp);
+    const HRESULT hr = m_real->CreateStateObject(&t.desc, riid, pp);
+    ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): %s; CreateStateObject hr=0x%08lx\n",
+             t.summary.c_str(), (unsigned long)hr);
+    if (SUCCEEDED(hr) && pp && *pp) {
+        ID3D12StateObject* so = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*pp)->QueryInterface(IID_PPV_ARGS(&so))) && so) {
+            gidx::Attach(so, t.info);
+            so->Release();
+        }
+    }
+    return hr;
+}
+
 void STDMETHODCALLTYPE Dxr11Device::GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) {
     // The SAME inputs the build will see, or the sizes would not be the build's.
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in2;
@@ -954,7 +992,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::AddToStateObject(const D3D12_STATE_OBJECT
     merged->StripAdditionsFlag();
 
     D3D12_STATE_OBJECT_DESC full = merged->Desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
-    HRESULT hr = m_real->CreateStateObject(&full, riid, ppNewStateObject);
+    HRESULT hr = CreateStateObjectReal(&full, riid, ppNewStateObject);
     ProxyLog("[dxr-tier-11-proxy-log] AddToStateObject EMULATED: base %u + addition %u -> "
              "%u subobjects, rebuilt hr=0x%08lx\n",
              (unsigned)baseDesc.NumSubobjects, (unsigned)pAddition->NumSubobjects,

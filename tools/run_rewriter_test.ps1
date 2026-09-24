@@ -286,6 +286,22 @@ else {
 }
 
 Write-Host ''
+Write-Host '=== GeometryIndex() in an application library: Python and C++ identical, output valid ==='
+# Tier 1.1 completion, item a. The render check is gitest.exe (build_tier11.bat),
+# which drives a whole DXR 1.0 application through the shim against WARP.
+foreach ($sm in @('lib_6_5', 'lib_6_6')) {
+    $ll = "phase5\out\geomidx_$sm.ll"
+    & 'C:\DW\DXC\bin\x64\dxc.exe' -T $sm -D R_VAL=0 -D M_VAL=1 -D ANYHIT=1 -Fc $ll 'phase5\cases\geomidx_app.hlsl' | Out-Null
+    & python phase5\rewriter\geomidx.py $ll "phase5\out\geomidx_$sm.py.ll" | Out-Null
+    & .\phase5out\dxrw.exe geomidx $ll "phase5\out\geomidx_$sm.cpp.ll" | Out-Null
+    $same = (Get-FileHash "phase5\out\geomidx_$sm.py.ll").Hash -eq (Get-FileHash "phase5\out\geomidx_$sm.cpp.ll").Hash
+    $asm = (& .\phase5out\dxilrt.exe asm "phase5\out\geomidx_$sm.py.ll" "phase5\out\geomidx_$sm.dxil" 2>&1) -join "`n"
+    $valid = $asm -match 'validated and signed ok'
+    if ($same -and $valid) { Write-Host "  geomidx $sm : PASS (byte-identical, validates and signs)" }
+    else { Write-Host "  geomidx $sm : FAIL (identical=$same valid=$valid)"; $failed++ }
+}
+
+Write-Host ''
 Write-Host '=== refusal checks ==='
 & python phase5\rewriter\test_reject.py
 if ($LASTEXITCODE -ne 0) { $failed++ }
