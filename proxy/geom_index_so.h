@@ -31,9 +31,12 @@
 
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
+
+class StateObjectStore;
 
 namespace gidx {
 
@@ -48,6 +51,15 @@ struct Group {
     uint8_t id[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
 };
 
+// An identifier the variant pipeline changed. `insert`, when nonzero, is
+// where in the record the shim scene's address goes: a raygen's appended root
+// descriptor.
+struct Remap {
+    uint8_t from[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
+    uint8_t to[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
+    UINT insert = 0;
+};
+
 // What DispatchRays needs, attached to the state object.
 struct Info {
     std::vector<Group> groups;
@@ -56,6 +68,21 @@ struct Info {
     // pipeline's TraceRay calls use, low 4 bits each.
     std::vector<std::pair<UINT, UINT>> traceArgs;
     bool dynamicTraceArgs = false; // a TraceRay whose R or M is not a constant
+
+    // The shim's own record layout, for when the application's shares a
+    // record between geometries: a VARIANT pipeline tracing the shim's copy
+    // of the scene (proxy/shim_scene.h). Built from `store`, a copy of the
+    // object's (transformed) subobjects, eagerly when a TraceRay multiplier
+    // is 0, otherwise at the first dispatch that needs it.
+    D3D12_STATE_OBJECT_TYPE type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+    std::shared_ptr<StateObjectStore> store;
+    std::mutex variantLock;
+    bool variantTried = false;
+    std::string variantWhy;
+    Microsoft::WRL::ComPtr<ID3D12StateObject> variant;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12StateObject>> variantParts;  // its collections
+    std::vector<Remap> remaps;
+    UINT raygenBytes = 0;          // the largest raygen record the variant needs
 };
 
 // Owns everything the transformed desc points at.
@@ -67,6 +94,7 @@ struct Transformed {
     std::deque<D3D12_DXIL_LIBRARY_DESC> libs;
     std::deque<D3D12_LOCAL_ROOT_SIGNATURE> lrs;
     std::deque<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION> assoc;
+    std::deque<D3D12_EXISTING_COLLECTION_DESC> colls;
     std::deque<std::vector<LPCWSTR>> exportLists;
     std::deque<std::wstring> names;
     std::vector<Microsoft::WRL::ComPtr<ID3D12RootSignature>> sigs;
@@ -84,17 +112,33 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
                   Transformed* out, std::string* why);
 
 // After a successful create: reads the identifiers and attaches the info.
-void Attach(ID3D12StateObject* so, const std::shared_ptr<Info>& info);
+// Keeps a copy of the subobjects when a variant may be needed, and builds it
+// at once when a TraceRay multiplier of 0 makes it certain to be.
+void Attach(ID3D12Device* dev, ID3D12StateObject* so, const D3D12_STATE_OBJECT_DESC& desc,
+            const std::shared_ptr<Info>& info);
 std::shared_ptr<Info> Get(ID3D12StateObject* so);
 
 // Records the shim's copy of the application's hit group table into `cl`,
 // and returns the range the dispatch should use instead. Replaces the
 // compute root signature and pipeline; the CALLER restores them. `owner` is
 // the recording list, for the buffers' lifetimes (gpu_hold).
+// `*shared` is set when it failed because the application's layout shares a
+// record between geometries, which the variant serves.
 bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& info,
                  const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& app,
                  D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* shim,
                  const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs,
-                 const void* owner, std::string* why);
+                 const void* owner, bool* shared, std::string* why);
+
+// The variant, built once; false with *why when it cannot be.
+bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::string* why);
+
+// Records the variant's four tables, the hit group table in the shim's own
+// layout, into `cl`, and fills `mine` with them. The caller binds the
+// variant, dispatches, and binds the application's pipeline again.
+bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
+                   const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
+                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs,
+                   const void* owner, std::string* why);
 
 }  // namespace gidx

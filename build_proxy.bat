@@ -40,7 +40,7 @@ if errorlevel 1 exit /b 1
 
 cl /nologo /EHsc /std:c++17 /O2 /W4 %INCS% /I "C:\DW\DXC\inc" /LD ^
    /Fo:"%~dp0obj\\" ^
-   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp proxy\state_object_cache.cpp proxy\queue_hook.cpp proxy\d3d12_command_list.cpp proxy\command_signature.cpp proxy\dxil_scan.cpp proxy\rq_pipeline.cpp proxy\as_tracker.cpp proxy\dispatch_stats.cpp proxy\gpu_hold.cpp proxy\res_tracker.cpp proxy\config.cpp proxy\dllinfo.cpp proxy\proxy_log.cpp proxy\pso_stream.cpp proxy\shader_dump.cpp proxy\d3d12_pipeline_library.cpp proxy\group_count.cpp proxy\geom_index_so.cpp ^
+   proxy\d3d12_proxy.cpp proxy\d3d12_device.cpp proxy\state_object_cache.cpp proxy\queue_hook.cpp proxy\d3d12_command_list.cpp proxy\command_signature.cpp proxy\dxil_scan.cpp proxy\rq_pipeline.cpp proxy\as_tracker.cpp proxy\dispatch_stats.cpp proxy\gpu_hold.cpp proxy\res_tracker.cpp proxy\config.cpp proxy\dllinfo.cpp proxy\proxy_log.cpp proxy\pso_stream.cpp proxy\shader_dump.cpp proxy\d3d12_pipeline_library.cpp proxy\group_count.cpp proxy\geom_index_so.cpp proxy\shim_scene.cpp ^
    proxy\rewriter\dxc_host.cpp proxy\rewriter\ll_model.cpp ^
    proxy\rewriter\rq_analyze.cpp proxy\rewriter\rq_lower.cpp proxy\rewriter\nvapi_fold.cpp proxy\rewriter\geom_index.cpp ^
    /Fe:d3d12.dll ^

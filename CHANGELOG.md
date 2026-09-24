@@ -24,6 +24,59 @@ not.
 
 ---
 
+## 0.46.0
+
+Tier 1.1 item a, third part: **`GeometryIndex()` when one hit group record is
+reached by SEVERAL geometries**, a TraceRay multiplier of 0 for instance.
+No record can say which geometry was hit, so the shim gives the dispatch a
+record layout of its own, where every (instance, geometry, TraceRay argument
+pair) has a record: `q + k * geometry + instance * block`. The hardware
+computes that only from the TraceRay arguments and the instances'
+contributions, so:
+
+- **A variant pipeline.** Every TraceRay in it traces the shim's copy of the
+  scene with (q, k), q the index of the call's original (R, M) pair and k the
+  number of pairs (`phase5/rewriter/shimtrace.py`, C++ port in
+  `proxy/rewriter/geom_index.cpp`, byte-identical; shapes read off DXC in
+  `phase5/cases/reference/lib_shimtlas_ref.hlsl`). The copy is bound through a
+  root descriptor at `t0, space 0x7FFF0000` appended to each raygen's local
+  root signature. The association logic is now one helper (`Rebuild`), used
+  for the geometry index constant and for this descriptor alike. Collections
+  are handled: a collection that traces is kept, and a pipeline's variant
+  links a variant of it; the rest are linked as they are. Built at pipeline
+  creation when a multiplier is 0, otherwise at the first dispatch that needs
+  it.
+- **The shim's copy of the scene** (`proxy/shim_scene`). Once a variant
+  exists, every application top-level build is followed, in the same list,
+  by a small pass (`proxy/shim_scene.hlsl`) that copies the instance
+  descriptions from the application's buffer with each contribution replaced
+  by `instance * block`, and a build of the shim's own structure from them:
+  so the copy is always exactly the scene just built. For a pipeline created
+  after its scene was built, the copy is made from a snapshot of that build's
+  instance descriptions when they were CPU-visible
+  (`astrack::InstanceSnapshot`, dropped at every rebuild).
+- **The variant's tables** (`proxy/shim_table.hlsl`): the hit group table in
+  the shim's layout, each record filled from the application's record for
+  that hit (`R[q] + M[q] * g + contribution`) with its geometry index
+  written in; raygen, miss and callable tables copied with every identifier
+  the variant changed swapped, and the scene copy's address written into the
+  raygen record. The dispatch binds the variant, dispatches, and binds the
+  application's pipeline again.
+- **Measured:** `gitest.exe`, all 7 layouts bit-exact against WARP as one
+  state object, as collections, and as collections grown by AddToStateObject,
+  at lib_6_5 and lib_6_6: 42 of 42. With `DXR_TIER11_GI_POISON=1` the two
+  shared-record layouts diverge in all three modes. Dispatch suite 36 of 36;
+  rewriter checks pass with the new byte-identity check.
+- **Costs, stated:** once a variant exists, one extra top-level build and one
+  small pass per application top-level build, a second compiled pipeline, and
+  per dispatch four small table passes. Unreal's layout never needs it.
+- **Still not built, refused by name:** a scene bound through a descriptor
+  table (item 2), and in the shim's layout also a closest-hit or miss that
+  calls TraceRay (recursion above 1), more than 15 TraceRay argument pairs,
+  and TraceRay arguments computed at run time. A variant first needed at a
+  dispatch whose scene was built on the GPU before the variant existed is NOT
+  DRAWN until that scene's next build, which engines do every frame.
+
 ## 0.45.0
 
 Tier 1.1 item a, second part: **`GeometryIndex()` through COLLECTIONS, the way

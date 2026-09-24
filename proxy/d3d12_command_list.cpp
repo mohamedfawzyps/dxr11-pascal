@@ -7,6 +7,7 @@
 
 #include "d3d12_command_list.h"
 #include "geom_index_so.h"
+#include "shim_scene.h"
 #include "proxy_log.h"
 #include "command_signature.h"
 #include "rq_pipeline.h"
@@ -652,6 +653,20 @@ void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(co
         }
     }
     FWD(BuildRaytracingAccelerationStructure(d, n, p));
+    // The shim's copy of the scene, when a variant pipeline needs one: built
+    // here, from the instance buffer the application just built from.
+    if (d && d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+        shimscene::Active()) {
+        std::string why;
+        ID3D12Device5* dev = RealDevice();
+        if (!dev || !shimscene::Record(m_real, dev, *d, this, &why)) {
+            static LONG k = 0;
+            if (InterlockedIncrement(&k) <= 8)
+                ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): scene copy not built: %s\n",
+                         why.empty() ? "no device" : why.c_str());
+        }
+        RestoreComputeAfterCapture();
+    }
 }
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { WorkBarrier(); FWD(CopyRaytracingAccelerationStructure(d, s, m)); }
@@ -677,8 +692,27 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
     for (const auto& r : m_bindings.roots)
         if (r.kind == Dxr11RootParam::SRV && r.address) srvs.push_back(r.address);
+    bool shared = false;
     if (!dev || !gidx::RecordTable(m_real, dev, *gi, d->HitGroupTable, &mine.HitGroupTable,
-                                   srvs, this, &why)) {
+                                   srvs, this, &shared, &why)) {
+        // A record several geometries reach: the shim's own layout, through
+        // the variant pipeline and the shim's copy of the scene.
+        std::string vwhy;
+        if (dev && shared && gidx::EnsureVariant(dev, *gi, m_bindings.stateObject, &vwhy) &&
+            gidx::RecordVariant(m_real, dev, *gi, *d, &mine, srvs, this, &vwhy)) {
+            RestoreComputeAfterCapture();
+            m_real->SetPipelineState1(gi->variant.Get());
+            m_real->DispatchRays(&mine);
+            m_real->SetPipelineState1(m_bindings.stateObject);
+            static LONG firstVariant = 0;
+            if (InterlockedCompareExchange(&firstVariant, 1, 0) == 0)
+                ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first dispatch in the shim's own "
+                         "layout (%s), %llu hit group records\n", why.c_str(),
+                         (unsigned long long)(mine.HitGroupTable.SizeInBytes /
+                                              mine.HitGroupTable.StrideInBytes));
+            return;
+        }
+        if (shared) why += "; the shim's own layout could not serve it either: " + vwhy;
         static LONG n = 0;
         if (InterlockedIncrement(&n) <= 16)
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch NOT DRAWN: %s\n",
@@ -726,6 +760,8 @@ ID3D12Device5* Dxr11CommandList::RealDevice() {
 void Dxr11CommandList::CaptureInstances(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
     const auto& in = desc->Inputs;
+    // Whatever the previous build of this structure was, it is not this one.
+    astrack::DropSnapshot(desc->DestAccelerationStructureData);
     if (!in.NumDescs || !in.InstanceDescs) return;
 
     if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {

@@ -310,4 +310,175 @@ bool LowerGeometryIndex(const std::string& in, std::string* out,
     return true;
 }
 
+// --- shimtrace.py -------------------------------------------------------------
+
+bool RetraceToShimScene(const std::string& in,
+                        const std::vector<std::pair<unsigned, unsigned>>& pairs,
+                        std::string* out, int* calls, std::string* why) {
+    static const std::regex kTrace(
+        R"RX(^(\s*)call void @dx\.op\.traceRay\.([^(]+)\(i32 157, %dx\.types\.Handle (%[\w.]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), (.*)$)RX");
+    static const std::regex kNum(R"RX(^-?\d+$)RX");
+    const std::string H = kHandle, RAS = "%struct.RaytracingAccelerationStructure",
+                      G = "@dxr11.tlas", P = kResProps;
+    *calls = 0;
+    auto lines = llm::SplitLines(in);
+    bool any = false;
+    for (const auto& l : lines) if (std::regex_match(l, kTrace)) { any = true; break; }
+    if (!any) { *out = in; return true; }
+    if (in.find(G + " ") != std::string::npos) {
+        *why = "the library already defines " + G;
+        return false;
+    }
+    const bool sm66 = IsSm66(in);
+    const unsigned k = (unsigned)pairs.size();
+    std::vector<std::string> cur;
+    int n = 0;
+    for (const auto& l : lines) {
+        std::smatch m;
+        if (!std::regex_match(l, m, kTrace)) { cur.push_back(l); continue; }
+        const std::string R = m[6].str(), M = m[7].str();
+        if (!std::regex_match(R, kNum) || !std::regex_match(M, kNum)) {
+            *why = "a TraceRay whose hit group arguments are computed at run time";
+            return false;
+        }
+        const std::pair<unsigned, unsigned> pr((unsigned)std::stol(R) & 15u,
+                                               (unsigned)std::stol(M) & 15u);
+        auto it = std::find(pairs.begin(), pairs.end(), pr);
+        if (it == pairs.end()) {
+            *why = "a TraceRay argument pair the pipeline did not list";
+            return false;
+        }
+        const std::string t = "%st." + std::to_string(n);
+        if (sm66) {
+            cur.push_back("  " + t + ".v = load " + H + ", " + H + "* " + G + ", align 4");
+            cur.push_back("  " + t + ".l = call " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " +
+                          H + " " + t + ".v)  ; CreateHandleForLib(Resource)");
+            cur.push_back("  " + t + ".h = call " + H + " @dx.op.annotateHandle(i32 216, " + H + " " + t +
+                          ".l, " + P + " { i32 16, i32 0 })  ; AnnotateHandle(res,props)  resource: RTAccelerationStructure");
+        } else {
+            cur.push_back("  " + t + ".v = load " + RAS + ", " + RAS + "* " + G + ", align 4");
+            cur.push_back("  " + t + ".h = call " + H +
+                          " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32 160, " +
+                          RAS + " " + t + ".v)  ; CreateHandleForLib(Resource)");
+        }
+        cur.push_back(m[1].str() + "call void @dx.op.traceRay." + m[2].str() + "(i32 157, " + H + " " + t +
+                      ".h, i32 " + m[4].str() + ", i32 " + m[5].str() + ", i32 " +
+                      std::to_string(it - pairs.begin()) + ", i32 " + std::to_string(k) + ", " + m[8].str());
+        ++n;
+    }
+    lines.swap(cur);
+
+    const std::string body = llm::JoinLines(lines);
+    std::vector<std::string> decls;
+    if (sm66) {
+        if (body.find("declare " + H + " @dx.op.createHandleForLib.dx.types.Handle(") == std::string::npos)
+            decls.push_back("declare " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32, " + H + ") #RQRO");
+        if (body.find("declare " + H + " @dx.op.annotateHandle(") == std::string::npos)
+            decls.push_back("declare " + H + " @dx.op.annotateHandle(i32, " + H + ", " + P + ") #RQNONE");
+    } else if (body.find("declare " + H + " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(") ==
+               std::string::npos) {
+        decls.push_back("declare " + H + " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32, " +
+                        RAS + ") #RQRO");
+    }
+    int lastDecl = -1;
+    for (size_t i = 0; i < lines.size(); ++i) if (StartsWith(lines[i], "declare ")) lastDecl = (int)i;
+    std::vector<std::string> ins;
+    for (const auto& d : decls) { ins.push_back(""); ins.push_back(d); }
+    lines.insert(lines.begin() + lastDecl + 1, ins.begin(), ins.end());
+
+    auto haveType = [&](const std::string& ty) {
+        for (const auto& l : lines) if (StartsWith(l, ty + " = type")) return true;
+        return false;
+    };
+    std::vector<std::string> types;
+    if (!haveType(H)) types.push_back(H + " = type { i8* }");
+    if (sm66 && !haveType(P)) types.push_back(P + " = type { i32, i32 }");
+    if (!haveType(RAS)) types.push_back(RAS + " = type { i32 }");
+    static const std::regex kTypeLine(R"RX(^%[\w.]+ = type )RX");
+    static const std::regex kGlobalLine(R"RX(^@[\w."\\?@]+ = )RX");
+    int lastType = -1;
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (std::regex_search(lines[i], kTypeLine)) lastType = (int)i;
+    lines.insert(lines.begin() + lastType + 1, types.begin(), types.end());
+    int lastGlobal = -1;
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (std::regex_search(lines[i], kGlobalLine)) lastGlobal = (int)i;
+    const int at = (lastGlobal >= 0 ? lastGlobal : lastType + (int)types.size()) + 1;
+    std::vector<std::string> g;
+    if (lastGlobal < 0) g.push_back("");
+    g.push_back(G + " = external constant " + (sm66 ? H : RAS) + ", align 4");
+    lines.insert(lines.begin() + at, g.begin(), g.end());
+
+    // Metadata: an SRV record, kind 16, in the resources' SRV group.
+    static const std::regex kNode(R"RX(^!(\d+) = (?:distinct )?!\{(.*)\}\s*$)RX");
+    std::map<int, std::string> md;
+    for (const auto& l : lines) {
+        std::smatch m;
+        if (std::regex_match(l, m, kNode)) md[std::stoi(m[1].str())] = m[2].str();
+    }
+    int nxt = md.empty() ? 0 : md.rbegin()->first + 1;
+    std::vector<std::string> added;
+    auto node = [&](const std::string& b) {
+        const int id = nxt++;
+        added.push_back("!" + std::to_string(id) + " = !{" + b + "}");
+        return id;
+    };
+    auto rewrite = [&](int nid, const std::string& b) {
+        const std::regex pat("^!" + std::to_string(nid) + R"RX( = !\{.*\}\s*$)RX");
+        for (auto& l : lines)
+            if (std::regex_match(l, pat)) l = "!" + std::to_string(nid) + " = !{" + b + "}";
+    };
+    const std::string gref = sm66 ? RAS + "* bitcast (" + H + "* " + G + " to " + RAS + "*)" : RAS + "* " + G;
+    static const std::regex kEp(R"RX(^!dx\.entryPoints = !\{(.*)\}\s*$)RX");
+    static const std::regex kRes(R"RX(^!dx\.resources = !\{!(\d+)\}\s*$)RX");
+    int entry = -1, rid = -1;
+    bool haveEp = false;
+    for (const auto& l : lines) {
+        std::smatch m;
+        if (std::regex_match(l, m, kEp)) {
+            haveEp = true;
+            for (const auto& ref : SplitTrim(m[1].str())) {
+                const int nid = std::stoi(ref.substr(1));
+                if (SplitTrim(md[nid])[0] == "null") entry = nid;
+            }
+        } else if (std::regex_match(l, m, kRes)) {
+            rid = std::stoi(m[1].str());
+        }
+    }
+    if (!haveEp) { *why = "no !dx.entryPoints"; return false; }
+    if (entry < 0) { *why = "no module entry in !dx.entryPoints"; return false; }
+    auto fields = SplitTrim(md[entry]);
+    const std::string space = std::to_string(kGeomIndexSpace);
+    const int extra = node("i32 0, i32 4");
+    if (rid >= 0) {
+        auto groups = SplitTrim(md[rid]);
+        std::vector<std::string> have;
+        if (groups[0] != "null") have = SplitTrim(md[std::stoi(groups[0].substr(1))]);
+        const int rec = node("i32 " + std::to_string(have.size()) + ", " + gref + ", !\"dxr11.tlas\", i32 " +
+                             space + ", i32 0, i32 1, i32 16, i32 0, !" + std::to_string(extra));
+        have.push_back("!" + std::to_string(rec));
+        groups[0] = "!" + std::to_string(node(Join(have, ", ")));
+        rewrite(rid, Join(groups, ", "));
+    } else {
+        const int rec = node("i32 0, " + gref + ", !\"dxr11.tlas\", i32 " + space +
+                             ", i32 0, i32 1, i32 16, i32 0, !" + std::to_string(extra));
+        const int list = node("!" + std::to_string(rec));
+        rid = node("!" + std::to_string(list) + ", null, null, null");
+        for (size_t i = 0; i < lines.size(); ++i)
+            if (StartsWith(lines[i], "!dx.entryPoints = ")) {
+                lines.insert(lines.begin() + i, "!dx.resources = !{!" + std::to_string(rid) + "}");
+                break;
+            }
+        fields[3] = "!" + std::to_string(rid);
+        rewrite(entry, Join(fields, ", "));
+    }
+    std::string s = llm::JoinLines(lines);
+    while (!s.empty() && s.back() == '\n') s.pop_back();
+    std::string err;
+    *out = ResolveAttrs(s + "\n" + Join(added, "\n") + "\n", &err);
+    if (!err.empty()) { *why = err; return false; }
+    *calls = n;
+    return true;
+}
+
 }  // namespace rq

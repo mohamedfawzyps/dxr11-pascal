@@ -86,6 +86,25 @@ int main(int argc, char** argv) {
         std::printf("GeometryIndex() read in: %s\n", list.empty() ? "nothing" : list.c_str());
         return 0;
     }
+    if (argc >= 4 && std::string(argv[1]) == "shimtrace") {
+        // The C++ half of phase5/rewriter/shimtrace.py: dxrw shimtrace in out R,M ...
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        std::vector<std::pair<unsigned, unsigned>> pairs;
+        for (int i = 4; i < argc; ++i) {
+            unsigned r = 0, m = 0;
+            if (std::sscanf(argv[i], "%u,%u", &r, &m) == 2) pairs.emplace_back(r, m);
+        }
+        std::string text, why;
+        int calls = 0;
+        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, &text, &calls, &why)) {
+            std::printf("UNSUPPORTED: %s\n", why.c_str());
+            return 2;
+        }
+        if (!WriteAll(argv[3], text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
+        std::printf("TraceRay calls pointed at the shim scene: %d\n", calls);
+        return 0;
+    }
     if (argc >= 4 && std::string(argv[1]) == "lower") {
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }

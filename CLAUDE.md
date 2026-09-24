@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.46.0: `GeometryIndex()` WITH RECORDS SHARED BY SEVERAL GEOMETRIES (item a,
+part 1 of the list).** The shim's own record layout: a VARIANT pipeline whose
+TraceRay calls trace the shim's copy of the scene with (pair index, pair
+count), the copy built after every application top-level build with each
+instance's contribution replaced by `instance * block`, and tables filled
+from the application's records. `gitest.exe`: 7 of 7 layouts bit-exact in all
+three construction modes at 6.5 and 6.6, poison diverges. Remaining for item
+a: descriptor-table TLAS binding with several scenes live, TraceRay in a
+closest-hit or miss, runtime TraceRay arguments, indirect DispatchRays, the
+first dispatch before a GPU-built scene's copy exists, associations from
+inside a library. **A collection may carry a whole library and export one
+shader of it: decide anything about what a collection can run from what it
+EXPORTS, not from what its library contains.**
+
 **0.45.0: `GeometryIndex()` THROUGH COLLECTIONS, UNREAL'S WAY.** Unreal compiles
 every shader into its own collection (renamed exports, one local root
 signature per shader export) and links them, often by AddToStateObject. A

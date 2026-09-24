@@ -299,6 +299,18 @@ foreach ($sm in @('lib_6_5', 'lib_6_6')) {
     $valid = $asm -match 'validated and signed ok'
     if ($same -and $valid) { Write-Host "  geomidx $sm : PASS (byte-identical, validates and signs)" }
     else { Write-Host "  geomidx $sm : FAIL (identical=$same valid=$valid)"; $failed++ }
+    # The variant's raygen, pointed at the shim scene (shimtrace), after geomidx,
+    # as the shim chains them, on a multiplier-0 library.
+    $z = "phase5\out\geomidx0_$sm.ll"
+    & 'C:\DW\DXC\bin\x64\dxc.exe' -T $sm -D R_VAL=0 -D M_VAL=0 -D ANYHIT=1 -Fc $z 'phase5\cases\geomidx_app.hlsl' | Out-Null
+    & python phase5\rewriter\geomidx.py $z "phase5\out\geomidx0_$sm.gi.ll" | Out-Null
+    & python phase5\rewriter\shimtrace.py "phase5\out\geomidx0_$sm.gi.ll" "phase5\out\shimtrace_$sm.py.ll" 0,0 | Out-Null
+    & .\phase5out\dxrw.exe shimtrace "phase5\out\geomidx0_$sm.gi.ll" "phase5\out\shimtrace_$sm.cpp.ll" 0,0 | Out-Null
+    $same = (Get-FileHash "phase5\out\shimtrace_$sm.py.ll").Hash -eq (Get-FileHash "phase5\out\shimtrace_$sm.cpp.ll").Hash
+    $asm = (& .\phase5out\dxilrt.exe asm "phase5\out\shimtrace_$sm.py.ll" "phase5\out\shimtrace_$sm.dxil" 2>&1) -join "`n"
+    $valid = $asm -match 'validated and signed ok'
+    if ($same -and $valid) { Write-Host "  shimtrace $sm : PASS (byte-identical, validates and signs)" }
+    else { Write-Host "  shimtrace $sm : FAIL (identical=$same valid=$valid)"; $failed++ }
 }
 
 Write-Host ''

@@ -928,7 +928,7 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d, REF
     if (SUCCEEDED(hr) && pp && *pp) {
         ID3D12StateObject* so = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*pp)->QueryInterface(IID_PPV_ARGS(&so))) && so) {
-            gidx::Attach(so, t.info);
+            gidx::Attach(m_real, so, t.desc, t.info);
             so->Release();
         }
     }

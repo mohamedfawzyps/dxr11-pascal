@@ -78,6 +78,9 @@ const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* NoDuplicateAnyHit(
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* copy,
     std::vector<D3D12_RAYTRACING_GEOMETRY_DESC>* storage);
 
+// The most geometries any bottom-level structure seen so far holds, at least 1.
+UINT MaxGeometryCount();
+
 // What was recorded for the structure at this address, or kUnknown.
 BlasInfo Lookup(D3D12_GPU_VIRTUAL_ADDRESS address);
 
@@ -163,9 +166,19 @@ std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& tr
                                     bool* read);
 
 // The instance descriptions of a top-level build, read from CPU-visible memory
-// at record time. Cheap path: no copy, no sync.
+// at record time. Cheap path: no copy, no sync. They are also KEPT, as the
+// snapshot below, until the structure is built again.
 void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                    const D3D12_RAYTRACING_INSTANCE_DESC* descs, UINT count);
+
+// Exactly the instance descriptions the LATEST build of this structure used,
+// when they were CPU-visible; false otherwise. So a copy of the scene can be
+// built after the fact, for a pipeline created after its structure. Every
+// top-level build drops the old one first (DropSnapshot), so a snapshot is
+// never older than the structure it stands for.
+bool InstanceSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas,
+                      std::vector<D3D12_RAYTRACING_INSTANCE_DESC>* out);
+void DropSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas);
 
 // A GPU copy of those descriptions, recorded into the application's own list
 // but not readable until it has run. Expensive path. `owner` is the list that

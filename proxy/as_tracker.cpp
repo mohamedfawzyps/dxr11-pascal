@@ -359,11 +359,28 @@ BlasInfo Lookup(D3D12_GPU_VIRTUAL_ADDRESS address) {
     return it == g_blas.end() ? BlasInfo() : it->second;
 }
 
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<D3D12_RAYTRACING_INSTANCE_DESC>> g_snapshots;
+
 void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                    const D3D12_RAYTRACING_INSTANCE_DESC* descs, UINT count) {
     if (!tlas || !descs || !count) return;
     std::lock_guard<std::mutex> g(g_lock);
     ParseLocked(tlas, descs, count);
+    g_snapshots[tlas].assign(descs, descs + count);
+}
+
+bool InstanceSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas,
+                      std::vector<D3D12_RAYTRACING_INSTANCE_DESC>* out) {
+    std::lock_guard<std::mutex> g(g_lock);
+    auto it = g_snapshots.find(tlas);
+    if (it == g_snapshots.end()) return false;
+    *out = it->second;
+    return true;
+}
+
+void DropSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
+    std::lock_guard<std::mutex> g(g_lock);
+    g_snapshots.erase(tlas);
 }
 
 void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
@@ -631,6 +648,13 @@ std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& tr
                 }
     }
     return out;
+}
+
+UINT MaxGeometryCount() {
+    std::lock_guard<std::mutex> g(g_lock);
+    UINT m = 1;
+    for (const auto& kv : g_blas) m = (std::max)(m, kv.second.geometryCount);
+    return m;
 }
 
 std::vector<uint8_t> RecordKinds() {
