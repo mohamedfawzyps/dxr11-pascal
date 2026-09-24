@@ -64,7 +64,7 @@ namespace {
 // Must match kPayloadBytes in rq_lower.cpp and rq_pipeline.cpp. A state object
 // whose shader config disagrees with the generated shaders is refused with
 // E_INVALIDARG, which would look like a result and is not one.
-const UINT kPayloadBytes = 92;
+const UINT kPayloadBytes = 92;   // a shape's payload=N overrides it
 const UINT kAttrBytes = 8;
 
 // SOTEST_ADD_RANGES="u0:1001,b4:0": append ONE descriptor table holding these
@@ -154,6 +154,9 @@ struct Shape {
     // (geometry, contribution) pair, exported as <name>_<k>. 0 for a library
     // written before 0.37.0 or one that reads no record constant.
     UINT baked = 0;
+    // `payload=N` (shim 0.42.0 on): the payload grows with the values a loop
+    // body reads from before it, so the shader config has to match.
+    UINT payload = 0;
     // `recordsrv=1` (shim 0.40.0 on): the record is read through a local root
     // SRV at t0, so that is the local root signature to build.
     bool recordSrv = false;
@@ -210,6 +213,8 @@ Shape ReadShape(const std::string& libPath) {
     s.recordConstants = r != 0;
     s.baked = got == 5 && k > 0 ? static_cast<UINT>(k) : 0;
     s.recordSrv = std::strstr(line, "recordsrv=1") != nullptr;
+    if (const char* pl = std::strstr(line, "payload="))
+        s.payload = static_cast<UINT>(std::strtoul(pl + 8, nullptr, 10));
     s.known = true;
     return s;
 }
@@ -325,7 +330,7 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     hgNullProc.IntersectionShaderImport = L"IsectNull";
 
     D3D12_RAYTRACING_SHADER_CONFIG sc{};
-    sc.MaxPayloadSizeInBytes = kPayloadBytes;
+    sc.MaxPayloadSizeInBytes = shape.payload ? shape.payload : kPayloadBytes;
     sc.MaxAttributeSizeInBytes = kAttrBytes;
 
     D3D12_RAYTRACING_PIPELINE_CONFIG pc{};

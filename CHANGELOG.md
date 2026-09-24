@@ -24,6 +24,43 @@ not.
 
 ---
 
+## 0.42.0
+
+- **The 24 MegaLights light-sampling shaders lower.** In the 0.41.1 run they
+  got do-nothing pipelines, "Proceed loop body reads values defined outside
+  it": `HardwareRayTraceLightSamplesCS` (16) and
+  `VolumeHardwareRayTraceLightSamplesCS` (8). Each reads its light sample
+  before the trace, `RWLightSamples[SampleCoord]` and
+  `RWLightSampleRays[SampleCoord]` (UAVs) plus a structured and a typed buffer
+  (SRVs), and uses what it read in the shadow test inside the loop.
+- **A value read from a READ-ONLY resource is read again** in the hit shader:
+  `textureLoad`, `bufferLoad` and `rawBufferLoad` on an SRV join the values the
+  hit shader may rebuild. Exact, since a dispatch cannot write what it reads as
+  an SRV, and an out-of-range load returns zero rather than trapping.
+- **Any other value the hit shader cannot rebuild travels in the PAYLOAD.** The
+  raygen stores it just before `TraceRay`, the any-hit loads it at entry under
+  its original name, so the loop body is transplanted unchanged. Fields go
+  after the fixed ones, so nothing else moves: the payload is 92 bytes plus 4
+  per value, and the shim sets `MaxPayloadSizeInBytes` per pipeline. MegaLights
+  needs one. Up to 16 `i32`, `float` or `i1` values; refused by name: more
+  than that, a value computed after `TraceRayInline`, and a loop body that
+  becomes an intersection shader, which has no payload.
+- **A UAV is not re-read, and the first version did.** It re-read a UAV when
+  nothing in the shader wrote before the trace. The old `refuse_uav_in_loop`
+  test failed on it, rightly: that shader reads another thread's slot, so two
+  re-reads during one ray can differ, which the original, reading once, never
+  does. The test is flipped to check the value comes from the payload.
+- Measured: Python and C++ byte-identical on all 246 shaders of the 0.40.3 and
+  0.41.1 dumps, the loop-isolation refusal gone from both; the 24 validate and
+  build 72 of 72 cold on the 1070 with the NVAPI slot registered. Case
+  `preload` (`rayquery_preload_sm66.hlsl`, `raytest --prefill N`) reads its own
+  prefilled output slot and a read-only buffer before the loop: bit-exact
+  against WARP with two seeds, and seed 1 against seed 2 diverges on 14450
+  rays, a gate in the suite. Dispatch suite 35 of 35 plus gates, rewriter
+  checks 39 of 39.
+- `sotest` reads `payload=N` from the shape line the shim now writes.
+- Scope, set by the user: nothing is given up; see the brief.
+
 ## 0.41.1
 
 - **0.41.0 crashed Escher 3 runs of 3, and the fix is to what 0.41.0 got

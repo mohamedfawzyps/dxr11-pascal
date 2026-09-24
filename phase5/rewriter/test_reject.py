@@ -294,21 +294,46 @@ def main():
     # Attribute group numbers are the module's, not a constant.
     ok.append(expect_attrs('attribute numbering differs', alpha))
 
-    # The BOUNDARY of the recomputable exemption.
-    #
-    # A cbuffer read or a ray-index value read inside the Proceed loop is
-    # rebuilt by the generated hit shader rather than refused, because neither
-    # is caller state. A UAV read is: the raygen may have written that buffer,
-    # so running the load again in a different invocation is not the same as
-    # carrying the value. `param` in the dispatch suite proves the exemption
-    # works; this proves it stops.
+    # A UAV read before the loop, used inside it. This was the BOUNDARY of the
+    # recomputable exemption, and a refusal, until 0.42.0: running the load
+    # again in the hit shader is not the same read, because another thread may
+    # write that location meanwhile (this one reads outBuf[0], which thread 0
+    # writes). So the value is not re-read: it is CARRIED in the payload, the
+    # value the raygen read, once. The fifth test here whose premise moved;
+    # it is kept and flipped, and checks the any-hit takes the value from the
+    # payload rather than loading the buffer again.
     UAV = os.path.join('phase5', 'cases', 'refuse_uav_in_loop.ll')
     if os.path.isfile(UAV):
-        # expect_lower_reject, not expect_reject: this lives in the LOWERING,
-        # because it is about whether the loop body can be transplanted rather
-        # than about what the query does. The analysis accepts it happily.
-        ok.append(expect_lower_reject('UAV read used inside the loop', load(UAV),
-                                      'reads values defined outside it'))
+        t = load(UAV)
+        name = 'UAV read before the loop, carried'
+        try:
+            m = Module(t)
+            out = lower.lower(m, rayquery.analyze(m))
+            ah = re.search(r'(?s)define void @AnyHit\(.*?\n\}', out).group(0)
+            carried = re.search(r'= load float, float\* %rq\.pac11', ah)
+            reread = 'rawBufferLoad' in ah or 'bufferLoad' in ah
+            good = bool(carried) and not reread
+            print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                                     'from payload field 11' if good else
+                                     'carried=%s re-read=%s' % (bool(carried), reread)))
+            ok.append(good)
+        except rayquery.Unsupported as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None))
+
+    # Where the payload cannot carry it, refused by name: a loop body that
+    # becomes an INTERSECTION shader has no payload in DXR 1.0, and a value
+    # computed after TraceRayInline does not exist yet when the raygen fills
+    # the payload.
+    for f, why in (('refuse_carry_isect.ll', 'has no payload'),
+                   ('refuse_carry_after.ll', 'computed after the trace')):
+        path = os.path.join('phase5', 'cases', f)
+        if os.path.isfile(path):
+            t = load(path)
+            name = 'carry ' + ('into an intersection' if 'isect' in f else 'after the trace')
+            ok.append(expect_lower_reject(name, t, why))
+            ok.append(cpp_agrees(name, t, why))
 
     # A Proceed loop body that WRITES.
     #

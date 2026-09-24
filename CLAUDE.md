@@ -1,9 +1,49 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.41.1.
+proxy/version.h, and is currently 0.42.0.
+
+## Scope (set by the user, 2026-09-24): NOTHING IS GIVEN UP
+
+**Every ray tracing feature an application uses is emulated. Nothing is
+switched off.** That is the premise of the project, and it overrides every
+narrower scope statement further down this brief. Consequences:
+
+- A do-nothing pipeline for a refused shader, a refused dispatch, or a
+  capability reported unsupported so the engine falls back, is a STOPGAP, not
+  an end state. Each one is named in every report, with what it costs.
+- Easy cases first, the hardest later. The order is a schedule, not a filter.
+- ONE exception, decided by the user: a feature that is purely an
+  ACCELERATION with no visual difference is not emulated, because emulating it
+  can only be slower than not doing it. Shader Execution Reordering is the
+  case. Stays reported unsupported.
+- NOW IN SCOPE, previously written off below as out of scope: NVAPI's ray
+  tracing extensions that change what is drawn. Cluster operations (RTX Mega
+  Geometry: Unreal ray traces Nanite at full detail through them, and against
+  fallback meshes without), and the sphere and linear swept sphere geometry
+  types. Opacity micromaps are to be ASSESSED: an acceleration if Unreal's
+  any-hit fallback draws the same, in scope if not.
+- The order agreed on 2026-09-24: the 24 MegaLights loop-isolation shaders
+  (done, 0.42.0), then the 33 two-query shaders, then cluster operations.
 
 ## Current position (2026-09-23)
+
+**0.42.0: THE 24 MEGALIGHTS SHADERS LOWER.** `HardwareRayTraceLightSamplesCS`
+and its volume form read the light sample at the top (`RWLightSamples`,
+`RWLightSampleRays`, UAVs) and use it in the shadow loop. Two mechanisms, and
+the difference is the lesson: a READ-ONLY load (SRV) before the loop is read
+again in the hit shader, exact because a dispatch cannot write what it reads as
+an SRV; a value from a UAV is CARRIED IN THE PAYLOAD (fields after the fixed
+ones, payload 92 + 4 per value, `MaxPayloadSizeInBytes` per pipeline). The
+first version re-read UAVs too, guarded by "nothing writes before the trace",
+and the old `refuse_uav_in_loop` test caught it: that case reads another
+thread's slot, which can change between two re-reads of one ray, a result the
+original cannot produce. **A re-read is exact only for memory nothing can
+write; anything else has to travel as a value.** Offline: 24 of 24 lower and
+validate, Python and C++ identical on 246 dumped shaders, 72 of 72 cold driver
+compiles with the NVAPI slot registered, and case `preload` bit-exact against
+WARP with a cross-seed gate that diverges. Game run pending.
+
 
 **THE ESCHER GPU CRASH IS FIXED, CONFIRMED IN THE GAME (0.37.0).** A hit
 shader reading a local root signature cbuffer crashed the Pascal driver inside
@@ -290,7 +330,8 @@ APPLICATION did, not a gap:
 - RayQuery inside an any-hit or intersection shader, which cannot call
   TraceRay (a raygen is a different case, see 4 above);
 - groupshared memory or wave intrinsics around the query;
-- a loop body reading genuine caller locals that do not fit the payload;
+- a loop body reading caller locals that do not fit the payload (0.42.0 carries up
+  to 16 i32, float or i1 values; an intersection shader has no payload);
 - an application routing both geometry kinds to ONE hit group record.
 
 So the question is still **WHAT TO RUN**, not what to build: real software,
@@ -2608,7 +2649,8 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   - RTXPT's driver minimum of 595.71 is NOT the blocker it looks like: its
     README documents dropping Agility SDK 1.619 at configure time, which drops
     it to DXR 1.1. A DXR 1.1 requirement is the TARGET, not a cost. DXR 1.2,
-    SM 6.9, SER and OMM are the genuinely out-of-scope parts.
+    SM 6.9, SER and OMM are the genuinely out-of-scope parts. [SUPERSEDED
+    2026-09-24 by the Scope section at the top: only SER stays out.]
 
   Next action. **Not a feature: exposure.** Run real software through it, until
   the refusal list is trusted. All three defects named above are now fixed, and

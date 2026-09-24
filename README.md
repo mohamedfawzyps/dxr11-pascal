@@ -56,10 +56,10 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 34 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
+- 35 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
   sensitivity gate
 - 14 rewriter cases, each byte-identical between the Python reference and the
-  C++ port, on both the `.ll` path and the DXIL container path, plus 34
+  C++ port, on both the `.ll` path and the DXIL container path, plus 39
   analysis and lowering checks, 3 record-read checks, an append check and a
   driver check of NVAPI calls with the extension slot registered
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
@@ -133,7 +133,12 @@ Refused because DXR 1.0 offers nothing to lower onto:
   call `TraceRay`
 - `groupshared` memory, group barriers or wave intrinsics in the same entry
   point as the query
-- a loop body reading caller locals that do not fit the payload
+- a loop body reading caller locals that do not fit the payload. From 0.42.0
+  a value read before the loop is carried: re-read in the hit shader when it
+  comes from a read-only resource, and otherwise stored in the payload, up to
+  16 i32, float or i1 values. Still refused: more than that, a value computed
+  after `TraceRayInline`, and a loop body that becomes an intersection shader,
+  which has no payload
 - a loop body with a side effect other than an APPEND, such as a UAV write at
   a fixed index or an atomic. The any-hit shader it would become runs in no
   defined order, so the write would not be the same write. An append, a

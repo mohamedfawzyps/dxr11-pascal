@@ -335,6 +335,11 @@ static bool g_move = false;
 // traversal order, which is implementation-defined, so only the multiset is
 // comparable between WARP and the 1070. Direct dispatch only.
 static bool g_append = false;
+// --prefill N: fill the output buffer with a pattern seeded by N before the
+// dispatch, on both sides, so a shader that READS its output slot before the
+// trace (Unreal's MegaLights does) reads data rather than zeros. Different
+// seeds on the two sides must diverge; see the preload case.
+static unsigned g_prefill = 0;
 static std::string g_outPath;
 static const UINT kLogCount = 65536;
 static bool g_indirectUp = false;
@@ -1680,6 +1685,24 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = CreateBuffer(device.Get(), outSize, D3D12_HEAP_TYPE_READBACK,
         D3D12_RESOURCE_STATE_COPY_DEST);
+    if (g_prefill) {
+        auto up = CreateBuffer(device.Get(), outSize, D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+        Result* pr = nullptr; D3D12_RANGE nr{ 0, 0 };
+        HR(up->Map(0, &nr, (void**)&pr), "map prefill");
+        for (UINT i = 0; i < kWidth * kHeight; ++i) {
+            Result r{};
+            r.hit = (((i * 2654435761u) >> 30) + g_prefill) & 3u;
+            pr[i] = r;
+        }
+        up->Unmap(0, nullptr);
+        Transition(g.list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        g.list->CopyBufferRegion(out.Get(), 0, up.Get(), 0, outSize);
+        Transition(g.list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        g.flush();
+    }
 
     if (method == Method::RayQuery) {
         const char* hlsl = (pattern == Pattern::Opaque) ? kRayQueryHLSL : kRayQueryAlphaHLSL;
@@ -1799,6 +1822,12 @@ int main(int argc, char** argv) {
                 g_stream = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--prefill") == 0 && i + 1 < argc) {
+                g_prefill = (unsigned)std::strtoul(argv[i + 1], nullptr, 10);
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
                 continue;
             }
             if (std::strcmp(argv[i], "--append") == 0) {

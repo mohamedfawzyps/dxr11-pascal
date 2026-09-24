@@ -243,7 +243,14 @@ $cases = @(
     # Lumen shape. The records land in traversal order, which is undefined, so
     # raytest sorts them into <out>.append and those must be identical too.
     @{ name = 'append'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_append_sm66.hlsl', '--multi', '--append');
-       desc = 'a Proceed loop that appends a record per candidate through a UAV counter'; append = $true }
+       desc = 'a Proceed loop that appends a record per candidate through a UAV counter'; append = $true },
+    # Values LOADED before the loop and used inside it, MegaLights' shape: the
+    # thread's own output slot (a UAV, prefilled) and a read-only buffer. The
+    # UAV value travels in the payload, the SRV is read again in the hit
+    # shader. The gate below runs the two sides with different prefill seeds
+    # and must diverge, so the pre-read value is shown to drive the image.
+    @{ name = 'preload'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_preload_sm66.hlsl', '--prefill', '1');
+       desc = 'values loaded before the loop, one carried in the payload, one re-read' }
 )
 
 $failed = 0
@@ -308,6 +315,25 @@ if ($diff -match 'RESULT: DIVERGE') {
     Write-Host '  diverges with the check off, so the churn case can see it'
 } else {
     Write-Host '  NOT SENSITIVE: churn matched with in-flight tables reused'
+    $failed++
+}
+
+Write-Host ''
+Write-Host '=== the value read before the loop drives the image ==='
+# The preload case with prefill seed 1 on WARP and seed 2 on the 1070 must
+# DIVERGE: if the image did not depend on the pre-read, a lowering that
+# carried or re-read the wrong value would pass the case above.
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_preload_sm66.hlsl', '--prefill')
+& .\raytest.exe warp rayquery alpha dp_pre_a.bin @x 1 | Out-Null
+& .\raytest.exe hw rayquery alpha dp_pre_b.bin @x 2 | Out-Null
+$env:DXR_TIER11 = ''
+$diff = & .\raytest.exe diff dp_pre_a.bin dp_pre_b.bin 2>&1
+Remove-Item dp_pre_a.bin, dp_pre_b.bin -ErrorAction SilentlyContinue
+if ($diff -match 'RESULT: DIVERGE') {
+    Write-Host '  diverges with different prefills, so the preload case can see it'
+} else {
+    Write-Host '  NOT SENSITIVE: preload matched with different prefilled values'
     $failed++
 }
 

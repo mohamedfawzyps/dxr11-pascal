@@ -26,6 +26,10 @@ struct LowerResult {
     // The loop body appends to a buffer, which is only faithful while the
     // proxy sets NO_DUPLICATE_ANYHIT_INVOCATION on the scene's geometry.
     bool appends = false;
+    // The payload's size in bytes: 92, plus 4 for every value the loop body
+    // reads from before it and the payload carries. MaxPayloadSizeInBytes.
+    int payloadBytes = 92;
+    int carried = 0;
 };
 
 struct Exports {

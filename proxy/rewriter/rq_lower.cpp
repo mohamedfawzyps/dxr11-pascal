@@ -26,6 +26,10 @@ const char* kAttrs = "%struct.BuiltInTriangleIntersectionAttributes";
 const char* kPayloadType =
     "{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float], i32, i32 }";
 const int kPayloadBytes = 92;
+// Values the loop body reads from before it and the hit shader cannot rebuild
+// ride after the fixed fields, 4 bytes each. See _plan_carry in lower.py.
+const int kCarryField0 = 11;
+const int kMaxCarry = 16;
 
 // The record's own two numbers, and how the generated shaders reach them.
 //
@@ -419,9 +423,48 @@ std::string ThreadIndexText(const llm::Instr& i, const llm::Module& m,
     return out;
 }
 
+// Loads, 0.42.0: a value read from a READ-ONLY buffer or texture before the
+// loop and used inside it, which the hit shader reads again. Exact, because a
+// dispatch cannot write what it reads as an SRV. A UAV load is not re-read: it
+// travels in the payload instead. See LOAD_OPS and _plan_carry in lower.py.
+bool IsLoadOp(int op) { return op == 66 || op == 68 || op == 139; }
+const int kUavBit = 0x1000;   // ResourceProperties, first word: IsUAV
+
+// "srv", "uav" or "", read from how the handle was made.
+std::string HandleClass(const std::map<std::string, const llm::Instr*>& defs,
+                        const std::string& name) {
+    auto it = defs.find(name);
+    if (it == defs.end()) return "";
+    const llm::Instr& i = *it->second;
+    std::smatch m;
+    if (i.DxOp() == kAnnotateHandle) {
+        static const std::regex kProps(R"RX(%dx\.types\.ResourceProperties \{ i32 (\d+),)RX");
+        if (!std::regex_search(i.line, m, kProps)) return "";
+        return (std::stoll(m[1].str()) & kUavBit) ? "uav" : "srv";
+    }
+    std::string cls;
+    if (i.DxOp() == kCreateHandle) {
+        static const std::regex kCls(R"RX(^i8 (\d+))RX");
+        const std::string a1 = i.args.size() > 1 ? Trim(i.args[1]) : std::string();
+        if (!std::regex_search(a1, m, kCls)) return "";
+        cls = m[1].str();
+    } else if (i.DxOp() == kBindHandle) {
+        static const std::regex kBind(
+            R"RX(ResBind \{ i32 -?\d+, i32 -?\d+, i32 -?\d+, i8 (\d+) \})RX");
+        if (!std::regex_search(i.line, m, kBind)) return "";
+        cls = m[1].str();
+    } else {
+        return "";
+    }
+    return cls == "0" ? "srv" : cls == "1" ? "uav" : "";
+}
+
 std::map<std::string, const llm::Instr*> Recomputable(
         const llm::Function& fn, const std::set<std::string>& types) {
-    std::map<std::string, const llm::Instr*> ok;
+    std::map<std::string, const llm::Instr*> ok, defs;
+    for (const auto& b : fn.blocks)
+        for (const auto& i : b.instrs)
+            if (!i.result.empty()) defs[i.result] = &i;
     bool changed = true;
     while (changed) {
         changed = false;
@@ -429,7 +472,17 @@ std::map<std::string, const llm::Instr*> Recomputable(
             for (const auto& i : b.instrs) {
                 if (i.result.empty() || ok.count(i.result)) continue;
                 const int op = i.DxOp();
-                if (op >= 0) { if (!PureDxOp(op)) continue; }
+                if (IsLoadOp(op)) {
+                    std::string h;
+                    if (i.args.size() > 1) {
+                        const std::string a = Trim(i.args[1]);
+                        size_t sp = a.find_last_of(" \t");
+                        h = sp == std::string::npos ? a : a.substr(sp + 1);
+                    }
+                    const std::string cls = HandleClass(defs, h);
+                    if (!ok.count(h) || cls != "srv") continue;
+                }
+                else if (op >= 0) { if (!PureDxOp(op)) continue; }
                 else if (!PureInstruction(i)) continue;
                 bool all = true;
                 for (const auto& u : Operands(i, types))
@@ -441,6 +494,65 @@ std::map<std::string, const llm::Instr*> Recomputable(
         }
     }
     return ok;
+}
+
+// The LLVM type of the value an instruction defines, or "". _result_type in
+// lower.py, which this mirrors.
+std::string ResultType(const llm::Instr& i) {
+    static const std::set<std::string> kFlags = {
+        "nuw", "nsw", "exact", "fast", "nnan", "ninf", "nsz", "arcp", "contract",
+        "afn", "reassoc"};
+    std::string body = i.body;
+    size_t cut = body.find(';');
+    if (cut != std::string::npos) body = body.substr(0, cut);
+    std::vector<std::string> words;
+    {
+        std::istringstream ws(body);
+        std::string w;
+        while (ws >> w) words.push_back(w);
+    }
+    if (words.empty()) return "";
+    const std::string& op = words[0];
+    std::vector<std::string> rest;
+    for (size_t k = 1; k < words.size(); ++k)
+        if (!kFlags.count(words[k])) rest.push_back(words[k]);
+    std::smatch m;
+    if (op == "icmp" || op == "fcmp") return "i1";
+    if (op == "call" || op == "load" || op == "phi") {
+        if (rest.empty()) return "";
+        std::string t = rest[0];
+        while (!t.empty() && t.back() == ',') t.pop_back();
+        return t;
+    }
+    if (op == "select") {
+        static const std::regex kSel(R"RX(^select\s+i1\s+[^,]+,\s+(\S+)\s)RX");
+        return std::regex_search(body, m, kSel) ? m[1].str() : "";
+    }
+    static const std::set<std::string> kCasts = {
+        "zext", "sext", "trunc", "bitcast", "sitofp", "uitofp", "fptosi",
+        "fptoui", "fpext", "fptrunc"};
+    if (kCasts.count(op)) {
+        static const std::regex kTo(R"RX(\sto\s+(\S+)\s*$)RX");
+        const std::string t = Trim(body);
+        if (std::regex_search(t, m, kTo)) return m[1].str();
+        return rest.empty() ? "" : rest[0];
+    }
+    if (op == "extractvalue") {
+        static const std::regex kEv(
+            R"RX(^extractvalue\s+%dx\.types\.(ResRet|CBufRet)\.(\w+)\s+\S+,\s*(\d+))RX");
+        if (!std::regex_search(body, m, kEv)) return "";
+        if (m[1].str() == "ResRet" && m[3].str() == "4") return "i32";
+        static const std::map<std::string, std::string> kSuffix = {
+            {"i32", "i32"}, {"f32", "float"}, {"i16", "i16"}, {"f16", "half"},
+            {"i64", "i64"}, {"f64", "double"}};
+        auto it = kSuffix.find(m[2].str());
+        return it == kSuffix.end() ? "" : it->second;
+    }
+    if (op == "extractelement") {
+        static const std::regex kEe(R"RX(^extractelement\s+<\d+ x (\S+)>)RX");
+        return std::regex_search(body, m, kEe) ? m[1].str() : "";
+    }
+    return rest.empty() ? "" : rest[0];
 }
 
 // `skip` is what the loop body defines for itself. Without it the closure walks
@@ -642,6 +754,8 @@ unsigned long long ModuleFlags(const std::string& text,
 }
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
+    struct Carry { std::string name, ty; int field; };
+    std::vector<Carry> carry;
     LowerResult r;
     const std::string& text0 = m.text;
     const auto md = Metadata(text0);
@@ -937,17 +1051,6 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         for (const auto& u : used)
             if (!defined.count(u) && u != q.handle && !handles.count(u))
                 outside.push_back(u);
-        if (!outside.empty()) {
-            std::string list;
-            for (size_t i = 0; i < outside.size(); ++i) {
-                if (i) list += ", ";
-                list += outside[i];
-            }
-            r.error = "Proceed loop body reads values defined outside it (" + list +
-                      "); the any-hit shader is a separate invocation and the payload "
-                      "is the only shared state";
-            return r;
-        }
         for (const auto& b : fn.blocks) {
             if (q.loop.body.count(b.label)) continue;
             for (const auto& i : b.instrs)
@@ -957,6 +1060,66 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                   "after it; the any-hit shader cannot return it";
                         return r;
                     }
+        }
+
+        // What the hit shader cannot rebuild travels in the PAYLOAD, 0.42.0:
+        // the raygen stores it before TraceRay and the any-hit loads it back
+        // under its original name. See _plan_carry in lower.py.
+        if (!outside.empty()) {
+            std::string names;
+            for (size_t k = 0; k < outside.size(); ++k) {
+                if (k) names += ", ";
+                names += outside[k];
+            }
+            if (q.NeedsIntersection()) {
+                r.error = "Proceed loop body reads values defined outside it (" + names +
+                          ") and becomes an intersection shader, which has no payload "
+                          "to carry them in";
+                return r;
+            }
+            if ((int)outside.size() > kMaxCarry) {
+                r.error = "Proceed loop body reads " + std::to_string(outside.size()) +
+                          " values defined outside it (" + names + "); more than the " +
+                          std::to_string(kMaxCarry) + " the payload carries";
+                return r;
+            }
+            std::map<std::string, std::pair<const llm::Block*, const llm::Instr*>> defs;
+            for (const auto& b : fn.blocks)
+                for (const auto& i : b.instrs)
+                    if (!i.result.empty()) defs[i.result] = {&b, &i};
+            const auto dom = fn.Dominators();
+            const std::string tb = q.traceBlock->label;
+            for (size_t k = 0; k < outside.size(); ++k) {
+                const std::string& name = outside[k];
+                auto it = defs.find(name);
+                if (it == defs.end()) {
+                    r.error = "Proceed loop body reads " + name + ", which no instruction "
+                              "defines; the any-hit shader is a separate invocation";
+                    return r;
+                }
+                const llm::Block* db = it->second.first;
+                const llm::Instr* di = it->second.second;
+                bool before = false;
+                if (db->label == tb) before = di->index < q.trace->index;
+                else {
+                    auto d = dom.find(tb);
+                    before = d != dom.end() && d->second.count(db->label);
+                }
+                if (!before) {
+                    r.error = "Proceed loop body reads " + name + ", which is computed "
+                              "after the trace; the raygen cannot put it in the payload "
+                              "before TraceRay";
+                    return r;
+                }
+                const std::string ty = ResultType(*di);
+                if (ty != "i32" && ty != "float" && ty != "i1") {
+                    r.error = "Proceed loop body reads " + name + ", of type " +
+                              (ty.empty() ? std::string("None") : ty) +
+                              ", from before it; the payload carries i32, float and i1";
+                    return r;
+                }
+                carry.push_back({name, ty, kCarryField0 + (int)k});
+            }
         }
 
         // A Proceed loop body that WRITES is not transplantable.
@@ -1095,6 +1258,18 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             "* %rq.pl" + std::to_string(f.idx) + ", align " +
                             std::to_string(f.align));
         }
+        for (const auto& c : carry) {
+            const std::string f = std::to_string(c.field);
+            lines.push_back("  %rq.plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                            kPayload + "* %rq.pl, i32 0, i32 " + f);
+            if (c.ty == "i1") {
+                lines.push_back("  %rq.plz" + f + " = zext i1 " + c.name + " to i32");
+                lines.push_back("  store i32 %rq.plz" + f + ", i32* %rq.plc" + f + ", align 4");
+            } else {
+                lines.push_back("  store " + c.ty + " " + c.name + ", " + c.ty + "* %rq.plc" +
+                                f + ", align 4");
+            }
+        }
         const auto ra = q.RayArgs();
         // The RayFlags operand, which may be a runtime value. The OR that
         // combines it with the template's flags has to land before the call.
@@ -1220,7 +1395,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     // --- types and globals --------------------------------------------------
     {
         std::vector<std::string> decls;
-        decls.push_back(std::string(kPayload) + " = type " + kPayloadType);
+        std::string ptype = kPayloadType;
+        ptype = ptype.substr(0, ptype.size() - 2);
+        for (const auto& c : carry) ptype += c.ty == "i1" ? ", i32" : ", " + c.ty;
+        ptype += " }";
+        decls.push_back(std::string(kPayload) + " = type " + ptype);
         decls.push_back(std::string(kAttrs) + " = type { <2 x float> }");
         if (q.needsRecordConstants) {
             // The raw buffer's element type, as DXC declares a ByteAddressBuffer.
@@ -1625,6 +1804,18 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ah.push_back(std::string("  %rq.ap = getelementptr inbounds ") + kAttrs +
                          ", " + kAttrs + "* %attr, i32 0, i32 0");
             ah.push_back("  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4");
+            for (const auto& c : carry) {
+                const std::string f = std::to_string(c.field);
+                ah.push_back("  %rq.pac" + f + " = getelementptr inbounds " +
+                             std::string(kPayload) + ", " + kPayload + "* %p, i32 0, i32 " + f);
+                if (c.ty == "i1") {
+                    ah.push_back("  %rq.pav" + f + " = load i32, i32* %rq.pac" + f + ", align 4");
+                    ah.push_back("  " + c.name + " = icmp ne i32 %rq.pav" + f + ", 0");
+                } else {
+                    ah.push_back("  " + c.name + " = load " + c.ty + ", " + c.ty + "* %rq.pac" +
+                                 f + ", align 4");
+                }
+            }
 
             // Recreate every resource handle the body uses, under the SAME SSA
             // name it had in the raygen, so the transplanted instructions need
@@ -2056,7 +2247,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         auto entry = [&](const std::string& name, const std::string& sig, int kind,
                          bool payload, bool attrs) {
             std::vector<std::string> props{ "i32 8", "i32 " + std::to_string(kind) };
-            if (payload) { props.push_back("i32 6"); props.push_back("i32 " + std::to_string(kPayloadBytes)); }
+            if (payload) {
+                props.push_back("i32 6");
+                props.push_back("i32 " + std::to_string(kPayloadBytes + 4 * (int)carry.size()));
+            }
             if (attrs) { props.push_back("i32 7"); props.push_back("i32 8"); }
             props.push_back("i32 5");
             props.push_back("!" + std::to_string(zero));
@@ -2125,6 +2319,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
     r.ok = true;
     r.text = out;
+    r.payloadBytes = kPayloadBytes + 4 * (int)carry.size();
+    r.carried = (int)carry.size();
     return r;
 }
 

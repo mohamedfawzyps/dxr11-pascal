@@ -264,6 +264,7 @@ def lower(module, q, exports=None):
     binds = _binding_map(text, md) if binding else None
     # How the record handle is written; see RECORD_TYPE.
     q.record_sm66 = _is_sm66(text)
+    q.carry = []
     globals_ = _plan_globals(table)
     _edit_resources(module, q, edits, table, globals_, binds)
     _edit_ray_index(module, q, edits)
@@ -274,7 +275,7 @@ def lower(module, q, exports=None):
 
     out = render(module, edits)
     out = _add_types_and_globals(out, globals_, q.needs_record_constants, binding,
-                                 q.record_sm66)
+                                 q.record_sm66, _payload_type(q))
     out = _swap_declarations(out, q, globals_, binding)
     out = _append_shaders(out, module, q, exports, table, globals_, binds)
     out = _rewrite_metadata(out, md, table, globals_, q, exports, binding)
@@ -681,7 +682,9 @@ def _edit_query(module, q, edits, exports):
     if q.loop:
         header, latch, body = q.loop
         exit_label = _loop_exit(fn, header, latch, body)
-        _check_loop_isolated(fn, q, header, latch, body, _type_names(module.text))
+        outside = _check_loop_isolated(fn, q, header, latch, body,
+                                       _type_names(module.text))
+        q.carry = _plan_carry(fn, q, outside)
         _check_loop_side_effects(module, fn, q, body)
 
     edits[q.trace.index] = _trace_block(q, ra, exit_label)
@@ -737,6 +740,14 @@ def _trace_block(q, ra, exit_label):
         lines.append('  %%rq.pl%d = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 %d'
                      % (idx, PAYLOAD, PAYLOAD, idx))
         lines.append('  store %s %s, %s* %%rq.pl%d, align %d' % (ty, zero, ty, idx, align))
+    for name, ty, field in q.carry:
+        lines.append('  %%rq.plc%d = getelementptr inbounds %s, %s* %%rq.pl, i32 0, i32 %d'
+                     % (field, PAYLOAD, PAYLOAD, field))
+        if ty == 'i1':
+            lines.append('  %%rq.plz%d = zext i1 %s to i32' % (field, name))
+            lines.append('  store i32 %%rq.plz%d, i32* %%rq.plc%d, align 4' % (field, field))
+        else:
+            lines.append('  store %s %s, %s* %%rq.plc%d, align 4' % (ty, name, ty, field))
     lines += flag_setup
     lines += [
         '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, %s, '
@@ -896,18 +907,61 @@ def _operands(instr, types):
     return out
 
 
+# Loads, 0.42.0. A value read from a READ-ONLY buffer or texture before the
+# loop and used inside it: the hit shader reads it again, and gets the same
+# value, because a dispatch cannot write a resource it reads as an SRV: SRV and
+# UAV access are exclusive resource states in D3D12. An out-of-range load
+# returns zero rather than trapping, so hoisting one past a guard is safe in a
+# way integer division is not.
+#
+# A load from a UAV is NOT re-read. Another thread may write that location
+# during the dispatch, so a hit shader reading it on every candidate could see
+# the old value on one and the new on the next, which the original, reading
+# once, never can. Such a value travels in the PAYLOAD instead, see
+# _plan_carry; that is exact whatever other threads do.
+LOAD_OPS = (66, 68, 139)   # textureLoad, bufferLoad, rawBufferLoad
+_UAV_BIT = 0x1000          # ResourceProperties, first word: IsUAV
+
+
+def _handle_class(defs, name):
+    """'srv', 'uav' or None, read from how the handle was made."""
+    i = defs.get(name)
+    if i is None:
+        return None
+    if i.dxop == ANNOTATE_HANDLE:
+        m = re.search(r'%dx\.types\.ResourceProperties \{ i32 (\d+),', i.line)
+        if not m:
+            return None
+        return 'uav' if int(m.group(1)) & _UAV_BIT else 'srv'
+    if i.dxop == 57 and i.args:
+        m = re.match(r'i8 (\d+)', i.args[1].strip()) if len(i.args) > 1 else None
+    elif i.dxop == BIND_HANDLE:
+        m = re.search(r'ResBind \{ i32 -?\d+, i32 -?\d+, i32 -?\d+, i8 (\d+) \}', i.line)
+    else:
+        return None
+    if not m:
+        return None
+    return {'0': 'srv', '1': 'uav'}.get(m.group(1))
+
+
 def _recomputable(fn, types):
     """{result -> instr} for every value the generated hit shader can rebuild.
 
     A fixpoint, because a chain is only recomputable if every link is."""
     ok = {}
+    defs = {i.result: i for _, i in fn.instrs() if i.result}
     changed = True
     while changed:
         changed = False
         for _, i in fn.instrs():
             if not i.result or i.result in ok:
                 continue
-            if i.dxop is not None and i.dxop not in _PURE_DXOP:
+            if i.dxop in LOAD_OPS:
+                h = i.args[1].split()[-1] if len(i.args) > 1 else None
+                cls = _handle_class(defs, h)
+                if h not in ok or cls != 'srv':
+                    continue
+            elif i.dxop is not None and i.dxop not in _PURE_DXOP:
                 continue
             if i.dxop is None:
                 op = re.match(r'\s*%\S+\s*=\s*(\w+)', i.line)
@@ -1080,13 +1134,8 @@ def _check_loop_isolated(fn, q, header, latch, body, types):
                 'the Proceed loop; the index is computed in the raygen and the '
                 'any-hit shader is a separate invocation that cannot see it'
                 % (i.result, _dynamic_index(i)))
-    outside = {u for u in used
-               if u not in defined and u != q.handle and u not in handles}
-    if outside:
-        raise rq.Unsupported(
-            'Proceed loop body reads values defined outside it (%s); the '
-            'any-hit shader is a separate invocation and the payload is the '
-            'only shared state' % ', '.join(sorted(outside)))
+    outside = sorted(u for u in used
+                     if u not in defined and u != q.handle and u not in handles)
     for b, i in fn.instrs():
         if b.label in body:
             continue
@@ -1095,6 +1144,113 @@ def _check_loop_isolated(fn, q, header, latch, body, types):
                 raise rq.Unsupported(
                     'value %s defined in the Proceed loop is used after it; '
                     'the any-hit shader cannot return it' % u)
+    return outside
+
+
+# Values the loop body reads from before it and the hit shader cannot rebuild,
+# 0.42.0: they travel in the PAYLOAD. The raygen stores each one just before
+# TraceRay and the any-hit loads it back at entry under its original name, so
+# the loop body needs no rewriting. Exact, since it is the value the raygen
+# computed, read once, whatever any other thread writes meanwhile.
+#
+# 24 of Unreal's MegaLights shaders need exactly one: a light sample field read
+# from RWLightSamples before the trace. The fields go AFTER the fixed ones, so
+# nothing else moves, and the payload grows 4 bytes per value.
+#
+# Refused, and each is named: a value defined after the trace (the raygen
+# cannot store what it has not computed yet); a type other than i32, float or
+# i1; more than MAX_CARRY values; and a loop body that becomes an INTERSECTION
+# shader, which has no payload in DXR 1.0.
+CARRY_FIELD0 = 11
+MAX_CARRY = 16
+_CARRY_TYPES = ('i32', 'float', 'i1')
+_FLAGS = {'nuw', 'nsw', 'exact', 'fast', 'nnan', 'ninf', 'nsz', 'arcp', 'contract',
+          'afn', 'reassoc'}
+_RET_SUFFIX = {'i32': 'i32', 'f32': 'float', 'i16': 'i16', 'f16': 'half',
+               'i64': 'i64', 'f64': 'double'}
+
+
+def _result_type(i):
+    """The LLVM type of the value an instruction defines, or None."""
+    body = i.body
+    cut = body.find(';')
+    if cut >= 0:
+        body = body[:cut]
+    words = body.split()
+    if not words:
+        return None
+    op = words[0]
+    if op in ('icmp', 'fcmp'):
+        return 'i1'
+    if op in ('call', 'load', 'phi'):
+        rest = [w for w in words[1:] if w not in _FLAGS]
+        return rest[0].rstrip(',') if rest else None
+    if op == 'select':
+        m = re.match(r'select\s+i1\s+[^,]+,\s+(\S+)\s', body)
+        return m.group(1) if m else None
+    m = re.search(r'\sto\s+(\S+)\s*$', body.strip())
+    if op in ('zext', 'sext', 'trunc', 'bitcast', 'sitofp', 'uitofp', 'fptosi',
+              'fptoui', 'fpext', 'fptrunc') and m:
+        return m.group(1)
+    if op == 'extractvalue':
+        m = re.match(r'extractvalue\s+%dx\.types\.(ResRet|CBufRet)\.(\w+)\s+\S+,\s*(\d+)', body)
+        if not m:
+            return None
+        if m.group(1) == 'ResRet' and m.group(3) == '4':
+            return 'i32'
+        return _RET_SUFFIX.get(m.group(2))
+    if op == 'extractelement':
+        m = re.match(r'extractelement\s+<\d+ x (\S+)>', body)
+        return m.group(1) if m else None
+    rest = [w for w in words[1:] if w not in _FLAGS]
+    return rest[0] if rest else None
+
+
+def _plan_carry(fn, q, outside):
+    """[(name, type, field)] for the values that travel in the payload."""
+    if not outside:
+        return []
+    names = ', '.join(outside)
+    if q.needs_intersection:
+        raise rq.Unsupported(
+            'Proceed loop body reads values defined outside it (%s) and becomes '
+            'an intersection shader, which has no payload to carry them in' % names)
+    if len(outside) > MAX_CARRY:
+        raise rq.Unsupported(
+            'Proceed loop body reads %d values defined outside it (%s); more '
+            'than the %d the payload carries' % (len(outside), names, MAX_CARRY))
+    defs = {i.result: (b, i) for b, i in fn.instrs() if i.result}
+    dom = fn.dominators()
+    tb = q.trace_block.label
+    plan = []
+    for k, name in enumerate(outside):
+        if name not in defs:
+            raise rq.Unsupported(
+                'Proceed loop body reads %s, which no instruction defines; the '
+                'any-hit shader is a separate invocation' % name)
+        b, i = defs[name]
+        before = (b.label == tb and i.index < q.trace.index) or \
+                 (b.label != tb and b.label in dom.get(tb, set()))
+        if not before:
+            raise rq.Unsupported(
+                'Proceed loop body reads %s, which is computed after the trace; '
+                'the raygen cannot put it in the payload before TraceRay' % name)
+        ty = _result_type(i)
+        if ty not in _CARRY_TYPES:
+            raise rq.Unsupported(
+                'Proceed loop body reads %s, of type %s, from before it; the '
+                'payload carries i32, float and i1' % (name, ty))
+        plan.append((name, ty, CARRY_FIELD0 + k))
+    return plan
+
+
+def _payload_type(q):
+    extra = ''.join(', i32' if ty == 'i1' else ', ' + ty for _, ty, _ in q.carry)
+    return PAYLOAD_TYPE[:-2] + extra + ' }'
+
+
+def _payload_bytes(q):
+    return PAYLOAD_BYTES + 4 * len(q.carry)
 
 
 def _edit_ray_flags(q, edits):
@@ -1160,8 +1316,8 @@ def _edit_committed(q, edits):
 # --- generated text --------------------------------------------------------
 
 def _add_types_and_globals(text, globals_, needs_record=False, binding=False,
-                           sm66=False):
-    decls = ['%s = type %s' % (PAYLOAD, PAYLOAD_TYPE),
+                           sm66=False, payload_type=PAYLOAD_TYPE):
+    decls = ['%s = type %s' % (PAYLOAD, payload_type),
              '%s = type { <2 x float> }' % ATTRS, '']
     if needs_record:
         # The raw buffer's element type, as DXC declares a ByteAddressBuffer.
@@ -1602,6 +1758,14 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
            % (exports['anyhit'], PAYLOAD, ATTRS),
            '  %rq.ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
            '  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4']
+    for name, ty, field in q.carry:
+        out.append('  %%rq.pac%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                   % (field, PAYLOAD, PAYLOAD, field))
+        if ty == 'i1':
+            out.append('  %%rq.pav%d = load i32, i32* %%rq.pac%d, align 4' % (field, field))
+            out.append('  %s = icmp ne i32 %%rq.pav%d, 0' % (name, field))
+        else:
+            out.append('  %s = load %s, %s* %%rq.pac%d, align 4' % (name, ty, ty, field))
 
     # Recreate every resource handle the body uses, under the SAME SSA name it
     # had in the raygen, so the transplanted instructions need no rewriting.
@@ -1811,7 +1975,7 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
         # payload size only, and hit shaders carry both.
         props = ['i32 8', 'i32 %d' % kind]
         if payload:
-            props += ['i32 6', 'i32 %d' % PAYLOAD_BYTES]
+            props += ['i32 6', 'i32 %d' % _payload_bytes(q)]
         if attrs:
             props += ['i32 7', 'i32 8']
         props += ['i32 5', '!%d' % zero]
