@@ -30,6 +30,8 @@ const int kPayloadBytes = 92;
 // ride after the fixed fields, 4 bytes each. See _plan_carry in lower.py.
 const int kCarryField0 = 11;
 const int kMaxCarry = 16;
+// With several queries, field 11 says which one a trace serves.
+const int kQidField = 11;
 
 // The record's own two numbers, and how the generated shaders reach them.
 //
@@ -755,7 +757,16 @@ unsigned long long ModuleFlags(const std::string& text,
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     struct Carry { std::string name, ty; int field; };
+    // Every value carried by any query, in field order, once all are planned.
     std::vector<Carry> carry;
+    // Several queries in one entry point, 0.43.0: each its own TraceRay and
+    // payload, one any-hit choosing the loop body from the query id. See
+    // lower.py. A value two loop bodies read travels in one field.
+    std::vector<const Query*> queries{ &q };
+    for (const auto& o : q.others) queries.push_back(&o);
+    const bool multi = queries.size() > 1;
+    std::map<std::string, std::pair<std::string, int>> carryFields;
+    const int carryBase = kCarryField0 + (multi ? 1 : 0);
     LowerResult r;
     const std::string& text0 = m.text;
     const auto md = Metadata(text0);
@@ -979,32 +990,34 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 edits[i.index] = t;
             }
 
+    auto editQuery = [&](const Query& x) -> bool {
+    std::vector<Carry> qcarry;
     // --- the payload alloca has to be in the entry block --------------------
     {
         const llm::Block& entry = fn.blocks.front();
-        if (entry.instrs.empty()) { r.error = "entry block is empty"; return r; }
+        if (entry.instrs.empty()) { r.error = "entry block is empty"; return false; }
         const llm::Instr& first = entry.instrs.front();
         std::string pending = first.line;
         auto it = edits.find(first.index);
         if (it != edits.end() && it->second.has_value()) pending = *it->second;
-        edits[first.index] = std::string("  %rq.pl = alloca ") + kPayload +
+        edits[first.index] = std::string("  %" + x.pfx + ".pl = alloca ") + kPayload +
                              ", align 8\n" + pending;
     }
 
-    edits[q.alloc->index] = std::nullopt;
+    edits[x.alloc->index] = std::nullopt;
 
     // --- the loop, if there is one -----------------------------------------
     std::string exitLabel;
     std::string preheader;
-    if (q.hasLoop) {
-        const llm::Block* latchBlk = fn.FindBlock(q.loop.latch);
+    if (x.hasLoop) {
+        const llm::Block* latchBlk = fn.FindBlock(x.loop.latch);
         std::vector<std::string> outs;
         for (const auto& s : latchBlk->Successors())
-            if (!q.loop.body.count(s)) outs.push_back(s);
+            if (!x.loop.body.count(s)) outs.push_back(s);
         if (outs.size() != 1) {
             r.error = "Proceed loop has " + std::to_string(outs.size()) +
                       " exits; expected one";
-            return r;
+            return false;
         }
         exitLabel = outs[0];
 
@@ -1014,7 +1027,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // resource the any-hit shader can reach for itself.
         const std::set<std::string> types = TypeNames(m.text);
         std::set<std::string> defined, used, handles;
-        for (const auto& lbl : q.loop.body) {
+        for (const auto& lbl : x.loop.body) {
             const llm::Block* b = fn.FindBlock(lbl);
             if (!b) continue;
             for (const auto& i : b->instrs) {
@@ -1044,21 +1057,21 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                           a3 + ") and used inside the Proceed loop; the index is "
                           "computed in the raygen and the any-hit shader is a "
                           "separate invocation that cannot see it";
-                return r;
+                return false;
             }
         }
         std::vector<std::string> outside;
         for (const auto& u : used)
-            if (!defined.count(u) && u != q.handle && !handles.count(u))
+            if (!defined.count(u) && u != x.handle && !handles.count(u))
                 outside.push_back(u);
         for (const auto& b : fn.blocks) {
-            if (q.loop.body.count(b.label)) continue;
+            if (x.loop.body.count(b.label)) continue;
             for (const auto& i : b.instrs)
                 for (const auto& u : Operands(i, types))
                     if (defined.count(u)) {
                         r.error = "value " + u + " defined in the Proceed loop is used "
                                   "after it; the any-hit shader cannot return it";
-                        return r;
+                        return false;
                     }
         }
 
@@ -1071,36 +1084,36 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (k) names += ", ";
                 names += outside[k];
             }
-            if (q.NeedsIntersection()) {
+            if (x.NeedsIntersection()) {
                 r.error = "Proceed loop body reads values defined outside it (" + names +
                           ") and becomes an intersection shader, which has no payload "
                           "to carry them in";
-                return r;
+                return false;
             }
             if ((int)outside.size() > kMaxCarry) {
                 r.error = "Proceed loop body reads " + std::to_string(outside.size()) +
                           " values defined outside it (" + names + "); more than the " +
                           std::to_string(kMaxCarry) + " the payload carries";
-                return r;
+                return false;
             }
             std::map<std::string, std::pair<const llm::Block*, const llm::Instr*>> defs;
             for (const auto& b : fn.blocks)
                 for (const auto& i : b.instrs)
                     if (!i.result.empty()) defs[i.result] = {&b, &i};
             const auto dom = fn.Dominators();
-            const std::string tb = q.traceBlock->label;
+            const std::string tb = x.traceBlock->label;
             for (size_t k = 0; k < outside.size(); ++k) {
                 const std::string& name = outside[k];
                 auto it = defs.find(name);
                 if (it == defs.end()) {
                     r.error = "Proceed loop body reads " + name + ", which no instruction "
                               "defines; the any-hit shader is a separate invocation";
-                    return r;
+                    return false;
                 }
                 const llm::Block* db = it->second.first;
                 const llm::Instr* di = it->second.second;
                 bool before = false;
-                if (db->label == tb) before = di->index < q.trace->index;
+                if (db->label == tb) before = di->index < x.trace->index;
                 else {
                     auto d = dom.find(tb);
                     before = d != dom.end() && d->second.count(db->label);
@@ -1109,16 +1122,26 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     r.error = "Proceed loop body reads " + name + ", which is computed "
                               "after the trace; the raygen cannot put it in the payload "
                               "before TraceRay";
-                    return r;
+                    return false;
                 }
                 const std::string ty = ResultType(*di);
                 if (ty != "i32" && ty != "float" && ty != "i1") {
                     r.error = "Proceed loop body reads " + name + ", of type " +
                               (ty.empty() ? std::string("None") : ty) +
                               ", from before it; the payload carries i32, float and i1";
-                    return r;
+                    return false;
                 }
-                carry.push_back({name, ty, kCarryField0 + (int)k});
+                auto fit = carryFields.find(name);
+                if (fit == carryFields.end())
+                    fit = carryFields.emplace(name, std::make_pair(
+                        ty, carryBase + (int)carryFields.size())).first;
+                qcarry.push_back({name, ty, fit->second.second});
+            }
+            if ((int)carryFields.size() > kMaxCarry) {
+                r.error = "the Proceed loops read " + std::to_string(carryFields.size()) +
+                          " values defined outside them between them; more than the " +
+                          std::to_string(kMaxCarry) + " the payload carries";
+                return false;
             }
         }
 
@@ -1171,7 +1194,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::vector<const llm::Instr*> writes;
             std::set<std::string> counters;
             for (const auto& b : fn.blocks) {
-                if (!q.loop.body.count(b.label)) continue;
+                if (!x.loop.body.count(b.label)) continue;
                 for (const auto& i : b.instrs) {
                     if (i.callee.compare(0, 6, "dx.op.") != 0) continue;
                     // The RayQuery ops are mutators too and are all declared
@@ -1206,32 +1229,32 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                           "number of times than the loop body does, and in an "
                           "implementation-defined order, so the write would not "
                           "be the same write";
-                return r;
+                return false;
             }
-            if (!writes.empty() && !q.aborts.empty()) {
+            if (!writes.empty() && !x.aborts.empty()) {
                 r.error = "Proceed loop body appends to a buffer and the query calls "
                           "Abort(); this lowering lets traversal continue after an "
                           "abort, so it would append records RayQuery would not";
-                return r;
+                return false;
             }
-            if (!writes.empty() && q.NeedsIntersection()) {
+            if (!writes.empty() && x.NeedsIntersection()) {
                 r.error = "Proceed loop body appends to a buffer and becomes an "
                           "intersection shader, which may run more than once per "
                           "primitive whatever the geometry flags say";
-                return r;
+                return false;
             }
             r.appends = !writes.empty();
         }
 
         // The block the guard branches through to reach the loop, if any.
-        for (const auto& p : q.proceeds) {
-            if (p.first->label == q.loop.latch) continue;
+        for (const auto& p : x.proceeds) {
+            if (p.first->label == x.loop.latch) continue;
             for (const auto& s : p.first->Successors()) {
-                if (q.loop.body.count(s)) continue;
+                if (x.loop.body.count(s)) continue;
                 const llm::Block* blk = fn.FindBlock(s);
                 if (blk) {
                     auto succ = blk->Successors();
-                    if (succ.size() == 1 && succ[0] == q.loop.header) preheader = s;
+                    if (succ.size() == 1 && succ[0] == x.loop.header) preheader = s;
                 }
             }
             break;
@@ -1251,39 +1274,47 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             const std::string zero =
                 std::string(f.ty) == "float" ? "0.000000e+00"
                 : ((f.ty[0] == '<' || f.ty[0] == '[') ? "zeroinitializer" : "0");
-            lines.push_back("  %rq.pl" + std::to_string(f.idx) +
+            lines.push_back("  %" + x.pfx + ".pl" + std::to_string(f.idx) +
                             " = getelementptr inbounds " + kPayload + ", " + kPayload +
-                            "* %rq.pl, i32 0, i32 " + std::to_string(f.idx));
+                            "* %" + x.pfx + ".pl, i32 0, i32 " + std::to_string(f.idx));
             lines.push_back(std::string("  store ") + f.ty + " " + zero + ", " + f.ty +
-                            "* %rq.pl" + std::to_string(f.idx) + ", align " +
+                            "* %" + x.pfx + ".pl" + std::to_string(f.idx) + ", align " +
                             std::to_string(f.align));
         }
-        for (const auto& c : carry) {
+        if (multi) {
+            // Which query this trace serves, read by the one any-hit they share.
+            lines.push_back("  %" + x.pfx + ".plq = getelementptr inbounds " + kPayload +
+                            ", " + kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " +
+                            std::to_string(kQidField));
+            lines.push_back("  store i32 " + std::to_string(x.qid) + ", i32* %" + x.pfx +
+                            ".plq, align 4");
+        }
+        for (const auto& c : qcarry) {
             const std::string f = std::to_string(c.field);
-            lines.push_back("  %rq.plc" + f + " = getelementptr inbounds " + kPayload + ", " +
-                            kPayload + "* %rq.pl, i32 0, i32 " + f);
+            lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                            kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
             if (c.ty == "i1") {
-                lines.push_back("  %rq.plz" + f + " = zext i1 " + c.name + " to i32");
-                lines.push_back("  store i32 %rq.plz" + f + ", i32* %rq.plc" + f + ", align 4");
+                lines.push_back("  %" + x.pfx + ".plz" + f + " = zext i1 " + c.name + " to i32");
+                lines.push_back("  store i32 %" + x.pfx + ".plz" + f + ", i32* %" + x.pfx + ".plc" + f + ", align 4");
             } else {
-                lines.push_back("  store " + c.ty + " " + c.name + ", " + c.ty + "* %rq.plc" +
+                lines.push_back("  store " + c.ty + " " + c.name + ", " + c.ty + "* %" + x.pfx + ".plc" +
                                 f + ", align 4");
             }
         }
-        const auto ra = q.RayArgs();
+        const auto ra = x.RayArgs();
         // The RayFlags operand, which may be a runtime value. The OR that
         // combines it with the template's flags has to land before the call.
-        const auto flags = q.FlagsOperand();
+        const auto flags = x.FlagsOperand();
         if (!flags.first.empty()) lines.push_back(flags.first);
         std::ostringstream tr;
         tr << "  call void @dx.op.traceRay." << std::string(kPayload).substr(1)
-           << "(i32 157, %dx.types.Handle " << q.AsHandle() << ", " << flags.second
+           << "(i32 157, %dx.types.Handle " << x.AsHandle() << ", " << flags.second
            << ", " << ra[0] << ", i32 0, i32 "
-           << (q.needsRecordConstants ? 1 : 0)
+           << (x.needsRecordConstants ? 1 : 0)
            << ", i32 0, " << ra[1] << ", " << ra[2]
            << ", " << ra[3] << ", " << ra[4] << ", " << ra[5] << ", " << ra[6]
            << ", " << ra[7] << ", " << ra[8] << ", " << kPayload
-           << "* nonnull %rq.pl)  ; TraceRay(...)";
+           << "* nonnull %" + x.pfx + ".pl)  ; TraceRay(...)";
         lines.push_back(tr.str());
         if (!exitLabel.empty()) lines.push_back("  br label " + exitLabel);
         std::string joined;
@@ -1291,13 +1322,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (i) joined += "\n";
             joined += lines[i];
         }
-        edits[q.trace->index] = joined;
+        edits[x.trace->index] = joined;
     }
 
     // --- Proceed calls vanish ----------------------------------------------
-    for (const auto& p : q.proceeds) {
+    for (const auto& p : x.proceeds) {
         edits[p.second->index] = std::nullopt;
-        if (q.hasLoop && p.first->label == q.loop.latch) continue;
+        if (x.hasLoop && p.first->label == x.loop.latch) continue;
         const llm::Instr* term = p.first->Terminator();
         if (term && term != p.second && !edits.count(term->index)) {
             static const std::regex kBr(R"(^\s*br\s+i1\s+(\S+),)");
@@ -1308,8 +1339,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     }
 
     // --- the loop blocks go --------------------------------------------------
-    if (q.hasLoop) {
-        std::set<std::string> gone = q.loop.body;
+    if (x.hasLoop) {
+        std::set<std::string> gone = x.loop.body;
         if (!preheader.empty()) gone.insert(preheader);
         for (const auto& lbl : gone) {
             const llm::Block* b = fn.FindBlock(lbl);
@@ -1329,34 +1360,34 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     //
     // An SSA name needs an instruction to define it, hence `add N, 0`, which
     // the assembler folds away.
-    for (const auto& c : q.candidateOps) {
+    for (const auto& c : x.candidateOps) {
         const llm::Instr& i = *c.second;
         if (i.DxOp() != kRayFlags) continue;
         // A read inside the loop already has an edit: the whole block is marked
         // for deletion and the body is re-emitted into the any-hit, where the
         // intrinsic IS legal. Overwriting that would resurrect it in the raygen
         // as well.
-        if (edits.count(i.index)) { q.rayFlagsInLoop = true; continue; }
-        if (q.StaticFlags()) {
+        if (edits.count(i.index)) { x.rayFlagsInLoop = true; continue; }
+        if (x.StaticFlags()) {
             edits[i.index] = "  " + i.result + " = add i32 " +
-                             std::to_string(q.RayFlags()) + ", 0";
+                             std::to_string(x.RayFlags()) + ", 0";
         } else {
             // RayFlags() can only be called after TraceRayInline, so the
             // runtime operand dominates this point.
             edits[i.index] = "  " + i.result + " = or i32 " +
-                             llm::OperandName(q.trace->args[3]) + ", " +
-                             std::to_string(q.constFlags);
+                             llm::OperandName(x.trace->args[3]) + ", " +
+                             std::to_string(x.constFlags);
         }
     }
 
     // --- committed accessors become payload reads ---------------------------
-    for (const auto& c : q.committedOps) {
+    for (const auto& c : x.committedOps) {
         const llm::Instr& i = *c.second;
         const auto f = PayloadField(i.DxOp());
         if (!f) continue;
         if (i.DxOp() == kCommittedFrontFace) {
             const std::string tmp = "%rq.ff" + i.result.substr(1);
-            edits[i.index] = "  " + tmp + " = load i32, i32* %rq.pl7, align 4\n  " +
+            edits[i.index] = "  " + tmp + " = load i32, i32* %" + x.pfx + ".pl7, align 4\n  " +
                 i.result + " = icmp eq i32 " + tmp + ", " +
                 std::to_string(kHitKindFront);
         } else if (i.DxOp() == kCommittedWorldToObject) {
@@ -1370,7 +1401,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             const std::string ptr = "%rq.w" + i.result.substr(1);
             edits[i.index] =
                 "  " + ptr + " = getelementptr inbounds [12 x float], [12 x float]* "
-                "%rq.pl8, i32 0, i32 " + std::to_string(slot) + "\n  " +
+                "%" + x.pfx + ".pl8, i32 0, i32 " + std::to_string(slot) + "\n  " +
                 i.result + " = load float, float* " + ptr + ", align 4";
         } else if (i.DxOp() == kCommittedBary) {
             static const std::regex kI8(R"(i8\s+(\d+))");
@@ -1379,16 +1410,31 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::regex_search(a2, mm, kI8);
             const std::string tmp = "%rq.bv" + i.result.substr(1);
             edits[i.index] = "  " + tmp +
-                " = load <2 x float>, <2 x float>* %rq.pl1, align 4\n  " + i.result +
+                " = load <2 x float>, <2 x float>* %" + x.pfx + ".pl1, align 4\n  " + i.result +
                 " = extractelement <2 x float> " + tmp + ", i32 " + mm[1].str();
         } else {
             edits[i.index] = "  " + i.result + " = load " + f->ty + ", " + f->ty +
-                "* %rq.pl" + std::to_string(f->idx) + ", align " +
+                "* %" + x.pfx + ".pl" + std::to_string(f->idx) + ", align " +
                 std::to_string(f->align);
         }
     }
 
+    return true;
+    };
+    for (const Query* qp : queries)
+        if (!editQuery(*qp)) return r;
+    {
+        std::vector<std::pair<int, std::pair<std::string, std::string>>> byField;
+        for (const auto& kv : carryFields)
+            byField.push_back({kv.second.second, {kv.first, kv.second.first}});
+        std::sort(byField.begin(), byField.end());
+        for (const auto& bf : byField)
+            carry.push_back({bf.second.first, bf.second.second, bf.first});
+    }
+
     edits[fn.index] = "define void @" + e.raygen + "() #RQNW {";
+    bool anyLoop = false;
+    for (const Query* qp : queries) anyLoop = anyLoop || qp->hasLoop;
 
     std::string out = llm::Render(m, edits);
 
@@ -1397,6 +1443,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         std::vector<std::string> decls;
         std::string ptype = kPayloadType;
         ptype = ptype.substr(0, ptype.size() - 2);
+        if (multi) ptype += ", i32";
         for (const auto& c : carry) ptype += c.ty == "i1" ? ", i32" : ", " + c.ty;
         ptype += " }";
         decls.push_back(std::string(kPayload) + " = type " + ptype);
@@ -1493,8 +1540,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // emitted only when something calls them. The rest are always used,
         // because the generated closest-hit reads them every time.
         std::set<int> usedOps;
-        for (const auto& c : q.candidateOps) usedOps.insert(c.second->DxOp());
-        for (const auto& c : q.committedOps) usedOps.insert(c.second->DxOp());
+        bool rayFlagsInLoop = false;
+        for (const Query* qp : queries) {
+            for (const auto& c : qp->candidateOps) usedOps.insert(c.second->DxOp());
+            for (const auto& c : qp->committedOps) usedOps.insert(c.second->DxOp());
+            rayFlagsInLoop = rayFlagsInLoop || qp->rayFlagsInLoop;
+        }
         auto addDecl = [&](bool want, const char* d) {
             if (!want) return;
             add.push_back("");
@@ -1504,7 +1555,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // Only reached from a generated hit shader. A raygen read of RayFlags
         // became a constant, so a shader reading it only there declares
         // nothing, and an unused declare is itself a validation error.
-        addDecl(q.rayFlagsInLoop, "declare i32 @dx.op.rayFlags.i32(i32) #RQNONE");
+        addDecl(rayFlagsInLoop, "declare i32 @dx.op.rayFlags.i32(i32) #RQNONE");
         addDecl(usedOps.count(kCandidateWorldToObject) ||
                 usedOps.count(kCommittedWorldToObject),
                 "declare float @dx.op.worldToObject.f32(i32, i32, i8) #RQNONE");
@@ -1749,16 +1800,17 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         }
         // Not an else: a both-kinds query emits the intersection shader above
         // AND the any-hit below, from the same loop body.
-        if (q.hasLoop && (q.NeedsBoth() || !q.NeedsIntersection())) {
+        if (anyLoop && (q.NeedsBoth() || !q.NeedsIntersection())) {
             // AnyHit IS the Proceed loop body, re-rooted. Accept is falling off
             // the end; reject is IgnoreHit. The polarity is the reverse of the
-            // RayQuery form, where committing is the special path.
-            std::set<std::string> commitBlocks;
-            for (const auto& c : q.commits) commitBlocks.insert(c.first->label);
+            // RayQuery form, where committing is the special path. With several
+            // queries it holds every loop body and picks one by the query id.
+            std::vector<const Query*> loops;
+            for (const Query* qp : queries) if (qp->hasLoop) loops.push_back(qp);
 
             std::map<std::string, std::string> subst;
-            for (const auto& lbl : q.loop.body) {
-                if (lbl == q.loop.latch) continue;
+            for (const Query* xp : loops) for (const auto& lbl : xp->loop.body) {
+                if (lbl == xp->loop.latch) continue;
                 const llm::Block* b = fn.FindBlock(lbl);
                 if (!b) continue;
                 for (const auto& i : b->instrs)
@@ -1786,16 +1838,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // AcceptHitAndEndSearch would be exact for commit-then-abort, but
             // only after proving the commit dominates the abort in the same
             // iteration, and correctness comes first.
-            const bool aborts = !q.aborts.empty();
-
-            std::vector<std::string> order{ q.loop.header };
-            {
-                std::vector<std::string> rest;
-                for (const auto& l : q.loop.body)
-                    if (l != q.loop.header && l != q.loop.latch) rest.push_back(l);
-                std::sort(rest.begin(), rest.end());
-                for (const auto& l : rest) order.push_back(l);
-            }
+            bool aborts = false;
+            for (const Query* xp : loops) aborts = aborts || !xp->aborts.empty();
 
             std::vector<std::string> ah;
             ah.push_back("define void @" + e.anyhit + "(" + kPayload +
@@ -1822,8 +1866,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // no rewriting.
             const std::set<std::string> types = TypeNames(m.text);
             std::set<std::string> usedNames, inBody;
-            for (const auto& lbl : q.loop.body) {
-                if (lbl == q.loop.latch) continue;
+            for (const Query* xp : loops) for (const auto& lbl : xp->loop.body) {
+                if (lbl == xp->loop.latch) continue;
                 const llm::Block* b = fn.FindBlock(lbl);
                 if (!b) continue;
                 for (const auto& i : b->instrs) {
@@ -1863,84 +1907,117 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 ah.push_back("rq.body:");
             }
 
-            for (const auto& lbl : order) {
-                const llm::Block* b = fn.FindBlock(lbl);
-                if (!b) continue;
-                if (lbl != q.loop.header) {
+            if (multi) {
+                // Which query's trace this is, set by the raygen before TraceRay.
+                ah.push_back(std::string("  %rq.pq = getelementptr inbounds ") + kPayload +
+                             ", " + kPayload + "* %p, i32 0, i32 " +
+                             std::to_string(kQidField));
+                ah.push_back("  %rq.qid = load i32, i32* %rq.pq, align 4");
+                for (size_t n = 1; n < loops.size(); ++n) {
+                    const std::string ns = std::to_string(n);
+                    ah.push_back("  %rq.qc" + ns + " = icmp eq i32 %rq.qid, " +
+                                 std::to_string(loops[n]->qid));
+                    ah.push_back("  br i1 %rq.qc" + ns + ", label " + loops[n]->loop.header +
+                                 ", label %rq.qn" + ns);
                     ah.push_back("");
-                    ah.push_back(lbl.substr(1) + ":");
+                    ah.push_back("rq.qn" + ns + ":");
                 }
-                for (const auto& i : b->instrs) {
-                    const int op = i.DxOp();
-                    if (op == kCandidateType || op == kCommitNonOpaque ||
-                        op == kCandidateProcNonOpaque) continue;
-                    // A PROCEDURAL commit, in the arm CandidateType folded
-                    // away. Dead, and an any-hit shader cannot report a
-                    // procedural hit, so it simply goes.
-                    if (op == kCommitProcedural) continue;
-                    if (op == kAbort) {
-                        ah.push_back("  store i32 1, i32* %rq.pab, align 4");
-                        continue;
+                ah.push_back("  br label " + loops[0]->loop.header);
+            }
+
+            for (const Query* xp : loops) {
+                const Query& x = *xp;
+                std::set<std::string> commitBlocks;
+                for (const auto& c : x.commits) commitBlocks.insert(c.first->label);
+
+                std::vector<std::string> order{ x.loop.header };
+                {
+                    std::vector<std::string> rest;
+                    for (const auto& l : x.loop.body)
+                        if (l != x.loop.header && l != x.loop.latch) rest.push_back(l);
+                    std::sort(rest.begin(), rest.end());
+                    for (const auto& l : rest) order.push_back(l);
+                }
+
+                for (const auto& lbl : order) {
+                    const llm::Block* b = fn.FindBlock(lbl);
+                    if (!b) continue;
+                    if (multi || lbl != x.loop.header) {
+                        ah.push_back("");
+                        ah.push_back(lbl.substr(1) + ":");
                     }
-                    if (op == kCandidateFrontFace) {
-                        // RayQuery returns a bool; HitKind() is an integer.
-                        const std::string hk = "%rq.hk" + i.result.substr(1);
-                        ah.push_back("  " + hk +
-                                     " = call i32 @dx.op.hitKind.i32(i32 143)"
-                                     "  ; HitKind()");
-                        ah.push_back("  " + i.result + " = icmp eq i32 " + hk + ", " +
-                                     std::to_string(kHitKindFront));
-                        continue;
-                    }
-                    if (RecordWord(op) >= 0) {
-                        // The record answers, because nothing in the shader
-                        // can. The local root signature bound this record's own
-                        // constants.
-                        for (const auto& l :
-                             RecordRead(i.result.substr(1), RecordWord(op), i.result, sm66))
-                            ah.push_back(l);
-                        continue;
-                    }
-                    if (const CandMap* cmap = FindCand(op)) {
-                        // Same operands as the RayQuery form, minus the handle.
-                        std::string cargs = "i32 " + std::to_string(cmap->dxop);
-                        for (int k = 0; k < cmap->extra; ++k)
-                            cargs += ", " + Trim(i.args[2 + k]);
-                        ah.push_back("  " + i.result + " = call " + cmap->ty + " @" +
-                                     cmap->callee + "(" + cargs + ")");
-                        continue;
-                    }
-                    if (op == kCandidateBary) {
-                        static const std::regex kI8(R"(i8\s+(\d+))");
-                        std::smatch mm;
-                        std::string a2 = Trim(i.args[2]);
-                        std::regex_search(a2, mm, kI8);
-                        ah.push_back("  " + i.result +
-                                     " = extractelement <2 x float> %rq.ab, i32 " +
-                                     mm[1].str());
-                        continue;
-                    }
-                    std::string line = i.line;
-                    for (const auto& kv : subst)
-                        line = std::regex_replace(
-                            line, std::regex(kv.first.substr(0, 1) == "%"
-                                             ? "\\" + kv.first + "\\b" : kv.first),
-                            kv.second);
-                    const std::string target =
-                        commitBlocks.count(lbl) ? "%rq.accept" : "%rq.reject";
-                    line = std::regex_replace(
-                        line, std::regex("label\\s+" + std::string("\\") + q.loop.latch +
-                                         "\\b"),
-                        "label " + target);
-                    for (const auto& s2 : Block_successors(line))
-                        if (!q.loop.body.count(s2) && s2 != "%rq.accept" &&
-                            s2 != "%rq.reject") {
-                            r.error = "Proceed loop body branches to " + s2 +
-                                      ", outside the loop; no lowering is defined "
-                                      "for that";
-                            return r;
+                    for (const auto& i : b->instrs) {
+                        const int op = i.DxOp();
+                        if (op == kCandidateType || op == kCommitNonOpaque ||
+                            op == kCandidateProcNonOpaque) continue;
+                        // A PROCEDURAL commit, in the arm CandidateType folded
+                        // away. Dead, and an any-hit shader cannot report a
+                        // procedural hit, so it simply goes.
+                        if (op == kCommitProcedural) continue;
+                        if (op == kAbort) {
+                            ah.push_back("  store i32 1, i32* %rq.pab, align 4");
+                            continue;
                         }
-                    ah.push_back(line);
+                        if (op == kCandidateFrontFace) {
+                            // RayQuery returns a bool; HitKind() is an integer.
+                            const std::string hk = "%rq.hk" + i.result.substr(1);
+                            ah.push_back("  " + hk +
+                                         " = call i32 @dx.op.hitKind.i32(i32 143)"
+                                         "  ; HitKind()");
+                            ah.push_back("  " + i.result + " = icmp eq i32 " + hk + ", " +
+                                         std::to_string(kHitKindFront));
+                            continue;
+                        }
+                        if (RecordWord(op) >= 0) {
+                            // The record answers, because nothing in the shader
+                            // can. The local root signature bound this record's own
+                            // constants.
+                            for (const auto& l :
+                                 RecordRead(i.result.substr(1), RecordWord(op), i.result, sm66))
+                                ah.push_back(l);
+                            continue;
+                        }
+                        if (const CandMap* cmap = FindCand(op)) {
+                            // Same operands as the RayQuery form, minus the handle.
+                            std::string cargs = "i32 " + std::to_string(cmap->dxop);
+                            for (int k = 0; k < cmap->extra; ++k)
+                                cargs += ", " + Trim(i.args[2 + k]);
+                            ah.push_back("  " + i.result + " = call " + cmap->ty + " @" +
+                                         cmap->callee + "(" + cargs + ")");
+                            continue;
+                        }
+                        if (op == kCandidateBary) {
+                            static const std::regex kI8(R"(i8\s+(\d+))");
+                            std::smatch mm;
+                            std::string a2 = Trim(i.args[2]);
+                            std::regex_search(a2, mm, kI8);
+                            ah.push_back("  " + i.result +
+                                         " = extractelement <2 x float> %rq.ab, i32 " +
+                                         mm[1].str());
+                            continue;
+                        }
+                        std::string line = i.line;
+                        for (const auto& kv : subst)
+                            line = std::regex_replace(
+                                line, std::regex(kv.first.substr(0, 1) == "%"
+                                                 ? "\\" + kv.first + "\\b" : kv.first),
+                                kv.second);
+                        const std::string target =
+                            commitBlocks.count(lbl) ? "%rq.accept" : "%rq.reject";
+                        line = std::regex_replace(
+                            line, std::regex("label\\s+" + std::string("\\") + x.loop.latch +
+                                             "\\b"),
+                            "label " + target);
+                        for (const auto& s2 : Block_successors(line))
+                            if (!x.loop.body.count(s2) && s2 != "%rq.accept" &&
+                                s2 != "%rq.reject") {
+                                r.error = "Proceed loop body branches to " + s2 +
+                                          ", outside the loop; no lowering is defined "
+                                          "for that";
+                                return r;
+                            }
+                        ah.push_back(line);
+                    }
                 }
             }
             ah.push_back("");
@@ -2011,7 +2088,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // gets an offset wrong; it is the per-invocation work worth
             // avoiding.
             bool wantsW2O = false;
-            for (const auto& cw : q.committedOps)
+            for (const Query* qp : queries) for (const auto& cw : qp->committedOps)
                 if (cw.second->DxOp() == kCommittedWorldToObject) wantsW2O = true;
             if (wantsW2O) {
                 ch.push_back(std::string("  %pw = getelementptr inbounds ") + kPayload +
@@ -2212,7 +2289,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // An intersection shader is void(), so it annotates like a raygen.
             ann.push_back("void ()* @" + e.intersection);
             ann.push_back("!" + std::to_string(annRaygen));
-        } else if (q.hasLoop) {
+        } else if (anyLoop) {
             ann.push_back("void " + sigH + "* @" + e.anyhit);
             ann.push_back("!" + std::to_string(annHit));
         }
@@ -2249,7 +2326,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::vector<std::string> props{ "i32 8", "i32 " + std::to_string(kind) };
             if (payload) {
                 props.push_back("i32 6");
-                props.push_back("i32 " + std::to_string(kPayloadBytes + 4 * (int)carry.size()));
+                props.push_back("i32 " + std::to_string(
+                    kPayloadBytes + 4 * ((multi ? 1 : 0) + (int)carry.size())));
             }
             if (attrs) { props.push_back("i32 7"); props.push_back("i32 8"); }
             props.push_back("i32 5");
@@ -2271,7 +2349,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             eps.push_back(entry(e.anyhit, sigH, 9, true, true));
         } else if (q.NeedsIntersection())
             eps.push_back(entry(e.intersection, "()", 8, false, false));
-        else if (q.hasLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
+        else if (anyLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
         eps.push_back(entry(e.closesthit, sigH, 10, true, true));
         if (q.NeedsBoth())
             eps.push_back(entry(e.closesthitproc, sigH, 10, true, true));
@@ -2319,7 +2397,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
     r.ok = true;
     r.text = out;
-    r.payloadBytes = kPayloadBytes + 4 * (int)carry.size();
+    r.payloadBytes = kPayloadBytes + 4 * ((multi ? 1 : 0) + (int)carry.size());
     r.carried = (int)carry.size();
     return r;
 }

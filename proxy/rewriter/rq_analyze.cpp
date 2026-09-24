@@ -128,8 +128,8 @@ std::pair<std::string, std::string> Query::FlagsOperand() const {
     if (StaticFlags())
         return { "", "i32 " + std::to_string(RayFlags()) };
     const std::string dyn = llm::OperandName(trace->args[3]);
-    return { "  %rq.flags = or i32 " + dyn + ", " + std::to_string(constFlags),
-             "i32 %rq.flags" };
+    return { "  %" + pfx + ".flags = or i32 " + dyn + ", " + std::to_string(constFlags),
+             "i32 %" + pfx + ".flags" };
 }
 
 std::string Query::AsHandle() const {
@@ -167,7 +167,10 @@ std::string RejectModule(const llm::Module& m) {
     return "";
 }
 
-std::string Collect(const llm::Function& fn, Query& q) {
+// `others` are the handles of the entry point's other queries, whose ops
+// belong to them.
+std::string Collect(const llm::Function& fn, Query& q,
+                    const std::vector<std::string>& others) {
     for (const auto& b : fn.blocks) {
         for (const auto& i : b.instrs) {
             const int op = i.DxOp();
@@ -176,7 +179,10 @@ std::string Collect(const llm::Function& fn, Query& q) {
             const bool usesHandle =
                 std::find(uses.begin(), uses.end(), q.handle) != uses.end();
             if (!usesHandle) {
-                if (IsKnownOpcode(op) && op != kAllocate)
+                bool theirs = false;
+                for (const auto& h : others)
+                    if (std::find(uses.begin(), uses.end(), h) != uses.end()) theirs = true;
+                if (IsKnownOpcode(op) && op != kAllocate && !theirs)
                     return std::string(OpcodeName(op)) + " at \"" +
                            i.body.substr(0, 60) + "\" does not use the query handle";
                 continue;
@@ -268,6 +274,63 @@ std::string RejectFunction(const llm::Function& fn, const Query& q) {
     return "";
 }
 
+// Several queries in one entry point, 0.43.0. See _check_queries in
+// rayquery.py, which this mirrors message for message.
+std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) {
+    std::string names;
+    for (size_t k = 0; k < qs.size(); ++k) {
+        if (k) names += ", ";
+        names += qs[k].handle;
+    }
+    for (const auto& q : qs) {
+        if (q.NeedsIntersection())
+            return std::to_string(qs.size()) + " RayQuery objects in " + fn.name + " (" +
+                   names + "), and query " + q.handle + " becomes an intersection "
+                   "shader, which cannot read the payload field that says which query "
+                   "it serves";
+        if (!q.hasLoop) continue;
+        for (const auto& label : q.loop.body) {
+            const llm::Block* blk = fn.FindBlock(label);
+            if (!blk) continue;
+            for (const auto& i : blk->instrs) {
+                const auto uses = i.Uses();
+                for (const auto& o : qs) {
+                    if (o.handle == q.handle) continue;
+                    if (std::find(uses.begin(), uses.end(), o.handle) != uses.end())
+                        return "RayQuery " + o.handle + " is used inside the Proceed "
+                               "loop of " + q.handle + "; that loop becomes an any-hit "
+                               "shader, which cannot call TraceRay";
+                }
+            }
+        }
+    }
+    return "";
+}
+
+// The pattern, or an error when a shape has no defined lowering.
+std::string Classify(Query& q) {
+    if (q.NeedsBoth()) {
+        q.patternNum = 5;
+        q.patternDesc = "both triangle and procedural commits (two hit groups)";
+    } else if (q.NeedsIntersection()) {
+        q.patternNum = 4;
+        q.patternDesc = "procedural primitives (generated intersection shader)";
+    } else if (q.NeedsAnyHit()) {
+        q.patternNum = 3;
+        q.patternDesc = "alpha-tested closest hit (generated any-hit shader)";
+    } else if (q.RayFlags() & 0x004) {
+        q.patternNum = 2;
+        q.patternDesc = "shadow / visibility (miss shader only)";
+    } else if (q.RayFlags() & 0x001) {
+        q.patternNum = 1;
+        q.patternDesc = "opaque closest hit (no any-hit shader)";
+    } else {
+        return "query has no Proceed loop but is not FORCE_OPAQUE (flags " +
+               FlagNames(q.RayFlags()) + "); no lowering is defined for this";
+    }
+    return "";
+}
+
 }  // namespace
 
 AnalyzeResult Analyze(const llm::Module& m) {
@@ -287,52 +350,48 @@ AnalyzeResult Analyze(const llm::Module& m) {
     const llm::Function& fn = *cands[0];
 
     const auto allocs = fn.FindOp(kAllocate);
-    if (allocs.size() != 1) {
-        // TraceRay has one payload and one in-flight trace, so concurrent
-        // queries have no lowering. Named in the brief's table.
-        r.error = std::to_string(allocs.size()) + " concurrent RayQuery objects in " +
-                  fn.name + "; TraceRay has one payload and one in-flight trace";
-        return r;
+    std::vector<std::string> handles;
+    for (const auto* a : allocs) handles.push_back(a->result);
+
+    std::vector<Query> qs;
+    for (size_t k = 0; k < allocs.size(); ++k) {
+        Query q;
+        q.fn = &fn;
+        q.alloc = allocs[k];
+        q.handle = allocs[k]->result;
+        q.constFlags = Imm(allocs[k]->args[1]);
+        if (k) { q.pfx = "rq.q" + std::to_string(k); q.qid = (int)k; }
+        std::vector<std::string> others;
+        for (const auto& h : handles) if (h != q.handle) others.push_back(h);
+        std::string err = Collect(fn, q, others);
+        if (!err.empty()) { r.error = err; return r; }
+        err = FindLoop(fn, q);
+        if (!err.empty()) { r.error = err; return r; }
+        qs.push_back(q);
     }
-
-    Query q;
-    q.fn = &fn;
-    q.alloc = allocs[0];
-    q.handle = allocs[0]->result;
-    q.constFlags = Imm(allocs[0]->args[1]);
-
-    std::string err = Collect(fn, q);
-    if (!err.empty()) { r.error = err; return r; }
-    err = FindLoop(fn, q);
-    if (!err.empty()) { r.error = err; return r; }
-    err = RejectFunction(fn, q);
-    if (!err.empty()) { r.error = err; return r; }
-
-    // Classify here rather than on demand, so a shape with no defined lowering
-    // is refused by analysis itself.
-    if (q.NeedsBoth()) {
-        q.patternNum = 5;
-        q.patternDesc = "both triangle and procedural commits (two hit groups)";
-    } else if (q.NeedsIntersection()) {
-        q.patternNum = 4;
-        q.patternDesc = "procedural primitives (generated intersection shader)";
-    } else if (q.NeedsAnyHit()) {
-        q.patternNum = 3;
-        q.patternDesc = "alpha-tested closest hit (generated any-hit shader)";
-    } else if (q.RayFlags() & 0x004) {
-        q.patternNum = 2;
-        q.patternDesc = "shadow / visibility (miss shader only)";
-    } else if (q.RayFlags() & 0x001) {
-        q.patternNum = 1;
-        q.patternDesc = "opaque closest hit (no any-hit shader)";
-    } else {
-        r.error = "query has no Proceed loop but is not FORCE_OPAQUE (flags " +
-                  FlagNames(q.RayFlags()) + "); no lowering is defined for this";
-        return r;
+    // Before the per-query checks, so a query nested in another's loop is
+    // refused for THAT, not for whatever it happens to read there.
+    if (qs.size() > 1) {
+        const std::string err = CheckQueries(fn, qs);
+        if (!err.empty()) { r.error = err; return r; }
     }
+    for (auto& q : qs) {
+        std::string err = RejectFunction(fn, q);
+        if (!err.empty()) { r.error = err; return r; }
+        // Classify here rather than on demand, so a shape with no defined
+        // lowering is refused by analysis itself.
+        err = Classify(q);
+        if (!err.empty()) { r.error = err; return r; }
+    }
+    // One table serves every trace, so record data is needed for all if any
+    // query reads it.
+    bool rc = false;
+    for (const auto& q : qs) rc = rc || q.needsRecordConstants;
+    for (auto& q : qs) q.needsRecordConstants = rc;
 
     r.ok = true;
-    r.query = q;
+    r.query = qs[0];
+    r.query.others.assign(qs.begin() + 1, qs.end());
     return r;
 }
 

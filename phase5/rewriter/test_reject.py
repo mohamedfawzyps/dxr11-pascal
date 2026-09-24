@@ -221,7 +221,11 @@ def main():
         '  %v33 = call i32 @dx.op.allocateRayQuery(i32 178, i32 1)',
         '  %v33 = call i32 @dx.op.allocateRayQuery(i32 178, i32 1)\n'
         '  %vq2 = call i32 @dx.op.allocateRayQuery(i32 178, i32 1)')
-    ok.append(expect_reject('two concurrent queries', two, 'one payload'))
+    # This was "two concurrent queries" until 0.43.0, which lowers several
+    # queries in one entry point. The mutation adds an allocation that is never
+    # traced, which is still refused, for that reason: the sixth test here
+    # whose premise moved.
+    ok.append(expect_reject('a second query never traced', two, 'never traced'))
 
     # groupshared: a raygen shader has no thread group.
     gs = opaque.replace(
@@ -321,6 +325,39 @@ def main():
             print('  FAILED   %-34s refused: %s' % (name, e))
             ok.append(False)
         ok.append(cpp_agrees(name, t, None))
+
+    # Several queries in one entry point (0.43.0): each its own TraceRay and
+    # payload, ONE any-hit choosing the loop body from the query id the raygen
+    # stored. The two loop bodies commit opposite triangle halves, so running
+    # the wrong one changes the render, which the dispatch suite compares
+    # against WARP; here, the structure and the C++ verdict.
+    TWOQ = os.path.join('phase5', 'cases', 'rayquery_twoq_sm66.ll')
+    if os.path.isfile(TWOQ):
+        t = load(TWOQ)
+        name = 'two queries in sequence'
+        try:
+            m = Module(t)
+            out = lower.lower(m, rayquery.analyze(m))
+            ids = re.findall(r'store i32 (\d), i32\* %rq(?:\.q\d)?\.plq', out)
+            ah = re.search(r'(?s)define void @AnyHit\(.*?\n\}', out).group(0)
+            good = (ids == ['0', '1'] and '%rq.qid = load i32' in ah
+                    and out.count('call void @dx.op.traceRay.') == 2)
+            print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                                     'two traces, ids 0 and 1, one any-hit' if good
+                                     else 'ids=%s' % ids))
+            ok.append(good)
+        except rayquery.Unsupported as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None))
+    for f, why in (('refuse_nested_query.ll', 'cannot call TraceRay'),
+                   ('refuse_twoq_isect.ll', 'which query it serves')):
+        path = os.path.join('phase5', 'cases', f)
+        if os.path.isfile(path):
+            t = load(path)
+            name = 'query nested in a loop' if 'nested' in f else 'two queries, one intersection'
+            ok.append(expect_reject(name, t, why))
+            ok.append(cpp_agrees(name, t, why))
 
     # Where the payload cannot carry it, refused by name: a loop body that
     # becomes an INTERSECTION shader has no payload in DXR 1.0, and a value

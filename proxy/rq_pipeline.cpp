@@ -85,7 +85,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     }
     auto l = rq::Lower(m, a.query);
     if (!l.ok) { *why = l.error; return false; }
-    x->hasAnyHit = a.query.NeedsAnyHit();
+    x->hasAnyHit = a.query.AnyNeedsAnyHit();
     x->hasIntersection = a.query.NeedsIntersection();
     x->needsBoth = a.query.NeedsBoth();
     x->needsRecordConstants = a.query.needsRecordConstants;

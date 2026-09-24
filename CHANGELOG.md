@@ -24,6 +24,40 @@ not.
 
 ---
 
+## 0.43.0
+
+- **Several RayQuery objects in one entry point lower.** 33 of Escher's
+  shaders got do-nothing pipelines for "2 concurrent RayQuery objects":
+  `LumenScreenProbeGatherHardwareRayTracingCS` (16),
+  `LumenRadiosityHardwareRayTracingCS` (8),
+  `LumenSceneDirectLightingHardwareRayTracingCS` (8) and
+  `NiagaraCollisionRayTraceCS` (1). The check counted allocations. Profiled
+  from the dump: every one is two queries one after the other, each with its
+  own Proceed loop and one triangle commit.
+- **How:** each query becomes its own `TraceRay`, with its own payload and
+  raygen names (`%rq.q1.pl`, `%rq.q1.flags`; the first query keeps `%rq.`, so
+  one-query output is byte-identical to before). ONE generated any-hit holds
+  every loop body and branches on a query id the raygen stores in payload
+  field 11 before each trace; carried values move to field 12 on. The shader
+  table does not change: one hit group serves every trace. Record data, the
+  closest-hit's matrix fetch and the declarations are the union over queries,
+  and the shim builds the any-hit whenever ANY query needs one.
+- **Refused by name:** a query traced inside another's Proceed loop (that loop
+  becomes an any-hit, which cannot call `TraceRay`), and a multi-query shader
+  in which a query commits procedural hits (an intersection shader has no
+  payload to read the query id from). The multi-query checks run before the
+  per-query ones, so a nested query is refused for being nested.
+- Measured: every shader in the 0.40.3 and 0.41.1 dumps now lowers, 246 of
+  246, Python and C++ byte-identical, all validate and sign. The 33 build 99 of
+  99 cold on the 1070 with the NVAPI slot registered. Case `twoq`
+  (`rayquery_twoq_sm66.hlsl`): the two loop bodies commit opposite triangle
+  halves and the second carries a prefilled UAV value; bit-exact against WARP
+  on two seeds, and on WARP itself swapping the bodies changes 11536 rays, so
+  a wrong dispatch cannot pass. Dispatch suite 36 of 36 plus gates, rewriter
+  checks 45 of 45.
+- Not hit yet, recorded: the CFG model does not follow `switch` edges, and 55
+  of the 125 dumped shaders contain one.
+
 ## 0.42.0
 
 - **The 24 MegaLights light-sampling shaders lower.** In the 0.41.1 run they

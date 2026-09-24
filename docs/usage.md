@@ -314,7 +314,8 @@ scene layouts it can only partly serve.
 them into two lists, and the difference matters when you are deciding whether
 to report it: refusals that are facts about DXR 1.0 will not change, and
 refusals that are gaps in the rewriter will. "More than one RayQuery object"
-is the second kind and is the most common one a real game hits. "Proceed loop
+was the second kind and the most common one a real game hit, and is lowered
+from 0.43.0. "Proceed loop
 body has a side effect" is the first kind: the any-hit shader the loop body
 becomes runs in no defined order, so a write at a fixed index would not be
 the same write. An APPEND, a counter update and stores at the index it

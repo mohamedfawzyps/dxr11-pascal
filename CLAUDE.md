@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.42.0.
+proxy/version.h, and is currently 0.43.0.
 
 ## Scope (set by the user, 2026-09-24): NOTHING IS GIVEN UP
 
@@ -24,9 +24,30 @@ narrower scope statement further down this brief. Consequences:
   types. Opacity micromaps are to be ASSESSED: an acceleration if Unreal's
   any-hit fallback draws the same, in scope if not.
 - The order agreed on 2026-09-24: the 24 MegaLights loop-isolation shaders
-  (done, 0.42.0), then the 33 two-query shaders, then cluster operations.
+  (done, 0.42.0), then the 33 two-query shaders (done, 0.43.0), then cluster
+  operations.
 
 ## Current position (2026-09-23)
+
+**0.43.0: THE 33 TWO-QUERY SHADERS LOWER, AND EVERY SHADER BOTH ESCHER DUMPS
+HOLD NOW LOWERS: 246 OF 246.** Lumen screen probe gather (16), radiosity (8),
+scene direct lighting (8) and Niagara collision (1), refused since the first
+Unreal run as "2 concurrent RayQuery objects", a check that counted
+allocations. All 33 are two queries one after the other, each with its own
+Proceed loop. Each query now becomes its own TraceRay with its own payload
+alloca and its own `%rq.qN.` names; ONE generated any-hit holds every loop
+body and branches on a query id the raygen stores in payload field 11
+(carried values move to 12 on). The shader table is untouched. Refused by
+name: a query traced inside another's loop (the any-hit cannot TraceRay) and
+a multi-query shader needing an intersection shader (no payload to read the
+id from). Offline: Python and C++ byte-identical on all 246, all validate,
+99 of 99 cold compiles of the 33 with the NVAPI slot registered, case `twoq`
+bit-exact against WARP on two seeds, and swapping the two bodies on WARP
+changes 11536 rays, so a wrong dispatch cannot pass. Game run pending, with
+0.42.0's MegaLights change in the same build. **KNOWN MODEL GAP, not yet
+hit:** the CFG model does not follow `switch` edges, and 55 of 125 dumped
+Unreal shaders contain one. Every output validates, so none of them loses a
+loop-body block today; a block reachable only through a switch would.
 
 **0.42.0: THE 24 MEGALIGHTS SHADERS LOWER.** `HardwareRayTraceLightSamplesCS`
 and its volume form read the light sample at the top (`RWLightSamples`,
@@ -310,11 +331,9 @@ any-hit AND an intersection shader from one Proceed loop.
 **WHAT IS LEFT IS A SHORT LIST, AND TWO OF THEM ARE THE REWRITER'S OWN.**
 Ordered by what a real engine actually hits:
 
-1. **Multiple RayQuery objects in one entry point.** 33 of Unreal's shaders,
-   and **the refusal is FALSE**: the check counts ALLOCATIONS, not liveness,
-   and the two queries in NiagaraCollisionRayTraceCS are three hundred lines
-   apart. Lowering them is real work, one TraceRay and one hit shader set per
-   query, but "no lowering exists" was never true. THIS IS THE NEXT BUILD.
+1. **Multiple RayQuery objects in one entry point.** DONE in 0.43.0, see
+   the position section: one TraceRay and payload per query, one any-hit
+   choosing the loop body by a query id in the payload.
 2. **One assembler failure** left in Unreal's log, cause not yet identified.
    The dump is the way in, not more reasoning.
 3. **A 6.6 binding into a resource ARRAY at a dynamic index.** The 6.5 path

@@ -250,7 +250,14 @@ $cases = @(
     # shader. The gate below runs the two sides with different prefill seeds
     # and must diverge, so the pre-read value is shown to drive the image.
     @{ name = 'preload'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_preload_sm66.hlsl', '--prefill', '1');
-       desc = 'values loaded before the loop, one carried in the payload, one re-read' }
+       desc = 'values loaded before the loop, one carried in the payload, one re-read' },
+    # Two RayQuery objects one after the other, the shape of 33 Lumen and
+    # Niagara shaders: two traces, one shared any-hit choosing the loop body by
+    # a query id in the payload. The bodies commit opposite triangle halves;
+    # measured on WARP, swapping them changes 11536 rays, so running the wrong
+    # one for either trace cannot match.
+    @{ name = 'twoq'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoq_sm66.hlsl', '--multi', '--prefill', '1');
+       desc = 'two queries in sequence, one any-hit picking the loop body by query id' }
 )
 
 $failed = 0

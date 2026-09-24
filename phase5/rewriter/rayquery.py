@@ -210,6 +210,13 @@ class Query(object):
         # only then may it be declared, since an unused declare is itself a
         # validation error.
         self.rayflags_in_loop = False
+        # Several queries in one entry point, 0.43.0: the first is returned and
+        # carries the rest here. Each names its raygen values with its own
+        # prefix, so two traces never define the same %name; the first keeps
+        # "rq", so a one-query shader lowers byte for byte as before.
+        self.others = []
+        self.pfx = 'rq'
+        self.qid = 0
 
     # --- derived ---------------------------------------------------------
 
@@ -241,8 +248,8 @@ class Query(object):
             return [], 'i32 %d' % self.ray_flags
         from dxil import operand_name
         dyn = operand_name(self.trace.args[3])
-        return (['  %%rq.flags = or i32 %s, %d' % (dyn, self.const_flags or 0)],
-                'i32 %rq.flags')
+        return (['  %%%s.flags = or i32 %s, %d' % (self.pfx, dyn, self.const_flags or 0)],
+                'i32 %%%s.flags' % self.pfx)
 
     @property
     def as_handle(self):
@@ -320,34 +327,70 @@ def analyze(module, fn_name=None):
         fn = cands[0]
 
     allocs = fn.find(ALLOCATE)
-    if len(allocs) != 1:
-        # TraceRay has one payload and one in-flight trace, so concurrent
-        # queries have no lowering. Named in the brief's table.
-        raise Unsupported('%d concurrent RayQuery objects in %s; TraceRay has '
-                          'one payload and one in-flight trace'
-                          % (len(allocs), fn.name))
+    handles = [a.result for _, a in allocs]
+    queries = []
+    for k, (block, alloc) in enumerate(allocs):
+        q = Query(fn, block, alloc)
+        if k:
+            q.pfx, q.qid = 'rq.q%d' % k, k
+        _collect(fn, q, [h for h in handles if h != q.handle])
+        _find_loop(fn, q)
+        queries.append(q)
+    # Before the per-query checks, so a query nested in another's loop is
+    # refused for THAT, not for whatever it happens to read there.
+    if len(queries) > 1:
+        _check_queries(fn, queries)
+    for q in queries:
+        _reject_function(fn, q)
+        # Classify here rather than on demand, so that a shape with no defined
+        # lowering is refused by analysis itself. Leaving it lazy meant a caller
+        # that never asked for the pattern got a Query back for a shader that
+        # cannot be lowered at all.
+        q.pattern_num, q.pattern_desc = q.pattern()
+    queries[0].others = queries[1:]
+    return queries[0]
 
-    q = Query(fn, allocs[0][0], allocs[0][1])
-    _collect(fn, q)
-    _find_loop(fn, q)
-    _reject_function(fn, q)
-    # Classify here rather than on demand, so that a shape with no defined
-    # lowering is refused by analysis itself. Leaving it lazy meant a caller
-    # that never asked for the pattern got a Query back for a shader that
-    # cannot be lowered at all.
-    q.pattern_num, q.pattern_desc = q.pattern()
-    return q
+
+def _check_queries(fn, queries):
+    """Several queries in one entry point, 0.43.0.
+
+    Each becomes its own TraceRay with its own payload, and ONE any-hit serves
+    them all, choosing the loop body by a payload field the raygen sets before
+    each trace. 33 of Unreal's Lumen and Niagara shaders are this shape, two
+    queries one after the other. The check this replaces counted
+    ALLOCATIONS and called them concurrent; what actually matters is below."""
+    names = ', '.join(q.handle for q in queries)
+    for q in queries:
+        if q.needs_intersection:
+            raise Unsupported(
+                '%d RayQuery objects in %s (%s), and query %s becomes an '
+                'intersection shader, which cannot read the payload field that '
+                'says which query it serves' % (len(queries), fn.name, names, q.handle))
+        if not q.loop:
+            continue
+        others = [x.handle for x in queries if x is not q]
+        for label in q.loop[2]:
+            for instr in fn.block(label).instrs:
+                used = instr.uses()
+                for h in others:
+                    if h in used:
+                        raise Unsupported(
+                            'RayQuery %s is used inside the Proceed loop of %s; '
+                            'that loop becomes an any-hit shader, which cannot '
+                            'call TraceRay' % (h, q.handle))
 
 
-def _collect(fn, q):
-    """Walk every dx.op call that reads the query handle."""
+def _collect(fn, q, others=()):
+    """Walk every dx.op call that reads the query handle. `others` are the
+    handles of the entry point's other queries, whose ops belong to them."""
     for block, instr in fn.instrs():
         op = instr.dxop
         if op is None:
             continue
         # Only rayQuery ops take the handle; anything else is ordinary code.
         if q.handle not in instr.uses():
-            if op in KNOWN and op != ALLOCATE:
+            if op in KNOWN and op != ALLOCATE and not any(
+                    h in instr.uses() for h in others):
                 raise Unsupported('%s at "%s" does not use the query handle'
                                   % (KNOWN[op], instr.body[:60]))
             continue

@@ -56,10 +56,10 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 35 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
+- 36 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
   sensitivity gate
 - 14 rewriter cases, each byte-identical between the Python reference and the
-  C++ port, on both the `.ll` path and the DXIL container path, plus 39
+  C++ port, on both the `.ll` path and the DXIL container path, plus 45
   analysis and lowering checks, 3 record-read checks, an append check and a
   driver check of NVAPI calls with the extension slot registered
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
@@ -154,9 +154,13 @@ Refused because DXR 1.0 offers nothing to lower onto:
 Refused because the rewriter has not been taught them yet, which is a different
 thing and is said differently in the log:
 
-- more than one `RayQuery` object per entry point. The check counts
-  allocations rather than overlap, so two queries used one after the other are
-  refused as well, which is the largest remaining gap against Unreal
+- several `RayQuery` objects in one entry point when one of them commits
+  procedural hits. Several queries share one generated hit group and pick
+  their loop body from a query id in the payload, from 0.43.0; an
+  intersection shader has no payload, so it cannot tell them apart. A query
+  traced INSIDE another's Proceed loop is refused too, and that one is a fact
+  about DXR 1.0: the loop becomes an any-hit shader, which cannot call
+  `TraceRay`
 - a Shader Model 6.6 binding into a resource array at a dynamic index. The 6.5
   form of exactly that works
 - an NVAPI shader extension call other than the RayQuery cluster ID ones.

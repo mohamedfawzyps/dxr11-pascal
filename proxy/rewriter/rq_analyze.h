@@ -139,6 +139,20 @@ struct Query {
     int patternNum = 0;
     std::string patternDesc;
 
+    // Several queries in one entry point, 0.43.0: the first is returned and
+    // carries the rest here. Each names its raygen values with its own prefix,
+    // so two traces never define the same %name; the first keeps "rq", so a
+    // one-query shader lowers byte for byte as before. See rayquery.py.
+    std::vector<Query> others;
+    std::string pfx = "rq";
+    int qid = 0;
+    // Over this query and the others: does any need a generated any-hit?
+    bool AnyNeedsAnyHit() const {
+        if (NeedsAnyHit()) return true;
+        for (const auto& o : others) if (o.NeedsAnyHit()) return true;
+        return false;
+    }
+
     int DynFlags() const;
     // The flags KNOWN AT COMPILE TIME. Classification only: when
     // TraceRayInline is given a runtime value this is just the template's
