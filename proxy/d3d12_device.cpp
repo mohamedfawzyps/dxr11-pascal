@@ -919,8 +919,12 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d, REF
     }
     if (o != gidx::Outcome::kTransformed) return m_real->CreateStateObject(d, riid, pp);
     const HRESULT hr = m_real->CreateStateObject(&t.desc, riid, pp);
-    ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): %s; CreateStateObject hr=0x%08lx\n",
-             t.summary.c_str(), (unsigned long)hr);
+    // A collection that only records its TraceRay arguments has no summary,
+    // and Unreal creates one per raygen, so it stays quiet unless it fails.
+    if (!t.summary.empty() || FAILED(hr))
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): %s; CreateStateObject hr=0x%08lx\n",
+                 t.summary.empty() ? "TraceRay arguments recorded" : t.summary.c_str(),
+                 (unsigned long)hr);
     if (SUCCEEDED(hr) && pp && *pp) {
         ID3D12StateObject* so = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*pp)->QueryInterface(IID_PPV_ARGS(&so))) && so) {

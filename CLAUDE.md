@@ -153,6 +153,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.45.0: `GeometryIndex()` THROUGH COLLECTIONS, UNREAL'S WAY.** Unreal compiles
+every shader into its own collection (renamed exports, one local root
+signature per shader export) and links them, often by AddToStateObject. A
+collection is transformed like a pipeline and remembers its extended hit
+groups; a raygen collection records its TraceRay arguments, found through the
+RDAT shader kinds so nothing else is disassembled; a pipeline merges both.
+`gitest.exe --collections` and `--grow`: 5 of 7 bit-exact, as one state
+object. Next for item a: the shim's own table layout for records several
+geometries reach.
+
 **0.44.0: `GeometryIndex()` IN AN APPLICATION'S OWN HIT SHADERS WORKS FOR THE
 COMMON LAYOUTS (Tier 1.1 item a, first part).** Read becomes a constant at
 b0 space 0x7FFF0000, appended to the local root signature of the hit groups

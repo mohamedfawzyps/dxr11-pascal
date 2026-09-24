@@ -52,6 +52,99 @@ void TraceArgs(const std::string& text, Info* info) {
     }
 }
 
+// The shader kinds a library defines, read from its RDAT function table, so a
+// library that cannot call TraceRay is never disassembled. Layout checked on
+// a DXC 1.10 library: RDAT {version, part count, part offsets}, each part
+// {type, size, data}, the function table (type 4) {count, stride, records},
+// the kind in word 4 of a record (7 raygen, 9 any-hit, 10 closest-hit,
+// 11 miss, 12 callable). False when there is no readable RDAT.
+bool ShaderKinds(const void* container, size_t size, std::vector<uint32_t>* kinds) {
+    const uint8_t* b = static_cast<const uint8_t*>(container);
+    auto u32 = [&](size_t at) { uint32_t v; std::memcpy(&v, b + at, 4); return v; };
+    if (!b || size < 32 || std::memcmp(b, "DXBC", 4) != 0) return false;
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts && 32 + 4 * (size_t)i + 4 <= size; ++i) {
+        const size_t o = u32(32 + 4 * (size_t)i);
+        if (o + 8 > size || std::memcmp(b + o, "RDAT", 4) != 0) continue;
+        const size_t base = o + 8, len = u32(o + 4);
+        if (base + len > size || len < 8) return false;
+        const uint32_t count = u32(base + 4);
+        for (uint32_t p = 0; p < count && 8 + 4 * (size_t)p + 4 <= len; ++p) {
+            const size_t po = base + u32(base + 8 + 4 * (size_t)p);
+            if (po + 16 > base + len || u32(po) != 4) continue;
+            const size_t data = po + 8;
+            const uint32_t recs = u32(data), stride = u32(data + 4);
+            if (stride < 20 || data + 8 + (size_t)recs * stride > base + len) return false;
+            for (uint32_t r = 0; r < recs; ++r) kinds->push_back(u32(data + 8 + (size_t)r * stride + 16));
+            return true;
+        }
+    }
+    return false;
+}
+
+// The pipeline config's recursion depth, 0 when the object has none.
+UINT Recursion(const D3D12_STATE_OBJECT_DESC& in) {
+    for (UINT i = 0; i < in.NumSubobjects; ++i) {
+        const auto& so = in.pSubobjects[i];
+        if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG && so.pDesc)
+            return static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG*>(so.pDesc)->MaxTraceRecursionDepth;
+        if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1 && so.pDesc)
+            return static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG1*>(so.pDesc)->MaxTraceRecursionDepth;
+    }
+    return 0;
+}
+
+// The TraceRay arguments of one library, when it has a shader that can call
+// TraceRay: a raygen, or with a recursion depth above 1 (or unknown) a
+// closest-hit or miss. Unreal's is 1, so only its raygen collections pay a
+// disassembly.
+void LibraryTraceArgs(const D3D12_DXIL_LIBRARY_DESC* ld, UINT recursion, Info* info) {
+    std::vector<uint32_t> kinds;
+    const bool known = ShaderKinds(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength,
+                                   &kinds);
+    bool can = !known;
+    for (uint32_t k : kinds)
+        if (k == 7 || ((k == 10 || k == 11) && recursion != 1)) can = true;
+    if (!can) return;
+    std::string text, err;
+    if (dxch::Disassemble(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength, &text,
+                          &err))
+        TraceArgs(text, info);
+    else
+        info->dynamicTraceArgs = true;
+}
+
+// What the collections this object links already know: their TraceRay
+// arguments, and their extended hit groups under the names this object gives
+// them (an EXISTING_COLLECTION can export a subset, renamed).
+void MergeCollections(const D3D12_STATE_OBJECT_DESC& in, Info* info) {
+    for (UINT i = 0; i < in.NumSubobjects; ++i) {
+        const auto& so = in.pSubobjects[i];
+        if (so.Type != D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION || !so.pDesc) continue;
+        const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(so.pDesc);
+        auto ci = Get(c->pExistingCollection);
+        if (!ci) continue;
+        for (const auto& p : ci->traceArgs)
+            if (std::find(info->traceArgs.begin(), info->traceArgs.end(), p) == info->traceArgs.end())
+                info->traceArgs.push_back(p);
+        info->dynamicTraceArgs = info->dynamicTraceArgs || ci->dynamicTraceArgs;
+        for (const auto& g : ci->groups) {
+            std::vector<std::wstring> as;
+            if (!c->NumExports) as.push_back(g.name);
+            for (UINT e = 0; e < c->NumExports; ++e) {
+                const auto& x = c->pExports[e];
+                if ((x.ExportToRename ? x.ExportToRename : x.Name) == g.name) as.push_back(x.Name);
+            }
+            for (const auto& name : as) {
+                Group ng = g;
+                ng.name = name;
+                info->groups.push_back(ng);
+                info->recordBytes = (std::max)(info->recordBytes, g.offset + 4);
+            }
+        }
+    }
+}
+
 UINT Align(UINT v, UINT a) { return (v + a - 1) / a * a; }
 
 // Where the appended constant lands in the local arguments, which follow the
@@ -200,7 +293,30 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
         L.text = std::move(text);
         rewritten.push_back(std::move(L));
     }
-    if (rewritten.empty()) return Outcome::kNothing;
+    if (rewritten.empty()) {
+        // Nothing of its own to rewrite. A pipeline may still link collections
+        // whose hit groups were extended, and a collection holding a raygen
+        // records its TraceRay arguments for the pipelines that will link it.
+        auto info = std::make_shared<Info>();
+        MergeCollections(in, info.get());
+        const bool collection = in.Type == D3D12_STATE_OBJECT_TYPE_COLLECTION;
+        if (collection || !info->groups.empty()) {
+            const UINT rec = Recursion(in);
+            for (UINT i = 0; i < n; ++i)
+                if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && s[i].pDesc)
+                    LibraryTraceArgs(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc), rec,
+                                     info.get());
+        }
+        if (info->groups.empty() && !(collection && (!info->traceArgs.empty() ||
+                                                     info->dynamicTraceArgs)))
+            return Outcome::kNothing;
+        out->desc = in;
+        out->info = info;
+        if (!info->groups.empty())
+            out->summary = std::to_string(info->groups.size()) +
+                           " extended hit group(s) linked from collections";
+        return Outcome::kTransformed;
+    }
 
     // 2. The hit groups those functions serve, closed over shared shaders so
     //    that every shader of an extended group has the extended signature.
@@ -342,21 +458,18 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
     }
     if (info->groups.empty() && loose.empty()) return Outcome::kNothing;
 
-    // 4. TraceRay arguments, from every library in the object.
+    // 4. TraceRay arguments, from every library in the object that can trace,
+    //    and whatever the collections it links know.
+    const UINT recursion = Recursion(in);
     for (UINT i = 0; i < n; ++i) {
         if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !s[i].pDesc) continue;
         const Lib* r = nullptr;
         for (const auto& L : rewritten) if (L.index == i) r = &L;
         if (r) { TraceArgs(r->text, info.get()); continue; }
-        const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc);
-        std::string text, err;
-        if (dxch::Disassemble(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength,
-                              &text, &err))
-            TraceArgs(text, info.get());
+        LibraryTraceArgs(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc), recursion,
+                         info.get());
     }
-    for (UINT i = 0; i < n; ++i)
-        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION)
-            info->dynamicTraceArgs = true;   // its TraceRay calls are not visible here
+    MergeCollections(in, info.get());
 
     // 5. The new subobject array. Associations to a local root signature lose
     //    the extended exports; one left with none is dropped rather than

@@ -24,6 +24,39 @@ not.
 
 ---
 
+## 0.45.0
+
+Tier 1.1 item a, second part: **`GeometryIndex()` through COLLECTIONS, the way
+Unreal builds its ray tracing pipelines.** Read from
+`D3D12RayTracing.cpp`: every shader is compiled into its own
+`D3D12_STATE_OBJECT_TYPE_COLLECTION`, exports RENAMED, one local root
+signature associated to each shader export by name (never to the hit group),
+and the pipeline is only `EXISTING_COLLECTION` subobjects, often grown by
+`AddToStateObject`, with the shader identifiers taken from the collections.
+
+- A collection whose library reads `GeometryIndex()` is transformed like a
+  pipeline, and the extended hit groups are remembered on it. A pipeline
+  linking it merges them under the names its `EXISTING_COLLECTION` gives them
+  (a subset, renamed).
+- A collection holding a shader that can call TraceRay records its TraceRay
+  arguments for the pipelines that will link it. Which shaders can is read
+  from the container's `RDAT` function table (layout checked on a DXC 1.10
+  library: kind in word 4, 7 raygen, 10 closest-hit, 11 miss), so only a
+  raygen, or with a recursion depth above 1 a closest-hit or miss, is ever
+  disassembled. Unreal's depth is 1: only its raygen collections pay.
+- The AddToStateObject emulation's rebuild goes through the same path, so a
+  pipeline grown by collections is served.
+- **Measured:** `gitest.exe --collections` (raygen and hit collections,
+  renamed exports, per-shader associations) and `--grow` (the hit collection
+  linked by AddToStateObject) each give the same 5 of 7 layouts bit-exact
+  against WARP as one state object does, at lib_6_5 and lib_6_6; the poison
+  check diverges in both. Dispatch suite 36 of 36.
+- **Still not built, refused by name:** records several geometries reach, a
+  top-level structure bound through a descriptor table while several are
+  live, TraceRay arguments computed at run time, indirect DispatchRays of such
+  a pipeline, the first dispatch before instance data is read, associations
+  from inside a library. Escher's debug view has not been run.
+
 ## 0.44.0
 
 Tier 1.1 completion, item a, first part: **`GeometryIndex()` in an

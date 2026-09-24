@@ -28,7 +28,8 @@
 //
 // Build:  build_tier11.bat          -> gitest.exe in the repository root,
 //                                      beside the proxy d3d12.dll and DXC
-// Run:    gitest.exe [--sm66] [layout ...]      default: every layout
+// Run:    gitest.exe [--sm66] [--collections | --grow] [layout ...]
+//         default: every layout, one state object
 //
 // Exit code 0 only when every layout matches WARP.
 
@@ -68,6 +69,9 @@ static void HR(HRESULT hr, const char* what) {
 }
 
 static bool g_sm66 = false;
+// 0 one state object, 1 --collections (Unreal's way), 2 --grow (the hit
+// collection linked by AddToStateObject, how Unreal grows its pipeline).
+static int g_mode = 0;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -372,7 +376,103 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a3 });
     D3D12_STATE_OBJECT_DESC sd{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, (UINT)sub.size(), sub.data() };
     ComPtr<ID3D12StateObject> so;
-    HR(g.dev->CreateStateObject(&sd, IID_PPV_ARGS(&so)), "CreateStateObject");
+    if (g_mode == 0) {
+        HR(g.dev->CreateStateObject(&sd, IID_PPV_ARGS(&so)), "CreateStateObject");
+    } else {
+        // Unreal's way (D3D12RayTracing.cpp): every shader compiled into a
+        // COLLECTION with its exports RENAMED and one local root signature
+        // associated to each export by name, then collections linked into a
+        // pipeline. --grow links the hit collection by AddToStateObject.
+        D3D12_ROOT_SIGNATURE_DESC ld0{ 0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
+        auto lrs0 = RootSig(g.dev.Get(), ld0);
+        D3D12_LOCAL_ROOT_SIGNATURE lsub0{ lrs0.Get() };
+
+        // Raygen and miss.
+        D3D12_EXPORT_DESC rgExp[2] = { { L"RayGen", nullptr, D3D12_EXPORT_FLAG_NONE },
+                                       { L"Miss", nullptr, D3D12_EXPORT_FLAG_NONE } };
+        D3D12_DXIL_LIBRARY_DESC rgLib = libd;
+        rgLib.NumExports = 2; rgLib.pExports = rgExp;
+        std::vector<D3D12_STATE_SUBOBJECT> rs;
+        rs.reserve(8);
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &rgLib });
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub0 });
+        const D3D12_STATE_SUBOBJECT* r0 = &rs.back();
+        const wchar_t* rgName[] = { L"RayGen" }; const wchar_t* msName[] = { L"Miss" };
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION ra{ r0, 1, rgName }, rm{ r0, 1, msName };
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &ra });
+        rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &rm });
+        D3D12_STATE_OBJECT_DESC rd{ D3D12_STATE_OBJECT_TYPE_COLLECTION, (UINT)rs.size(), rs.data() };
+        ComPtr<ID3D12StateObject> rgColl;
+        HR(g.dev->CreateStateObject(&rd, IID_PPV_ARGS(&rgColl)), "CreateStateObject(raygen collection)");
+
+        // Hit shaders, renamed, and the hit groups over the new names.
+        D3D12_EXPORT_DESC hExp[4] = {
+            { L"CH_a", L"ClosestHit", D3D12_EXPORT_FLAG_NONE },
+            { L"CH_b", L"ClosestHit3", D3D12_EXPORT_FLAG_NONE },
+            { L"CH_c", L"ClosestHitOther", D3D12_EXPORT_FLAG_NONE },
+            { L"AH_a", L"AnyHit", D3D12_EXPORT_FLAG_NONE } };
+        D3D12_DXIL_LIBRARY_DESC hLib = libd;
+        hLib.NumExports = 4; hLib.pExports = hExp;
+        D3D12_HIT_GROUP_DESC chg[3] = { hg[0], hg[1], hg[2] };
+        chg[0].ClosestHitShaderImport = L"CH_a";
+        chg[1].ClosestHitShaderImport = L"CH_b";
+        chg[2].ClosestHitShaderImport = L"CH_c";
+        if (chg[0].AnyHitShaderImport) chg[0].AnyHitShaderImport = L"AH_a";
+        std::vector<D3D12_STATE_SUBOBJECT> hs;
+        hs.reserve(16);
+        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &hLib });
+        for (auto& h : chg) hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &h });
+        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
+        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
+        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
+        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub1 });
+        const D3D12_STATE_SUBOBJECT* h1 = &hs.back();
+        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub3 });
+        const D3D12_STATE_SUBOBJECT* h3 = &hs.back();
+        // One association per SHADER, as Unreal does it: the hit groups' own
+        // names are never listed.
+        const wchar_t* e1[] = { L"CH_a" }; const wchar_t* e2[] = { L"CH_c" };
+        const wchar_t* e3[] = { L"AH_a" }; const wchar_t* e4[] = { L"CH_b" };
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION x1{ h1, 1, e1 }, x2{ h1, 1, e2 }, x3{ h1, 1, e3 },
+                                               x4{ h3, 1, e4 };
+        for (auto* x : { &x1, &x2, &x3, &x4 })
+            hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, x });
+        D3D12_STATE_OBJECT_DESC hd{ D3D12_STATE_OBJECT_TYPE_COLLECTION, (UINT)hs.size(), hs.data() };
+        ComPtr<ID3D12StateObject> hitColl;
+        HR(g.dev->CreateStateObject(&hd, IID_PPV_ARGS(&hitColl)), "CreateStateObject(hit collection)");
+
+        D3D12_EXISTING_COLLECTION_DESC ec1{ rgColl.Get(), 0, nullptr }, ec2{ hitColl.Get(), 0, nullptr };
+        D3D12_STATE_OBJECT_CONFIG grow{ D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS };
+        std::vector<D3D12_STATE_SUBOBJECT> ps;
+        ps.reserve(8);
+        ps.push_back({ D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &ec1 });
+        if (g_mode == 1) ps.push_back({ D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &ec2 });
+        else ps.push_back({ D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &grow });
+        ps.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
+        ps.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
+        ps.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
+        D3D12_STATE_OBJECT_DESC pd{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, (UINT)ps.size(), ps.data() };
+        HR(g.dev->CreateStateObject(&pd, IID_PPV_ARGS(&so)), "CreateStateObject(pipeline)");
+        if (g_mode == 2) {
+            // The addition repeats the configs, as an addition must.
+            std::vector<D3D12_STATE_SUBOBJECT> as;
+            as.reserve(8);
+            as.push_back({ D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &ec2 });
+            as.push_back({ D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &grow });
+            as.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
+            as.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
+            as.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
+            D3D12_STATE_OBJECT_DESC addDesc{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, (UINT)as.size(), as.data() };
+            ComPtr<ID3D12Device7> d7;
+            HR(g.dev.As(&d7), "ID3D12Device7");
+            ComPtr<ID3D12StateObject> grown;
+            HR(d7->AddToStateObject(&addDesc, so.Get(), IID_PPV_ARGS(&grown)), "AddToStateObject");
+            so = grown;
+        }
+    }
     ComPtr<ID3D12StateObjectProperties> props;
     HR(so.As(&props), "StateObjectProperties");
 
@@ -430,6 +530,8 @@ int main(int argc, char** argv) {
     std::set<std::string> want;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sm66")) g_sm66 = true;
+        else if (!std::strcmp(argv[i], "--collections")) g_mode = 1;
+        else if (!std::strcmp(argv[i], "--grow")) g_mode = 2;
         else want.insert(argv[i]);
     }
     ComPtr<IDXGIFactory6> fac;
@@ -438,7 +540,10 @@ int main(int argc, char** argv) {
     fac->EnumWarpAdapter(IID_PPV_ARGS(&warp));
     fac->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&hw));
     DXGI_ADAPTER_DESC1 hd{}; hw->GetDesc1(&hd);
-    std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s\n", g_sm66 ? "lib_6_6" : "lib_6_5");
+    std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s, %s\n",
+                g_sm66 ? "lib_6_6" : "lib_6_5",
+                g_mode == 0 ? "one state object" : g_mode == 1 ? "collections"
+                                                               : "collections grown by AddToStateObject");
     std::printf("ground truth WARP, against %ls\n\n", hd.Description);
 
     int failed = 0, ran = 0;
