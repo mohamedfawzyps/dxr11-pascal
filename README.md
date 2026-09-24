@@ -65,18 +65,20 @@ Done: RayQuery (all 25 accessors Unreal uses), indirect `DispatchRays`,
 `AddToStateObject`, the new ray flags, and every RayQuery shader in the Unreal
 game used for testing. Next, in order:
 
-1. NVIDIA cluster operations (RTX Mega Geometry), which Unreal uses to ray
+1. the rest of Tier 1.1, which the shim already reports: `GeometryIndex()` in
+   an application's own ray tracing shaders, the pipeline-wide skip flags, the
+   rewriter's remaining refusals, and `RayQuery` inside ray tracing shaders,
+   beside `groupshared` memory or wave operations, and in pixel, vertex, mesh
+   and amplification shaders
+2. NVIDIA cluster operations (RTX Mega Geometry), which Unreal uses to ray
    trace Nanite at full detail
-2. Shader Execution Reordering, fully: measured faster on the GTX 1070 where
-   shading diverges, see below
-3. spheres and linear swept spheres
-4. opacity micromaps, NVAPI's form and DXR 1.2's. A 2-state micromap decides
-   opacity without running the any-hit shader, so it can draw differently from
-   the alpha test; emulating it means reproducing the micromap lookup
-5. Shader Model 6.9 and DXR 1.2, fully, whether or not an application asks for
-   them yet. They include Shader Execution Reordering, so they are claimed only
-   once that is complete, see below
-6. DLSS, including Ray Reconstruction, last. It needs tensor cores, which
+3. Tier 1.2: Shader Execution Reordering, fully, measured faster on the GTX
+   1070 where shading diverges (see below); opacity micromaps, NVAPI's form and
+   DXR 1.2's, where a 2-state micromap decides opacity without running the
+   any-hit shader, so emulating it means reproducing the micromap lookup; and
+   Shader Model 6.9 with DXR 1.2 in full, claimed only once SER is complete
+4. spheres and linear swept spheres
+5. DLSS, including Ray Reconstruction, last. It needs tensor cores, which
    Pascal lacks; how to emulate it, and whether NVIDIA's license allows running
    its networks another way, are open
 
@@ -171,7 +173,8 @@ A shader the rewriter cannot lower is logged and forwarded unchanged, so the
 application gets the driver's own error rather than a silently wrong render.
 Nothing here is guessed at: each refusal is provoked by a test.
 
-Refused because DXR 1.0 offers nothing to lower onto:
+Refused because DXR 1.0 offers nothing to lower onto. Under the scope above
+the first three are still to be solved, as the end of Tier 1.1, not accepted:
 
 - `RayQuery` in a pixel, vertex, mesh or amplification shader. `DispatchRays`
   only launches a raygen, and there is no promotion path

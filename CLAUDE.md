@@ -18,34 +18,57 @@ narrower scope statement further down this brief. Consequences:
   source, not assumed. SER is the one case so far, and only until it is
   complete, see below.
 
-**The order**, agreed 2026-09-24, extended the same day:
+**The order**, agreed 2026-09-24 and revised the same day: finish Tier 1.1,
+then cluster operations, then Tier 1.2.
 
 1. The 24 MegaLights loop-isolation shaders. DONE, 0.42.0.
 2. The 33 two-query shaders. DONE, 0.43.0.
-3. **NVIDIA cluster operations** (RTX Mega Geometry). Unreal ray traces Nanite
+3. **Finish Tier 1.1**, easiest first. Reporting 1.1 promises all of it.
+   Escher hits none of these today, every one of its shaders lowers, so they
+   are for correctness, not for anything visible there.
+   a. **`GeometryIndex()` in the APPLICATION's own DXR shaders.** Tier 1.1
+      (SFI0 0x2000000; `CreateStateObject` returns E_INVALIDARG on the 1070).
+      Solved only inside the shaders the shim generates. Never tested.
+   b. **`D3D12_RAYTRACING_PIPELINE_CONFIG1` flags**, SKIP_TRIANGLES and
+      SKIP_PROCEDURAL_PRIMITIVES for a whole pipeline. Today only cached for
+      AddToStateObject; never run on the 1070.
+   c. **The rewriter's own gaps**: several queries where one needs an
+      intersection shader, a 6.6 binding into a resource array at a dynamic
+      index, and `switch` edges in the CFG model.
+   d. **RayQuery inside DXR shaders**, the raygen first (it can call
+      TraceRay; the obstacle is that the application owns the shader table).
+   e. **RayQuery beside groupshared memory, group barriers or wave
+      intrinsics.**
+   f. **RayQuery in pixel, vertex, mesh and amplification shaders.** The
+      hardest, so last in 1.1. Listed below as "no valid lowering"; under the
+      premise that is a feature loss to solve, not a fact to accept.
+4. **NVIDIA cluster operations** (RTX Mega Geometry). Unreal ray traces Nanite
    at full detail through them, and against fallback meshes without.
-4. **Shader Execution Reordering, full.** Measured faster where shading
-   diverges (docs/ser-test.md), so it is built: the whole HitObject API in
-   NVAPI's form, and the reordering in software, applied where shading
-   diverges. Claimed to Unreal only once complete, see SER below.
-5. **Spheres and linear swept spheres**, NVAPI geometry types.
-6. **Opacity micromaps (OMM)**, emulated, in both forms: NVAPI's, which is
-   what Unreal uses (`WindowsD3D12Device.cpp:1717`, gated by
-   `r.RayTracing.Geometry.OpacityMicromaps.Enable`, checking
-   `NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_OMM_SUPPORT`), and the
-   DXR 1.2 one. Not skippable as an "acceleration": a 2-state micromap DECIDES
-   opacity per micro-triangle without running the any-hit, so it can draw a
-   different edge than the alpha test does. Exact emulation means reproducing
-   the micromap lookup, not falling back to the any-hit.
-7. **Shader Model 6.9 and DXR 1.2, fully supported**, whether or not an
-   application asks yet. The NvRTX 5.7 clone does not: its
-   `FindHighestShaderModel` stops at 6.7 (`WindowsD3D12Device.cpp:195`) and
-   its D3D12 RHI names no 6.9. Escher's 5.8.2 is not checked. The DXC here
-   (1.10.2605) compiles `lib_6_9`. SER is part of 6.9 and DXR 1.2, so neither
-   is claimed before SER is complete, see below.
-   The full 6.9 feature list is to be read off DXC and the spec before any
-   design, not recalled.
-8. **DLSS, including Ray Reconstruction and the latest versions. LAST.** See
+   An NVIDIA extension, in neither tier. Placed after Tier 1.1 by the user.
+5. **Tier 1.2**, in this order:
+   a. **Shader Execution Reordering, full.** Measured faster where shading
+      diverges (docs/ser-test.md), so it is built: the whole HitObject API in
+      NVAPI's form, and the reordering in software, applied where shading
+      diverges. Claimed to Unreal only once complete, see SER below.
+   b. **Opacity micromaps (OMM)**, emulated, in both forms: NVAPI's, which is
+      what Unreal uses (`WindowsD3D12Device.cpp:1717`, gated by
+      `r.RayTracing.Geometry.OpacityMicromaps.Enable`, checking
+      `NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_OMM_SUPPORT`), and the
+      DXR 1.2 one. Not skippable as an "acceleration": a 2-state micromap DECIDES
+      opacity per micro-triangle without running the any-hit, so it can draw a
+      different edge than the alpha test does. Exact emulation means reproducing
+      the micromap lookup, not falling back to the any-hit.
+   c. **Shader Model 6.9 and DXR 1.2, fully supported**, whether or not an
+      application asks yet. The NvRTX 5.7 clone does not: its
+      `FindHighestShaderModel` stops at 6.7 (`WindowsD3D12Device.cpp:195`) and
+      its D3D12 RHI names no 6.9. Escher's 5.8.2 is not checked. The DXC here
+      (1.10.2605) compiles `lib_6_9`. SER is part of 6.9 and DXR 1.2, so neither
+      is claimed before SER is complete, see below.
+      The full 6.9 feature list is to be read off DXC and the spec before any
+      design, not recalled.
+6. **Spheres and linear swept spheres**, NVAPI geometry types.
+   An NVIDIA extension, in neither tier.
+7. **DLSS, including Ray Reconstruction and the latest versions. LAST.** See
    the DLSS note below.
 
 **SER (Shader Execution Reordering): FULL SER OR NOTHING, decided by the
