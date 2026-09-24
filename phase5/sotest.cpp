@@ -479,7 +479,38 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
         std::printf("calling CreateStateObject with %u subobjects...\n", n);
         std::fflush(stdout);
     }
+    // SOTEST_NVEXT="0,1001": register the NVAPI shader extension UAV slot on
+    // this thread around the call, as Unreal does around every compute PSO
+    // it creates with a vendor extension. The driver then reads stores to
+    // that UAV as NVAPI intrinsics rather than as plain writes. TEST ONLY.
+    typedef void* (__cdecl* NvQI)(unsigned);
+    typedef int (__cdecl* NvSetSlot)(IUnknown*, unsigned, unsigned);
+    NvSetSlot nvSet = nullptr;
+    {
+        char spec[64] = {};
+        unsigned slot = 0, space = 0;
+        if (GetEnvironmentVariableA("SOTEST_NVEXT", spec, sizeof(spec)) &&
+            std::sscanf(spec, "%u,%u", &slot, &space) == 2) {
+            HMODULE nv = LoadLibraryW(L"nvapi64.dll");
+            NvQI qi = nv ? (NvQI)GetProcAddress(nv, "nvapi_QueryInterface") : nullptr;
+            typedef int (__cdecl* NvInit)();
+            NvInit init = qi ? (NvInit)qi(0x0150e828) : nullptr;
+            nvSet = qi ? (NvSetSlot)qi(0x43d867c0) : nullptr;
+            int a = init ? init() : -1;
+            int b = (nvSet && a == 0) ? nvSet(dev, slot, space) : -1;
+            if (!quiet) std::printf("NVAPI extension slot u%u space%u: init %d, set %d\n", slot, space, a, b);
+            // What the driver says about cluster operations, the capability the
+            // cluster-ID intrinsics depend on. Unreal asks the same question.
+            typedef int (__cdecl* NvCaps)(ID3D12Device*, int, void*, size_t);
+            NvCaps caps = qi ? (NvCaps)qi(0x85a6c2a0) : nullptr;
+            unsigned cl = 0xDEAD;
+            int c = (caps && a == 0) ? caps(dev, 3, &cl, sizeof(cl)) : -1;
+            if (!quiet) std::printf("NVAPI cluster operations caps: status %d, value 0x%X\n", c, cl);
+            if (b != 0) nvSet = nullptr;
+        }
+    }
     out.hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&out.so));
+    if (nvSet) nvSet(dev, 0xFFFFFFFFu, 0);
     if (!quiet) Report("CreateStateObject", out.hr);
     // With DXR_TIER11_DEBUGLAYER=1 the layer is on; print what it said about
     // this call. It reports through OutputDebugString otherwise, which a

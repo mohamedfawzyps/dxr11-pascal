@@ -59,8 +59,9 @@ Verified on a GTX 1070, with WARP as the oracle for every result:
 - 34 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
   sensitivity gate
 - 14 rewriter cases, each byte-identical between the Python reference and the
-  C++ port, on both the `.ll` path and the DXIL container path, plus 28
-  analysis and lowering checks, 3 record-read checks and an append check
+  C++ port, on both the `.ll` path and the DXIL container path, plus 34
+  analysis and lowering checks, 3 record-read checks, an append check and a
+  driver check of NVAPI calls with the extension slot registered
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
   pixel-identical to its no-proxy baseline
 
@@ -153,6 +154,14 @@ thing and is said differently in the log:
   refused as well, which is the largest remaining gap against Unreal
 - a Shader Model 6.6 binding into a resource array at a dynamic index. The 6.5
   form of exactly that works
+- an NVAPI shader extension call other than the RayQuery cluster ID ones.
+  NVIDIA's HLSL extensions are stores to a `RWStructuredBuffer` of
+  `NvShaderExtnStruct`, which the driver reads as intrinsics while the
+  application has registered that buffer's slot, as Unreal does around its
+  compute pipelines. The candidate and committed cluster ID calls (ops 94 and
+  95) are replaced with 0xFFFFFFFF, the answer for every geometry on a card
+  without cluster operations, which is what Pascal reports; any other call is
+  refused rather than moved into a DXR 1.0 shader
 
 **All 25 of the `RayQuery` accessors Unreal uses are now supported.** Four of
 them, `Candidate`/`CommittedGeometryIndex` and the two

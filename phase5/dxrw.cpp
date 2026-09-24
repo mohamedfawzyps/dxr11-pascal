@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../proxy/rewriter/ll_model.h"
+#include "../proxy/rewriter/nvapi_fold.h"
 #include "../proxy/rewriter/rq_analyze.h"
 #include "../proxy/rewriter/rq_lower.h"
 #include "../proxy/rewriter/dxc_host.h"
@@ -43,9 +44,14 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "analyze") {
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
-        llm::Module m(llm::Normalize(raw));
-        auto a = rq::Analyze(m);
+        std::string text, why;
         std::printf("\n-- %s --\n", argv[2]);
+        if (!rq::FoldNvapi(llm::Normalize(raw), &text, &why)) {
+            std::printf("   UNSUPPORTED            : %s\n", why.c_str());
+            return 2;
+        }
+        llm::Module m(text);
+        auto a = rq::Analyze(m);
         if (!a.ok) { std::printf("   UNSUPPORTED            : %s\n", a.error.c_str()); return 2; }
         const auto& q = a.query;
         std::printf("   entry function         : %s\n", q.fn->name.c_str());
@@ -65,7 +71,12 @@ int main(int argc, char** argv) {
     if (argc >= 4 && std::string(argv[1]) == "lower") {
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
-        llm::Module m(llm::Normalize(raw));
+        std::string text, why;
+        if (!rq::FoldNvapi(llm::Normalize(raw), &text, &why)) {
+            std::fprintf(stderr, "REFUSED: %s\n", why.c_str());
+            return 2;
+        }
+        llm::Module m(text);
         auto a = rq::Analyze(m);
         if (!a.ok) { std::fprintf(stderr, "REFUSED: %s\n", a.error.c_str()); return 2; }
         auto l = rq::Lower(m, a.query);
@@ -89,7 +100,9 @@ int main(int argc, char** argv) {
         auto xform = [](const std::string& in, std::string* out, std::string* why,
                         void* c) -> bool {
             Ctx* x = static_cast<Ctx*>(c);
-            llm::Module m(llm::Normalize(in));
+            std::string text;
+            if (!rq::FoldNvapi(llm::Normalize(in), &text, why)) return false;
+            llm::Module m(text);
             auto a = rq::Analyze(m);
             if (!a.ok) { *why = a.error; return false; }
             auto l = rq::Lower(m, a.query);

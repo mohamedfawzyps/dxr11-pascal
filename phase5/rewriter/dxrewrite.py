@@ -21,10 +21,16 @@ from dxil import Module
 from llnorm import normalize
 import rayquery
 import lower
+import nvapi
 
 
 def cmd_analyze(path):
     text = normalize(io.open(path, encoding='utf-8').read())
+    try:
+        text = nvapi.fold(text)
+    except rayquery.Unsupported as e:
+        print('\n-- %s --\n   UNSUPPORTED            : %s' % (path, e))
+        return 2
     mod = Module(text)
     print('\n-- %s --' % path)
     print('   functions              : %s'
@@ -70,8 +76,8 @@ def cmd_analyze(path):
 
 def cmd_lower(src, dst):
     text = normalize(io.open(src, encoding='utf-8').read())
-    mod = Module(text)
     try:
+        mod = Module(nvapi.fold(text))
         q = rayquery.analyze(mod)
     except rayquery.Unsupported as e:
         sys.stderr.write('REFUSED: %s\n' % e)

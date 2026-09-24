@@ -22,6 +22,7 @@ from dxil import Module
 from llnorm import normalize
 import rayquery
 import lower
+import nvapi
 
 OPAQUE = os.path.join('phase5', 'dxil', 'rayquery_opaque.ll')
 ALPHA = os.path.join('phase5', 'dxil', 'rayquery_alpha.ll')
@@ -417,6 +418,56 @@ def main():
         name = 'append with ' + ('Abort()' if 'abort' in path else 'an intersection')
         ok.append(expect_lower_reject(name, t, why))
         ok.append(cpp_agrees(name, t, why))
+
+    # NVAPI shader extension calls (0.41.1). What 0.41.0 took for an append is
+    # NVIDIA's encoding of an intrinsic: stores to a RWStructuredBuffer of
+    # NvShaderExtnStruct, which the driver reads as a RayQuery cluster-ID call
+    # while Unreal has the slot registered. Moved into an any-hit it killed the
+    # driver. Ops 94 and 95 fold to 0xFFFFFFFF, and nothing of the call may be
+    # left; any other op is refused, by both implementations.
+    NV = os.path.join('phase5', 'cases', 'rayquery_nvapi_sm66.ll')
+    if os.path.isfile(NV):
+        t = load(NV)
+
+        def nv_lower(text):
+            m = Module(nvapi.fold(text))
+            return lower.lower(m, rayquery.analyze(m))
+
+        name = 'NVAPI cluster ID calls folded'
+        try:
+            out = nv_lower(t)
+            left = re.search(r'bufferUpdateCounter|i32 0, i32 9[45],', out)
+            folded = re.search(r'icmp eq i32 -1, -1', out) and re.search(r'uitofp i32 -1 ', out)
+            if left or not folded:
+                print('  FAILED   %-34s %s' % (name, 'left in place: ' + left.group(0) if left
+                                               else 'the constant is not where the calls were'))
+                ok.append(False)
+            else:
+                print('  ok       %-34s both calls are 0xFFFFFFFF' % name)
+                ok.append(True)
+        except rayquery.Unsupported as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None, r'bufferUpdateCounter|NvShaderExtnStruct"\* undef'))
+
+        for name, text, why in (
+                ('NVAPI op other than cluster ID',
+                 t.replace('i32 0, i32 94,', 'i32 0, i32 50,', 1), 'op 50'),
+                ('NVAPI call without its result',
+                 re.sub(r'(?m)^(\s*)(%v\d+) = (call i32 @dx\.op\.bufferUpdateCounter\(i32 70, '
+                        r'%dx\.types\.Handle %v\d+, i8 1\)(?:(?!\n).)*\n)((?:(?!bufferUpdateCounter).*\n)*?)'
+                        r'\s*%v\d+ = call i32 @dx\.op\.bufferUpdateCounter.*\n',
+                        r'\1\2 = \3\4', t, count=1), 'op 94')):
+            assert text != t, 'cannot build the mutation: ' + name
+            try:
+                nv_lower(text)
+                print('  FAILED   %-34s was LOWERED, should have been refused' % name)
+                ok.append(False)
+            except rayquery.Unsupported as e:
+                good = why.lower() in str(e).lower()
+                print('  %s %-34s %s' % ('refused ' if good else 'FAILED  ', name, str(e)[:52]))
+                ok.append(good)
+            ok.append(cpp_agrees(name, text, why))
 
     # Committing BOTH kinds is no longer refused: the loop body lowers twice,
     # into an any-hit and an intersection shader, with two closest-hits because

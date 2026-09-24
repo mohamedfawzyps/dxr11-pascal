@@ -11,6 +11,7 @@
 #include "shader_dump.h"
 #include "rewriter/dxc_host.h"
 #include "rewriter/ll_model.h"
+#include "rewriter/nvapi_fold.h"
 #include "rewriter/rq_analyze.h"
 #include "rewriter/rq_lower.h"
 
@@ -69,7 +70,9 @@ std::string ShapeLine(const Xform& f) {
 
 bool DoLower(const std::string& in, std::string* out, std::string* why, void* ctx) {
     Xform* x = static_cast<Xform*>(ctx);
-    llm::Module m(llm::Normalize(in));
+    std::string text;
+    if (!rq::FoldNvapi(llm::Normalize(in), &text, why)) return false;
+    llm::Module m(text);
     auto a = rq::Analyze(m);
     if (!a.ok) { *why = a.error; return false; }
     if (!rq::NumThreads(m, x->threads)) {

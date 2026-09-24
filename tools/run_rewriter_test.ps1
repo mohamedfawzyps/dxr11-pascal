@@ -250,6 +250,42 @@ else {
 }
 
 Write-Host ''
+Write-Host '=== NVAPI cluster ID calls, on the driver with the slot registered ==='
+# 0.41.1. Unreal registers the NVAPI extension UAV (u0 space1001) around the
+# compute pipelines it creates, so the shim's CreateStateObject runs with it
+# registered and the driver reads stores to that UAV as intrinsics. 0.41.0
+# moved a RayQuery cluster-ID call into the any-hit and the driver died
+# compiling it. sotest registers the slot the same way (SOTEST_NVEXT). The
+# folded library must build; the same case lowered WITHOUT the fold is the
+# control and must kill the driver, or this check proves nothing. A crash is
+# never cached, so the control stays sensitive on a warm cache.
+$case = 'phase5\cases\rayquery_nvapi_sm66'
+if (-not (Test-Path "$case.dxil")) { Write-Host "  nvapi : SKIPPED, $case.dxil missing"; $failed++ }
+else {
+    & 'C:\DW\DXC\bin\x64\dxc.exe' -T rootsig_1_1 -E RS -Fo 'phase5\out\nvapi.rs.bin' "$case.hlsl" | Out-Null
+    Copy-Item 'phase5\out\nvapi.rs.bin' 'phase5\out\nvctl.rs.bin'
+    $shape = "anyhit=1 intersection=0 both=0 recordconstants=0 baked=0 recordsrv=0`n"
+    [IO.File]::WriteAllText("$PWD\phase5\out\nvapi.shape.txt", $shape)
+    [IO.File]::WriteAllText("$PWD\phase5\out\nvctl.shape.txt", $shape)
+    & .\phase5out\dxrw.exe rewrite "$case.dxil" 'phase5\out\nvapi.out.dxil' | Out-Null
+    & python phase5\rewriter\nofold.py "$case.ll" 'phase5\out\nvctl.ll'
+    & .\phase5out\dxilrt.exe asm 'phase5\out\nvctl.ll' 'phase5\out\nvctl.out.dxil' | Out-Null
+    $env:SOTEST_NVEXT = '0,1001'
+    $fix = (& .\phase5out\sotest.exe 'phase5\out\nvapi.out.dxil' 'phase5\out\nvapi.rs.bin' hw 2>&1) -join "`n"
+    $ctl = (& .\phase5out\sotest.exe 'phase5\out\nvctl.out.dxil' 'phase5\out\nvctl.rs.bin' hw 2>&1) -join "`n"
+    Remove-Item Env:\SOTEST_NVEXT
+    $slot = $fix -match 'NVAPI extension slot u0 space1001: init 0, set 0'
+    $fixOk = $fix -match 'CreateStateObject\s+hr=0x00000000'
+    $ctlDied = $ctl -match 'DXGI_ERROR_DRIVER_INTERNAL_ERROR'
+    if ($slot -and $fixOk -and $ctlDied) {
+        Write-Host '  nvapi : PASS (folded library builds with the slot registered; unfolded control kills the driver)'
+    } else {
+        Write-Host "  nvapi : FAIL (slot registered=$slot folded builds=$fixOk control died=$ctlDied)"
+        $failed++
+    }
+}
+
+Write-Host ''
 Write-Host '=== refusal checks ==='
 & python phase5\rewriter\test_reject.py
 if ($LASTEXITCODE -ne 0) { $failed++ }

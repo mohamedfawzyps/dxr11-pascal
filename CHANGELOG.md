@@ -24,6 +24,60 @@ not.
 
 ---
 
+## 0.41.1
+
+- **0.41.0 crashed Escher 3 runs of 3, and the fix is to what 0.41.0 got
+  wrong.** Each run lost the device, `DXGI_ERROR_DRIVER_INTERNAL_ERROR`,
+  inside the shim's `CreateStateObject`, on exactly the libraries that carried
+  the newly lowered "append". It was never an append. It is NVIDIA's HLSL
+  extension encoding (`nvHLSLExtnsInternal.h`): a counter increment on a
+  `RWStructuredBuffer<NvShaderExtnStruct>` at u0 space1001, the opcode stored
+  at offset 0, `rq.RayFlags()` at offset 76 to name the query, and a second
+  increment whose result is the answer. Op 94 is
+  `NV_EXTN_OP_RT_GET_CANDIDATE_CLUSTER_ID`, in the Proceed loop; op 95, the
+  committed form, sits after it. The "constant 94" and "RayFlags at offset 76"
+  that 0.41.0 and the brief read as a debug record were the opcode and the
+  query handle.
+- **Why only in the game.** Unreal calls
+  `NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(u0, space1001)` around
+  every compute pipeline it creates with a vendor extension
+  (`WindowsD3D12PipelineState.cpp`), and the shim's `CreateStateObject` runs
+  inside that call, on that thread. The driver then compiles a RayQuery
+  intrinsic into a hit shader with no RayQuery, and dies. Every offline replay
+  lacked the registration. `sotest` now has it, `SOTEST_NVEXT="0,1001"`:
+  the two Escher libraries fail 10 of 10 with the game's exact error, and
+  build 24 of 24 cold without it; a library with no extension buffer builds 5
+  of 5 with it.
+- **The fix, in both rewriters, byte-identical:** a pre-pass on the normalised
+  text, `phase5/rewriter/nvapi.py` and `proxy/rewriter/nvapi_fold.cpp`, finds
+  the extension buffer by its type, replaces each op 94 and 95 call with
+  0xFFFFFFFF and removes its stores and counters, and refuses any other use of
+  that buffer. 0xFFFFFFFF is "not a cluster", the value Unreal itself uses
+  when cluster operations are off; measured on the 1070,
+  `NvAPI_D3D12_GetRaytracingCaps(CLUSTER_OPERATIONS)` is 0x0, `CAP_NONE`, so
+  no geometry can be a cluster. A module without the buffer passes through
+  unchanged.
+- Measured: the 125 shaders dumped from the 0.40.3 run, Python and C++
+  identical on every one; 40 carry the extension buffer and 18 of those now
+  lower (the rest hit the concurrent-query and loop-isolation refusals); every
+  lowered output validates and none keeps a counter update. On the 1070, cold
+  cache, slot registered: those 18 build 90 of 90; the same 18 lowered the
+  0.41.0 way fail 5 of 5, and the Escher library 3 of 3, in the same harness.
+- `phase5/cases/rayquery_nvapi_sm66.hlsl` writes both calls the NVAPI way.
+  Three new checks in `test_reject.py`: the calls fold and nothing is left, an
+  op other than 94 or 95 is refused, and a call without its result is refused,
+  each also checked in the C++; with the fold off, all three fail. The
+  rewriter suite gains a driver check: the folded library builds with the slot
+  registered, and the same case lowered without the fold
+  (`phase5/rewriter/nofold.py`) must kill the driver, which it does.
+- **Probably also the 0.36 crash that never reproduced offline.** That was
+  `RayTracingDebugMainCS`, 13132 bytes, which is one of the two Escher
+  libraries here, and it carries the same calls. Not re-run: that dump is
+  gone.
+- Unchanged: a genuine append still lowers, and
+  `NO_DUPLICATE_ANYHIT_INVOCATION` is still set on every bottom-level
+  geometry. No Escher shader lowered so far appends for real.
+
 ## 0.41.0
 
 - **A Proceed loop that APPENDS is lowered, not refused.** 47 of Escher's

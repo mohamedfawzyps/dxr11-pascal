@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.41.0.
+proxy/version.h, and is currently 0.41.1.
 
 ## Current position (2026-09-23)
 
@@ -61,6 +61,31 @@ more than 256 baked pairs. See the CHANGELOG.
 **0.40.3 IN THE GAME: 18 MINUTES CLEAN, TABLES REUSED (2026-09-24).** 36034
 lowered dispatches drawn, 112 refused (0.3%, short bursts at structure
 changes), 9693 of 10142 tables written into a spare, 377 buffers freed.
+
+**0.41.0 CRASHED ESCHER 3 OF 3, AND THE "APPEND" WAS NEVER AN APPEND
+(2026-09-24).** `DRIVER_INTERNAL_ERROR` inside the shim's `CreateStateObject`,
+on exactly the libraries carrying the transplanted "append". It is NVIDIA's
+HLSL extension encoding: a counter on `RWStructuredBuffer<NvShaderExtnStruct>`
+at u0 space1001, the OPCODE stored at offset 0 (94 is
+`RT_GET_CANDIDATE_CLUSTER_ID`, 95 the committed form), `rq.RayFlags()` at 76 to
+name the query, a second increment returning the answer. The "constant 94" and
+"RayFlags at 76" below were read as a debug record; they were the opcode and
+the query handle. Unreal registers that slot with
+`NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread` around every compute PSO it
+creates with a vendor extension, and the shim's `CreateStateObject` runs inside
+that call, so the driver compiled a RayQuery intrinsic into a hit shader. Every
+offline replay lacked the registration: `sotest` with `SOTEST_NVEXT="0,1001"`
+fails the Escher libraries 10 of 10 with the game's exact error, 0 of 24
+without. 0.41.1 folds ops 94 and 95 to 0xFFFFFFFF ("not a cluster"; the 1070
+reports cluster operations `CAP_NONE`, measured) and refuses any other NVAPI
+use. 18 Unreal NVAPI shaders now lower, 90 of 90 cold compiles with the slot
+registered, the 0.41.0 lowering of the same 5 of 5 fatal. **Probably also the
+0.36 in-game-only crash of `RayTracingDebugMainCS`**: same shader, same calls,
+and the 0.36 entry's "no NVAPI shader extension markers" looked for the wrong
+thing. **The rule: an offline replay must reproduce the application's DEVICE
+STATE, not only its inputs. NVAPI state set per thread around a call is
+invisible to every D3D12 instrument, the debug layer included.** Game run
+pending.
 
 **0.41.0: THE UAV-APPEND FAMILY LOWERS.** The route the spec entry below
 describes, built: an append in the loop body (counter update, stores indexed
@@ -1496,6 +1521,8 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
   side, the Lumen one and the debug one are instruction for instruction the
   same shape: a counter increment on a `RWStructuredBuffer<stride=256,
   counter>`, a record whose first field is the constant **94**, `RayFlags`
+  [WRONG, see 0.41.1: 94 is NVAPI's candidate cluster ID opcode, and the
+  "record" is an NVAPI intrinsic call, not instrumentation]
   stored at offset 76, all behind a runtime flag read from a cbuffer. That is
   one piece of instrumentation appearing in unrelated passes.
 
@@ -2121,7 +2148,9 @@ use `_wfsopen` with `_SH_DENYNO` now, and logging lives in
 
   **TWO MORE DEAD, BOTH CHEAP.** 336 state objects built across 8 threads, 48
   of them the suspect, device alive: driver concurrency among our own builds
-  is not it. And no NVAPI shader extension markers in any of the seven
+  is not it. [WRONG, see 0.41.1: the suspect DOES carry NVAPI calls, as
+  stores to an NvShaderExtnStruct buffer, which this check did not look for.]
+  And no NVAPI shader extension markers in any of the seven
   containers, so the driver's extension pattern matching is not involved
   either, which would have explained the offline/in-game split neatly and does
   not.

@@ -323,6 +323,13 @@ returned, is lowered from 0.41.0, and to keep it the same append the shim sets
 application builds, in the build and in the size query. That applies to the
 application's own DXR 1.0 any-hit shaders too: legal, and possibly slower.
 
+What looks like an append in Unreal's shaders is usually not one. NVIDIA's
+HLSL extensions are written as a counter increment and stores into a buffer of
+`NvShaderExtnStruct`, and the driver reads them as intrinsics while the
+application has registered that buffer's slot. From 0.41.1 the RayQuery
+cluster ID calls become the constant 0xFFFFFFFF, and any other NVAPI call is
+refused with "uses NVAPI shader extension op N".
+
 Turn `dump` on and the refused shader is written out as a `.dxil` container
 with a `.txt` saying why, which is what makes a useful bug report.
 
