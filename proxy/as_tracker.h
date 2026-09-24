@@ -58,6 +58,26 @@ struct BlasInfo {
 // top-level ones and unreadable layouts are ignored.
 void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc);
 
+// NO_DUPLICATE_ANYHIT_INVOCATION on every geometry of a BOTTOM-level build.
+//
+// A lowered Proceed loop that appends to a buffer is only the same append
+// when the any-hit it becomes runs once per candidate, as Proceed() yields
+// each candidate once; without this flag the spec lets an any-hit run more
+// than once for one intersection. The flag lives in the geometry
+// descriptions, CPU memory in the build call, and it has to be set in the
+// PREBUILD query too, with the same inputs, or the buffers the application
+// sized would not be the ones the build needs.
+//
+// Returns `in` when nothing changes (a top-level build, or every geometry
+// already flagged), otherwise `copy`, filled in and pointing at `storage`.
+// An array of pointers becomes a plain array, the same geometry. Applies to
+// the application's own DXR 1.0 any-hit shaders too, which the spec already
+// allows to see exactly this behaviour; slower, not wrong.
+const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* NoDuplicateAnyHit(
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* copy,
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC>* storage);
+
 // What was recorded for the structure at this address, or kUnknown.
 BlasInfo Lookup(D3D12_GPU_VIRTUAL_ADDRESS address);
 

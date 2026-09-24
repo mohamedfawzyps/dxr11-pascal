@@ -36,6 +36,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <stdexcept>
 
@@ -327,6 +328,15 @@ static bool g_churnFlush = false;
 // as live; while it does count, the two disagree about records and the shim
 // refuses, which draws nothing.
 static bool g_move = false;
+// --append: bind a RWStructuredBuffer<uint> WITH A UAV COUNTER at u1 through a
+// descriptor table, root parameter 4, for a shader whose Proceed loop appends
+// a record per candidate. After the dispatch the counter and the records are
+// read back and written, SORTED, to <out>.append: the order records land in is
+// traversal order, which is implementation-defined, so only the multiset is
+// comparable between WARP and the 1070. Direct dispatch only.
+static bool g_append = false;
+static std::string g_outPath;
+static const UINT kLogCount = 65536;
 static bool g_indirectUp = false;
 // Create the compute PSO through CreatePipelineState, the pipeline STREAM
 // form, instead of CreateComputePipelineState. Unreal uses the stream form
@@ -937,7 +947,7 @@ static Scene BuildScene(Gpu& g, bool opaque) {
 
 // --- root signature shared by both methods: b0 CBV, t0 SRV(TLAS), u0 UAV(out)
 static ComPtr<ID3D12RootSignature> MakeRootSig(ID3D12Device* dev) {
-    D3D12_ROOT_PARAMETER params[4]{};
+    D3D12_ROOT_PARAMETER params[5]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -946,7 +956,15 @@ static ComPtr<ID3D12RootSignature> MakeRootSig(ID3D12Device* dev) {
     params[2].Descriptor.ShaderRegister = 0;
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[3].Descriptor.ShaderRegister = 1;
-    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 4; rd.pParameters = params;
+    // --append: u1, with its counter, has to come through a descriptor table.
+    D3D12_DESCRIPTOR_RANGE logRange{};
+    logRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    logRange.NumDescriptors = 1;
+    logRange.BaseShaderRegister = 1;
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[4].DescriptorTable.NumDescriptorRanges = 1;
+    params[4].DescriptorTable.pDescriptorRanges = &logRange;
+    D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = g_append ? 5 : 4; rd.pParameters = params;
     ComPtr<ID3DBlob> blob, err;
     HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
         &blob, &err);
@@ -1119,6 +1137,39 @@ static void Churn(Gpu& g, Scene& s, ID3D12PipelineState* pso, ID3D12RootSignatur
                 g_churnFlush ? "each submitted and waited for" : "before submitting");
 }
 
+// --append: read the counter and the records back and write them, sorted, to
+// <out>.append as a count followed by the records.
+static void ReadAppendLog(Gpu& g, ID3D12Resource* logBuf, ID3D12Resource* counter) {
+    auto rb = CreateBuffer(g.device.Get(), kLogCount * 4ull + 4, D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (int i = 0; i < 2; ++i) {
+        b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[i].Transition.pResource = i ? counter : logBuf;
+        b[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    g.list->ResourceBarrier(2, b);
+    g.list->CopyBufferRegion(rb.Get(), 0, logBuf, 0, kLogCount * 4ull);
+    g.list->CopyBufferRegion(rb.Get(), kLogCount * 4ull, counter, 0, 4);
+    g.flush();
+    const uint32_t* p = nullptr;
+    HR(rb->Map(0, nullptr, (void**)&p), "map append log");
+    uint32_t n = p[kLogCount];
+    std::vector<uint32_t> recs(p, p + (n < kLogCount ? n : kLogCount));
+    rb->Unmap(0, nullptr);
+    std::sort(recs.begin(), recs.end());
+    const std::string path = g_outPath + ".append";
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "wb") == 0 && f) {
+        std::fwrite(&n, sizeof(n), 1, f);
+        std::fwrite(recs.data(), sizeof(uint32_t), recs.size(), f);
+        std::fclose(f);
+    }
+    std::printf("        %u records appended, written sorted to %s\n", n, path.c_str());
+}
+
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
     // --table has to reach this side too, or a shader written against a
@@ -1196,6 +1247,29 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     ComPtr<ID3D12Resource> decoy;
     if (g_table) heap = MakeTableHeap(g.device.Get(), out, decoy);
 
+    // --append: the log, its counter, and a one-entry heap holding the UAV.
+    ComPtr<ID3D12Resource> logBuf, logCounter;
+    ComPtr<ID3D12DescriptorHeap> logHeap;
+    if (g_append && !g_table) {
+        logBuf = CreateBuffer(g.device.Get(), kLogCount * 4ull, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        logCounter = CreateBuffer(g.device.Get(), 4, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 1;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        HR(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&logHeap)), "log heap");
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = kLogCount;
+        ud.Buffer.StructureByteStride = 4;
+        ud.Buffer.CounterOffsetInBytes = 0;
+        g.device->CreateUnorderedAccessView(logBuf.Get(), logCounter.Get(), &ud,
+            logHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
     // Reset the list WITH the pipeline state, not with null.
     //
     // This is how Unreal reuses a command list and it is not what this harness
@@ -1218,9 +1292,16 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
             2, heap->GetGPUDescriptorHandleForHeapStart());
         g.list->SetComputeRootShaderResourceView(3, mask->GetGPUVirtualAddress());
     } else {
+        if (logHeap) {
+            ID3D12DescriptorHeap* heaps[] = { logHeap.Get() };
+            g.list->SetDescriptorHeaps(1, heaps);
+        }
         BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
                   s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
                   mask->GetGPUVirtualAddress());
+        if (logHeap)
+            g.list->SetComputeRootDescriptorTable(
+                4, logHeap->GetGPUDescriptorHandleForHeapStart());
     }
     };
     start();
@@ -1254,6 +1335,7 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
             Churn(g, const_cast<Scene&>(s), pso.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
                   mask->GetGPUVirtualAddress(), out->GetDesc().Width, gx, gy, keep);
         g.flush();
+        if (logHeap) ReadAppendLog(g, logBuf.Get(), logCounter.Get());
         return;
     }
 
@@ -1499,6 +1581,7 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
     const char* mn = (method == Method::RayQuery) ? "RayQuery(compute)" : "TraceRay(DXR1.0)";
     const char* pn = (pattern == Pattern::Opaque) ? "opaque" : "alpha";
     std::printf("[trial] %s %s on %s -> %s\n", pn, mn, an, outPath);
+    g_outPath = outPath;
 
     // Poison only the LOWERED side. Corrupting both would leave them agreeing
     // with each other, so the diff would still report MATCH and would prove
@@ -1714,6 +1797,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--stream") == 0) {
                 g_stream = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--append") == 0) {
+                g_append = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

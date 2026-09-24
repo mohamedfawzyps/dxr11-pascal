@@ -24,7 +24,57 @@ not.
 
 ---
 
-## 0.40.3
+## 0.41.0
+
+- **A Proceed loop that APPENDS is lowered, not refused.** 47 of Escher's
+  refusals, MegaLights light sampling and the Lumen translucency, direct
+  lighting and debug passes, were one construct from Unreal's shared
+  TraceRayInline wrapper: under a runtime flag, a counter increment and
+  stores at the index it returned, a debug record per candidate. The rule,
+  in both rewriters: a loop body may keep `bufferUpdateCounter` and
+  `bufferStore`/`rawBufferStore` whose index is a counter result from the same
+  body. Anything else that writes is still refused, and so is an append next
+  to `Abort()` (the lowering lets traversal continue after it) or in a body
+  that becomes an intersection shader (which the spec lets run more than once
+  per primitive whatever the flags say).
+- **Why it is the same append:** its result does not depend on the order of
+  candidates, which is undefined for RayQuery and any-hit alike, only on how
+  many there are. The spec lets an any-hit run more than once per
+  intersection unless the geometry carries
+  `D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION`, and lists
+  no such exception for `Proceed()`; so the proxy sets that flag on every
+  bottom-level geometry, in `BuildRaytracingAccelerationStructure` and in
+  `GetRaytracingAccelerationStructurePrebuildInfo` alike, so the sizes the
+  application allocated are the build's. Legal for the application's own
+  any-hit shaders, possibly slower. Read from the spec, Raytracing.md, the
+  geometry flags and "observable duplication"; that `Proceed()` yields each
+  candidate once is the reading of that list, not a sentence.
+- **A parser bug it uncovered, the next refusal behind this one:** a call with
+  a metadata attachment, `, !dx.precise !20`, did not match the call pattern
+  in either model, so a RayQuery accessor carrying one was never rewritten and
+  kept naming the deleted query handle: "use of undefined value" from the
+  assembler, 17 of the 18 dumped shaders. Probably the one assembler failure
+  the brief listed as unexplained. A test in `test_reject.py` adds the
+  attachment to `CommittedRayT` and fails against either old parser.
+- Measured: all 18 side-effect refusals dumped from the 0.40.3 run now lower,
+  validate and sign, byte-identical between the Python and the C++. On the
+  1070, each built with a root signature borrowed from the same dump plus the
+  bindings the debug layer named missing (the debug append buffer at u0,
+  space1001): 54 of 54 cold compiles clean, where the vendored crash library
+  crashed 7 of 8 under the same procedure.
+- `raytest --append` binds a counter-backed UAV at u1 and writes the appended
+  records, sorted, to `<out>.append`. Case `append`
+  (`rayquery_append_sm66.hlsl`, `--multi`): 18496 records, sorted sets
+  identical to WARP's, image bit-exact; a variant storing each record plus one
+  differs, so the comparison can fail. Dispatch suite 34 of 34 plus 5 gates;
+  rewriter suite 28 of 28 checks, each new verdict also checked in the C++.
+  The Tier 1.1 probe through the proxy still matches WARP with the flag on.
+- `sotest`: `DXR_TIER11_DEBUGLAYER=1` prints what the debug layer says about
+  `CreateStateObject`, and `SOTEST_ADD_RANGES="u0:1001,b4:0"` appends a table
+  of those ranges to a borrowed root signature. Test only.
+- NOT verified: that the flag changes anything observable on this driver.
+  With one candidate per ray no duplicate any-hit was ever seen, flag or not.
+
 
 - **Spare shader tables are reused in the open world too.** 0.40.2 in Escher
   freed the leak (7105 tables built, 5859 freed), but reuse stopped at 1169

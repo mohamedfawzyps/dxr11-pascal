@@ -23,6 +23,9 @@ struct LowerResult {
     bool ok = false;
     std::string error;
     std::string text;      // the lowered .ll, when ok
+    // The loop body appends to a buffer, which is only faithful while the
+    // proxy sets NO_DUPLICATE_ANYHIT_INVOCATION on the scene's geometry.
+    bool appends = false;
 };
 
 struct Exports {

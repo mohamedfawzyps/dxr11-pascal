@@ -14,6 +14,7 @@
 #include "state_object_cache.h"
 #include "queue_hook.h"
 #include "d3d12_command_list.h"
+#include "as_tracker.h"
 #include "group_count.h"
 #include "command_signature.h"
 #include "dxil_scan.h"
@@ -892,7 +893,13 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
     }
     return hr;
 }
-void STDMETHODCALLTYPE Dxr11Device::GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) { m_real->GetRaytracingAccelerationStructurePrebuildInfo(pDesc, pInfo); }
+void STDMETHODCALLTYPE Dxr11Device::GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) {
+    // The SAME inputs the build will see, or the sizes would not be the build's.
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in2;
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geoms;
+    m_real->GetRaytracingAccelerationStructurePrebuildInfo(
+        astrack::NoDuplicateAnyHit(pDesc, &in2, &geoms), pInfo);
+}
 D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE Dxr11Device::CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE SerializedDataType, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* pIdentifierToCheck) { FWD(CheckDriverMatchingIdentifier(SerializedDataType, pIdentifierToCheck)); }
 
 // --- ID3D12Device6 ----------------------------------------------------------

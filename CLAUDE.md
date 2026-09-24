@@ -1,7 +1,7 @@
 # pascal-dxr-tier-1.1: DXR Tier 1.1 compatibility shim for NVIDIA Pascal
 
 Brief version 1. Not the project's version: that lives in CHANGELOG.md and
-proxy/version.h, and is currently 0.40.3.
+proxy/version.h, and is currently 0.41.0.
 
 ## Current position (2026-09-23)
 
@@ -57,6 +57,22 @@ open world against 19 and 27 record tables while that scene reaches record
 dense forest would look the same. 0.39.1 re-reads changed structures, counts
 only live ones, pads the table with no-hit records, and skips a scene needing
 more than 256 baked pairs. See the CHANGELOG.
+
+**0.40.3 IN THE GAME: 18 MINUTES CLEAN, TABLES REUSED (2026-09-24).** 36034
+lowered dispatches drawn, 112 refused (0.3%, short bursts at structure
+changes), 9693 of 10142 tables written into a spare, 377 buffers freed.
+
+**0.41.0: THE UAV-APPEND FAMILY LOWERS.** The route the spec entry below
+describes, built: an append in the loop body (counter update, stores indexed
+by its result) is transplanted, and the proxy sets NO_DUPLICATE_ANYHIT_
+INVOCATION on every bottom-level geometry, in the build AND the prebuild
+query. Still refused with Abort() or in an intersection shader. Behind it, as
+always, the next refusal: a call with `, !dx.precise !N` did not parse as a
+call, so the accessor was never rewritten. All 18 dumped shaders now lower;
+54 of 54 cold compiles clean with borrowed root signatures, control 7 of 8.
+**The spec was read before building, and it said the brief's own premise,
+that Proceed() yields each candidate once, is an inference from the list of
+permitted duplications, not a sentence.** Game run pending.
 
 **0.40.2 IN THE GAME: THE LEAK IS FIXED, TWO LEFTOVERS FIXED IN 0.40.3
 (2026-09-23).** Same route, clean: 21123 drawn, 7105 tables built, 5859

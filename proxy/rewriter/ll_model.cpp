@@ -7,7 +7,9 @@ namespace llm {
 namespace {
 
 const std::regex kResult(R"(^\s*(%[\w.$-]+)\s*=\s*(.*)$)");
-const std::regex kCall(R"(\bcall\s+.*?@([\w.$"<>-]+|"[^"]+")\s*\((.*)\)\s*(?:#\d+)?\s*$)");
+// Metadata attachments after the arguments, `, !dx.precise !20`, are part of
+// a call too; see the Python.
+const std::regex kCall(R"(\bcall\s+.*?@([\w.$"<>-]+|"[^"]+")\s*\((.*)\)\s*(?:#\d+)?(?:\s*,\s*![\w.$-]+\s+!\d+)*\s*$)");
 const std::regex kBrCond(R"(^\s*br\s+i1\s+(\S+),\s*label\s+(%[\w.$-]+),\s*label\s+(%[\w.$-]+))");
 const std::regex kBrUncond(R"(^\s*br\s+label\s+(%[\w.$-]+))");
 const std::regex kPhiIn(R"(\[\s*([^,\]]+),\s*(%[\w.$-]+)\s*\])");

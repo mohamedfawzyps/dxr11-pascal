@@ -163,6 +163,11 @@ const CandMap* FindCand(int op) {
 const int kBindHandle = 217;
 const int kAnnotateHandle = 216;
 const int kHeapHandle = 218;
+// The append a transplanted loop body may keep: a counter update, and stores
+// whose index operand, argument 2, is its result.
+const int kBufferUpdateCounter = 70;
+const int kBufferStore = 69;
+const int kRawBufferStore = 140;
 // The library form's global is a HANDLE, not the resource type, and the
 // overload is named after the handle type too. That is the part that cannot be
 // guessed from the 6.5 path, where both are the resource type.
@@ -996,6 +1001,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     auto it = byNum.find(mm[2].str());
                     groupText[mm[1].str()] = it == byNum.end() ? "" : it->second;
                 }
+            // One exception, 0.41.0: an APPEND, a counter update and stores
+            // indexed by the value it returned. Order-independent, and the
+            // proxy makes the COUNT equal by setting NO_DUPLICATE_ANYHIT_
+            // INVOCATION on every bottom-level geometry. See the Python.
+            std::vector<const llm::Instr*> writes;
+            std::set<std::string> counters;
             for (const auto& b : fn.blocks) {
                 if (!q.loop.body.count(b.label)) continue;
                 for (const auto& i : b.instrs) {
@@ -1012,16 +1023,41 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         (g->second.find("readnone") != std::string::npos ||
                          g->second.find("readonly") != std::string::npos))
                         continue;
-                    const int op = i.DxOp();
-                    r.error = "Proceed loop body has a side effect (" + i.callee +
-                              ", opcode " + (op >= 0 ? std::to_string(op) : "?") +
-                              "); the any-hit shader it becomes runs a different "
-                              "number of times than the loop body does, and in an "
-                              "implementation-defined order, so the write would not "
-                              "be the same write";
-                    return r;
+                    writes.push_back(&i);
+                    if (i.DxOp() == kBufferUpdateCounter && !i.result.empty())
+                        counters.insert(i.result);
                 }
             }
+            for (const llm::Instr* w : writes) {
+                const int op = w->DxOp();
+                if (op == kBufferUpdateCounter) continue;
+                if ((op == kBufferStore || op == kRawBufferStore) && w->args.size() > 2) {
+                    const std::string& a = w->args[2];
+                    const size_t sp = a.find_last_of(" \t");
+                    const std::string name = sp == std::string::npos ? a : a.substr(sp + 1);
+                    if (counters.count(name)) continue;
+                }
+                r.error = "Proceed loop body has a side effect (" + w->callee +
+                          ", opcode " + (op >= 0 ? std::to_string(op) : "?") +
+                          "); the any-hit shader it becomes runs a different "
+                          "number of times than the loop body does, and in an "
+                          "implementation-defined order, so the write would not "
+                          "be the same write";
+                return r;
+            }
+            if (!writes.empty() && !q.aborts.empty()) {
+                r.error = "Proceed loop body appends to a buffer and the query calls "
+                          "Abort(); this lowering lets traversal continue after an "
+                          "abort, so it would append records RayQuery would not";
+                return r;
+            }
+            if (!writes.empty() && q.NeedsIntersection()) {
+                r.error = "Proceed loop body appends to a buffer and becomes an "
+                          "intersection shader, which may run more than once per "
+                          "primitive whatever the geometry flags say";
+                return r;
+            }
+            r.appends = !writes.empty();
         }
 
         // The block the guard branches through to reach the loop, if any.

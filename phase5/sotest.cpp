@@ -32,6 +32,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 
 #include <cstdio>
@@ -65,6 +66,66 @@ namespace {
 // E_INVALIDARG, which would look like a result and is not one.
 const UINT kPayloadBytes = 92;
 const UINT kAttrBytes = 8;
+
+// SOTEST_ADD_RANGES="u0:1001,b4:0": append ONE descriptor table holding these
+// ranges, one descriptor each, to the root signature read from disk. TEST
+// ONLY. A refused shader is dumped without its root signature, so a newly
+// lowered one can only be compile-tested with a borrowed one, and a borrowed
+// one can lack a binding or two; the debug layer names exactly which. The
+// point is a cold compile on the driver, not a dispatch.
+bool AddRanges(ID3D12Device* dev, std::vector<unsigned char>* rs, const char* spec) {
+    ID3D12VersionedRootSignatureDeserializer* de = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(rs->data(), rs->size(),
+                                                              IID_PPV_ARGS(&de))))
+        return false;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* v = nullptr;
+    if (FAILED(de->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &v)) || !v) {
+        de->Release();
+        return false;
+    }
+    const D3D12_ROOT_SIGNATURE_DESC1& d = v->Desc_1_1;
+    std::vector<D3D12_DESCRIPTOR_RANGE1> ranges;
+    for (const char* c = spec; *c;) {
+        D3D12_DESCRIPTOR_RANGE1 r{};
+        r.RangeType = *c == 'u' ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                    : *c == 't' ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                    : *c == 's' ? D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER
+                                : D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+        r.NumDescriptors = 1;
+        r.BaseShaderRegister = (UINT)strtoul(c + 1, (char**)&c, 10);
+        if (*c == ':') r.RegisterSpace = (UINT)strtoul(c + 1, (char**)&c, 10);
+        r.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+                  D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+        if (r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+            r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+        ranges.push_back(r);
+        while (*c == ',' || *c == ' ') ++c;
+    }
+    std::vector<D3D12_ROOT_PARAMETER1> params(d.pParameters, d.pParameters + d.NumParameters);
+    D3D12_ROOT_PARAMETER1 t{};
+    t.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    t.DescriptorTable.NumDescriptorRanges = (UINT)ranges.size();
+    t.DescriptorTable.pDescriptorRanges = ranges.data();
+    t.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params.push_back(t);
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC nv{};
+    nv.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    nv.Desc_1_1 = d;
+    nv.Desc_1_1.NumParameters = (UINT)params.size();
+    nv.Desc_1_1.pParameters = params.data();
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* err = nullptr;
+    const HRESULT hr = D3D12SerializeVersionedRootSignature(&nv, &blob, &err);
+    de->Release();
+    if (err) { std::printf("  add ranges: %s\n", (const char*)err->GetBufferPointer()); err->Release(); }
+    if (FAILED(hr) || !blob) return false;
+    rs->assign((unsigned char*)blob->GetBufferPointer(),
+               (unsigned char*)blob->GetBufferPointer() + blob->GetBufferSize());
+    blob->Release();
+    (void)dev;
+    return true;
+}
 
 bool ReadFileBytes(const std::string& path, std::vector<unsigned char>* out) {
     FILE* f = nullptr;
@@ -196,6 +257,15 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
         return out;
     }
     ReadFileBytes(rsPath, &rsBlob);   // optional, but almost always needed
+    {
+        char spec[256] = {};
+        if (!rsBlob.empty() &&
+            GetEnvironmentVariableA("SOTEST_ADD_RANGES", spec, sizeof(spec)) && spec[0]) {
+            const bool added = AddRanges(dev, &rsBlob, spec);
+            if (!quiet) std::printf("  root signature + table {%s}: %s\n", spec,
+                                    added ? "added" : "FAILED");
+        }
+    }
 
     const Shape shape = ReadShape(libPath);
     if (!shape.known) {
@@ -411,6 +481,25 @@ Built BuildOne(ID3D12Device5* dev, const std::string& libPath,
     }
     out.hr = dev->CreateStateObject(&sod, IID_PPV_ARGS(&out.so));
     if (!quiet) Report("CreateStateObject", out.hr);
+    // With DXR_TIER11_DEBUGLAYER=1 the layer is on; print what it said about
+    // this call. It reports through OutputDebugString otherwise, which a
+    // console never sees, so its silence here would mean nothing.
+    {
+        ID3D12InfoQueue* iq = nullptr;
+        if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&iq)))) {
+            for (UINT64 k = 0; k < iq->GetNumStoredMessages(); ++k) {
+                SIZE_T len = 0;
+                iq->GetMessage(k, nullptr, &len);
+                std::vector<char> buf(len);
+                auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                if (SUCCEEDED(iq->GetMessage(k, msg, &len)) &&
+                    msg->Severity <= D3D12_MESSAGE_SEVERITY_WARNING)
+                    std::printf("  debug layer: %s\n", msg->pDescription);
+            }
+            iq->ClearStoredMessages();
+            iq->Release();
+        }
+    }
 
     if (SUCCEEDED(out.hr) && out.so) {
         // Getting an identifier forces the driver past mere acceptance, which
@@ -559,6 +648,17 @@ int main(int argc, char** argv) {
     if (warp) factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
     else factory->EnumAdapters1(0, &adapter);
 
+    {
+        char v[8] = {};
+        if (GetEnvironmentVariableA("DXR_TIER11_DEBUGLAYER", v, sizeof(v)) && v[0] == '1') {
+            ID3D12Debug* dbg = nullptr;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+                dbg->EnableDebugLayer();
+                dbg->Release();
+                std::printf("debug layer ON\n");
+            }
+        }
+    }
     ID3D12Device5* dev = nullptr;
     HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));
     if (FAILED(hr) || !dev) {

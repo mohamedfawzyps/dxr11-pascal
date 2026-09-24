@@ -637,6 +637,19 @@ void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(co
     astrack::NoteBuild(d);
     if (d && d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
         CaptureInstances(d);
+    // Every bottom-level geometry gets NO_DUPLICATE_ANYHIT_INVOCATION, the
+    // same as in the prebuild query; see astrack::NoDuplicateAnyHit.
+    if (d) {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in2;
+        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geoms;
+        const auto* in = astrack::NoDuplicateAnyHit(&d->Inputs, &in2, &geoms);
+        if (in != &d->Inputs) {
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC d2 = *d;
+            d2.Inputs = *in;
+            FWD(BuildRaytracingAccelerationStructure(&d2, n, p));
+            return;
+        }
+    }
     FWD(BuildRaytracingAccelerationStructure(d, n, p));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }

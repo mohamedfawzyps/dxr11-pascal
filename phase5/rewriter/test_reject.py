@@ -144,6 +144,51 @@ def expect_lower_reject(name, text, must_mention):
         return True
 
 
+def expect_lower_ok(name, text):
+    """LOWERED, where it used to be refused."""
+    try:
+        m = Module(text)
+        lower.lower(m, rayquery.analyze(m))
+        print('  ok       %-34s lowered' % name)
+        return True
+    except rayquery.Unsupported as e:
+        print('  FAILED   %-34s refused: %s' % (name, e))
+        return False
+
+
+DXRW = os.path.join('phase5out', 'dxrw.exe')
+
+
+def cpp_agrees(name, text, must_mention=None, forbid=None):
+    """The C++ port gives the same verdict. Byte-identity compares OUTPUTS, so
+    it cannot see a refusal one side has and the other lacks; that is how the
+    C++ once lost a Python refusal and nothing noticed. None means it must
+    lower, and `forbid`, a pattern, must then not appear in what it wrote."""
+    if not os.path.isfile(DXRW):
+        print('  FAILED   %-34s %s missing, build_rewriter.bat' % (name, DXRW))
+        return False
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp()
+    src, dst = os.path.join(d, 'in.ll'), os.path.join(d, 'out.ll')
+    with io.open(src, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+    r = subprocess.run([DXRW, 'lower', src, dst], capture_output=True, text=True)
+    said = (r.stdout + r.stderr).strip()
+    if must_mention is None:
+        good = r.returncode == 0
+        if good and forbid:
+            with io.open(dst, encoding='utf-8') as f:
+                left = re.search(forbid, f.read())
+            if left:
+                good, said = False, 'left in place: ' + left.group(0)
+    else:
+        good = r.returncode != 0 and must_mention.lower() in said.lower()
+    print('  %s %-34s C++ %s' % ('ok      ' if good else 'FAILED  ', name,
+                                 'agrees' if good else 'disagrees: ' + said[:80]))
+    return good
+
+
 def main():
     if not os.path.isfile(OPAQUE):
         sys.exit('run build_phase5.bat first')
@@ -273,30 +318,105 @@ def main():
     # transplanted the append into the any-hit shader, where it runs a
     # different number of times and in a different order.
     #
-    # The mutation adds a counter increment on %v2, the handle the loop body
-    # ALREADY reads its alpha mask through, so the isolation check exempts it
-    # and this provokes the new refusal rather than the old one. Pointing it at
-    # a UAV handle instead makes refuse_uav_in_loop fire first, which the first
-    # version of this test did, and which is how the two were told apart.
-    # The attribute group number is looked up rather than written as #1, which
-    # is the mistake 0.26.0 had to fix once already.
+    # 0.41.0 narrowed it to what an APPEND needs: a counter update, and stores
+    # indexed by the value it returned. The mutations add them on %v2, the
+    # handle the loop body ALREADY reads its alpha mask through, so the
+    # isolation check exempts it and the side-effect rule is what decides.
+    # Pointing one at a UAV defined outside the loop made refuse_uav_in_loop
+    # fire instead in the first version of this test, which is how the two
+    # were told apart. The attribute group is looked up rather than written as
+    # #1, which is the mistake 0.26.0 had to fix once already. Every verdict
+    # is checked in the C++ too.
     SFX = os.path.join('phase5', 'cases', 'rayquery_indep.ll')
     if os.path.isfile(SFX):
-        sfx = load(SFX)
-        g = re.search(r'^attributes #(\d+) = \{ nounwind \}\s*$', sfx, re.M)
+        base = load(SFX)
+        g = re.search(r'^attributes #(\d+) = \{ nounwind \}\s*$', base, re.M)
         assert g, 'no bare nounwind attribute group to hang a writing op on'
-        commit = re.search(r'^.*rayQuery_CommitNonOpaqueTriangleHit.*$', sfx, re.M)
+        commit = re.search(r'^.*rayQuery_CommitNonOpaqueTriangleHit.*$', base, re.M)
         assert commit, 'the independent case no longer commits inside the loop'
-        sfx = sfx.replace(
-            commit.group(0),
-            '  %sidefx = call i32 @dx.op.bufferUpdateCounter'
-            '(i32 70, %dx.types.Handle %v2, i8 1)\n' + commit.group(0))
-        sfx = sfx.replace(
-            g.group(0),
-            'declare i32 @dx.op.bufferUpdateCounter(i32, %%dx.types.Handle, i8) #%s\n\n%s'
-            % (g.group(1), g.group(0)))
-        ok.append(expect_lower_reject('UAV counter updated inside the loop', sfx,
-                                      'has a side effect'))
+        decl = ('declare i32 @dx.op.bufferUpdateCounter(i32, %%dx.types.Handle, i8) #%s\n\n%s'
+                % (g.group(1), g.group(0)))
+        counter = ('  %sidefx = call i32 @dx.op.bufferUpdateCounter'
+                   '(i32 70, %dx.types.Handle %v2, i8 1)\n')
+
+        def store(index):
+            return ('  call void @dx.op.rawBufferStore.i32(i32 140, %%dx.types.Handle %%v2, '
+                    'i32 %s, i32 0, i32 94, i32 undef, i32 undef, i32 undef, i8 1, i32 4)\n'
+                    % index)
+
+        def mutate(extra):
+            t = base.replace(commit.group(0), counter + extra + commit.group(0))
+            return t.replace(g.group(0), decl)
+
+        for name, text, why in (
+                ('counter updated inside the loop', mutate(''), None),
+                ('append at the counter\'s index', mutate(store('%sidefx')), None),
+                ('store at a FIXED index in the loop', mutate(store('0')),
+                 'has a side effect')):
+            if why is None:
+                ok.append(expect_lower_ok(name, text))
+            else:
+                ok.append(expect_lower_reject(name, text, why))
+            ok.append(cpp_agrees(name, text, why))
+
+    # A call with a METADATA ATTACHMENT, `, !dx.precise !N`, which DXC emits for
+    # a `precise` value. The call pattern ended at the closing parenthesis, so
+    # such a call was not seen as a call at all: a RayQuery accessor carrying
+    # one was never rewritten and still named the deleted query handle, and the
+    # assembler said "use of undefined value". 17 of Unreal's MegaLights and
+    # Lumen shaders, hidden until 0.41.0 behind the side-effect refusal, and
+    # probably the one assembler failure the brief could not explain.
+    if os.path.isfile(SFX):
+        t = load(SFX)
+        rayt = re.search(r'^.*rayQuery_StateScalar\.f32\(i32 200, i32 %v\d+\)', t, re.M)
+        ids = [int(x) for x in re.findall(r'^!(\d+) = ', t, re.M)]
+        assert rayt and ids, 'the independent case no longer reads CommittedRayT'
+        md = max(ids) + 1
+        t = t.replace(rayt.group(0), rayt.group(0) + ', !dx.precise !%d' % md, 1)
+        t = t.rstrip('\n') + '\n!%d = !{i32 1}\n' % md
+        name = 'accessor with !dx.precise attached'
+        try:
+            m = Module(t)
+            out = lower.lower(m, rayquery.analyze(m))
+            left = re.search(r'rayQuery_\w+[.\w]*\(i32 \d+', out)
+            if left:
+                print('  FAILED   %-34s left in place: %s' % (name, left.group(0)))
+                ok.append(False)
+            else:
+                print('  ok       %-34s rewritten, nothing left behind' % name)
+                ok.append(True)
+        except rayquery.Unsupported as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None, r'rayQuery_\w+[.\w]*\(i32 \d+'))
+
+    # Around an append, Abort() and an intersection shader stay refused: after
+    # an abort the lowering lets traversal continue, and an intersection
+    # shader may run more than once per primitive whatever the flags say.
+    for path, anchor, why in (
+            (os.path.join('phase5', 'cases', 'rayquery_abort.ll'),
+             r'^.*rayQuery_Abort\(i32 181.*$', 'calls Abort()'),
+            (os.path.join('phase5', 'cases', 'rayquery_proc.ll'),
+             r'^.*rayQuery_CommitProceduralPrimitiveHit\(i32 183.*$',
+             'intersection shader')):
+        if not os.path.isfile(path):
+            continue
+        t = load(path)
+        g = re.search(r'^attributes #(\d+) = \{ nounwind \}\s*$', t, re.M)
+        uav = re.search(r'^\s*(%v\d+) = call %dx\.types\.Handle @dx\.op\.createHandle'
+                        r'\(i32 57, i8 1,', t, re.M)
+        at = re.search(anchor, t, re.M)
+        assert g and uav and at, 'cannot build the append mutation of ' + path
+        t = t.replace(at.group(0),
+                      '  %%sidefx = call i32 @dx.op.bufferUpdateCounter(i32 70, '
+                      '%%dx.types.Handle %s, i8 1)\n%s' % (uav.group(1), at.group(0)))
+        if 'declare i32 @dx.op.bufferUpdateCounter' not in t:
+            t = t.replace(g.group(0),
+                          'declare i32 @dx.op.bufferUpdateCounter(i32, %%dx.types.Handle, i8) #%s'
+                          '\n\n%s' % (g.group(1), g.group(0)))
+        name = 'append with ' + ('Abort()' if 'abort' in path else 'an intersection')
+        ok.append(expect_lower_reject(name, t, why))
+        ok.append(cpp_agrees(name, t, why))
 
     # Committing BOTH kinds is no longer refused: the loop body lowers twice,
     # into an any-hit and an intersection shader, with two closest-hits because

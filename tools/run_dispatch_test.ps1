@@ -238,7 +238,12 @@ $cases = @(
     # disagreed about records, and the dispatch was refused: 9248 hit/miss
     # mismatches here, two bursts of refusals per Escher session.
     @{ name = 'move'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--move');
-       desc = 'top-level structure moved to a new address with a different layout' }
+       desc = 'top-level structure moved to a new address with a different layout' },
+    # A Proceed loop that APPENDS a record per candidate, the MegaLights and
+    # Lumen shape. The records land in traversal order, which is undefined, so
+    # raytest sorts them into <out>.append and those must be identical too.
+    @{ name = 'append'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_append_sm66.hlsl', '--multi', '--append');
+       desc = 'a Proceed loop that appends a record per candidate through a UAV counter'; append = $true }
 )
 
 $failed = 0
@@ -261,7 +266,15 @@ foreach ($c in $cases) {
     $diff = & .\raytest.exe diff $a $b 2>&1
     $diff | Where-Object { $_ -match 'rays|mismatches|max|RESULT' } |
         ForEach-Object { "  $($_.Trim())" }
-    if ($diff -match 'RESULT: MATCH') { Write-Host "  $n : PASS" }
+    $appendOk = $true
+    if ($c.append) {
+        $appendOk = (Test-Path "$a.append") -and (Test-Path "$b.append") -and
+            ((Get-FileHash "$a.append").Hash -eq (Get-FileHash "$b.append").Hash)
+        $recs = if (Test-Path "$a.append") { [BitConverter]::ToUInt32([IO.File]::ReadAllBytes("$a.append"), 0) } else { 0 }
+        Write-Host "  appended records   : $recs, sorted sets $(if ($appendOk) { 'identical' } else { 'DIFFER' })"
+        Remove-Item "$a.append", "$b.append" -ErrorAction SilentlyContinue
+    }
+    if (($diff -match 'RESULT: MATCH') -and $appendOk) { Write-Host "  $n : PASS" }
     else { Write-Host "  $n : FAIL"; $failed++ }
     Remove-Item $a, $b -ErrorAction SilentlyContinue
 }

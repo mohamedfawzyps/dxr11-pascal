@@ -56,11 +56,11 @@ both, and the committed accessors travel in the ray payload.
 
 Verified on a GTX 1070, with WARP as the oracle for every result:
 
-- 33 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
+- 34 end-to-end render cases, all bit-exact, plus 4 refusal gates and a
   sensitivity gate
 - 14 rewriter cases, each byte-identical between the Python reference and the
-  C++ port, on both the `.ll` path and the DXIL container path, plus 17
-  analysis and lowering checks and 3 record-read checks
+  C++ port, on both the `.ll` path and the DXIL container path, plus 28
+  analysis and lowering checks, 3 record-read checks and an append check
 - Two Microsoft DXR 1.0 samples run through the proxy unchanged, one of them
   pixel-identical to its no-proxy baseline
 
@@ -133,9 +133,15 @@ Refused because DXR 1.0 offers nothing to lower onto:
 - `groupshared` memory, group barriers or wave intrinsics in the same entry
   point as the query
 - a loop body reading caller locals that do not fit the payload
-- a loop body with a side effect, such as a UAV write or a counter append.
-  DXR allows an any-hit shader to run more than once for the same candidate,
-  and in no defined order, so the write would not be the same write
+- a loop body with a side effect other than an APPEND, such as a UAV write at
+  a fixed index or an atomic. The any-hit shader it would become runs in no
+  defined order, so the write would not be the same write. An append, a
+  counter update and stores at the index it returned, IS lowered, from
+  0.41.0: its result does not depend on the order, and the shim sets
+  `NO_DUPLICATE_ANYHIT_INVOCATION` on every bottom-level geometry so the
+  any-hit runs once per hit, as the loop did. An append is still refused
+  alongside `Abort()`, or where the loop body becomes an intersection shader,
+  which may run more than once whatever the flags say
 - an application routing both triangle and procedural geometry to the same hit
   group record, which no shader table can serve
 

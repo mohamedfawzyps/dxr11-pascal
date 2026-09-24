@@ -682,7 +682,7 @@ def _edit_query(module, q, edits, exports):
         header, latch, body = q.loop
         exit_label = _loop_exit(fn, header, latch, body)
         _check_loop_isolated(fn, q, header, latch, body, _type_names(module.text))
-        _check_loop_side_effects(module, fn, body)
+        _check_loop_side_effects(module, fn, q, body)
 
     edits[q.trace.index] = _trace_block(q, ra, exit_label)
 
@@ -962,8 +962,27 @@ def _attr_groups(module):
     return out
 
 
-def _check_loop_side_effects(module, fn, body):
-    """A Proceed loop body that WRITES is not transplantable.
+BUFFER_UPDATE_COUNTER = 70
+# Stores whose index operand, argument 2, can be a counter's result.
+APPEND_STORES = (69, 140)   # bufferStore, rawBufferStore
+
+
+def _check_loop_side_effects(module, fn, q, body):
+    """A Proceed loop body that WRITES is not transplantable, with one
+    exception: an APPEND.
+
+    The exception, 0.41.0. Unreal's shared TraceRayInline wrapper appends a
+    debug record per candidate, which put 47 MegaLights and Lumen shaders
+    behind this refusal. An append is a counter update and stores indexed by
+    the value it returned. Its result does not depend on the ORDER candidates
+    arrive in, which is undefined for RayQuery and for any-hit alike, only on
+    how MANY arrive. And that is the part the proxy makes equal: it sets
+    D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION on every
+    bottom-level geometry, so the any-hit runs at most once per intersection,
+    as Proceed() yields each candidate once. Still refused around an append:
+    Abort(), after which this lowering lets traversal continue and would
+    append records RayQuery would not; and an intersection shader, which the
+    spec lets run more than once per primitive whatever the flags say.
 
     The isolation check above guards what the body READS. Nothing guarded what
     it writes, and the two are not the same question. The any-hit shader runs a
@@ -989,6 +1008,7 @@ def _check_loop_side_effects(module, fn, body):
     reaches only an alloca or groupshared in practice, and groupshared around a
     query is already refused."""
     groups = _attr_groups(module)
+    writes, counters = [], set()
     for label in body:
         for i in fn.block(label).instrs:
             if not i.callee or not i.callee.startswith('dx.op.'):
@@ -1002,12 +1022,31 @@ def _check_loop_side_effects(module, fn, body):
             attr = groups.get(i.callee)
             if attr is not None and ('readnone' in attr or 'readonly' in attr):
                 continue
-            raise rq.Unsupported(
-                'Proceed loop body has a side effect (%s, opcode %s); the '
-                'any-hit shader it becomes runs a different number of times '
-                'than the loop body does, and in an implementation-defined '
-                'order, so the write would not be the same write'
-                % (i.callee, i.dxop if i.dxop is not None else '?'))
+            writes.append(i)
+            if i.dxop == BUFFER_UPDATE_COUNTER and i.result:
+                counters.add(i.result)
+    for i in writes:
+        if i.dxop == BUFFER_UPDATE_COUNTER:
+            continue
+        if (i.dxop in APPEND_STORES and len(i.args) > 2
+                and i.args[2].split()[-1] in counters):
+            continue
+        raise rq.Unsupported(
+            'Proceed loop body has a side effect (%s, opcode %s); the '
+            'any-hit shader it becomes runs a different number of times '
+            'than the loop body does, and in an implementation-defined '
+            'order, so the write would not be the same write'
+            % (i.callee, i.dxop if i.dxop is not None else '?'))
+    if writes and q.aborts:
+        raise rq.Unsupported(
+            'Proceed loop body appends to a buffer and the query calls Abort(); '
+            'this lowering lets traversal continue after an abort, so it would '
+            'append records RayQuery would not')
+    if writes and q.needs_intersection:
+        raise rq.Unsupported(
+            'Proceed loop body appends to a buffer and becomes an intersection '
+            'shader, which may run more than once per primitive whatever the '
+            'geometry flags say')
 
 
 def _check_loop_isolated(fn, q, header, latch, body, types):

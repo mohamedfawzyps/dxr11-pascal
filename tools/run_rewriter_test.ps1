@@ -223,6 +223,33 @@ foreach ($r in $recs) {
 }
 
 Write-Host ''
+Write-Host '=== a Proceed loop that appends, lowered into the any-hit ==='
+# 0.41.0: an append, a counter update and a store at the index it returned,
+# is transplanted rather than refused. Byte-identical between the Python and
+# the C++, valid, and the counter update must land in the generated AnyHit.
+$src = 'phase5\cases\rayquery_append_sm66.ll'
+if (-not (Test-Path $src)) { Write-Host "  append : SKIPPED, $src missing"; $failed++ }
+else {
+    & python phase5\rewriter\dxrewrite.py lower $src 'phase5\out\append.ll' | Out-Null
+    $pyOk = $LASTEXITCODE -eq 0
+    New-Item -ItemType Directory -Force 'phase5\outcpp' | Out-Null
+    & .\phase5out\dxrw.exe lower $src 'phase5\outcpp\append.ll' | Out-Null
+    $same = $pyOk -and ((Get-FileHash 'phase5\out\append.ll').Hash -eq (Get-FileHash 'phase5\outcpp\append.ll').Hash)
+    $asm = & .\phase5out\dxilrt.exe asm 'phase5\out\append.ll' 'phase5\out\append.dxil' 2>&1
+    $valid = $LASTEXITCODE -eq 0
+    $text = if ($pyOk) { Get-Content 'phase5\out\append.ll' -Raw } else { '' }
+    $m = [regex]::Match($text, '(?s)define void @AnyHit\(.*?\n\}')
+    $inAnyHit = $m.Success -and $m.Value.Contains('@dx.op.bufferUpdateCounter(i32 70')
+    if ($same -and $valid -and $inAnyHit) {
+        Write-Host '  append : PASS (counter update in AnyHit, byte-identical, validates)'
+    } else {
+        Write-Host "  append : FAIL (lowered=$pyOk identical=$same validates=$valid inAnyHit=$inAnyHit)"
+        if (-not $valid) { $asm | Select-Object -Last 4 | ForEach-Object { "    $_" } }
+        $failed++
+    }
+}
+
+Write-Host ''
 Write-Host '=== refusal checks ==='
 & python phase5\rewriter\test_reject.py
 if ($LASTEXITCODE -ne 0) { $failed++ }

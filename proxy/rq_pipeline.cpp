@@ -48,6 +48,8 @@ struct Xform {
     // Does the shader ask what geometry or what instance contribution it hit?
     // Only then do the hit records carry a pointer to their pair.
     bool needsRecordConstants = false;
+    // The loop body appends to a buffer; see rq::LowerResult::appends.
+    bool appends = false;
     int threads[3] = { 1, 1, 1 };
 };
 
@@ -81,6 +83,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     x->hasIntersection = a.query.NeedsIntersection();
     x->needsBoth = a.query.NeedsBoth();
     x->needsRecordConstants = a.query.needsRecordConstants;
+    x->appends = l.appends;
     *out = l.text;
     return true;
 }
@@ -664,12 +667,13 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     }
 
     ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader lowered and ready: "
-             "%zu -> %zu bytes, numthreads(%u,%u,%u)%s\n",
+             "%zu -> %zu bytes, numthreads(%u,%u,%u)%s%s\n",
              static_cast<size_t>(desc->CS.BytecodeLength), lib.size(),
              self->m_threads[0], self->m_threads[1], self->m_threads[2],
              x.needsBoth ? ", with a generated any-hit AND intersection shader"
                  : x.hasIntersection ? ", with a generated intersection shader"
-                 : (x.hasAnyHit ? ", with a generated any-hit shader" : ""));
+                 : (x.hasAnyHit ? ", with a generated any-hit shader" : ""),
+             x.appends ? ", which appends to a buffer per candidate" : "");
     // The object the application holds is a REAL pipeline state: its own root
     // signature, and a compute shader that does nothing. It is never executed,
     // because Dispatch is intercepted and replaced by SetPipelineState1 plus

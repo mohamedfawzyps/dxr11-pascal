@@ -224,6 +224,43 @@ const char* KindName(Kind k) {
     }
 }
 
+const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* NoDuplicateAnyHit(
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* copy,
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC>* storage) {
+    if (!in || in->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL ||
+        !in->NumDescs)
+        return in;
+    const bool ptrs = in->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+    if (ptrs ? !in->ppGeometryDescs : !in->pGeometryDescs) return in;
+    auto at = [&](UINT i) -> const D3D12_RAYTRACING_GEOMETRY_DESC& {
+        return ptrs ? *in->ppGeometryDescs[i] : in->pGeometryDescs[i];
+    };
+    const auto kFlag = D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION;
+    bool all = true;
+    for (UINT i = 0; i < in->NumDescs && all; ++i)
+        all = (at(i).Flags & kFlag) != 0;
+    if (all) return in;
+
+    storage->assign(in->NumDescs, D3D12_RAYTRACING_GEOMETRY_DESC{});
+    for (UINT i = 0; i < in->NumDescs; ++i) {
+        (*storage)[i] = at(i);
+        (*storage)[i].Flags |= kFlag;
+    }
+    *copy = *in;
+    copy->DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    copy->pGeometryDescs = storage->data();
+
+    static LONG s_said = 0;
+    if (InterlockedCompareExchange(&s_said, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] setting NO_DUPLICATE_ANYHIT_INVOCATION on "
+                 "bottom-level geometry (first build: %u geometries), so an any-hit "
+                 "shader runs once per intersection, as a Proceed loop sees each "
+                 "candidate once. Applied in the prebuild query too.\n",
+                 in->NumDescs);
+    return copy;
+}
+
 void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
     if (!desc) return;
     const auto& in = desc->Inputs;

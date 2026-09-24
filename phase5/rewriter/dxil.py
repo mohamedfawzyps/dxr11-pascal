@@ -62,7 +62,13 @@ def operand_name(arg):
 # --- model -----------------------------------------------------------------
 
 _RESULT = re.compile(r'^\s*(%[\w.$-]+)\s*=\s*(.*)$')
-_CALL = re.compile(r'\bcall\s+.*?@([\w.$"<>-]+|"[^"]+")\s*\((.*)\)\s*(?:#\d+)?\s*$')
+# A call can carry metadata attachments after its arguments, `, !dx.precise !20`
+# for a `precise` value. Without them in the pattern such a call was not
+# recognised as a call at all, so a RayQuery accessor carrying one was never
+# rewritten and still named the deleted query handle: "use of undefined value"
+# from the assembler, 17 of Unreal's MegaLights and Lumen shaders.
+_CALL = re.compile(r'\bcall\s+.*?@([\w.$"<>-]+|"[^"]+")\s*\((.*)\)\s*(?:#\d+)?'
+                   r'(?:\s*,\s*![\w.$-]+\s+!\d+)*\s*$')
 _BR_COND = re.compile(r'^\s*br\s+i1\s+(\S+),\s*label\s+(%[\w.$-]+),\s*label\s+(%[\w.$-]+)')
 _BR_UNCOND = re.compile(r'^\s*br\s+label\s+(%[\w.$-]+)')
 _PHI_IN = re.compile(r'\[\s*([^,\]]+),\s*(%[\w.$-]+)\s*\]')

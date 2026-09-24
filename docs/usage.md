@@ -315,9 +315,13 @@ them into two lists, and the difference matters when you are deciding whether
 to report it: refusals that are facts about DXR 1.0 will not change, and
 refusals that are gaps in the rewriter will. "More than one RayQuery object"
 is the second kind and is the most common one a real game hits. "Proceed loop
-body has a side effect" is the first kind: DXR lets an any-hit shader run more
-than once for the same candidate, so a UAV write or counter append moved into
-one would not be the same write.
+body has a side effect" is the first kind: the any-hit shader the loop body
+becomes runs in no defined order, so a write at a fixed index would not be
+the same write. An APPEND, a counter update and stores at the index it
+returned, is lowered from 0.41.0, and to keep it the same append the shim sets
+`NO_DUPLICATE_ANYHIT_INVOCATION` on every bottom-level geometry the
+application builds, in the build and in the size query. That applies to the
+application's own DXR 1.0 any-hit shaders too: legal, and possibly slower.
 
 Turn `dump` on and the refused shader is written out as a `.dxil` container
 with a `.txt` saying why, which is what makes a useful bug report.
