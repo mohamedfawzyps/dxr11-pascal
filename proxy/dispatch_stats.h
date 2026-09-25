@@ -30,6 +30,7 @@ enum Counter {
     kSceneResolved,       // the dispatch's scene resolved through its root signature
     kSceneUnresolved,     // not resolved: judged over every live structure
     kRefusedUnread,       // resolved to a structure whose instances are not read yet
+    kRefusedUnknownBlas,  // an instance on a bottom-level structure of unknown geometry
     kCount
 };
 

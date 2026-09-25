@@ -1545,6 +1545,11 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
     bool read = false, stale = false;
     const auto labels =
         astrack::GeometryLabels(info.traceArgs, records, boundSrvs, exact, &read, &stale);
+    if (read && !stale && astrack::UnknownBlas(boundSrvs, exact)) {
+        *why = "an instance points at a bottom-level structure whose geometry the shim does "
+               "not know (deserialized, or never seen built)";
+        return false;
+    }
     if (!read || stale) {
         *why = !read ? (exact ? "the scene this dispatch traces has not been read yet"
                               : "no top-level structure has been read yet")

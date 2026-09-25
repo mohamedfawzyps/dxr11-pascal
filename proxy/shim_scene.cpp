@@ -289,6 +289,31 @@ void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas) {
     g_saved.erase(appTlas);
 }
 
+void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src, bool same) {
+    std::lock_guard<std::mutex> g(g_lock);
+    const bool known = same && g_builds.count(src) != 0;
+    if (!known && !g_builds.count(dst)) return;   // not a top-level structure we know
+    const UINT64 build = ++g_builds[dst];
+    g_copies.erase(dst);
+    g_saved.erase(dst);
+    if (!known) return;
+    const UINT64 srcBuild = g_builds[src];
+    g_buildGmax[dst] = g_buildGmax[src];
+    // The same scene: the source's saved instances and copy stand for it too.
+    auto sv = g_saved.find(src);
+    if (sv != g_saved.end() && sv->second.build == srcBuild) {
+        Saved s = sv->second;
+        s.build = build;
+        g_saved[dst] = s;
+    }
+    auto cp = g_copies.find(src);
+    if (cp != g_copies.end() && cp->second.build == srcBuild) {
+        Held h = cp->second;
+        h.build = build;
+        g_copies[dst] = h;
+    }
+}
+
 bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
           const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
           const void* owner, ID3D12Resource** readback, std::string* why) {

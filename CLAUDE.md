@@ -153,6 +153,19 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.53.0: COPIED STRUCTURES ARE FOLLOWED; A COPIED BOTTOM-LEVEL STRUCTURE
+WAS DRAWN WRONG, SILENTLY.** Unreal compacts bottom-level structures and
+deserializes offline ones, and the shim knew a structure only from its
+build: `raytest --blasclone` gave 0 hits of 13872 on 0.52.3, nothing logged.
+CLONE and COMPACT now carry the source's geometry or instances (a pending
+read followed through an alias); a deserialized structure's geometry is
+driver-opaque, so an instance on one is REFUSED by name. Suite 47 of 47.
+Remaining for item a: a scene through a local root signature, TraceRay in a
+closest-hit or miss in the shim's layout, runtime TraceRay arguments, a
+rewritten library with its own subobjects AND an export list, a library
+association to another library's subobject, and an unknown bottom-level
+structure under the `GeometryIndex()` variant.
+
 **0.52.3 IN THE GAME (2026-09-25, 3 min 27 s): THE FIRST RUN WITH NOTHING
 REFUSED.** Clean end marker, 162 RayQuery shaders lowered, 332 of 332 state
 objects hr=0, 12853 lowered dispatches drawn (all indirect), REFUSED 0 of

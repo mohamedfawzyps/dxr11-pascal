@@ -732,7 +732,17 @@ void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(co
     if (replaced) RestoreComputeAfterCapture();
 }
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
-void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { WorkBarrier(); FWD(CopyRaytracingAccelerationStructure(d, s, m)); }
+// A copy makes a structure the shim did not see built: what it is has to be
+// followed, or an instance on a compacted structure is misread (0.53.0).
+void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) {
+    WorkBarrier();
+    astrack::NoteCopy(d, s, m);
+    if (m != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE &&
+        m != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS)
+        shimscene::NoteCopy(d, s, m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE ||
+                                  m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+    FWD(CopyRaytracingAccelerationStructure(d, s, m));
+}
 void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s) {
     if (m_bindings.stateObject) m_bindings.stateObject->Release();
     m_bindings.stateObject = s;

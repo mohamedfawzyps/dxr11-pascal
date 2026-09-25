@@ -24,6 +24,41 @@ not.
 
 ---
 
+## 0.53.0
+
+**Structures made by `CopyRaytracingAccelerationStructure` are followed
+(Tier 1.1 item a, the gap listed as a copied top-level structure). And it was
+worse than listed: a copied BOTTOM-level structure was drawn WRONG,
+silently.**
+
+- **Why it matters for Unreal.** It COMPACTs bottom-level structures
+  (`D3D12RayTracing.cpp:5176`) and loads offline ones by DESERIALIZE
+  (`:4339`). The shim learns a structure only from its build, so a copy was
+  unknown: an instance on one counted one geometry of unknown kind and was
+  left out of the table, and a copy over a known address kept the old
+  answer. Escher's runs so far showed no instance on an unseen structure.
+- **Measured on 0.52.3 first**, with new `raytest` modes: `--blasclone`
+  (the instance on a CLONE of the bottom-level structure) **drawn with 0
+  hits of 13872, nothing logged**, with CPU-visible or GPU-written instances;
+  `--deserialize` (serialized, then deserialized) the same; `--tlasclone`
+  (the dispatch traces a CLONE of the top-level structure) refused.
+- **The fix.** CLONE and COMPACT make the same structure: a bottom-level
+  copy keeps the source's geometry, a top-level copy the source's instances
+  as of its latest build, a read still pending there followed at the split
+  (an alias in `astrack::BringToBuild`), and the source's saved instances
+  and scene copy stand for it in `shimscene`. Any other copy into an address
+  leaves nothing known there.
+- **Refused by name:** an instance on a bottom-level structure of unknown
+  geometry, a deserialized one above all (its geometry is in a driver-opaque
+  blob), in the RayQuery path and the `GeometryIndex()` table path. The
+  `stats:` line counts it ("unknown bottom-level structure"). Not refused:
+  the `GeometryIndex()` VARIANT, used when the read is stale, cannot see the
+  instances on the CPU, so an unknown structure there is a named gap.
+- **Measured:** the three copy cases match on the 1070 and deserialize is
+  refused with its reason. Suite cases `blasclone`, `blasclonegpu`,
+  `tlasclonegpu` and a gate for the deserialize refusal: 47 of 47 and every
+  gate. gitest 46 of 46.
+
 ## 0.52.3
 
 **FIXED: a lowered RayQuery dispatch drawn WRONG, silently, when a

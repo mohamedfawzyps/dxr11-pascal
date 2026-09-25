@@ -238,6 +238,22 @@ bool LiveCurrent();
 // it, or its fence has passed. False when it cannot be had.
 bool BringToBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list);
 
+// CopyRaytracingAccelerationStructure (0.53.0). CLONE and COMPACT make the
+// same structure: a bottom-level one keeps its geometry, a top-level one its
+// instances, as of the source's latest build (a read still pending there is
+// followed at a split). Any other copy into `dst` leaves nothing known about
+// it: a DESERIALIZED structure's geometry is inside a driver-opaque blob, so
+// an instance on one is refused, and a dispatch on a deserialized top-level
+// one is refused as not read. Until 0.53.0 copies were not followed at all:
+// an instance on a compacted structure counted one geometry of unknown kind,
+// silently, and a copy over a known address kept the old answer.
+void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
+              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode);
+
+// Does a scene the dispatch may trace have an instance on a bottom-level
+// structure of unknown geometry? Same selection as GeometryLabels.
+bool UnknownBlas(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact);
+
 // Should the instance data of this top-level build be read? Called once per
 // build, AFTER NoteBuild. Up to 0.39.0 the answer was "once per destination
 // address", and an engine that rebuilds a structure in place when a level

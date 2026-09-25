@@ -45,6 +45,11 @@ bool Active();
 // the structure's previous build no longer stands for it.
 void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas);
 
+// CopyRaytracingAccelerationStructure into `dst`: a new build of it, which
+// with `same` (CLONE or COMPACT) of a structure known here is the same scene
+// as the source's latest build (0.53.0).
+void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src, bool same);
+
 // After the application's top-level build is recorded into `cl`, when its
 // instances are in GPU-only memory: records the verbatim copy, and a copy of
 // that into a new readback buffer, returned with a reference in *readback

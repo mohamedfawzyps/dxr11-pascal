@@ -268,6 +268,16 @@ $cases = @(
     # Unreal reuses addresses as it streams geometry, recording ahead.
     @{ name = 'blasreuse'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--blasreuse', '--gpuinst');
        desc = 'bottom-level address reused by a later-recorded build, GPU-written instances' },
+    # Structures made by CopyRaytracingAccelerationStructure, which the shim
+    # never sees built. Unreal COMPACTs its bottom-level structures; a CLONE is
+    # the same structure too. 0.52.3 drew the cloned bottom-level case with 0
+    # hits of 13872, nothing logged, and refused the cloned top-level one.
+    @{ name = 'blasclone'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--blasclone');
+       desc = 'instance on a CLONE of the bottom-level structure' },
+    @{ name = 'blasclonegpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--blasclone', '--gpuinst');
+       desc = 'the same, GPU-written instances' },
+    @{ name = 'tlasclonegpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasclone', '--gpuinst');
+       desc = 'dispatch traces a CLONE of the top-level structure, its read still pending' },
     # A second LIVE top-level structure whose layout conflicts with the real
     # one. Judged over every live structure this is refused; the shim has to
     # resolve the scene the dispatch traces (0.49.0). And the same with the
@@ -461,6 +471,24 @@ if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'routes BOTH triang
     Write-Host '  refused, with the reason, as it must'
 } else {
     Write-Host '  REFUSAL MISSING: the unservable layout was allowed through'
+    $failed++
+}
+
+Write-Host '=== a DESERIALIZED bottom-level structure is refused ==='
+# Unreal loads offline structures by DESERIALIZE. Their geometry is inside a
+# driver-opaque blob, so the records a hit reaches cannot be known: refused
+# by name, never guessed. 0.52.3 drew it with 0 hits of 13872.
+$log = Join-Path $env:TEMP 'dxr-tier-11-proxy.log'
+Remove-Item $log -ErrorAction SilentlyContinue
+$env:DXR_TIER11 = '1'
+& .\raytest.exe hw rayquery alpha dp_deser.bin --cs phase5\cases\rayquery_geom.hlsl --geom --contrib --deserialize |
+    Out-Null
+$env:DXR_TIER11 = ''
+Remove-Item dp_deser.bin -ErrorAction SilentlyContinue
+if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'bottom-level structure whose geometry the shim does not know' -Quiet)) {
+    Write-Host '  refused, with the reason, as it must'
+} else {
+    Write-Host '  REFUSAL MISSING: a structure of unknown geometry was drawn'
     $failed++
 }
 

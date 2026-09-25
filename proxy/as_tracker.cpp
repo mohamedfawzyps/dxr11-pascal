@@ -30,6 +30,10 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, BlasInfo> g_blas;
 UINT64 g_asSerial = 0;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<std::pair<UINT64, BlasInfo>>> g_blasHist;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_tlasAsSerial;
+// A top-level structure made by CLONE or COMPACT of another whose read was
+// still pending: build `build` of `dst` is build `srcBuild` of `src`.
+struct Alias { D3D12_GPU_VIRTUAL_ADDRESS src = 0; UINT64 srcBuild = 0, build = 0; };
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, Alias> g_alias;
 
 // Caller holds g_lock. The bottom-level structure at `blas` as the build
 // recorded at `asOf` saw it: its latest build recorded before that. Null
@@ -598,10 +602,29 @@ bool LiveCurrent() {
     return true;
 }
 
+bool BringToBuildLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list,
+                        int depth);
+
 bool BringToBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list) {
     std::lock_guard<std::mutex> g(g_lock);
+    return BringToBuildLocked(tlas, build, list, 0);
+}
+
+bool BringToBuildLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list,
+                        int depth) {
     auto r = g_readOf.find(tlas);
     if (r != g_readOf.end() && r->second == build) return true;
+    // A copy of another structure: that one's build, then its answer.
+    auto al = g_alias.find(tlas);
+    if (al != g_alias.end() && al->second.build == build && depth < 8) {
+        const Alias a = al->second;
+        if (!BringToBuildLocked(a.src, a.srcBuild, list, depth + 1)) return false;
+        auto st = g_tlas.find(a.src);
+        if (st == g_tlas.end()) return false;
+        g_tlas[tlas] = st->second;
+        g_readOf[tlas] = build;
+        return true;
+    }
     for (auto it = g_pending.begin(); it != g_pending.end(); ++it) {
         PendingRead& pr = *it;
         if (pr.tlas != tlas || pr.build != build) continue;
@@ -628,6 +651,66 @@ bool BringToBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list
         }
         g_pending.erase(it);
         return ok;
+    }
+    return false;
+}
+
+void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
+              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
+    if (!dst) return;
+    const bool same = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE ||
+                      mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT;
+    // Serializing or decoding for tools writes a blob, not a structure.
+    if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE ||
+        mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS)
+        return;
+    std::lock_guard<std::mutex> g(g_lock);
+    auto hs = g_blasHist.find(src);
+    const bool srcBlas = same && hs != g_blasHist.end() && !hs->second.empty();
+    const bool srcTlas = same && g_lastBuilt.count(src) != 0;
+
+    // A bottom-level structure: the source's geometry, or none known.
+    BlasInfo bi;   // kind unknown, no geometries: refused when an instance points at it
+    if (srcBlas) bi = hs->second.back().second;
+    if (srcBlas || !srcTlas) {
+        g_blas[dst] = bi;
+        g_blasHist[dst].emplace_back(++g_asSerial, bi);
+    }
+
+    // A top-level structure: a new build of `dst` that IS the source's latest.
+    if (srcTlas || g_lastBuilt.count(dst)) {
+        g_lastBuilt[dst] = ++g_tlasSerial;
+        g_firstBuilt.emplace(dst, g_tlasSerial);
+        ++g_buildCount[dst];
+        g_snapshots.erase(dst);
+        g_alias.erase(dst);
+        if (!srcTlas) {
+            // Deserialized, or copied from something unknown: nothing known,
+            // so a dispatch on it is refused as not read.
+            g_tlas[dst].valid = false;
+            g_readOf.erase(dst);
+            return;
+        }
+        g_tlasAsSerial[dst] = g_tlasAsSerial[src];
+        if (CurrentLocked(src)) {
+            g_tlas[dst] = g_tlas[src];
+            g_readOf[dst] = g_lastBuilt[dst];
+            auto sn = g_snapshots.find(src);
+            if (sn != g_snapshots.end()) g_snapshots[dst] = sn->second;
+        } else {
+            g_readOf.erase(dst);
+            g_alias[dst] = Alias{ src, g_lastBuilt[src], g_lastBuilt[dst] };
+        }
+    }
+}
+
+bool UnknownBlas(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (const auto& kv : g_tlas) {
+        if (!kv.second.valid || !kv.second.unknownBlas) continue;
+        if (exact ? std::find(bound.begin(), bound.end(), kv.first) != bound.end()
+                  : LiveLocked(kv.first))
+            return true;
     }
     return false;
 }
@@ -686,6 +769,14 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
         for (const auto& kv : g_tlas) {
             const TlasInfo& t = kv.second;
             if (!t.valid || !CountsLocked(kv.first, only)) continue;
+            if (t.unknownBlas) {
+                dstats::Add(dstats::kRefusedUnknownBlas);
+                if (why)
+                    *why = std::to_string(t.unknownBlas) + " instance(s) point at a bottom-level "
+                           "structure whose geometry the shim does not know (deserialized, or "
+                           "never seen built), so the records its hits reach cannot be known";
+                return true;
+            }
             if (t.constantsConflict) {
                 dstats::Add(dstats::kRefusedOneTlas);
                 if (why)
