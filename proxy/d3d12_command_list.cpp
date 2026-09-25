@@ -773,10 +773,11 @@ std::vector<gidx::BoundRoot> RootsOf(const Dxr11Bindings& bb) {
 bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
                                           std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
                                           std::string* why, const Dxr11Bindings* with,
-                                          const gidx::LocalRecord* local, bool* needsLocal) {
+                                          const gidx::LocalRecord* local, bool* needsLocal,
+                                          std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>>* keys) {
     const Dxr11Bindings& bb = with ? *with : m_bindings;
     return gidx::ResolveScenes(sc, bb.rootSig, RootsOf(bb), bb.heaps.data(), (UINT)bb.heaps.size(),
-                               out, why, local, needsLocal);
+                               out, why, local, needsLocal, keys);
 }
 
 namespace {
@@ -870,21 +871,36 @@ int Dxr11CommandList::ReadRecords(const D3D12_DISPATCH_RAYS_DESC& d, bool all,
 void Dxr11CommandList::GlobalSel(gidx::Info& gi, const Dxr11Bindings& b, gidx::SceneSel* sel) {
     *sel = gidx::SceneSel{};
     sel->valid = true;
-    for (const auto& slot : gidx::SceneSlots(gi.scenes)) {
+    const auto slots = gidx::SceneSlots(gi.scenes);
+    sel->global.assign(slots.size(), {});
+    sel->perRecord.assign(slots.size(), false);
+    for (size_t j = 0; j < slots.size(); ++j) {
         std::vector<D3D12_GPU_VIRTUAL_ADDRESS> s;
+        std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> keys;
         std::string w;
         bool needs = false;
-        if (ResolveBoundScenes(slot, &s, &w, &b, nullptr, &needs)) {
-            if (s.size() == 1) { sel->fixed.push_back(sel->Add(s[0])); continue; }
-            sel->valid = false;
-            sel->why = "a TraceRay whose scene is picked at run time from an array of several";
-            return;
+        if (ResolveBoundScenes(slots[j], &s, &w, &b, nullptr, &needs, &keys)) {
+            // A scene picked by key: every scene each key names (0.60.0;
+            // until then refused).
+            if (gidx::KeyedSlot(slots[j])) {
+                sel->global[j].keyed = true;
+                sel->global[j].keys = keys;
+            } else if (s.size() == 1) {
+                sel->global[j].scene = s[0];
+            } else {
+                sel->valid = false;
+                sel->why = "a scene slot not picked by key resolves to several scenes";
+                return;
+            }
+            continue;
         }
-        if (needs) { sel->fixed.push_back(-1); continue; }
+        if (needs) { sel->perRecord[j] = true; continue; }
         sel->valid = false;
         sel->why = w;
         return;
     }
+    const std::vector<std::vector<gidx::SlotScenes>> none[3];
+    gidx::BuildSel(sel->global, sel->perRecord, none, sel);
 }
 
 bool Dxr11CommandList::RecordScenes(gidx::Info& gi, const Dxr11Bindings& b,
@@ -930,19 +946,21 @@ bool Dxr11CommandList::RecordScenes(gidx::Info& gi, const Dxr11Bindings& b,
     if (scenes.empty()) { *why = "no record names a scene"; return false; }
     *srvs = scenes;
     // Per record, the scene of every slot the global root signature leaves
-    // to the records: a record carries its own (0.59.0).
+    // to the records: a record carries its own (0.59.0), and with a keyed
+    // slot the scene of each key (0.60.0).
     if (sel && sel->valid) {
         const auto slots = gidx::SceneSlots(gi.scenes);
         const size_t S = slots.size();
         bool any = false;
-        for (int f : sel->fixed) any = any || f < 0;
+        for (size_t j = 0; j < S && j < sel->perRecord.size(); ++j) any = any || sel->perRecord[j];
+        std::vector<std::vector<gidx::SlotScenes>> rows[3];
         for (int k = 0; any && k < (all ? 3 : 1); ++k) {
             const UINT64 size = rec[k].size();
             UINT64 stride = k == 0 ? size : (k == 1 ? d.MissShaderTable : d.HitGroupTable).StrideInBytes;
             if (!stride || stride > size) stride = size;
             for (UINT64 off = 0; stride && off + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES <= size; off += stride) {
                 const uint8_t* r = rec[k].data() + off;
-                std::vector<int> row(S, -1);
+                std::vector<gidx::SlotScenes> row(S);
                 const gidx::RecordLocal* rl =
                     std::memcmp(r, kNull, sizeof(kNull)) ? gidx::RecordLocalOf(gi, r) : nullptr;
                 if (rl && rl->why.empty() && rl->desc) {
@@ -952,21 +970,31 @@ bool Dxr11CommandList::RecordScenes(gidx::Info& gi, const Dxr11Bindings& b,
                     lr.size = (UINT)(std::min)(stride, size - off);
                     lr.lenient = true;
                     for (size_t j = 0; j < S; ++j) {
-                        if (sel->fixed[j] >= 0) continue;
+                        if (!sel->perRecord[j]) continue;
                         std::vector<D3D12_GPU_VIRTUAL_ADDRESS> s;
+                        std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> keys;
                         std::string w;
-                        if (!ResolveBoundScenes(slots[j], &s, &w, &b, &lr, nullptr) || s.size() > 1) {
+                        if (!ResolveBoundScenes(slots[j], &s, &w, &b, &lr, nullptr, &keys)) {
                             sel->valid = false;
-                            sel->why = s.size() > 1 ? "a TraceRay whose scene is picked at run time "
-                                                      "from an array of several" : w;
+                            sel->why = w;
                             return true;
                         }
-                        if (s.size() == 1) row[j] = sel->Add(s[0]);
+                        if (gidx::KeyedSlot(slots[j])) {
+                            row[j].keyed = true;
+                            row[j].keys = keys;
+                        } else if (s.size() == 1) {
+                            row[j].scene = s[0];
+                        } else if (s.size() > 1) {
+                            sel->valid = false;
+                            sel->why = "a scene slot not picked by key resolves to several scenes";
+                            return true;
+                        }
                     }
                 }
-                sel->rec[k].insert(sel->rec[k].end(), row.begin(), row.end());
+                rows[k].push_back(row);
             }
         }
+        if (any) gidx::BuildSel(sel->global, sel->perRecord, rows, sel);
     }
     return true;
 }
@@ -1102,10 +1130,11 @@ static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5*
         // A record several geometries reach: the shim's own layout, through
         // the variant pipeline and the shim's copy of the scene.
         std::string vwhy;
-        if (dev && shared && gidx::EnsureVariant(dev, gi, so, &vwhy) &&
-            gidx::RecordVariant(cl, dev, gi, pairs, d, &mine, srvs, exact, sel, owner, &vwhy)) {
+        std::shared_ptr<gidx::Variant> var;
+        if (dev && shared && gidx::EnsureVariant(dev, gi, so, sel.need, &var, &vwhy) &&
+            gidx::RecordVariant(cl, dev, gi, *var, pairs, d, &mine, srvs, exact, sel, owner, &vwhy)) {
             restore();
-            cl->SetPipelineState1(gi.variant.Get());
+            cl->SetPipelineState1(var->so.Get());
             cl->DispatchRays(&mine);
             cl->SetPipelineState1(so);
             static LONG firstVariant = 0;

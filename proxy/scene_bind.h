@@ -16,6 +16,9 @@
 
 #include <d3d12.h>
 
+#include <utility>
+#include <vector>
+
 namespace scenebind {
 
 void NoteHeap(ID3D12Device* real, ID3D12DescriptorHeap* heap);
@@ -35,5 +38,15 @@ D3D12_GPU_VIRTUAL_ADDRESS Lookup(ID3D12DescriptorHeap* const* heaps, UINT n,
 // slot is past its end.
 D3D12_GPU_VIRTUAL_ADDRESS LookupSlot(ID3D12DescriptorHeap* const* heaps, UINT n, UINT slot,
                                      bool* inHeap);
+
+// Every structure written to the bound shader-visible CBV_SRV_UAV heap from
+// the descriptor at `from` on, at most `count` of them (to the heap's end):
+// (index from `from`, address), in index order. A scene picked at run time
+// from an unbounded array or the heap itself is one of these (0.60.0).
+// `from` 0 is the heap's start. `*inHeap` false when no such heap is bound
+// or `from` is not in it.
+std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> Enumerate(
+    ID3D12DescriptorHeap* const* heaps, UINT n, D3D12_GPU_DESCRIPTOR_HANDLE from, UINT64 count,
+    bool* inHeap);
 
 }  // namespace scenebind

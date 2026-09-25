@@ -24,6 +24,51 @@ not.
 
 ---
 
+## 0.60.0
+
+**A scene picked per ray at run time, and a scene the CPU cannot read, are
+drawn** (the two refusals 0.59.0 left in item a). Until now a `TraceRay` on
+an array of scenes at a dynamic element, on `ResourceDescriptorHeap[i]` with
+`i` computed in the shader, or with `i` in a cbuffer the CPU cannot read (GPU
+memory, a descriptor table), was refused whenever the shader's records
+needed the shim's own layout.
+
+- **Measured on 0.59.0 first**, with new `gitest` modes: `--scenearray`
+  (`Scenes[2]` through a descriptor table, element `x & 1` per ray, the real
+  scene and the second one of `--twoscenes`), `--sceneunbounded` (`Scenes[]`
+  over the rest of the heap), both also through the records' local tables
+  (`--localscenetable`, where every other hit record's table starts one
+  later, so element 0 is the other scene there), `--heapdyn`
+  (`ResourceDescriptorHeap[Pad + (x & 1)]`) and `--heapgpu` (the index in a
+  root CBV in GPU memory). 8 modes, 56 of 56 layouts NOT DRAWN, each by name.
+- **DXC was asked first whether a scene can be chosen by a branch**: it
+  refuses (`local resource not guaranteed to map to unique global resource`),
+  even in a library, so that shape cannot reach the shim.
+- **Keyed scene slots.** An array at a dynamic element and the heap are
+  KEYED: the key is the element, or the heap index, read off the handle's
+  definition. A dispatch resolves the scene of every key it can use (every
+  element holding a top-level structure the shim saw built; for the heap the
+  one slot the cbuffer names when the CPU can read it, else every such slot),
+  and a slot holds one sub-slot per group of keys naming the same scene,
+  per record where the records carry their own tables.
+- **The variant grows.** Each slot starts with room for one scene, which
+  rewrites exactly as before; a dispatch reaching more builds a larger
+  variant (at least double), each call finding its sub-slot in the shim's
+  key table by a binary search and tracing it through a switch. The old
+  variant stays alive for lists still holding it. Both rewriters,
+  byte-identical, `shimtrace --caps`.
+- **Also fixed on the way:** the scene scan did not read a non-uniform array
+  index (`!dx.nonuniform` after the `getelementptr`), so such a scene was
+  "unknown".
+- **Measured:** the 8 modes, 56 of 56 match; `tools/run_gitest_matrix.ps1 417 of 417, plus the root signature gate`. Sensitivity: `DXR_TIER11_KEY_POISON=1` (every key to
+  the first sub-slot) diverges every layout the key decides: all 7 of
+  `--heapdyn` and `--heapgpu`, 5 of 7 of `--scenearray --twoconflict`
+  (the other two put the same geometry on the same records in both scenes,
+  so the shim's plain table serves them and no key is looked up).
+- **Still refused by name:** a scene handle the scan cannot trace back to a
+  register or the heap (none known to DXC's output), and a variant whose
+  local root signature would pass the GTX 1070's limit.
+
 ## 0.59.0
 
 **The shim's own layout traces several scenes** (Tier 1.1 item a, "the

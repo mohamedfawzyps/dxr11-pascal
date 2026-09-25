@@ -113,6 +113,28 @@ $cfgs += ,@('--twoconflict', '--localscene', '--recurse', '--gpusbt')
 $cfgs += ,@('--twoscenes', '--dynargs')
 $cfgs += ,@('--twoconflict', '--dynargs', '--norefine', '--perstruct', '8')
 $cfgs += ,@('--twoscenes', '--libhg')
+# A scene picked per ray (0.60.0): an array at a dynamic element, bounded or
+# not, in the global root signature or the records' (where every other hit
+# record's table starts one later); the heap at an index computed in the
+# shader, or read from a cbuffer in GPU memory.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($m in @('--scenearray', '--sceneunbounded')) {
+        foreach ($x in @('', '--twoconflict', '--recurse', '--sm66')) { $cfgs += ,@(@($b, $m, $x) | Where-Object { $_ }) }
+        $cfgs += ,@(@($b, '--localscenetable', $m) | Where-Object { $_ })
+        $cfgs += ,@(@($b, '--localscenetable', $m, '--recurse', '--twoconflict') | Where-Object { $_ })
+    }
+    foreach ($m in @('--heapdyn', '--heapgpu')) { $cfgs += ,@(@($b, $m) | Where-Object { $_ }) }
+}
+$cfgs += ,@('--scenearray', '--twoconflict', '--gpuinst')
+$cfgs += ,@('--scenearray', '--twoconflict', '--stale')
+$cfgs += ,@('--scenearray', '--twoconflict', '--indirectgpu')
+$cfgs += ,@('--localscenetable', '--scenearray', '--twoconflict', '--gpusbt')
+$cfgs += ,@('--scenearray', '--twoconflict', '--dynargs')
+$cfgs += ,@('--scenearray', '--twoconflict', '--dynargs', '--norefine', '--perstruct', '8')
+$cfgs += ,@('--heapdyn', '--dynargs')
+$cfgs += ,@('--heapgpu', '--indirectgpu')
+$cfgs += ,@('--heapdyn', '--stale')
+$cfgs += ,@('--scenearray', '--libhg')
 
 # A failure keeps its output and the shim's log, so an intermittent one can
 # be read afterwards rather than rerun in hope.

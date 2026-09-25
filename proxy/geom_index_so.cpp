@@ -55,7 +55,7 @@ std::string GlobalAt(const std::string& l, size_t at) {
 
 void AddHeapScene(Scenes* sc, const Scenes::Heap& h) {
     for (const auto& x : sc->heap)
-        if (x.space == h.space && x.reg == h.reg && x.offset == h.offset) return;
+        if (x.space == h.space && x.reg == h.reg && x.offset == h.offset && x.kind == h.kind) return;
     sc->heap.push_back(h);
 }
 
@@ -69,14 +69,17 @@ void AddScene(Scenes* sc, const Scenes::Reg& r) {
 // handle traced back through annotateHandle and createHandleForLib to the
 // load of a resource global, maybe through a getelementptr into an array,
 // and that global's record in !dx.resources. Shapes read off DXC at lib_6_5
-// and lib_6_6. Anything else, a descriptor heap index above all, is unknown.
+// and lib_6_6. A heap index is a cbuffer dword when it is one; any other
+// index is computed in the shader (kind 1), or a literal (kind 2): keyed
+// either way (0.60.0; until then unknown, and refused).
 // `calls`, when given, receives each call's own scene, in order: one
 // register or heap entry, or `unknown` (0.59.0, the variant's scene slots).
 void SceneRegs(const std::string& text, Scenes* sc, std::vector<Scenes>* calls = nullptr) {
     struct Rec { UINT space; UINT lower; int size; };
     std::map<std::string, Rec> recs, anyRecs;   // structures; every resource
     static const std::regex kAnyFields(R"RX(, !"[^"]*", i32 (-?\d+), i32 (-?\d+), i32 (-?\d+),)RX");
-    static const std::regex kHeap(R"RX(\(i32 218, i32 (%[^,]+), i1 false,)RX");
+    static const std::regex kHeap(R"RX(\(i32 218, i32 ([^,]+), i1 false,)RX");
+    static const std::regex kNonUniform(R"RX(, !dx\.nonuniform !\d+$)RX");
     static const std::regex kExtract(R"RX(extractvalue %dx\.types\.CBufRet\.i32 (%[^,]+), (\d+)$)RX");
     static const std::regex kCbLoad(R"RX(@dx\.op\.cbufferLoadLegacy\.i32\(i32 59, %dx\.types\.Handle (%[^,]+), i32 (\d+)\))RX");
     static const std::regex kFields(R"RX(, !"[^"]*", i32 (-?\d+), i32 (-?\d+), i32 (-?\d+), i32 16,)RX");
@@ -132,12 +135,26 @@ void SceneRegs(const std::string& text, Scenes* sc, std::vector<Scenes>* calls =
             if (d.find("@dx.op.createHandleFromHeap(") != std::string::npos) {
                 // ResourceDescriptorHeap[i], i a dword of a cbuffer at a
                 // constant row: Unreal's bindless scene, all 64 dumped.
+                // Anything else is keyed by i itself (0.60.0).
                 if (!std::regex_search(d, m, kHeap)) break;
-                auto ei = defs.find(m[1].str());
-                if (ei == defs.end() || !std::regex_search(*ei->second, m, kExtract)) break;
+                const std::string idx = m[1].str();
+                auto keyed = [&](int kind, UINT value) {
+                    Scenes::Heap sh;
+                    sh.kind = kind;
+                    sh.offset = value;
+                    AddHeapScene(sc, sh);
+                    if (calls) { calls->emplace_back(); calls->back().heap.push_back(sh); }
+                    done = true;
+                };
+                if (!idx.empty() && idx[0] != '%') {
+                    keyed(2, (UINT)std::stoul(idx));
+                    break;
+                }
+                auto ei = defs.find(idx);
+                if (ei == defs.end() || !std::regex_search(*ei->second, m, kExtract)) { keyed(1, 0); break; }
                 const UINT comp = (UINT)std::stoul(m[2].str());
                 auto li = defs.find(m[1].str());
-                if (li == defs.end() || !std::regex_search(*li->second, m, kCbLoad)) break;
+                if (li == defs.end() || !std::regex_search(*li->second, m, kCbLoad)) { keyed(1, 0); break; }
                 const UINT row = (UINT)std::stoul(m[2].str());
                 std::string h = m[1].str(), g;
                 for (int k = 0; k < 4; ++k) {
@@ -155,7 +172,7 @@ void SceneRegs(const std::string& text, Scenes* sc, std::vector<Scenes>* calls =
                     break;
                 }
                 auto r = anyRecs.find(g);
-                if (r == anyRecs.end()) break;
+                if (r == anyRecs.end()) { keyed(1, 0); break; }
                 Scenes::Heap sh;
                 sh.space = r->second.space;
                 sh.reg = r->second.lower;
@@ -176,7 +193,7 @@ void SceneRegs(const std::string& text, Scenes* sc, std::vector<Scenes>* calls =
             } else if (std::regex_search(d, m, kPtrOperand)) {
                 auto gi = defs.find(m[1].str());
                 if (gi == defs.end() || gi->second->find("getelementptr") == std::string::npos) break;
-                const std::string& gep = *gi->second;
+                const std::string gep = std::regex_replace(*gi->second, kNonUniform, "");
                 g = GlobalAt(gep, gep.find('@'));
                 if (!std::regex_search(gep, m, kLastIndex)) break;
                 elem = m[1].str();
@@ -1227,12 +1244,88 @@ std::vector<Scenes> SceneSlots(const Scenes& sc) {
     return v;
 }
 
+bool KeyedSlot(const Scenes& slot) {
+    return !slot.heap.empty() || (!slot.regs.empty() && slot.regs[0].count != 1);
+}
+
+void BuildSel(const std::vector<SlotScenes>& global, const std::vector<bool>& perRecord,
+              const std::vector<std::vector<SlotScenes>> rows[3], SceneSel* sel) {
+    const size_t S = global.size();
+    sel->need.assign(S, 1u);
+    sel->keys.assign(S, {});
+    // Per slot: its sub-slots' scenes, for every record context: [ctx][sub].
+    // Context 0 is the global one; a per-record slot has one per record of
+    // each table, in order.
+    std::vector<std::vector<std::vector<int>>> subs(S);
+    size_t records[3] = {};
+    for (int t = 0; t < 3; ++t) records[t] = rows[t].size();
+    for (size_t j = 0; j < S; ++j) {
+        std::vector<const SlotScenes*> ctx;
+        if (!perRecord[j]) {
+            ctx.push_back(&global[j]);
+        } else {
+            for (int t = 0; t < 3; ++t)
+                for (const auto& r : rows[t]) ctx.push_back(j < r.size() ? &r[j] : nullptr);
+        }
+        bool keyed = false;
+        for (const SlotScenes* c : ctx) keyed = keyed || (c && c->keyed);
+        if (!keyed) {
+            for (const SlotScenes* c : ctx)
+                subs[j].push_back({ c && c->scene ? sel->Add(c->scene) : -1 });
+            continue;
+        }
+        // Every key any context can use, and what it names in each; keys
+        // naming the same scenes everywhere share a sub-slot.
+        std::map<UINT, std::vector<int>> byKey;
+        for (size_t x = 0; x < ctx.size(); ++x) {
+            if (!ctx[x]) continue;
+            for (const auto& kv : ctx[x]->keys) {
+                auto& v = byKey[kv.first];
+                v.resize(ctx.size(), -1);
+                v[x] = sel->Add(kv.second);
+            }
+        }
+        std::vector<std::vector<int>> groups;
+        for (auto& kv : byKey) {
+            kv.second.resize(ctx.size(), -1);
+            size_t p = 0;
+            while (p < groups.size() && groups[p] != kv.second) ++p;
+            if (p == groups.size()) groups.push_back(kv.second);
+            sel->keys[j].emplace_back(kv.first, (UINT)p);
+        }
+        if (groups.empty()) groups.push_back(std::vector<int>(ctx.size(), -1));
+        sel->need[j] = (UINT)groups.size();
+        for (size_t x = 0; x < ctx.size(); ++x) {
+            std::vector<int> row;
+            for (const auto& gr : groups) row.push_back(gr[x]);
+            subs[j].push_back(row);
+        }
+    }
+    const UINT U = sel->Subs();
+    sel->fixed.assign(U, -1);
+    for (int t = 0; t < 3; ++t) sel->rec[t].assign(records[t] * U, -1);
+    for (size_t j = 0; j < S; ++j) {
+        const UINT at = sel->Sub(j);
+        if (!perRecord[j]) {
+            for (UINT p = 0; p < sel->need[j]; ++p) sel->fixed[at + p] = subs[j][0][p];
+            continue;
+        }
+        size_t x = 0;
+        for (int t = 0; t < 3; ++t)
+            for (size_t r = 0; r < records[t]; ++r, ++x)
+                for (UINT p = 0; p < sel->need[j]; ++p) sel->rec[t][r * U + at + p] = subs[j][x][p];
+    }
+}
+
 bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why,
-                   const LocalRecord* local, bool* needsLocal) {
+                   const LocalRecord* local, bool* needsLocal,
+                   std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>>* keys) {
     out->clear();
     if (needsLocal) *needsLocal = false;
+    if (keys) keys->clear();
+    std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> keyList;
     // A parameter of the raygen's local root signature: its argument's
     // offset in the record, identifier included; false when past its end.
     auto localArg = [&](UINT param, UINT bytes, UINT at, void* v) -> bool {
@@ -1250,8 +1343,8 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
         return true;
     };
     if (sc.unknown) {
-        *why = "a TraceRay whose scene comes from a descriptor heap index, or could not be traced "
-               "back to a declared resource";
+        *why = "a TraceRay whose scene could not be traced back to a declared resource or the "
+               "descriptor heap";
         return false;
     }
     if (sc.regs.empty() && sc.heap.empty()) {
@@ -1277,13 +1370,97 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
     if (FAILED(rs->GetDevice(IID_PPV_ARGS(&dev)))) { *why = "no device"; return false; }
     const UINT64 inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const auto& d = v->Desc_1_1;
-    char buf[160];
+    char buf[200];
+    // A scene the shim can serve: a top-level structure it saw built. What
+    // a key reaches is every such one (0.60.0).
+    auto addKey = [&](UINT key, D3D12_GPU_VIRTUAL_ADDRESS a) {
+        if (!a || !astrack::LatestBuild(a)) return;
+        keyList.emplace_back(key, a);
+        if (std::find(out->begin(), out->end(), a) == out->end()) out->push_back(a);
+    };
+    // A descriptor table range holding register `r` of type `type` in
+    // `space`: the GPU handle of r's descriptor when the table is set (0 when
+    // not), and how many descriptors the range has from r on.
+    auto inTable = [&](const D3D12_ROOT_PARAMETER1& prm, UINT64 table, D3D12_DESCRIPTOR_RANGE_TYPE type,
+                       UINT space, UINT r, UINT64* at, UINT64* num) -> bool {
+        if (prm.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return false;
+        UINT64 running = 0;
+        for (UINT k = 0; k < prm.DescriptorTable.NumDescriptorRanges; ++k) {
+            const auto& rg = prm.DescriptorTable.pDescriptorRanges[k];
+            const UINT64 off = rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                   ? running : rg.OffsetInDescriptorsFromTableStart;
+            const UINT64 n = rg.NumDescriptors == UINT_MAX ? (1ull << 32) : rg.NumDescriptors;
+            running = off + n;
+            if (rg.RangeType != type || rg.RegisterSpace != space || r < rg.BaseShaderRegister ||
+                r - rg.BaseShaderRegister >= n)
+                continue;
+            *at = table ? table + (off + (r - rg.BaseShaderRegister)) * inc : 0;
+            *num = n - (r - rg.BaseShaderRegister);
+            return true;
+        }
+        return false;
+    };
+    // Every scene the heap holds: the key of a heap index the CPU cannot
+    // read, or one computed in the shader.
+    auto wholeHeap = [&](const char* what) -> bool {
+        bool inHeap = false;
+        const size_t before = keyList.size();
+        for (const auto& e : scenebind::Enumerate(heaps, numHeaps, D3D12_GPU_DESCRIPTOR_HANDLE{ 0 },
+                                                  ~0ull, &inHeap))
+            addKey(e.first, e.second);
+        if (keyList.size() > before) return true;
+        snprintf(buf, sizeof(buf), inHeap ? "%s, and the bound heap holds no structure the shim saw built"
+                                          : "%s, and no shader-visible descriptor heap is bound", what);
+        *why = buf;
+        return false;
+    };
     for (const auto& reg : sc.regs) {
-        if (!reg.count) {
-            snprintf(buf, sizeof(buf), "TraceRay on an unbounded array of scenes at t%u space%u",
-                     reg.lower, reg.space);
-            *why = buf;
-            return false;
+        if (reg.count != 1) {
+            // An array at an element picked at run time (0.60.0; until then
+            // refused): every element holding a scene, keyed by the element.
+            // Only a descriptor table can hold an array.
+            UINT64 at = 0, num = 0;
+            bool placed = false, inLocal = false;
+            for (UINT p = 0; p < d.NumParameters && !placed; ++p)
+                placed = inTable(d.pParameters[p], p < roots.size() ? roots[p].table : 0,
+                                 D3D12_DESCRIPTOR_RANGE_TYPE_SRV, reg.space, reg.lower, &at, &num);
+            if (!placed && local && local->desc)
+                for (UINT p = 0; p < local->desc->NumParameters && !inLocal; ++p) {
+                    UINT64 table = 0;
+                    if (local->desc->pParameters[p].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                        !localArg(p, 8, 0, &table))
+                        table = 0;
+                    inLocal = inTable(local->desc->pParameters[p], table, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                                      reg.space, reg.lower, &at, &num);
+                }
+            if (!placed && !inLocal && !local && needsLocal) *needsLocal = true;
+            if (!placed && !inLocal && local && local->lenient) continue;
+            if (!placed && !inLocal) {
+                snprintf(buf, sizeof(buf), "the array of scenes at t%u space%u is in no descriptor table of %s",
+                         reg.lower, reg.space, local ? "the global root signature or the record's local one"
+                                                     : "the global root signature (a local one?)");
+                *why = buf;
+                return false;
+            }
+            if (!at) {
+                snprintf(buf, sizeof(buf), "the descriptor table holding the array of scenes at t%u space%u is not set",
+                         reg.lower, reg.space);
+                *why = buf;
+                return false;
+            }
+            if (reg.count) num = (std::min)(num, (UINT64)reg.count);
+            bool inHeap = false;
+            const size_t before = keyList.size();
+            for (const auto& e : scenebind::Enumerate(heaps, numHeaps, D3D12_GPU_DESCRIPTOR_HANDLE{ at }, num,
+                                                      &inHeap))
+                addKey(e.first, e.second);
+            if (keyList.size() == before) {
+                snprintf(buf, sizeof(buf), "no element of the array of scenes at t%u space%u holds a "
+                         "structure the shim saw built", reg.lower, reg.space);
+                *why = buf;
+                return false;
+            }
+            continue;
         }
         for (UINT r = reg.lower; r < reg.lower + reg.count; ++r) {
             D3D12_GPU_VIRTUAL_ADDRESS a = 0;
@@ -1368,8 +1545,11 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
         // The heap index: a root constant, or a dword of a root CBV the CPU
         // can read. Read at record time, as the instance descriptions of an
         // upload heap are: what the application wrote before recording.
-        bool have = false, placed = false;
-        UINT slot = 0;
+        // Otherwise (a cbuffer in GPU memory or behind a descriptor table, an
+        // index computed in the shader) every scene of the heap, keyed by its
+        // slot (0.60.0; until then refused).
+        bool have = hs.kind == 2, placed = hs.kind != 0;
+        UINT slot = hs.kind == 2 ? hs.offset : 0;
         for (UINT p = 0; p < d.NumParameters && !placed; ++p) {
             const auto& prm = d.pParameters[p];
             const BoundRoot b = p < roots.size() ? roots[p] : BoundRoot{};
@@ -1397,12 +1577,18 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
                 }
             }
         }
+        // A CBV in a descriptor table: placed, not readable.
+        UINT64 at = 0, num = 0;
+        for (UINT p = 0; p < d.NumParameters && !placed; ++p)
+            placed = inTable(d.pParameters[p], 0, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, hs.space, hs.reg, &at, &num);
         // Not in the global signature: the raygen's local one (0.55.0).
         if (!placed && local && local->desc) {
             const auto& ld = *local->desc;
             for (UINT p = 0; p < ld.NumParameters && !placed; ++p) {
                 const auto& prm = ld.pParameters[p];
-                if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+                if (inTable(prm, 0, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, hs.space, hs.reg, &at, &num)) {
+                    placed = true;
+                } else if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
                     prm.Constants.RegisterSpace == hs.space && prm.Constants.ShaderRegister == hs.reg) {
                     placed = true;
                     if (hs.offset % 4 == 0 && hs.offset / 4 < prm.Constants.Num32BitValues)
@@ -1430,15 +1616,18 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
         }
         if (!placed && !local && needsLocal) *needsLocal = true;
         if (!placed && local && local->lenient) continue;
-        if (!have) {
-            snprintf(buf, sizeof(buf), placed
-                         ? "the heap index of the scene (b%u space%u, byte %u) is not readable on the "
-                           "CPU (a cbuffer in GPU-only memory, or unset)"
-                         : "the heap index of the scene is in b%u space%u, not a root constant or root "
-                           "CBV (a descriptor table, or a local root signature)",
-                     hs.reg, hs.space, hs.offset);
+        if (!placed) {
+            snprintf(buf, sizeof(buf), "the heap index of the scene is in b%u space%u, in %s",
+                     hs.reg, hs.space, local ? "neither the global root signature nor the record's local one"
+                                             : "no parameter of the global root signature (a local one?)");
             *why = buf;
             return false;
+        }
+        if (!have) {
+            if (!wholeHeap(hs.kind == 1 ? "a TraceRay's heap index is computed in the shader"
+                                        : "the heap index of the scene is not readable on the CPU"))
+                return false;
+            continue;
         }
         bool inHeap = false;
         const D3D12_GPU_VIRTUAL_ADDRESS a = scenebind::LookupSlot(heaps, numHeaps, slot, &inHeap);
@@ -1449,7 +1638,13 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
             *why = buf;
             return false;
         }
+        keyList.emplace_back(slot, a);
         if (std::find(out->begin(), out->end(), a) == out->end()) out->push_back(a);
+    }
+    if (keys) {
+        std::sort(keyList.begin(), keyList.end());
+        keyList.erase(std::unique(keyList.begin(), keyList.end()), keyList.end());
+        *keys = keyList;
     }
     return true;
 }
@@ -1651,7 +1846,8 @@ void Attach(ID3D12Device* dev, ID3D12StateObject* so, const D3D12_STATE_OBJECT_D
         if (targs::Literal(info->args))
             for (const auto& p : info->traceArgs) zero = zero || p.second == 0;
         std::string why;
-        if (zero && !EnsureVariant(dev, *info, so, &why))
+        std::shared_ptr<Variant> v;
+        if (zero && !EnsureVariant(dev, *info, so, {}, &v, &why))
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): variant NOT built: %s\n", why.c_str());
     }
 }
@@ -2103,7 +2299,8 @@ int SlotOf(const std::vector<Scenes>& slots, const Scenes& call) {
             s.regs[0].lower == call.regs[0].lower && s.regs[0].count == call.regs[0].count)
             return (int)j;
         if (!call.heap.empty() && !s.heap.empty() && s.heap[0].space == call.heap[0].space &&
-            s.heap[0].reg == call.heap[0].reg && s.heap[0].offset == call.heap[0].offset)
+            s.heap[0].reg == call.heap[0].reg && s.heap[0].offset == call.heap[0].offset &&
+            s.heap[0].kind == call.heap[0].kind)
             return (int)j;
     }
     return -1;
@@ -2111,7 +2308,7 @@ int SlotOf(const std::vector<Scenes>& slots, const Scenes& call) {
 
 bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                const std::vector<std::pair<UINT, UINT>>& pairs, UINT copies,
-               const std::vector<Scenes>& slots,
+               const std::vector<Scenes>& slots, const std::vector<UINT>& caps,
                ComPtr<ID3D12StateObject>* out,
                std::vector<Tracer>* tracers,
                std::vector<std::wstring>* names,
@@ -2165,8 +2362,9 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                 slotOf.push_back((unsigned)j);
             }
             int calls = 0;
+            std::vector<unsigned> ucaps(caps.begin(), caps.end());
             if (!rq::RetraceToShimScene(llm::Normalize(text), upairs, copies, slotOf,
-                                        (unsigned)slots.size(), &lowered, &calls, why))
+                                        (unsigned)slots.size(), ucaps, &lowered, &calls, why))
                 return false;
             if (!calls) continue;
             codeStore.emplace_back();
@@ -2212,7 +2410,7 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
             std::vector<Tracer> subRg;
             std::vector<std::wstring> subNames;
             D3D12_STATE_OBJECT_DESC cd = ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
-            if (!VariantOf(dev, cd, pairs, copies, slots, &vc, &subRg, &subNames, parts, why)) return false;
+            if (!VariantOf(dev, cd, pairs, copies, slots, caps, &vc, &subRg, &subNames, parts, why)) return false;
             if (!vc) continue;
             parts->push_back(vc);
             colls[i] = vc.Get();
@@ -2249,8 +2447,12 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
     Transformed t;
     std::vector<UINT> offsets;
     UINT sigs = 0;
-    // One root descriptor per structure of every slot's copy, then the table.
-    const UINT srvs = (UINT)slots.size() * (copies ? copies : 1u) + (copies ? 1u : 0u);
+    // One root descriptor per structure of every sub-slot's copy, then the
+    // pair table, then the key table.
+    UINT subs = 0;
+    bool keyed = false;
+    for (UINT c : caps) { subs += c; keyed = keyed || c > 1; }
+    const UINT srvs = subs * (copies ? copies : 1u) + (copies ? 1u : 0u) + (keyed ? 1u : 0u);
     if (!Rebuild(dev, d, srvs, units, code, colls, &t, &offsets, &sigs, why))
         return false;
     for (size_t u = 0; u < units.size(); ++u) tracers->push_back({ units[u][0], offsets[u], kinds[u] });
@@ -2275,43 +2477,31 @@ TablePipe g_tablePipe;
 
 }  // namespace
 
-bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::string* why) {
-    std::lock_guard<std::mutex> lk(info.variantLock);
-    if (info.variantTried) {
-        if (!info.variant) *why = info.variantWhy;
-        return info.variant != nullptr;
-    }
-    info.variantTried = true;
-    auto fail = [&](const std::string& w) { info.variantWhy = w; *why = w; return false; };
-    if (!info.store) return fail("the pipeline's subobjects were not kept");
-    if (info.dynamicTraceArgs) return fail("a library whose TraceRay calls could not be read");
-    if (info.traceArgs.empty()) return fail("the pipeline has no TraceRay");
+namespace {
+// One build of the variant at the capacities `caps`, into `v`.
+bool BuildVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, const std::vector<UINT>& caps,
+                  Variant* v, std::string* why) {
     // Literal arguments, at most 15 pairs: each call traces (its pair's
     // index, k). Otherwise each reads its pair and structure from the shim's
     // table, and the copy has a structure per 15 pairs (0.57.0; until then
     // both were refused).
     const UINT per = shimscene::PairsPerStructure();
-    info.variantCopies = targs::Literal(info.args) && info.traceArgs.size() <= per
-                             ? 0u : (UINT)((info.traceArgs.size() + per - 1) / per);
-    // A scene slot for every place a TraceRay takes its scene from.
-    if (info.scenes.unknown)
-        return fail("a TraceRay whose scene could not be traced back to a register or a heap index");
-    info.slots = SceneSlots(info.scenes);
-    if (info.slots.empty()) return fail("no TraceRay scene was found");
-    const UINT addrs = (UINT)info.slots.size() * (info.variantCopies ? info.variantCopies : 1u) +
-                       (info.variantCopies ? 1u : 0u);
+    v->copies = targs::Literal(info.args) && info.traceArgs.size() <= per
+                    ? 0u : (UINT)((info.traceArgs.size() + per - 1) / per);
+    v->caps = caps;
+    const UINT addrs = v->Subs() * (v->copies ? v->copies : 1u) + (v->copies ? 1u : 0u) +
+                       (v->Keyed() ? 1u : 0u);
     const D3D12_STATE_OBJECT_DESC d = info.store->Desc(info.type);
     std::vector<Tracer> tracers;
     std::vector<std::wstring> names;
-    std::string w;
-    if (!VariantOf(dev, d, info.traceArgs, info.variantCopies, info.slots, &info.variant, &tracers,
-                   &names, &info.variantParts, &w))
-        return fail(w);
+    if (!VariantOf(dev, d, info.traceArgs, v->copies, info.slots, caps, &v->so, &tracers, &names,
+                   &v->parts, why))
+        return false;
     ComPtr<ID3D12StateObjectProperties> pa, pv;
     if (FAILED(app->QueryInterface(IID_PPV_ARGS(&pa))) ||
-        FAILED(info.variant->QueryInterface(IID_PPV_ARGS(&pv)))) {
-        info.variant.Reset();
-        return fail("no state object properties");
+        FAILED(v->so->QueryInterface(IID_PPV_ARGS(&pv)))) {
+        *why = "no state object properties";
+        return false;
     }
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -2327,21 +2517,92 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
         uint32_t kind = 0;
         for (const auto& r : tracers)
             if (r.name == name) { m.insert = r.offset; kind = r.kind; }
-        if (m.insert || std::memcmp(m.from, m.to, sizeof(m.from)) != 0) info.remaps.push_back(m);
+        if (m.insert || std::memcmp(m.from, m.to, sizeof(m.from)) != 0) v->remaps.push_back(m);
         if (m.insert) {
-            UINT& bytes = kind == 3 ? info.variantHitBytes
-                        : kind == 11 ? info.variantMissBytes : info.raygenBytes;
+            UINT& bytes = kind == 3 ? v->hitBytes : kind == 11 ? v->missBytes : v->raygenBytes;
             bytes = (std::max)(bytes, m.insert + 8 * addrs);
         }
     }
     // With a table, a dispatch sizes the copies to the pairs it uses.
-    shimscene::Activate(info.variantCopies ? 1u : (UINT)info.traceArgs.size());
+    shimscene::Activate(v->copies ? 1u : (UINT)info.traceArgs.size());
+    std::string held;
+    if (v->Keyed()) {
+        held = ", scenes per slot";
+        for (UINT c : caps) held += " " + std::to_string(c);
+        held += ", each call picking its scene by key";
+    }
     ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): VARIANT pipeline built, the shim's own "
              "record layout: %zu shader(s) tracing the shim scene, %zu identifier(s) remapped, "
-             "%zu collection(s) rebuilt%s\n", tracers.size(), info.remaps.size(), info.variantParts.size(),
-             info.variantCopies ? (", TraceRay arguments computed at run time: pairs read from the "
-                                   "shim's table, up to " + std::to_string(info.variantCopies) +
-                                   " scene structure(s)").c_str() : "");
+             "%zu collection(s) rebuilt%s%s\n", tracers.size(), v->remaps.size(), v->parts.size(),
+             v->copies ? (", TraceRay arguments computed at run time: pairs read from the "
+                          "shim's table, up to " + std::to_string(v->copies) +
+                          " scene structure(s)").c_str() : "", held.c_str());
+    return true;
+}
+}  // namespace
+
+bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, const std::vector<UINT>& needIn,
+                   std::shared_ptr<Variant>* out, std::string* why) {
+    std::lock_guard<std::mutex> lk(info.variantLock);
+    auto fail = [&](const std::string& w) {
+        info.variantTried = true;
+        info.variantWhy = w;
+        *why = w;
+        return false;
+    };
+    if (!info.store) return fail("the pipeline's subobjects were not kept");
+    if (info.dynamicTraceArgs) return fail("a library whose TraceRay calls could not be read");
+    if (info.traceArgs.empty()) return fail("the pipeline has no TraceRay");
+    // A scene slot for every place a TraceRay takes its scene from.
+    if (info.scenes.unknown)
+        return fail("a TraceRay whose scene could not be traced back to a register or the heap");
+    if (info.slots.empty()) info.slots = SceneSlots(info.scenes);
+    if (info.slots.empty()) return fail("no TraceRay scene was found");
+    const size_t S = info.slots.size();
+    std::vector<UINT> need(S, 1u);
+    for (size_t j = 0; j < S && j < needIn.size(); ++j) need[j] = (std::max)(needIn[j], 1u);
+    for (size_t j = 0; j < S; ++j)
+        if (need[j] > 1 && !KeyedSlot(info.slots[j])) {
+            *why = "a scene slot not picked by key reaches several scenes";
+            return false;
+        }
+    if (info.variant) {
+        bool fits = true;
+        for (size_t j = 0; j < S; ++j) fits = fits && info.variant->caps[j] >= need[j];
+        if (fits) { *out = info.variant; return true; }
+    }
+    // Failed already at capacities these cover: a larger one fails too, its
+    // root signatures only longer.
+    if (info.variantTried && info.failedCaps.size() == S) {
+        bool covered = true;
+        for (size_t j = 0; j < S; ++j) covered = covered && info.failedCaps[j] <= need[j];
+        if (covered) { *why = info.variantWhy; return false; }
+    }
+    // Grown: what the old one held, a slot that has to grow at least doubled,
+    // so a scene count creeping up rebuilds rarely; at exactly what is
+    // needed when that is too large.
+    std::vector<UINT> exact = need, caps = need;
+    if (info.variant)
+        for (size_t j = 0; j < S; ++j) {
+            const UINT o = info.variant->caps[j];
+            exact[j] = (std::max)(o, need[j]);
+            caps[j] = need[j] > o ? (std::max)(need[j], 2 * o) : o;
+        }
+    auto v = std::make_shared<Variant>();
+    std::string w;
+    bool ok = BuildVariant(dev, info, app, caps, v.get(), &w);
+    if (!ok && caps != exact) {
+        v = std::make_shared<Variant>();
+        ok = BuildVariant(dev, info, app, exact, v.get(), &w);
+        caps = exact;
+    }
+    if (!ok) {
+        info.failedCaps = caps;
+        return fail(w);
+    }
+    if (info.variant) info.retired.push_back(info.variant);
+    info.variant = v;
+    *out = v;
     return true;
 }
 
@@ -2353,7 +2614,7 @@ bool StructurePoison() {
 }
 }  // namespace
 
-bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
+bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info, const Variant& v,
                    const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
@@ -2373,10 +2634,19 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     }
     if (!sel.valid) { *why = sel.why.empty() ? "which scene each TraceRay traces is not known" : sel.why; return false; }
     const UINT S = (UINT)info.slots.size();
-    if (sel.fixed.size() != S || sel.scenes.empty()) {
+    if (sel.need.size() != S || sel.fixed.size() != sel.Subs() || sel.scenes.empty() || v.caps.size() != S) {
         *why = "the scene selection does not match the variant's scene slots";
         return false;
     }
+    for (UINT j = 0; j < S; ++j)
+        if (sel.need[j] > v.caps[j]) {
+            *why = "a slot reaches more scenes than the variant holds";
+            return false;
+        }
+    // The variant's sub-slots: slot j's caps[j], its scene p at subAt[j] + p.
+    const UINT U = v.Subs(), selU = sel.Subs();
+    std::vector<UINT> subAt(S, 0);
+    for (UINT j = 1; j < S; ++j) subAt[j] = subAt[j - 1] + v.caps[j - 1];
     const UINT appStride = (UINT)app.HitGroupTable.StrideInBytes;
     if (!appStride) { *why = "a hit group table with stride 0"; return false; }
     const UINT appRecords = (UINT)(app.HitGroupTable.SizeInBytes / appStride);
@@ -2386,7 +2656,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     // With arguments computed at run time, the ones this dispatch can use,
     // pairs that put every hit on the same record sharing a block, and a
     // table the calls read theirs from, indexed by 16 * R + M (0.57.0).
-    const bool lut = info.variantCopies != 0;
+    const bool lut = v.copies != 0;
     std::vector<std::pair<UINT, UINT>> slots = info.traceArgs;
     std::vector<int> keySlot;
     if (lut) {
@@ -2420,7 +2690,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
             if (it != slotOf.end()) keySlot[key] = it->second;
         }
         const UINT per = shimscene::PairsPerStructure();
-        if ((slots.size() + per - 1) / per > info.variantCopies) {
+        if ((slots.size() + per - 1) / per > v.copies) {
             *why = "more TraceRay argument pairs than the variant was built for";
             return false;
         }
@@ -2475,7 +2745,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     // The addresses a tracing record can carry: each scene copy's structures
     // (every one the variant has a descriptor for; past this copy's, its
     // first, never picked), then with run-time arguments the pair table.
-    const UINT perSlot = lut ? info.variantCopies : 1u;
+    const UINT perSlot = lut ? v.copies : 1u;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> addrs;
     for (UINT x = 0; x < D; ++x)
         for (UINT c = 0; c < perSlot; ++c)
@@ -2496,6 +2766,33 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         table->Unmap(0, nullptr);
         addrs.push_back(table->GetGPUVirtualAddress());
     }
+    // The key table (0.60.0): dword j the start of slot j's list, there n,
+    // then n (key, sub-slot) pairs sorted by key. A slot this dispatch
+    // resolved to one scene still gets its key, so every key finds it.
+    // DXR_TIER11_KEY_POISON=1 sends every key to the first sub-slot, the
+    // sensitivity check for gitest --scenearray.
+    static const bool keyPoison = GetEnvironmentVariableA("DXR_TIER11_KEY_POISON", nullptr, 0) != 0;
+    if (v.Keyed()) {
+        std::vector<uint32_t> kt(S, 0u);
+        for (UINT j = 0; j < S; ++j) {
+            kt[j] = (uint32_t)kt.size();
+            kt.push_back((uint32_t)sel.keys[j].size());
+            for (const auto& kp : sel.keys[j]) {
+                kt.push_back(kp.first);
+                kt.push_back(keyPoison ? 0u : kp.second);
+            }
+        }
+        auto keys = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, (UINT64)kt.size() * 4, owner);
+        uint32_t* kp = nullptr;
+        D3D12_RANGE none{ 0, 0 };
+        if (!keys || FAILED(keys->Map(0, &none, reinterpret_cast<void**>(&kp)))) {
+            *why = "could not create the variant's key table";
+            return false;
+        }
+        std::memcpy(kp, kt.data(), kt.size() * 4);
+        keys->Unmap(0, nullptr);
+        addrs.push_back(keys->GetGPUVirtualAddress());
+    }
     // Which scene each record's slots name: per slot for every record, or
     // per record where a slot's scene is in the records (0.59.0).
     // DXR_TIER11_SCENE_POISON=1 names the first scene everywhere, the
@@ -2506,10 +2803,10 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     const UINT tableRecs[3] = { 1, missStride ? (UINT)(app.MissShaderTable.SizeInBytes / missStride) : 0u,
                                 appRecords };
     UINT selAt[3] = {};
-    const UINT groups = (UINT)info.groups.size(), remaps = (UINT)info.remaps.size();
+    const UINT groups = (UINT)info.groups.size(), remaps = (UINT)v.remaps.size();
     const UINT na = (UINT)addrs.size();
     UINT metaDwords = groups * 9 + remaps * 17 + 2 * k + 2 * na;
-    for (int t = 0; t < 3; ++t) { selAt[t] = metaDwords; metaDwords += (std::max)(tableRecs[t], 1u) * S; }
+    for (int t = 0; t < 3; ++t) { selAt[t] = metaDwords; metaDwords += (std::max)(tableRecs[t], 1u) * U; }
     auto meta = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, (UINT64)metaDwords * 4, owner);
     if (!meta) { *why = "could not create the variant table metadata"; return false; }
     uint32_t* m = nullptr;
@@ -2524,9 +2821,9 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     }
     for (UINT y = 0; y < remaps; ++y) {
         uint32_t* e = m + groups * 9 + y * 17;
-        std::memcpy(e, info.remaps[y].from, 32);
-        std::memcpy(e + 8, info.remaps[y].to, 32);
-        e[16] = info.remaps[y].insert;
+        std::memcpy(e, v.remaps[y].from, 32);
+        std::memcpy(e + 8, v.remaps[y].to, 32);
+        e[16] = v.remaps[y].insert;
     }
     uint32_t* pm = m + groups * 9 + remaps * 17;
     for (UINT q = 0; q < k; ++q) {
@@ -2537,16 +2834,20 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         pm[2 * k + 2 * a] = (uint32_t)(addrs[a] & 0xFFFFFFFFull);
         pm[2 * k + 2 * a + 1] = (uint32_t)(addrs[a] >> 32);
     }
+    // Sub-slot p of slot j: the dispatch's sub-slot p, or past what it
+    // needs its first, which no key picks.
     for (int t = 0; t < 3; ++t)
         for (UINT r = 0; r < (std::max)(tableRecs[t], 1u); ++r)
-            for (UINT j = 0; j < S; ++j) {
-                int v = sel.fixed[j];
-                if (v < 0) {
-                    const size_t at = (size_t)r * S + j;
-                    v = at < sel.rec[t].size() ? sel.rec[t][at] : -1;
+            for (UINT j = 0; j < S; ++j)
+                for (UINT p = 0; p < v.caps[j]; ++p) {
+                    const UINT su = sel.Sub(j) + (p < sel.need[j] ? p : 0u);
+                    int x = sel.fixed[su];
+                    if (x < 0) {
+                        const size_t at = (size_t)r * selU + su;
+                        x = at < sel.rec[t].size() ? sel.rec[t][at] : -1;
+                    }
+                    m[selAt[t] + r * U + subAt[j] + p] = x >= 0 && !scenePoison ? (uint32_t)x : 0u;
                 }
-                m[selAt[t] + r * S + j] = v >= 0 && !scenePoison ? (uint32_t)v : 0u;
-            }
     meta->Unmap(0, nullptr);
 
     static const bool poison = GetEnvironmentVariableA("DXR_TIER11_GI_POISON", nullptr, 0) != 0;
@@ -2570,10 +2871,10 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                     D3D12_GPU_VIRTUAL_ADDRESS dstAt, UINT mode, UINT appRecs, UINT x, int t) {
         const shimscene::Copy& cp = cps[x];
         const UINT per = cp.kc * cp.gmax, span = cp.count * per;
-        const UINT c[19] = { records, srcStride, dstStride, groups, remaps, mode, layoutK, cp.gmax,
-                             appRecs, k, span, per, poison ? 1u : 0u, S, perSlot, D, lut ? 1u : 0u,
-                             t >= 0 ? selAt[t] : selAt[0], t >= 0 ? S : 0u };
-        cl->SetComputeRoot32BitConstants(0, 19, c, 0);
+        const UINT c[20] = { records, srcStride, dstStride, groups, remaps, mode, layoutK, cp.gmax,
+                             appRecs, k, span, per, poison ? 1u : 0u, U, perSlot, D, lut ? 1u : 0u,
+                             t >= 0 ? selAt[t] : selAt[0], t >= 0 ? U : 0u, v.Keyed() ? 1u : 0u };
+        cl->SetComputeRoot32BitConstants(0, 20, c, 0);
         cl->SetComputeRootShaderResourceView(1, src);
         cl->SetComputeRootShaderResourceView(3, cp.contrib);
         cl->SetComputeRootUnorderedAccessView(4, dstAt);
@@ -2591,11 +2892,11 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         return dst;
     };
     *mine = app;
-    const auto A32 = [](UINT64 v) { return (UINT)((v + 31) / 32 * 32); };
+    const auto A32 = [](UINT64 b) { return (UINT)((b + 31) / 32 * 32); };
 
     // Raygen: one record, the variant's identifier, the shim's addresses.
     const UINT rgSrc = (UINT)app.RayGenerationShaderRecord.SizeInBytes;
-    const UINT rgDst = A32((std::max)((UINT64)rgSrc, (UINT64)info.raygenBytes));
+    const UINT rgDst = A32((std::max)((UINT64)rgSrc, (UINT64)v.raygenBytes));
     auto rg = table(app.RayGenerationShaderRecord.StartAddress, rgSrc, 1, rgDst, 1, 0);
     if (!rg) { *why = "could not create the variant raygen record"; return false; }
     mine->RayGenerationShaderRecord = { rg->GetGPUVirtualAddress(), rgDst };
@@ -2614,7 +2915,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         *o = { tb->GetGPUVirtualAddress(), (UINT64)recs * out, in.StrideInBytes ? out : 0 };
         return true;
     };
-    if (!plain(app.MissShaderTable, info.variantMissBytes, 1, &mine->MissShaderTable) ||
+    if (!plain(app.MissShaderTable, v.missBytes, 1, &mine->MissShaderTable) ||
         !plain(app.CallableShaderTable, 0, -1, &mine->CallableShaderTable)) {
         *why = "could not create the variant miss or callable table";
         return false;
@@ -2623,7 +2924,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     // Hit groups: the shim's own layout, one span per structure used, one
     // part per scene.
     const UINT records = base[D];
-    const UINT dstStride = A32((std::max)(appStride, (std::max)(info.recordBytes, info.variantHitBytes)));
+    const UINT dstStride = A32((std::max)(appStride, (std::max)(info.recordBytes, v.hitBytes)));
     auto hit = Acquire(dev, D3D12_HEAP_TYPE_DEFAULT, (UINT64)records * dstStride, owner);
     if (!hit) { *why = "could not create the variant hit group table"; return false; }
     transition(hit.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

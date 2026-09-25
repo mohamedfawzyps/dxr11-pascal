@@ -38,9 +38,14 @@ bool LowerGeometryIndex(const std::string& in, std::string* out,
 // at t(j * C + c), C = max(copies, 1), and the table after them all, at
 // t(slots * C); slot 0 keeps the names @dxr11.tlas[.c], slot j > 0 is
 // @dxr11.tlas.sJ[.c]. With one slot the output is what it was.
+// `caps`, when given, is each slot's capacity (0.60.0): a slot of capacity
+// above 1 holds that many scenes, and each of its calls picks one by its key
+// (the array element or heap index its handle was made from) through the
+// shim's key table, @dxr11.keys. Empty: every capacity 1.
 bool RetraceToShimScene(const std::string& in,
                         const std::vector<std::pair<unsigned, unsigned>>& pairs, unsigned copies,
                         const std::vector<unsigned>& slotOf, unsigned slots,
+                        const std::vector<unsigned>& caps,
                         std::string* out, int* calls, std::string* why);
 
 // The name a state object uses for a library function: DXC mangles

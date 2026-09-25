@@ -91,14 +91,24 @@ int main(int argc, char** argv) {
         //   dxrw shimtrace in out R,M ...      literal pairs
         //   dxrw shimtrace in out --copies N   pairs from the shim's table
         //   ... --slots S j,j,...               call n traces scene slot j_n of S
+        //   ... --caps c,c,...                  slot j holds c_j scenes, picked by key
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
         std::vector<std::pair<unsigned, unsigned>> pairs;
         unsigned copies = 0, slots = 1;
-        std::vector<unsigned> slotOf;
+        std::vector<unsigned> slotOf, caps;
         for (int i = 4; i < argc; ++i) {
             unsigned r = 0, m = 0;
             if (std::string(argv[i]) == "--copies" && i + 1 < argc) copies = (unsigned)std::atoi(argv[++i]);
+            else if (std::string(argv[i]) == "--caps" && i + 1 < argc) {
+                std::string l = argv[++i];
+                for (size_t at = 0; at <= l.size();) {
+                    size_t e = l.find(',', at);
+                    if (e == std::string::npos) e = l.size();
+                    caps.push_back((unsigned)std::atoi(l.substr(at, e - at).c_str()));
+                    at = e + 1;
+                }
+            }
             else if (std::string(argv[i]) == "--slots" && i + 2 < argc) {
                 slots = (unsigned)std::atoi(argv[++i]);
                 std::string l = argv[++i];
@@ -113,7 +123,7 @@ int main(int argc, char** argv) {
         }
         std::string text, why;
         int calls = 0;
-        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, copies, slotOf, slots, &text, &calls, &why)) {
+        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, copies, slotOf, slots, caps, &text, &calls, &why)) {
             std::printf("UNSUPPORTED: %s\n", why.c_str());
             return 2;
         }

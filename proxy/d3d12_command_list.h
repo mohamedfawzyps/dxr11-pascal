@@ -396,7 +396,8 @@ private:
     // `with`: bindings other than the list's current ones (a queued dispatch's).
     bool ResolveBoundScenes(const gidx::Scenes& sc, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
                             std::string* why, const Dxr11Bindings* with = nullptr,
-                            const gidx::LocalRecord* local = nullptr, bool* needsLocal = nullptr);
+                            const gidx::LocalRecord* local = nullptr, bool* needsLocal = nullptr,
+                            std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>>* keys = nullptr);
     // The same for a GeometryIndex() pipeline, logged when not resolved. With
     // `d`, a scene in the raygen's local root signature is read from its
     // record; `*defer` when that record is in GPU memory (or, with no `d`,

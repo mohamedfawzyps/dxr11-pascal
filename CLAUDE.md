@@ -153,6 +153,21 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.60.0: A SCENE PICKED PER RAY, AND ONE THE CPU CANNOT READ, ARE DRAWN.**
+An array of scenes at a dynamic element and the descriptor heap are KEYED
+scene slots: the element or heap index is the key, a dispatch resolves every
+key's scene, and the variant, grown on demand from one scene per slot,
+looks each call's key up in the shim's key table. `gitest --scenearray`,
+`--sceneunbounded`, `--heapdyn`, `--heapgpu`: 56 of 56 not drawn on 0.59.0,
+56 of 56 match; matrix 417 of 417, plus the root signature gate. DXC refuses a scene chosen by a
+branch, so that shape cannot arrive. Still refused by name: an untraceable
+scene handle, and a variant past the 1070's local root signature limit.
+NEXT, the rest of the refusal list, then item b: the RayQuery path's own
+layout (a record two instances disagree about, two live scenes disagreeing,
+triangles and procedurals on one record), a deserialized structure's
+geometry (`VISUALIZATION_DECODE_FOR_TOOLS` gives it, if the driver allows it
+outside developer mode: to be measured), and the root signature limit.
+
 **0.59.0: THE SHIM'S OWN LAYOUT TRACES SEVERAL SCENES; ITEM A'S LIST IS
 DONE.** Every place a TraceRay takes its scene from is a scene slot, each
 call traces its slot's copy (both rewriters, byte-identical, one slot

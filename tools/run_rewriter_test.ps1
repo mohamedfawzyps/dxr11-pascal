@@ -333,6 +333,27 @@ foreach ($sm in @('lib_6_5', 'lib_6_6')) {
         if ($same -and $valid) { Write-Host "  shimtrace $sm two scenes, $c structure(s) : PASS (byte-identical, validates and signs)" }
         else { Write-Host "  shimtrace $sm two scenes, $c structure(s) : FAIL (identical=$same valid=$valid)"; $failed++ }
     }
+    # A scene picked per ray (0.60.0): arrays at a dynamic element, and at
+    # 6.6 the heap at a computed index, each call finding its scene in the
+    # shim's key table; literal pairs, and pairs from the table over 2 and 3
+    # structures.
+    $kf = "phase5\out\shimkey_$sm.ll"
+    $kd = if ($sm -eq 'lib_6_6') { @('-D', 'HEAP=1') } else { @() }
+    & 'C:\DW\DXC\bin\x64\dxc.exe' -T $sm @kd -Fc $kf 'phase5\cases\shimtrace_key.hlsl' | Out-Null
+    $ks = if ($sm -eq 'lib_6_6') { @('--slots', '3', '0,1,2') } else { @('--slots', '2', '0,1') }
+    $kc = if ($sm -eq 'lib_6_6') { @('2,3,4', '1,2,3') } else { @('2,3', '3,2') }
+    foreach ($case in @(@{ n = 'literal pairs'; a = @('0,1', '1,1', '--caps', $kc[0]) },
+                        @{ n = 'pairs from the table, 2 structures'; a = @('--copies', '2', '--caps', $kc[1]) },
+                        @{ n = 'pairs from the table, 3 structures'; a = @('--copies', '3', '--caps', $kc[0]) })) {
+        $args2 = @($case.a) + $ks
+        & python phase5\rewriter\shimtrace.py $kf "phase5\out\shimkey_$sm.py.ll" @args2 | Out-Null
+        & .\phase5out\dxrw.exe shimtrace $kf "phase5\out\shimkey_$sm.cpp.ll" @args2 | Out-Null
+        $same = (Get-FileHash "phase5\out\shimkey_$sm.py.ll").Hash -eq (Get-FileHash "phase5\out\shimkey_$sm.cpp.ll").Hash
+        $asm = (& .\phase5out\dxilrt.exe asm "phase5\out\shimkey_$sm.py.ll" "phase5\out\shimkey_$sm.dxil" 2>&1) -join "`n"
+        $valid = $asm -match 'validated and signed ok'
+        if ($same -and $valid) { Write-Host "  shimtrace $sm scene by key, $($case.n) : PASS (byte-identical, validates and signs)" }
+        else { Write-Host "  shimtrace $sm scene by key, $($case.n) : FAIL (identical=$same valid=$valid)"; $failed++ }
+    }
 }
 
 Write-Host ''

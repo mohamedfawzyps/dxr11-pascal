@@ -154,4 +154,37 @@ D3D12_GPU_VIRTUAL_ADDRESS LookupSlot(ID3D12DescriptorHeap* const* heaps, UINT n,
     return 0;
 }
 
+std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> Enumerate(
+    ID3D12DescriptorHeap* const* heaps, UINT n, D3D12_GPU_DESCRIPTOR_HANDLE from, UINT64 count,
+    bool* inHeap) {
+    std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> out;
+    *inHeap = false;
+    for (UINT i = 0; i < n; ++i) {
+        ID3D12DescriptorHeap* h = heaps[i];
+        if (!h) continue;
+        const D3D12_DESCRIPTOR_HEAP_DESC d = h->GetDesc();
+        if (d.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            !(d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+            continue;
+        ID3D12Device* dev = nullptr;
+        if (FAILED(h->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return out;
+        const UINT64 inc = Increment(dev);
+        dev->Release();
+        const UINT64 g0 = h->GetGPUDescriptorHandleForHeapStart().ptr;
+        const UINT64 at = from.ptr ? from.ptr : g0;
+        if (!inc || at < g0 || at >= g0 + d.NumDescriptors * inc || (at - g0) % inc) return out;
+        *inHeap = true;
+        const UINT64 first = (at - g0) / inc;
+        const UINT64 num = (std::min)(count, (UINT64)d.NumDescriptors - first);
+        const SIZE_T cpu = h->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)(first * inc);
+        std::lock_guard<std::mutex> g(g_lock);
+        EachIn(cpu, (SIZE_T)num, (SIZE_T)inc, [&](SIZE_T k, D3D12_GPU_VIRTUAL_ADDRESS a) {
+            out.emplace_back((UINT)k, a);
+        });
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+    return out;
+}
+
 }  // namespace scenebind

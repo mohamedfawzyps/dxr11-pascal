@@ -86,11 +86,17 @@ struct Remap {
 // told WHICH scene it traces (ResolveScenes). `regs`: declared registers,
 // `count` 0 an unbounded array. `heap`: ResourceDescriptorHeap[i] (SM 6.6,
 // Unreal's bindless), `i` a dword of the cbuffer at (space, reg), byte
-// `offset`. `unknown`: a TraceRay whose scene handle could not be traced back
-// to either.
+// `offset` (kind 0); computed in the shader any other way (kind 1, 0.60.0);
+// a literal, `offset` (kind 2). `unknown`: a TraceRay whose scene handle
+// could not be traced back to either.
+//
+// A register array at a dynamic element (count not 1) and the heap are
+// KEYED (0.60.0): which scene a ray traces is picked at run time by a key,
+// the element or the heap index, so a dispatch resolves the scene of every
+// key it can use, and the variant looks each call's key up.
 struct Scenes {
     struct Reg { UINT space = 0, lower = 0, count = 1; };
-    struct Heap { UINT space = 0, reg = 0, offset = 0; };
+    struct Heap { UINT space = 0, reg = 0, offset = 0; int kind = 0; };
     std::vector<Reg> regs;
     std::vector<Heap> heap;
     bool unknown = false;
@@ -103,16 +109,36 @@ void ScanScenes(const std::string& text, Scenes* out);
 // The variant's scene slots for a pipeline's scenes: each register, then
 // each heap index, one Scenes each (0.59.0).
 std::vector<Scenes> SceneSlots(const Scenes& sc);
+// Whether a slot's scene is picked by a key at run time (0.60.0).
+bool KeyedSlot(const Scenes& slot);
+
+// One scene slot, resolved for a dispatch or one record: its scene, or with
+// a keyed slot the scene of every key (key, scene), sorted by key.
+struct SlotScenes {
+    bool keyed = false;
+    D3D12_GPU_VIRTUAL_ADDRESS scene = 0;   // not keyed; 0: the record names none
+    std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>> keys;
+};
 
 // Which scene each scene slot (Info::slots) of a GeometryIndex() dispatch
-// traces (0.59.0): `scenes` distinct; per slot an index into them, `fixed`,
-// or -1 when the slot's scene is in each record's local root signature, read
-// per record into rec[k] (k 0 raygen, 1 miss, 2 hit group table) at
-// [record * slots + slot], -1 where the record's shader does not name it.
+// traces (0.59.0): `scenes` distinct. A slot holds need[j] SUB-SLOTS, one
+// scene each (0.60.0): 1, or with a keyed slot one per group of keys that
+// name the same scene everywhere, `keys[j]` saying which: (key, sub-slot),
+// sorted by key. Per sub-slot, sub-slot p of slot j at Sub(j) + p, an index
+// into `scenes`, `fixed`, or -1 when the slot's scene is in each record's
+// local root signature, read per record into rec[k] (k 0 raygen, 1 miss, 2
+// hit group table) at [record * Subs() + sub], -1 where the record's shader
+// does not name it.
 struct SceneSel {
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scenes;
+    std::vector<UINT> need;
+    std::vector<std::vector<std::pair<UINT, UINT>>> keys;
     std::vector<int> fixed;
     std::vector<int> rec[3];
+    // What it was made from: each slot resolved globally, or left to the
+    // records (perRecord), which are read later.
+    std::vector<SlotScenes> global;
+    std::vector<bool> perRecord;
     bool valid = false;
     std::string why;   // not valid: why
     int Add(D3D12_GPU_VIRTUAL_ADDRESS a) {
@@ -120,7 +146,16 @@ struct SceneSel {
         scenes.push_back(a);
         return (int)scenes.size() - 1;
     }
+    UINT Sub(size_t j) const { UINT s = 0; for (size_t i = 0; i < j && i < need.size(); ++i) s += need[i]; return s; }
+    UINT Subs() const { return Sub(need.size()); }
 };
+
+// Makes `sel` from each slot's resolution: `global[j]` for a slot resolved
+// through the global root signature, or with perRecord[j] from `rows`, per
+// table k the records' resolutions [record][slot]. Keys naming the same
+// scene in every record share a sub-slot.
+void BuildSel(const std::vector<SlotScenes>& global, const std::vector<bool>& perRecord,
+              const std::vector<std::vector<SlotScenes>> rows[3], SceneSel* sel);
 
 // The local root signature of a raygen, miss or hit group, found by the
 // identifier its records start with: where a scene bound through it sits in
@@ -132,6 +167,8 @@ struct RecordLocal {
     Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> des;
     const D3D12_ROOT_SIGNATURE_DESC1* desc = nullptr;   // null: it has none
 };
+
+struct Variant;
 
 // What DispatchRays needs, attached to the state object.
 struct Info {
@@ -149,23 +186,18 @@ struct Info {
     // record between geometries: a VARIANT pipeline tracing the shim's copy
     // of the scene (proxy/shim_scene.h). Built from `store`, a copy of the
     // object's (transformed) subobjects, eagerly when a TraceRay multiplier
-    // is 0, otherwise at the first dispatch that needs it.
+    // is 0, otherwise at the first dispatch that needs it; built again,
+    // larger, when a dispatch's keyed slot reaches more scenes than it holds
+    // (0.60.0). A dispatch keeps the Variant it recorded with; the ones
+    // replaced stay alive in `retired` for lists still holding them.
     D3D12_STATE_OBJECT_TYPE type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
     std::shared_ptr<StateObjectStore> store;
     std::mutex variantLock;
-    bool variantTried = false;
+    bool variantTried = false;     // tried at the capacities `failedCaps`, and failed
     std::string variantWhy;
-    Microsoft::WRL::ComPtr<ID3D12StateObject> variant;
-    std::vector<Microsoft::WRL::ComPtr<ID3D12StateObject>> variantParts;  // its collections
-    std::vector<Remap> remaps;
-    UINT raygenBytes = 0;          // the largest raygen record the variant needs
-    // The largest hit group and miss records the variant needs: a closest-hit
-    // or miss that traces gets the shim scene's address too (0.56.0).
-    UINT variantHitBytes = 0, variantMissBytes = 0;
-    // 0: every call's pair a literal, traced as (its index, k). N >= 1: the
-    // pair read at run time from a table the shim writes per dispatch, onto
-    // one of N scene copies of 15 pairs each (0.57.0).
-    UINT variantCopies = 0;
+    std::vector<UINT> failedCaps;
+    std::shared_ptr<Variant> variant;
+    std::vector<std::shared_ptr<Variant>> retired;
     // The variant's SCENE SLOTS: every place a TraceRay takes its scene from
     // (a register, or a heap index in a cbuffer), one each; a call traces the
     // copy of its slot's scene, resolved per dispatch (0.59.0; until then
@@ -179,6 +211,27 @@ struct Info {
     std::string localWhy;
     std::vector<RecordLocal> recordLocals;
     UINT recursion = 0;
+};
+
+// One build of the variant pipeline.
+struct Variant {
+    Microsoft::WRL::ComPtr<ID3D12StateObject> so;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12StateObject>> parts;  // its collections
+    std::vector<Remap> remaps;
+    UINT raygenBytes = 0;          // the largest raygen record the variant needs
+    // The largest hit group and miss records the variant needs: a closest-hit
+    // or miss that traces gets the shim scene's address too (0.56.0).
+    UINT hitBytes = 0, missBytes = 0;
+    // 0: every call's pair a literal, traced as (its index, k). N >= 1: the
+    // pair read at run time from a table the shim writes per dispatch, onto
+    // one of N scene copies of 15 pairs each (0.57.0).
+    UINT copies = 0;
+    // Per scene slot, how many scenes it holds (0.60.0): 1, or for a keyed
+    // slot as many as a dispatch has needed, each call picking one by its key
+    // from the shim's key table (@dxr11.keys, after the pair table).
+    std::vector<UINT> caps;
+    bool Keyed() const { for (UINT c : caps) if (c > 1) return true; return false; }
+    UINT Subs() const { UINT s = 0; for (UINT c : caps) s += c; return s; }
 };
 
 // Owns everything the transformed desc points at.
@@ -244,10 +297,17 @@ struct LocalRecord {
     // the pipeline fails for a register no signature declares).
     bool lenient = false;
 };
+//
+// A keyed slot (0.60.0) resolves to every scene its key can reach: each
+// element of the array holding a top-level structure the shim saw built, or
+// for the heap the one slot the cbuffer names when it can be read, else
+// every such slot of the bound heap. `*keys`, when given, receives them as
+// (key, scene) sorted by key, for a Scenes of one keyed slot.
 bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why,
-                   const LocalRecord* local = nullptr, bool* needsLocal = nullptr);
+                   const LocalRecord* local = nullptr, bool* needsLocal = nullptr,
+                   std::vector<std::pair<UINT, D3D12_GPU_VIRTUAL_ADDRESS>>* keys = nullptr);
 
 // Finds, once, the local root signature of every raygen, miss and hit group
 // of the pipeline `app` (whose Info this is), through linked collections and
@@ -282,14 +342,17 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
                  const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                  const void* owner, bool* shared, std::string* why);
 
-// The variant, built once; false with *why when it cannot be.
-bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::string* why);
+// The variant, holding at least `need[j]` scenes in slot j (empty: 1 each):
+// the one built, or a larger one built now (0.60.0). False with *why when it
+// cannot be.
+bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app,
+                   const std::vector<UINT>& need, std::shared_ptr<Variant>* out, std::string* why);
 
 // Records the variant's four tables, the hit group table in the shim's own
 // layout, into `cl`, and fills `mine` with them. The caller binds the
 // variant, dispatches, and binds the application's pipeline again. `sel`:
 // which scene each of the variant's scene slots traces (0.59.0).
-bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
+bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info, const Variant& v,
                    const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,

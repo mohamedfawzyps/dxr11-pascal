@@ -26,6 +26,10 @@
 // a time, each dispatch writing its scene's part of the table; r and the
 // contributions are that scene's.
 //
+// A scene picked by key (0.60.0): `slots` counts SUB-SLOTS, a keyed slot
+// holding several, each with its own selection; with `keys` the key table's
+// address follows the pair table's.
+//
 //   meta, dwords: [0, 9 * groups)            identifier, offset
 //                 [.., + 17 * remaps)        from identifier, to identifier, insert offset
 //                 [.., + 2 * pairs)          R, M per pair
@@ -36,7 +40,7 @@
 //   C:\DW\DXC\bin\x64\dxc.exe -T cs_6_0 -E main -Vn g_shimTableCS
 //       -Fh proxy\shim_table_cs.h proxy\shim_table.hlsl
 
-#define RS "RootConstants(num32BitConstants=19, b0), SRV(t0), SRV(t1), SRV(t2), UAV(u0)"
+#define RS "RootConstants(num32BitConstants=20, b0), SRV(t0), SRV(t1), SRV(t2), UAV(u0)"
 
 cbuffer P : register(b0) {
     uint records; uint srcStride; uint dstStride; uint groups;
@@ -44,7 +48,7 @@ cbuffer P : register(b0) {
     uint appRecords; uint pairs; uint span; uint per;
     uint poison;   // DXR_TIER11_GI_POISON: write geometry 0, the sensitivity check
     uint slots; uint perSlot; uint scenes; uint lut;
-    uint selAt; uint selStride;
+    uint selAt; uint selStride; uint keys;
 };
 ByteAddressBuffer src : register(t0);
 ByteAddressBuffer meta : register(t1);
@@ -101,8 +105,8 @@ void main(uint r : SV_DispatchThreadID) {
                     dst.Store(to + 4, meta.Load(from + 4));
                 }
             }
-            if (lut) {
-                const uint from = addrAt + scenes * perSlot * 8, to = d + at + slots * perSlot * 8;
+            for (uint x = 0; x < lut + keys; ++x) {
+                const uint from = addrAt + (scenes * perSlot + x) * 8, to = d + at + (slots * perSlot + x) * 8;
                 dst.Store(to, meta.Load(from));
                 dst.Store(to + 4, meta.Load(from + 4));
             }
