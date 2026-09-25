@@ -160,8 +160,16 @@ constants and refusal come from that scene alone. This is the 0.40.0 "two
 live structures disagree" refusal, which drew nothing. All 64 dumped Unreal
 lowered libraries have the recognised shape (heap index from b0 space0). New
 dispatch cases `decoy` and `bindlessrq`; with resolution off both are
-refused. The `stats:` line now counts resolved and unresolved scenes, so the
-next Escher run settles whether Unreal's b0 is CPU-readable (INFERRED).
+refused. The `stats:` line now counts resolved and unresolved scenes.
+**IN THE GAME (2026-09-25, 6 min 51 s, the first run since 0.43.0):** clean
+end marker, 160 RayQuery shaders lowered and 0 refused, so no do-nothing
+pipelines are left in Escher; 323 of 323 `CreateStateObject` hr=0; 15134
+lowered dispatches drawn, all indirect; 1 refused (scene not read yet, at
+start); **scene resolved 19830, not resolved 0**, so Unreal's b0 IS a
+CPU-readable root CBV, now measured. Only one top-level structure was live
+the whole run, so the two-scene conflict the change fixes did not arise in
+it. No `GeometryIndex()` library was created: the ray tracing debug view was
+not opened, so the 0.44.0 to 0.46.0 work is still untested in the game.
 
 **0.48.0: THE BINDLESS SCENE IS RESOLVED (item a, part 3).** All 64 Unreal
 scene handles in the dumps are `ResourceDescriptorHeap[i]` with `i` a dword
