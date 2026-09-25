@@ -153,6 +153,25 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.51.0: A `GeometryIndex()` TABLE BUILT FROM AN OLDER BUILD OF THE SCENE
+WAS DRAWN WRONG, SILENTLY; FIXED.** GPU-written instances are read every 8
+builds and a submission late, and the table used that read without asking
+whether it was the latest build's. `gitest.exe --stale`: 0.50.0 draws 5 of 7
+layouts wrong with nothing logged. Now a read carries its build; unread or
+stale goes to the variant, which fills its table on the GPU, and every
+GPU-written top-level build's instances are SAVED verbatim so the copy of
+exactly that build can be made at the dispatch (also closing "the first
+dispatch before a GPU-built scene's copy exists", which for a scene built
+once was never drawn). `--gpuinst` and `--stale` 7 of 7, matrix 46 of 46.
+**THE RAYQUERY PATH READS THE SAME DATA WITH THE SAME GAP** (inferred from
+`rq_pipeline.cpp`, not measured): its record kinds and pairs can come from
+an older build, which in Escher means the frame after any instance change.
+Remaining for item a: a scene through a local root signature, TraceRay in a
+closest-hit or miss in the shim's layout, runtime TraceRay arguments, a
+rewritten library with its own subobjects AND an export list, a library
+association to another library's subobject, and a top-level structure made
+by CopyRaytracingAccelerationStructure (never tracked: refused as not read).
+
 **0.50.0: INDIRECT DispatchRays OF A `GeometryIndex()` PIPELINE WAS DRAWN
 WRONG, SILENTLY; FIXED.** Listed as "refused by name", it was not refused:
 both indirect paths bypassed the shim's DispatchRays and ran the hit shaders

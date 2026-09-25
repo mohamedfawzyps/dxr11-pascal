@@ -32,6 +32,11 @@
 // Subobjects a rewritten library declares itself are declared again at state
 // object scope, with the spec's association rules (0.50.0).
 //
+// A scene not read yet, or read from an older build than its latest (GPU-
+// written instances are read every few builds, a submission late), goes to
+// the variant, which needs no CPU read; its copy of the scene is made from
+// the instances the shim saved at that build (0.51.0).
+//
 // Not yet built, and each refused BY NAME rather than drawn wrong: TraceRay
 // arguments computed at run time, TraceRay in a closest-hit or miss in the
 // shim's layout, a rewritten library with its own subobjects included through

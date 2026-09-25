@@ -31,6 +31,19 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_lastAsked;
 // Per address: the build that FIRST wrote it, and how many builds have.
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_firstBuilt;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_buildCount;
+// Per address: the build (a g_lastBuilt value) the instance data in g_tlas
+// was read from. A GPU-written structure is read again only every few builds
+// and a submission late, so what is known can be an OLDER build's scene; a
+// table built from it can put the wrong geometry on a record (0.51.0).
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_readOf;
+
+// Caller holds g_lock. Was the structure's instance data read from its
+// latest build?
+bool CurrentLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
+    auto b = g_lastBuilt.find(tlas);
+    auto r = g_readOf.find(tlas);
+    return b != g_lastBuilt.end() && r != g_readOf.end() && r->second == b->second;
+}
 
 // A structure is SUPERSEDED once another one that did not exist at its last
 // build has been built this many times without it being rebuilt. That is an
@@ -81,6 +94,7 @@ struct PendingRead {
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     Microsoft::WRL::ComPtr<ID3D12Resource> keepAlive;   // the copy's own UAV
     UINT   count = 0;
+    UINT64 build = 0;                      // the build it copies, see g_readOf
     const void* owner = nullptr;           // the list that recorded the copy
     ID3D12CommandQueue* queue = nullptr;   // set when stamped
     UINT64 fenceValue = 0;                 // 0 until its list is submitted
@@ -374,6 +388,8 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     if (!tlas || !descs || !count) return;
     std::lock_guard<std::mutex> g(g_lock);
     ParseLocked(tlas, descs, count);
+    auto b = g_lastBuilt.find(tlas);
+    if (b != g_lastBuilt.end()) g_readOf[tlas] = b->second;
     g_snapshots[tlas].assign(descs, descs + count);
 }
 
@@ -402,6 +418,8 @@ void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     pr.count = count;
     pr.owner = owner;
     std::lock_guard<std::mutex> g(g_lock);
+    auto b = g_lastBuilt.find(tlas);
+    pr.build = b != g_lastBuilt.end() ? b->second : 0;
     g_pending.push_back(pr);
 }
 
@@ -473,6 +491,7 @@ void AfterSubmit(ID3D12CommandQueue* queue,
         if (SUCCEEDED(pr.readback->Map(0, &readRange, &p)) && p) {
             ParseLocked(pr.tlas,
                         static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count);
+            g_readOf[pr.tlas] = pr.build;
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
         } else {
@@ -639,10 +658,11 @@ std::vector<RecordConstants> RecordConstantsTable(
 std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& traceArgs,
                                     UINT records,
                                     const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact,
-                                    bool* read) {
+                                    bool* read, bool* stale) {
     std::lock_guard<std::mutex> g(g_lock);
     std::vector<int32_t> out(records, -1);
     *read = false;
+    *stale = false;
     bool anyBound = exact;
     for (auto a : bound) {
         auto it = g_tlas.find(a);
@@ -655,6 +675,7 @@ std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& tr
                      : !LiveLocked(kv.first))
             continue;
         *read = true;
+        if (!CurrentLocked(kv.first)) *stale = true;
         for (const auto& c : t.classes)
             for (UINT gi = 0; gi < c.second; ++gi)
                 for (const auto& rm : traceArgs) {

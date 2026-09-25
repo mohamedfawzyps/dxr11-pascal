@@ -159,11 +159,13 @@ struct TlasInfo {
 // `*read` is false unless one of them has been read. Otherwise `bound` is
 // empty (since 0.48.0; it used to be the bound root SRVs) and every live one
 // counts, which can only find MORE collisions, and `*read` is false when no
-// top-level structure has been read at all.
+// top-level structure has been read at all. `*stale` is set when a scene
+// that counted was read from an OLDER build than its latest: GPU-written
+// instances are read again only every few builds, and a submission late.
 std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& traceArgs,
                                     UINT records,
                                     const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact,
-                                    bool* read);
+                                    bool* read, bool* stale);
 
 // The instance descriptions of a top-level build, read from CPU-visible memory
 // at record time. Cheap path: no copy, no sync. They are also KEPT, as the

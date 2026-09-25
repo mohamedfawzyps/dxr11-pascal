@@ -24,6 +24,53 @@ not.
 
 ---
 
+## 0.51.0
+
+**FIXED: a `GeometryIndex()` table built from an OLDER build of the scene was
+drawn WRONG, silently.** Found while building the next item a gap, "the first
+dispatch before a GPU-built scene's copy exists", which turned out larger than
+listed.
+
+- **The stale read.** GPU-written instances (Unreal's kind) are read back
+  only every 8 builds of a structure, and always a submission late. The
+  table copy wrote each record's geometry index from that read with no check
+  that it came from the structure's LATEST build. `gitest.exe --stale` builds
+  the scene with every instance's structure swapped, submits, then builds it
+  again in place with the real ones: on 0.50.0, **5 of 7 layouts drawn wrong
+  with nothing logged** (mult, slots, shared, anyhit, mixrs), and zero1 not
+  drawn.
+- **The missing copy.** The variant (the shim's own record layout) traces a
+  copy of the scene, made only at a top-level build while switched on, or
+  from a CPU snapshot. A pipeline created after a scene whose instances the
+  GPU wrote got no copy: refused until the next build, and for a scene built
+  once, never drawn. `gitest.exe --gpuinst` on 0.50.0: zero1 not drawn.
+- **The fix.** The tracker now records which build each read came from
+  (`astrack`, `*stale` from `GeometryLabels`). A scene not read yet, or read
+  from an older build, goes to the variant, which needs no CPU read: its
+  table is filled on the GPU from the copy's own contributions. And every
+  top-level build with GPU-written instances gets them SAVED, copied verbatim
+  into a buffer of the shim's by one small pass (`shim_scene.hlsl`'s new
+  `verbatim` mode), so a dispatch can build the copy of exactly that build
+  in its own list (`shimscene::Ensure`). That also serves a pipeline tracing
+  with more argument pairs than the copy was built for, refused until now.
+- **A copy built at a dispatch belongs to that list.** The one built from a
+  CPU snapshot used to be registered for every list, so another list
+  submitted first could trace it before it existed. Copies are kept per
+  list now and dropped at its Reset.
+- **Measured:** `--gpuinst` and `--stale`, 7 of 7 at 6.5 and 6.6, and each
+  layout alone in its own process (28 of 28), where the log shows the copy
+  built from the saved instances. The gitest matrix, 46 configurations,
+  all match; the dispatch suite passes; the Phase 4 probe matches with
+  `-gpuinst`, `-gpuinst -debug` and `-openlist`.
+- **Cost:** one pass copying 64 bytes per instance after each top-level build
+  whose instances are in GPU memory, for every application, whether or not a
+  `GeometryIndex()` pipeline exists. Cheaper than being late: gating it on
+  such a pipeline existing would leave a scene built before the pipeline
+  undrawable.
+- **The same stale read feeds the RayQuery path's table** (record kinds and
+  the geometry index and contribution pairs, `rq_pipeline.cpp`), with no
+  check either. Read from the code, not yet measured; not changed here.
+
 ## 0.50.0
 
 **FIXED: an indirect DispatchRays of a `GeometryIndex()` pipeline was drawn

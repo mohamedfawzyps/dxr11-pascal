@@ -51,6 +51,12 @@
 // THE LIBRARY (HLSL LocalRootSignature and SubobjectToExportsAssociation)
 // instead of as state object subobjects. One state object only.
 //
+// --gpuinst puts the instance descriptions in GPU memory, copied there on the
+// GPU, as Unreal writes them: the shim cannot read them before the dispatch.
+// --stale (implies --gpuinst) first builds the scene with every instance's
+// structure swapped, submits, then builds it again IN PLACE with the real
+// ones, so what the shim read is the older build's scene.
+//
 // Exit code 0 only when every layout matches WARP.
 
 #include <windows.h>
@@ -96,6 +102,7 @@ static bool g_table = false;
 static int g_bindless = 0;   // 1 index in a root CBV, 2 in root constants
 static int g_indirect = 0;   // 1 arguments in upload memory, 2 in GPU memory
 static bool g_libassoc = false;
+static bool g_gpuinst = false, g_stale = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -286,14 +293,17 @@ struct Gpu {
 };
 
 static ComPtr<ID3D12Resource> BuildAS(Gpu& g, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& in,
-                                      std::vector<ComPtr<ID3D12Resource>>& keep) {
+                                      std::vector<ComPtr<ID3D12Resource>>& keep,
+                                      ID3D12Resource* into = nullptr) {
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
     g.dev->GetRaytracingAccelerationStructurePrebuildInfo(&in, &info);
     if (!info.ResultDataMaxSizeInBytes) throw std::runtime_error("prebuild info zero");
     auto scratch = Buffer(g.dev.Get(), info.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-    auto as = Buffer(g.dev.Get(), info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+    ComPtr<ID3D12Resource> as = into;
+    if (!as)
+        as = Buffer(g.dev.Get(), info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC d{};
     d.Inputs = in;
     d.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
@@ -361,25 +371,52 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     auto blasA = BuildBlas(g, kA, !L.anyhit, keep);
     auto blasB = BuildBlas(g, kB, !L.anyhit, keep);
     const UINT n = (UINT)L.inst.size();
-    auto ib = Buffer(g.dev.Get(), sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * n, D3D12_HEAP_TYPE_UPLOAD,
-                     D3D12_RESOURCE_STATE_GENERIC_READ);
-    D3D12_RAYTRACING_INSTANCE_DESC* id = nullptr;
-    HR(ib->Map(0, nullptr, (void**)&id), "Map instances");
-    for (UINT i = 0; i < n; ++i) {
-        std::memset(&id[i], 0, sizeof(id[i]));
-        id[i].Transform[0][0] = id[i].Transform[1][1] = id[i].Transform[2][2] = 1.0f;
-        id[i].Transform[0][3] = (float)i;
-        id[i].InstanceID = 50 + i;
-        id[i].InstanceMask = 0xFF;
-        id[i].InstanceContributionToHitGroupIndex = L.inst[i].contribution;
-        id[i].AccelerationStructure = (L.inst[i].blas == kA ? blasA : blasB)->GetGPUVirtualAddress();
-    }
-    ib->Unmap(0, nullptr);
+    const UINT64 ibBytes = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * n;
+    // `swap`: every instance on the other structure, for --stale.
+    auto instances = [&](bool swap) {
+        auto ib = Buffer(g.dev.Get(), ibBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        D3D12_RAYTRACING_INSTANCE_DESC* id = nullptr;
+        HR(ib->Map(0, nullptr, (void**)&id), "Map instances");
+        for (UINT i = 0; i < n; ++i) {
+            std::memset(&id[i], 0, sizeof(id[i]));
+            id[i].Transform[0][0] = id[i].Transform[1][1] = id[i].Transform[2][2] = 1.0f;
+            id[i].Transform[0][3] = (float)i;
+            id[i].InstanceID = 50 + i;
+            id[i].InstanceMask = 0xFF;
+            id[i].InstanceContributionToHitGroupIndex = L.inst[i].contribution;
+            id[i].AccelerationStructure =
+                ((L.inst[i].blas == kA) != swap ? blasA : blasB)->GetGPUVirtualAddress();
+        }
+        ib->Unmap(0, nullptr);
+        keep.push_back(ib);
+        if (!g_gpuinst) return ib->GetGPUVirtualAddress();
+        // --gpuinst: copied into GPU memory on the GPU.
+        auto gb = Buffer(g.dev.Get(), ibBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.cl->CopyBufferRegion(gb.Get(), 0, ib.Get(), 0, ibBytes);
+        D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = gb.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g.cl->ResourceBarrier(1, &b);
+        keep.push_back(gb);
+        return gb->GetGPUVirtualAddress();
+    };
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tl{};
     tl.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     tl.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tl.NumDescs = n; tl.InstanceDescs = ib->GetGPUVirtualAddress();
-    auto tlas = BuildAS(g, tl, keep);
+    tl.NumDescs = n; tl.InstanceDescs = instances(false);
+    ComPtr<ID3D12Resource> tlas;
+    if (g_stale) {
+        // The older scene, submitted, then the real one built over it.
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS old = tl;
+        old.InstanceDescs = instances(true);
+        tlas = BuildAS(g, old, keep);
+        g.flush();
+        BuildAS(g, tl, keep, tlas.Get());
+    } else {
+        tlas = BuildAS(g, tl, keep);
+    }
     // --table: a second live scene, instance A at contribution 2, which puts
     // different geometries on records the real scene uses.
     ComPtr<ID3D12Resource> decoy;
@@ -704,6 +741,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--indirect")) g_indirect = 1;
         else if (!std::strcmp(argv[i], "--indirectgpu")) g_indirect = 2;
         else if (!std::strcmp(argv[i], "--libassoc")) g_libassoc = true;
+        else if (!std::strcmp(argv[i], "--gpuinst")) g_gpuinst = true;
+        else if (!std::strcmp(argv[i], "--stale")) g_stale = g_gpuinst = true;
         else want.insert(argv[i]);
     }
     if (g_libassoc && g_mode != 0) {

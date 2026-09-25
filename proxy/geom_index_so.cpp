@@ -1537,11 +1537,19 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
     }
     const UINT records = (UINT)(app.SizeInBytes / app.StrideInBytes);
     if (!records) { *shim = app; return true; }
-    bool read = false;
-    const auto labels = astrack::GeometryLabels(info.traceArgs, records, boundSrvs, exact, &read);
-    if (!read) {
-        *why = exact ? "the scene this dispatch traces has not been read yet"
-                     : "no top-level structure has been read yet";
+    // The labels come from the scene's instances as the CPU read them. Not
+    // read yet, or read from an older build than the latest (GPU-written
+    // instances are read every few builds, a submission late), they may put
+    // the wrong geometry on a record: the variant is served on the GPU from
+    // the latest build itself, so it takes those (0.51.0).
+    bool read = false, stale = false;
+    const auto labels =
+        astrack::GeometryLabels(info.traceArgs, records, boundSrvs, exact, &read, &stale);
+    if (!read || stale) {
+        *why = !read ? (exact ? "the scene this dispatch traces has not been read yet"
+                              : "no top-level structure has been read yet")
+                     : "the scene changed since its instances were read";
+        *shared = true;
         return false;
     }
     for (UINT r = 0; r < records; ++r)
@@ -1809,39 +1817,26 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                    const void* owner, std::string* why) {
-    // The scene this dispatch traces, and the shim's copy of it: from its
-    // latest build, or from the snapshot of that build. The variant traces
-    // ONE copy, so every TraceRay has to trace the same scene.
-    if (exact && boundSrvs.size() != 1) {
+    // The scene this dispatch traces, and the shim's copy of its latest
+    // build: made with the build, or at this dispatch from the instances the
+    // shim saved then or the CPU snapshot (0.51.0; until then a scene built on
+    // the GPU before the variant existed was refused, and one built once was
+    // never drawn). The variant traces ONE copy, so every TraceRay has to
+    // trace the same, resolved, scene.
+    if (!exact) {
+        *why = "the scene this dispatch traces is not resolved through the root signature, and "
+               "the variant traces a copy of exactly that scene";
+        return false;
+    }
+    if (boundSrvs.size() != 1) {
         *why = "its TraceRay calls trace different scenes, and the variant has one scene copy";
         return false;
     }
-    if (!exact && info.scenes.regs.size() + info.scenes.heap.size() > 1) {
-        *why = "its TraceRay calls may trace different scenes, and the variant has one scene copy";
-        return false;
-    }
-    shimscene::Copy cp;
-    bool found = false;
-    for (auto a : boundSrvs)
-        if (shimscene::Lookup(a, &cp)) { found = true; break; }
-    if (!found)
-        for (auto a : boundSrvs) {
-            std::vector<D3D12_RAYTRACING_INSTANCE_DESC> snap;
-            std::string w;
-            if (astrack::InstanceSnapshot(a, &snap) &&
-                shimscene::RecordFromSnapshot(cl, dev, a, snap, owner, &w) &&
-                shimscene::Lookup(a, &cp)) { found = true; break; }
-        }
-    if (!found) {
-        *why = exact ? "no copy of the scene this dispatch traces yet (built on the GPU before the "
-                       "variant existed: its copy comes with its next build)"
-                     : "no copy of the scene this dispatch traces yet (not resolved through the root "
-                       "signature, or built on the GPU before the variant existed)";
-        return false;
-    }
     const UINT k = (UINT)info.traceArgs.size();
-    if (cp.k < k) {
-        *why = "the scene copy was built for fewer TraceRay argument pairs; its next build fixes it";
+    shimscene::Copy cp;
+    std::string cw;
+    if (!shimscene::Ensure(cl, dev, boundSrvs[0], k, owner, &cp, &cw)) {
+        *why = "no copy of the scene this dispatch traces: " + cw;
         return false;
     }
     gpuhold::Use(cp.tlasRes, owner);

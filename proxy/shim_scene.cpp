@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -18,15 +19,23 @@ using Microsoft::WRL::ComPtr;
 namespace shimscene {
 namespace {
 
-enum Kind { kResult, kScratch, kInstances, kContrib, kUploadInstances, kUploadContrib };
+enum Kind { kResult, kScratch, kInstances, kContrib, kUploadInstances, kUploadContrib, kSaved };
 struct Slot {
     ID3D12Device* device;
     Kind kind;
     UINT64 size;
     ComPtr<ID3D12Resource> res;
 };
-struct Entry {
+// A copy, and which build of the application's structure it stands for.
+struct Held {
     Copy copy;
+    UINT64 build = 0;
+};
+// A build's GPU-written instances, copied verbatim.
+struct Saved {
+    ID3D12Resource* res = nullptr;   // owned by g_pool
+    UINT count = 0;
+    UINT64 build = 0;
 };
 
 std::mutex g_lock;
@@ -36,11 +45,18 @@ ID3D12Device* g_pipeDevice = nullptr;
 ComPtr<ID3D12RootSignature> g_rs;
 ComPtr<ID3D12PipelineState> g_pso;
 std::vector<Slot> g_pool;
-std::map<D3D12_GPU_VIRTUAL_ADDRESS, Copy> g_copies;
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_builds;                    // builds of each structure
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, Held> g_copies;                       // built with the build
+std::map<std::pair<const void*, D3D12_GPU_VIRTUAL_ADDRESS>, Held> g_local;  // built at a dispatch
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, Saved> g_saved;
 
 bool Latest(ID3D12Resource* r) {
     for (const auto& kv : g_copies)
-        if (kv.second.tlasRes == r || kv.second.contribRes == r) return true;
+        if (kv.second.copy.tlasRes == r || kv.second.copy.contribRes == r) return true;
+    for (const auto& kv : g_local)
+        if (kv.second.copy.tlasRes == r || kv.second.copy.contribRes == r) return true;
+    for (const auto& kv : g_saved)
+        if (kv.second.res == r) return true;
     return false;
 }
 
@@ -89,62 +105,42 @@ void Transition(ID3D12GraphicsCommandList4* cl, ID3D12Resource* r, D3D12_RESOURC
     cl->ResourceBarrier(1, &x);
 }
 
-}  // namespace
-
-void Activate(UINT k) {
-    std::lock_guard<std::mutex> g(g_lock);
-    if (!g_active)
-        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the shim's copies of the scene are "
-                 "ON from the next top-level build, for up to %u TraceRay argument pair(s)\n", k);
-    g_active = true;
-    g_k = (std::max)(g_k, k);
-}
-
-bool Active() {
-    std::lock_guard<std::mutex> g(g_lock);
-    return g_active;
-}
-
-bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
-            const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
-            const void* owner, std::string* why) {
-    const auto& in = app.Inputs;
-    if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL || !in.NumDescs)
-        return true;
-    if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
-        *why = "an array of pointers to instance descriptions";
+// Caller holds g_lock.
+bool EnsurePipeLocked(ID3D12Device5* dev, std::string* why) {
+    if (g_pipeDevice == dev && g_pso) return true;
+    ComPtr<ID3D12RootSignature> rs;
+    ComPtr<ID3D12PipelineState> pso;
+    if (FAILED(dev->CreateRootSignature(0, g_shimSceneCS, sizeof(g_shimSceneCS), IID_PPV_ARGS(&rs)))) {
+        *why = "could not create the scene copy root signature";
         return false;
     }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = rs.Get();
+    pd.CS.pShaderBytecode = g_shimSceneCS;
+    pd.CS.BytecodeLength = sizeof(g_shimSceneCS);
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) {
+        *why = "could not create the scene copy pipeline";
+        return false;
+    }
+    g_rs = rs; g_pso = pso; g_pipeDevice = dev;
+    return true;
+}
+
+// Caller holds g_lock. The shim's structure from `count` instance
+// descriptions at `src` (GPU memory, readable as an SRV), recorded into `cl`.
+bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
+                 UINT count, UINT k, const void* owner, Copy* out, std::string* why) {
     const UINT gmax = astrack::MaxGeometryCount();
-    std::lock_guard<std::mutex> g(g_lock);
-    if (!g_active) return true;
-    const UINT k = g_k ? g_k : 1;
     const UINT64 stride = (UINT64)k * gmax;
-    if ((UINT64)in.NumDescs * stride > 0xFFFFFFull) {
+    if ((UINT64)count * stride > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
         return false;
     }
-    if (g_pipeDevice != dev || !g_pso) {
-        ComPtr<ID3D12RootSignature> rs;
-        ComPtr<ID3D12PipelineState> pso;
-        if (FAILED(dev->CreateRootSignature(0, g_shimSceneCS, sizeof(g_shimSceneCS), IID_PPV_ARGS(&rs)))) {
-            *why = "could not create the scene copy root signature";
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rs.Get();
-        pd.CS.pShaderBytecode = g_shimSceneCS;
-        pd.CS.BytecodeLength = sizeof(g_shimSceneCS);
-        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) {
-            *why = "could not create the scene copy pipeline";
-            return false;
-        }
-        g_rs = rs; g_pso = pso; g_pipeDevice = dev;
-    }
+    if (!EnsurePipeLocked(dev, why)) return false;
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS mine{};
     mine.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     mine.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-    mine.NumDescs = in.NumDescs;
+    mine.NumDescs = count;
     mine.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre{};
     dev->GetRaytracingAccelerationStructurePrebuildInfo(&mine, &pre);
@@ -154,8 +150,8 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     }
     auto result = Acquire(dev, kResult, pre.ResultDataMaxSizeInBytes, owner);
     auto scratch = Acquire(dev, kScratch, (std::max)(pre.ScratchDataSizeInBytes, (UINT64)256), owner);
-    auto inst = Acquire(dev, kInstances, (UINT64)in.NumDescs * 64, owner);
-    auto contrib = Acquire(dev, kContrib, (UINT64)in.NumDescs * 4, owner);
+    auto inst = Acquire(dev, kInstances, (UINT64)count * 64, owner);
+    auto contrib = Acquire(dev, kContrib, (UINT64)count * 4, owner);
     if (!result || !scratch || !inst || !contrib) {
         *why = "could not create the scene copy buffers";
         return false;
@@ -164,12 +160,12 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     Transition(cl, contrib.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cl->SetComputeRootSignature(g_rs.Get());
     cl->SetPipelineState(g_pso.Get());
-    const UINT c[2] = { in.NumDescs, (UINT)stride };
-    cl->SetComputeRoot32BitConstants(0, 2, c, 0);
-    cl->SetComputeRootShaderResourceView(1, in.InstanceDescs);
+    const UINT c[3] = { count, (UINT)stride, 0 };
+    cl->SetComputeRoot32BitConstants(0, 3, c, 0);
+    cl->SetComputeRootShaderResourceView(1, src);
     cl->SetComputeRootUnorderedAccessView(2, inst->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(3, contrib->GetGPUVirtualAddress());
-    cl->Dispatch((in.NumDescs + 63) / 64, 1, 1);
+    cl->Dispatch((count + 63) / 64, 1, 1);
     Transition(cl, inst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(cl, contrib.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -185,33 +181,23 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     u.UAV.pResource = result.Get();
     cl->ResourceBarrier(1, &u);
-
-    Copy cp;
-    cp.tlas = result->GetGPUVirtualAddress();
-    cp.contrib = contrib->GetGPUVirtualAddress();
-    cp.count = in.NumDescs;
-    cp.k = k;
-    cp.gmax = gmax;
-    cp.tlasRes = result.Get();
-    cp.contribRes = contrib.Get();
-    g_copies[app.DestAccelerationStructureData] = cp;
-    static LONG first = 0;
-    if (InterlockedCompareExchange(&first, 1, 0) == 0)
-        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first copy of a scene, %u instances, "
-                 "%u records each (%u pair(s) x %u geometries)\n",
-                 in.NumDescs, (UINT)stride, k, gmax);
+    out->tlas = result->GetGPUVirtualAddress();
+    out->contrib = contrib->GetGPUVirtualAddress();
+    out->count = count;
+    out->k = k;
+    out->gmax = gmax;
+    out->tlasRes = result.Get();
+    out->contribRes = contrib.Get();
     return true;
 }
 
-bool RecordFromSnapshot(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
-                        D3D12_GPU_VIRTUAL_ADDRESS appTlas,
-                        const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs,
-                        const void* owner, std::string* why) {
+// Caller holds g_lock. The same, from instance descriptions on the CPU.
+bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
+                        const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs, UINT k,
+                        const void* owner, Copy* out, std::string* why) {
     const UINT count = (UINT)descs.size();
     if (!count) { *why = "an empty scene"; return false; }
     const UINT gmax = astrack::MaxGeometryCount();
-    std::lock_guard<std::mutex> g(g_lock);
-    const UINT k = g_k ? g_k : 1;
     const UINT64 stride = (UINT64)k * gmax;
     if ((UINT64)count * stride > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
@@ -262,26 +248,157 @@ bool RecordFromSnapshot(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     u.UAV.pResource = result.Get();
     cl->ResourceBarrier(1, &u);
-    Copy cp;
-    cp.tlas = result->GetGPUVirtualAddress();
-    cp.contrib = contrib->GetGPUVirtualAddress();
-    cp.count = count;
-    cp.k = k;
-    cp.gmax = gmax;
-    cp.tlasRes = result.Get();
-    cp.contribRes = contrib.Get();
-    g_copies[appTlas] = cp;
-    ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): scene copy built from the snapshot of the "
-             "structure's latest build, %u instances\n", count);
+    out->tlas = result->GetGPUVirtualAddress();
+    out->contrib = contrib->GetGPUVirtualAddress();
+    out->count = count;
+    out->k = k;
+    out->gmax = gmax;
+    out->tlasRes = result.Get();
+    out->contribRes = contrib.Get();
     return true;
 }
 
-bool Lookup(D3D12_GPU_VIRTUAL_ADDRESS appTlas, Copy* out) {
+}  // namespace
+
+void Activate(UINT k) {
     std::lock_guard<std::mutex> g(g_lock);
-    auto it = g_copies.find(appTlas);
-    if (it == g_copies.end()) return false;
-    *out = it->second;
+    if (!g_active)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the shim's copies of the scene are "
+                 "ON from the next top-level build, for up to %u TraceRay argument pair(s)\n", k);
+    g_active = true;
+    g_k = (std::max)(g_k, k);
+}
+
+bool Active() {
+    std::lock_guard<std::mutex> g(g_lock);
+    return g_active;
+}
+
+void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas) {
+    std::lock_guard<std::mutex> g(g_lock);
+    ++g_builds[appTlas];
+    g_copies.erase(appTlas);
+    g_saved.erase(appTlas);
+}
+
+bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
+          const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
+          const void* owner, std::string* why) {
+    const auto& in = app.Inputs;
+    if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL || !in.NumDescs ||
+        !in.InstanceDescs)
+        return true;
+    if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
+        *why = "an array of pointers to instance descriptions";
+        return false;
+    }
+    std::lock_guard<std::mutex> g(g_lock);
+    if (!EnsurePipeLocked(dev, why)) return false;
+    auto saved = Acquire(dev, kSaved, (UINT64)in.NumDescs * 64, owner);
+    if (!saved) {
+        *why = "could not create the saved instance buffer";
+        return false;
+    }
+    Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cl->SetComputeRootSignature(g_rs.Get());
+    cl->SetPipelineState(g_pso.Get());
+    const UINT c[3] = { in.NumDescs, 0, 1 };
+    cl->SetComputeRoot32BitConstants(0, 3, c, 0);
+    cl->SetComputeRootShaderResourceView(1, in.InstanceDescs);
+    cl->SetComputeRootUnorderedAccessView(2, saved->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(3, saved->GetGPUVirtualAddress());  // unwritten
+    cl->Dispatch((in.NumDescs + 63) / 64, 1, 1);
+    Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Saved s;
+    s.res = saved.Get();
+    s.count = in.NumDescs;
+    s.build = g_builds[app.DestAccelerationStructureData];
+    g_saved[app.DestAccelerationStructureData] = s;
     return true;
+}
+
+bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
+            const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
+            const void* owner, std::string* why) {
+    const auto& in = app.Inputs;
+    if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL || !in.NumDescs)
+        return true;
+    if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
+        *why = "an array of pointers to instance descriptions";
+        return false;
+    }
+    std::lock_guard<std::mutex> g(g_lock);
+    if (!g_active) return true;
+    Held h;
+    h.build = g_builds[app.DestAccelerationStructureData];
+    if (!BuildLocked(cl, dev, in.InstanceDescs, in.NumDescs, g_k ? g_k : 1, owner, &h.copy, why))
+        return false;
+    g_copies[app.DestAccelerationStructureData] = h;
+    static LONG first = 0;
+    if (InterlockedCompareExchange(&first, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first copy of a scene, %u instances, "
+                 "%u records each (%u pair(s) x %u geometries)\n",
+                 in.NumDescs, h.copy.k * h.copy.gmax, h.copy.k, h.copy.gmax);
+    return true;
+}
+
+bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
+            UINT k, const void* owner, Copy* out, std::string* why) {
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> snap;
+    const bool haveSnap = astrack::InstanceSnapshot(appTlas, &snap);
+    std::lock_guard<std::mutex> g(g_lock);
+    auto b = g_builds.find(appTlas);
+    if (b == g_builds.end()) {
+        *why = "the scene this dispatch traces was never seen being built";
+        return false;
+    }
+    const UINT64 build = b->second;
+    auto c = g_copies.find(appTlas);
+    if (c != g_copies.end() && c->second.build == build && c->second.copy.k >= k) {
+        *out = c->second.copy;
+        return true;
+    }
+    const auto key = std::make_pair(owner, appTlas);
+    auto l = g_local.find(key);
+    if (l != g_local.end() && l->second.build == build && l->second.copy.k >= k) {
+        *out = l->second.copy;
+        return true;
+    }
+    const UINT kk = (std::max)(k, g_k ? g_k : 1u);
+    Held h;
+    h.build = build;
+    auto s = g_saved.find(appTlas);
+    bool ok = false;
+    const char* from = "";
+    if (s != g_saved.end() && s->second.build == build) {
+        gpuhold::Use(s->second.res, owner);
+        ok = BuildLocked(cl, dev, s->second.res->GetGPUVirtualAddress(), s->second.count, kk, owner,
+                         &h.copy, why);
+        from = "the saved instances";
+    } else if (haveSnap) {
+        ok = BuildFromCpuLocked(cl, dev, snap, kk, owner, &h.copy, why);
+        from = "the CPU snapshot";
+    } else {
+        *why = "neither the instances nor a snapshot of the scene's latest build were kept "
+               "(an array of pointers, or instances the shim could not save)";
+        return false;
+    }
+    if (!ok) return false;
+    g_local[key] = h;
+    *out = h.copy;
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): scene copy built at a dispatch from %s, "
+                 "%u instances, %u pair(s)\n", from, h.copy.count, h.copy.k);
+    return true;
+}
+
+void DropOwner(const void* owner) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (auto it = g_local.begin(); it != g_local.end();)
+        if (it->first.first == owner) it = g_local.erase(it);
+        else ++it;
 }
 
 }  // namespace shimscene

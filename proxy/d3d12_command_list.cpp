@@ -141,6 +141,7 @@ Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
 
 Dxr11CommandList::~Dxr11CommandList() {
     astrack::DropUnsubmitted(this);
+    shimscene::DropOwner(this);
     gpuhold::Detach(this);
     m_bindings.ReleaseAll();
     m_gfx.ReleaseAll();
@@ -231,6 +232,7 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     // A copy recorded before this Reset and never submitted will never run,
     // and nothing recorded before it can run again.
     astrack::DropUnsubmitted(this);
+    shimscene::DropOwner(this);
     gpuhold::Detach(this);
     m_segments.clear();
     m_openPendings.clear();
@@ -670,20 +672,39 @@ void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(co
         }
     }
     FWD(BuildRaytracingAccelerationStructure(d, n, p));
-    // The shim's copy of the scene, when a variant pipeline needs one: built
-    // here, from the instance buffer the application just built from.
-    if (d && d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
-        shimscene::Active()) {
+    if (!d || d->Inputs.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) return;
+    // GPU-written instances are saved, verbatim, so the shim's copy of this
+    // exact build can be made later, by a pipeline created after it; the CPU
+    // keeps the ones it can see (CaptureInstances). And while a variant
+    // pipeline needs it, the copy itself, built here from the instance
+    // buffer the application just built from. See proxy/shim_scene.h.
+    shimscene::NoteBuild(d->DestAccelerationStructureData);
+    const restrack::Found src = restrack::Find(d->Inputs.InstanceDescs);
+    const bool cpuVisible = src.resource &&
+        (src.heap == D3D12_HEAP_TYPE_UPLOAD || src.heap == D3D12_HEAP_TYPE_READBACK);
+    ID3D12Device5* dev = RealDevice();
+    bool replaced = false;
+    if (!cpuVisible && dev && d->Inputs.NumDescs) {
         std::string why;
-        ID3D12Device5* dev = RealDevice();
+        replaced = true;
+        if (!shimscene::Save(m_real, dev, *d, this, &why)) {
+            static LONG k = 0;
+            if (InterlockedIncrement(&k) <= 8)
+                ProxyLog("[dxr-tier-11-proxy-log] top-level AS: instances not saved: %s\n",
+                         why.c_str());
+        }
+    }
+    if (shimscene::Active()) {
+        std::string why;
+        replaced = true;
         if (!dev || !shimscene::Record(m_real, dev, *d, this, &why)) {
             static LONG k = 0;
             if (InterlockedIncrement(&k) <= 8)
                 ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): scene copy not built: %s\n",
                          why.empty() ? "no device" : why.c_str());
         }
-        RestoreComputeAfterCapture();
     }
+    if (replaced) RestoreComputeAfterCapture();
 }
 void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* a) { WorkBarrier(); FWD(EmitRaytracingAccelerationStructurePostbuildInfo(d, n, a)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) { WorkBarrier(); FWD(CopyRaytracingAccelerationStructure(d, s, m)); }

@@ -19,6 +19,15 @@
 // exactly the scene the application just built, moving objects included. It
 // costs one small pass and one extra top-level build per application build,
 // and only once a pipeline needs it; nothing needs it for Unreal's layout.
+//
+// A copy can also be needed where none was built then: the pipeline came
+// after the scene, or wants more argument pairs. So every top-level build
+// whose instances the GPU writes also gets them SAVED, copied verbatim into a
+// buffer of the shim's (one small pass, whether or not anything needs it),
+// and a dispatch builds the copy from that, in its own command list (0.51.0).
+// Instances the CPU can see are kept on the CPU instead
+// (astrack::InstanceSnapshot). Until 0.51.0 the first case was refused, and
+// for a scene built once, never drawn.
 #pragma once
 
 #include <d3d12.h>
@@ -32,21 +41,23 @@ namespace shimscene {
 void Activate(UINT k);
 bool Active();
 
-// After the application's top-level build is recorded into `cl`: records the
-// copy. Replaces the compute root signature and pipeline; the CALLER restores
-// them. `owner` is the recording list.
+// Every top-level build, before Save and Record: whatever the shim held for
+// the structure's previous build no longer stands for it.
+void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas);
+
+// After the application's top-level build is recorded into `cl`, when its
+// instances are in GPU-only memory: records the verbatim copy. Replaces the
+// compute root signature and pipeline; the CALLER restores them. `owner` is
+// the recording list.
+bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
+          const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
+          const void* owner, std::string* why);
+
+// After the application's top-level build is recorded into `cl`, while
+// switched on: records the copy. Same contract as Save.
 bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
             const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
             const void* owner, std::string* why);
-
-// The same, built from the instance descriptions a structure's latest build
-// used, kept on the CPU (astrack::InstanceSnapshot): for a pipeline created
-// after its scene was built, when the scene is not built again. Exact, since
-// the snapshot is that build's own data.
-bool RecordFromSnapshot(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
-                        D3D12_GPU_VIRTUAL_ADDRESS appTlas,
-                        const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs,
-                        const void* owner, std::string* why);
 
 struct Copy {
     D3D12_GPU_VIRTUAL_ADDRESS tlas = 0;     // the shim's structure
@@ -55,7 +66,17 @@ struct Copy {
     const void* tlasRes = nullptr;          // for gpu_hold
     const void* contribRes = nullptr;
 };
-// The latest copy of the application structure at `appTlas`.
-bool Lookup(D3D12_GPU_VIRTUAL_ADDRESS appTlas, Copy* out);
+
+// A copy of the latest build of `appTlas`, for at least `k` argument pairs,
+// that a dispatch recorded into `owner` may trace: the one built with that
+// build, or one this list built already, or a new one recorded into `cl`
+// from the saved instances or the CPU snapshot. A copy recorded here is this
+// list's alone: another list may run first. May replace the compute root
+// signature and pipeline; the CALLER restores them.
+bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
+            UINT k, const void* owner, Copy* out, std::string* why);
+
+// The list was reset or destroyed: the copies it built are forgotten.
+void DropOwner(const void* owner);
 
 }  // namespace shimscene
