@@ -90,18 +90,30 @@ int main(int argc, char** argv) {
         // The C++ half of phase5/rewriter/shimtrace.py:
         //   dxrw shimtrace in out R,M ...      literal pairs
         //   dxrw shimtrace in out --copies N   pairs from the shim's table
+        //   ... --slots S j,j,...               call n traces scene slot j_n of S
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
         std::vector<std::pair<unsigned, unsigned>> pairs;
-        unsigned copies = 0;
+        unsigned copies = 0, slots = 1;
+        std::vector<unsigned> slotOf;
         for (int i = 4; i < argc; ++i) {
             unsigned r = 0, m = 0;
             if (std::string(argv[i]) == "--copies" && i + 1 < argc) copies = (unsigned)std::atoi(argv[++i]);
+            else if (std::string(argv[i]) == "--slots" && i + 2 < argc) {
+                slots = (unsigned)std::atoi(argv[++i]);
+                std::string l = argv[++i];
+                for (size_t at = 0; at <= l.size();) {
+                    size_t e = l.find(',', at);
+                    if (e == std::string::npos) e = l.size();
+                    slotOf.push_back((unsigned)std::atoi(l.substr(at, e - at).c_str()));
+                    at = e + 1;
+                }
+            }
             else if (std::sscanf(argv[i], "%u,%u", &r, &m) == 2) pairs.emplace_back(r, m);
         }
         std::string text, why;
         int calls = 0;
-        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, copies, &text, &calls, &why)) {
+        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, copies, slotOf, slots, &text, &calls, &why)) {
             std::printf("UNSUPPORTED: %s\n", why.c_str());
             return 2;
         }

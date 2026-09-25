@@ -323,6 +323,15 @@ foreach ($sm in @('lib_6_5', 'lib_6_6')) {
         $valid = $asm -match 'validated and signed ok'
         if ($same -and $valid) { Write-Host "  shimtrace $sm run-time arguments, $c structure(s) : PASS (byte-identical, validates and signs)" }
         else { Write-Host "  shimtrace $sm run-time arguments, $c structure(s) : FAIL (identical=$same valid=$valid)"; $failed++ }
+        # Several scenes (0.59.0): the first call traces scene slot 1, the
+        # second slot 0.
+        & python phase5\rewriter\shimtrace.py $d "phase5\out\shimdyn2_${sm}_$c.py.ll" --copies $c --slots 2 1,0 | Out-Null
+        & .\phase5out\dxrw.exe shimtrace $d "phase5\out\shimdyn2_${sm}_$c.cpp.ll" --copies $c --slots 2 1,0 | Out-Null
+        $same = (Get-FileHash "phase5\out\shimdyn2_${sm}_$c.py.ll").Hash -eq (Get-FileHash "phase5\out\shimdyn2_${sm}_$c.cpp.ll").Hash
+        $asm = (& .\phase5out\dxilrt.exe asm "phase5\out\shimdyn2_${sm}_$c.py.ll" "phase5\out\shimdyn2_${sm}_$c.dxil" 2>&1) -join "`n"
+        $valid = $asm -match 'validated and signed ok'
+        if ($same -and $valid) { Write-Host "  shimtrace $sm two scenes, $c structure(s) : PASS (byte-identical, validates and signs)" }
+        else { Write-Host "  shimtrace $sm two scenes, $c structure(s) : FAIL (identical=$same valid=$valid)"; $failed++ }
     }
 }
 

@@ -36,6 +36,13 @@ tN, space GI_SPACE, after the N copies at t0..tN-1 (0.57.0). Shapes from
 DXC: rawBufferLoad (139) on createHandleForLib.struct.ByteAddressBuffer at
 6.5, annotateHandle {11, 0} at 6.6, an SRV record of kind 11 with no extra;
 the copy is chosen by a switch.
+
+Several scenes (0.59.0): with `slots` S, call n traces the copy of scene slot
+slot_of[n]; slot j's structure c is at t(j * C + c), C = max(copies, 1), the
+table at t(S * C). Slot 0 keeps the names @dxr11.tlas[.c], slot j is
+@dxr11.tlas.sJ[.c]. With one slot the output is what it was.
+
+    python phase5/rewriter/shimtrace.py <in.ll> <out.ll> ... --slots S j,j,...
 """
 
 import io
@@ -62,7 +69,7 @@ _TRACE = re.compile(r'^(\s*)call void @dx\.op\.traceRay\.([^(]+)\(i32 157, '
                     r'i32 ([^,]+), i32 ([^,]+), (.*)$')
 
 
-def retrace(text, pairs, copies=0):
+def retrace(text, pairs, copies=0, slot_of=None, slots=1):
     """Returns (text, calls). With `copies` 0, `pairs` is the pipeline's list
     of (R, M), low 4 bits each, and a call's r is the index of its pair. With
     `copies` N >= 1 (arguments computed at run time, or more than 15 pairs)
@@ -77,14 +84,13 @@ def retrace(text, pairs, copies=0):
         raise Unsupported('the library already defines %s' % TLAS_GLOBAL)
     sm66 = _is_sm66(text)
     k = len(pairs)
-
-    def glob(c):
-        return TLAS_GLOBAL + ('.%d' % c if c else '')
+    slots = slots or 1
+    slot = [0]   # the call being rewritten's
 
     def tlas_handle(o, t, sfx, c):
         if sm66:
             o += [
-                '  %s.v%s = load %s, %s* %s, align 4' % (t, sfx, HANDLE_TYPE, HANDLE_TYPE, glob(c)),
+                '  %s.v%s = load %s, %s* %s, align 4' % (t, sfx, HANDLE_TYPE, HANDLE_TYPE, _glob(slot[0], c)),
                 '  %s.l%s = call %s @dx.op.createHandleForLib.dx.types.Handle(i32 160, %s %s.v%s)'
                 '  ; CreateHandleForLib(Resource)' % (t, sfx, HANDLE_TYPE, HANDLE_TYPE, t, sfx),
                 '  %s.h%s = call %s @dx.op.annotateHandle(i32 216, %s %s.l%s, '
@@ -93,7 +99,7 @@ def retrace(text, pairs, copies=0):
             ]
         else:
             o += [
-                '  %s.v%s = load %s, %s* %s, align 4' % (t, sfx, RAS, RAS, glob(c)),
+                '  %s.v%s = load %s, %s* %s, align 4' % (t, sfx, RAS, RAS, _glob(slot[0], c)),
                 '  %s.h%s = call %s @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure'
                 '(i32 160, %s %s.v%s)  ; CreateHandleForLib(Resource)' % (t, sfx, HANDLE_TYPE, RAS, t, sfx),
             ]
@@ -119,6 +125,11 @@ def retrace(text, pairs, copies=0):
         if not m:
             out.append(line)
             continue
+        if slot_of and n >= len(slot_of):
+            raise Unsupported('more TraceRay calls than scene slots given')
+        slot[0] = slot_of[n] if slot_of else 0
+        if slot[0] >= slots:
+            raise Unsupported("a TraceRay's scene slot is out of range")
         R, M = m.group(6), m.group(7)
         t = '%%st.%d' % n
         head = '%scall void @dx.op.traceRay.%s(i32 157, %s ' % (m.group(1), m.group(2), HANDLE_TYPE)
@@ -238,16 +249,22 @@ def retrace(text, pairs, copies=0):
                       default=-1)
     at = (last_global if last_global >= 0 else last_type + len(types)) + 1
     g = [''] if last_global < 0 else []
-    for c in range(copies or 1):
-        g.append('%s = external constant %s, align 4' % (glob(c), HANDLE_TYPE if sm66 else RAS))
+    for j in range(slots):
+        for c in range(copies or 1):
+            g.append('%s = external constant %s, align 4' % (_glob(j, c), HANDLE_TYPE if sm66 else RAS))
     if copies:
         g.append('%s = external constant %s, align 4' % (LUT_GLOBAL, HANDLE_TYPE if sm66 else BAB))
     lines[at:at] = g
-    text = _metadata('\n'.join(lines), sm66, copies)
+    text = _metadata('\n'.join(lines), sm66, copies, slots)
     return _resolve_attrs(text), n
 
 
-def _metadata(text, sm66, copies):
+def _glob(j, c):
+    b = TLAS_GLOBAL + ('.s%d' % j if j else '')
+    return b + ('.%d' % c if c else '')
+
+
+def _metadata(text, sm66, copies, slots=1):
     md = {}
     for m in re.finditer(r'^!(\d+) = (?:distinct )?!\{(.*)\}\s*$', text, re.M):
         md[int(m.group(1))] = m.group(2)
@@ -290,14 +307,17 @@ def _metadata(text, sm66, copies):
         if groups[0] != 'null':
             have = [x.strip() for x in md[int(groups[0][1:])].split(',')]
     first = len(have)
-    for c in range(copies or 1):
-        gl = TLAS_GLOBAL + ('.%d' % c if c else '')
-        rec = node('i32 %d, %s, !"%s", i32 %d, i32 %d, i32 1, i32 16, i32 0, !%d'
-                   % (first + c, ref(RAS, gl), gl[1:], GI_SPACE, c, extra))
-        have.append('!%d' % rec)
+    cc = copies or 1
+    for j in range(slots):
+        for c in range(cc):
+            gl = _glob(j, c)
+            rec = node('i32 %d, %s, !"%s", i32 %d, i32 %d, i32 1, i32 16, i32 0, !%d'
+                       % (first + j * cc + c, ref(RAS, gl), gl[1:], GI_SPACE, j * cc + c, extra))
+            have.append('!%d' % rec)
     if copies:
         rec = node('i32 %d, %s, !"%s", i32 %d, i32 %d, i32 1, i32 11, i32 0, null'
-                   % (first + copies, ref(BAB, LUT_GLOBAL), LUT_GLOBAL[1:], GI_SPACE, copies))
+                   % (first + slots * cc, ref(BAB, LUT_GLOBAL), LUT_GLOBAL[1:], GI_SPACE,
+                      slots * cc))
         have.append('!%d' % rec)
     if res:
         groups[0] = '!%d' % node(', '.join(have))
@@ -317,13 +337,17 @@ def _metadata(text, sm66, copies):
 def main(argv):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hand'))
     from llnorm import normalize
-    rest, copies = argv[3:], 0
+    rest, copies, slots, slot_of = argv[3:], 0, 1, None
     if rest[:1] == ['--copies']:
         copies, rest = int(rest[1]), rest[2:]
+    if '--slots' in rest:
+        i = rest.index('--slots')
+        slots, slot_of = int(rest[i + 1]), [int(x) for x in rest[i + 2].split(',')]
+        rest = rest[:i] + rest[i + 3:]
     pairs = [tuple(int(x) for x in a.split(',')) for a in rest]
     text = normalize(io.open(argv[1], encoding='utf-8').read())
     try:
-        out, calls = retrace(text, pairs, copies)
+        out, calls = retrace(text, pairs, copies, slot_of, slots)
     except Unsupported as e:
         print('UNSUPPORTED: %s' % e)
         return 2

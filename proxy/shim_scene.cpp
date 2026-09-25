@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -54,7 +55,10 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_builds;                    // buil
 // one would otherwise shrink every instance's block of records (0.52.3).
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> g_buildGmax;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, Held> g_copies;                       // built with the build
-std::map<std::pair<const void*, D3D12_GPU_VIRTUAL_ADDRESS>, Held> g_local;  // built at a dispatch
+std::map<std::tuple<const void*, D3D12_GPU_VIRTUAL_ADDRESS, UINT>, Held> g_local;  // built at a dispatch
+// The base each scene's copy was last asked for: the copies made with its
+// later builds take it (0.59.0).
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> g_base;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, Saved> g_saved;
 
 bool Holds(const Copy& c, ID3D12Resource* r) {
@@ -168,12 +172,12 @@ bool BuildOneLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
 // Caller holds g_lock. The shim's structure from `count` instance
 // descriptions at `src` (GPU memory, readable as an SRV), recorded into `cl`.
 bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
-                 UINT count, UINT k, UINT gmaxFloor, const void* owner, Copy* out,
+                 UINT count, UINT k, UINT gmaxFloor, UINT base, const void* owner, Copy* out,
                  std::string* why) {
     const UINT gmax = (std::max)(astrack::MaxGeometryCount(), gmaxFloor);
     const UINT kc = (std::min)(k, PairsPerStructure()), copies = (k + kc - 1) / kc;
     const UINT64 stride = (UINT64)kc * gmax;
-    if ((UINT64)count * stride * copies > 0xFFFFFFull) {
+    if (base + (UINT64)count * stride * copies > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
         return false;
     }
@@ -199,8 +203,8 @@ bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_V
     Transition(cl, contrib.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cl->SetComputeRootSignature(g_rs.Get());
     cl->SetPipelineState(g_pso.Get());
-    const UINT c[4] = { count, (UINT)stride, 0, copies };
-    cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+    const UINT c[5] = { count, (UINT)stride, 0, copies, base };
+    cl->SetComputeRoot32BitConstants(0, 5, c, 0);
     cl->SetComputeRootShaderResourceView(1, src);
     cl->SetComputeRootUnorderedAccessView(2, inst->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(3, contrib->GetGPUVirtualAddress());
@@ -219,6 +223,7 @@ bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_V
     out->k = k;
     out->kc = kc;
     out->gmax = gmax;
+    out->base = base;
     out->contribRes = contrib.Get();
     return true;
 }
@@ -226,13 +231,13 @@ bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_V
 // Caller holds g_lock. The same, from instance descriptions on the CPU.
 bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
                         const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs, UINT k,
-                        UINT gmaxFloor, const void* owner, Copy* out, std::string* why) {
+                        UINT gmaxFloor, UINT base, const void* owner, Copy* out, std::string* why) {
     const UINT count = (UINT)descs.size();
     if (!count) { *why = "an empty scene"; return false; }
     const UINT gmax = (std::max)(astrack::MaxGeometryCount(), gmaxFloor);
     const UINT kc = (std::min)(k, PairsPerStructure()), copies = (k + kc - 1) / kc;
     const UINT64 stride = (UINT64)kc * gmax;
-    if ((UINT64)count * stride * copies > 0xFFFFFFull) {
+    if (base + (UINT64)count * stride * copies > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
         return false;
     }
@@ -267,7 +272,7 @@ bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
             x = descs[i];
             if (!n) c[i] = descs[i].InstanceContributionToHitGroupIndex;
             x.InstanceContributionToHitGroupIndex =
-                (UINT)(((UINT64)n * count * stride + i * stride) & 0xFFFFFFu);
+                (UINT)((base + (UINT64)n * count * stride + i * stride) & 0xFFFFFFu);
         }
     inst->Unmap(0, nullptr);
     contrib->Unmap(0, nullptr);
@@ -281,6 +286,7 @@ bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     out->k = k;
     out->kc = kc;
     out->gmax = gmax;
+    out->base = base;
     out->contribRes = contrib.Get();
     return true;
 }
@@ -302,8 +308,10 @@ UINT PairsPerStructure() {
         const UINT v = GetEnvironmentVariableA("DXR_TIER11_TARGS_PERSTRUCT", b, sizeof(b))
                            ? (UINT)std::atoi(b) : 15u;
         // Not below 4: a variant of 128 structures (2 pairs each, 256
-        // pairs) removed the device on a GTX 1070, 64 did not. The shim
-        // itself never needs more than 18.
+        // pairs) removed the device on a GTX 1070, 64 did not. Found in
+        // 0.59.0 to be the local root signature of 129 root descriptors,
+        // which the extension now refuses (geom_index_so.cpp, Extend). The
+        // shim itself needs at most 18 per scene.
         return v >= 4 && v <= 15 ? v : 15u;
     }();
     return n;
@@ -369,8 +377,8 @@ bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cl->SetComputeRootSignature(g_rs.Get());
     cl->SetPipelineState(g_pso.Get());
-    const UINT c[4] = { in.NumDescs, 0, 1, 1 };
-    cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+    const UINT c[5] = { in.NumDescs, 0, 1, 1, 0 };
+    cl->SetComputeRoot32BitConstants(0, 5, c, 0);
     cl->SetComputeRootShaderResourceView(1, in.InstanceDescs);
     cl->SetComputeRootUnorderedAccessView(2, saved->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(3, saved->GetGPUVirtualAddress());  // unwritten
@@ -425,7 +433,8 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     Held h;
     h.build = g_builds[app.DestAccelerationStructureData];
     if (!BuildLocked(cl, dev, in.InstanceDescs, in.NumDescs, g_k ? g_k : 1,
-                     g_buildGmax[app.DestAccelerationStructureData], owner, &h.copy, why))
+                     g_buildGmax[app.DestAccelerationStructureData],
+                     g_base[app.DestAccelerationStructureData], owner, &h.copy, why))
         return false;
     g_copies[app.DestAccelerationStructureData] = h;
     static LONG first = 0;
@@ -437,7 +446,7 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
 }
 
 bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
-            UINT k, const void* owner, Copy* out, std::string* why) {
+            UINT k, UINT base, const void* owner, Copy* out, std::string* why) {
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> snap;
     const bool haveSnap = astrack::InstanceSnapshot(appTlas, &snap);
     std::lock_guard<std::mutex> g(g_lock);
@@ -447,12 +456,14 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
         return false;
     }
     const UINT64 build = b->second;
+    g_base[appTlas] = base;
     auto c = g_copies.find(appTlas);
-    if (c != g_copies.end() && c->second.build == build && c->second.copy.k >= k) {
+    if (c != g_copies.end() && c->second.build == build && c->second.copy.k >= k &&
+        c->second.copy.base == base) {
         *out = c->second.copy;
         return true;
     }
-    const auto key = std::make_pair(owner, appTlas);
+    const auto key = std::make_tuple(owner, appTlas, base);
     auto l = g_local.find(key);
     if (l != g_local.end() && l->second.build == build && l->second.copy.k >= k) {
         *out = l->second.copy;
@@ -467,10 +478,10 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
     if (s != g_saved.end() && s->second.build == build) {
         gpuhold::Use(s->second.res, owner);
         ok = BuildLocked(cl, dev, s->second.res->GetGPUVirtualAddress(), s->second.count, kk,
-                         g_buildGmax[appTlas], owner, &h.copy, why);
+                         g_buildGmax[appTlas], base, owner, &h.copy, why);
         from = "the saved instances";
     } else if (haveSnap) {
-        ok = BuildFromCpuLocked(cl, dev, snap, kk, g_buildGmax[appTlas], owner, &h.copy, why);
+        ok = BuildFromCpuLocked(cl, dev, snap, kk, g_buildGmax[appTlas], base, owner, &h.copy, why);
         from = "the CPU snapshot";
     } else {
         *why = "neither the instances nor a snapshot of the scene's latest build were kept "
@@ -491,7 +502,7 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
 void DropOwner(const void* owner) {
     std::lock_guard<std::mutex> g(g_lock);
     for (auto it = g_local.begin(); it != g_local.end();)
-        if (it->first.first == owner) it = g_local.erase(it);
+        if (std::get<0>(it->first) == owner) it = g_local.erase(it);
         else ++it;
 }
 

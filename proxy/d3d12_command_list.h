@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include "geom_index_so.h"
+
 // --- command list splitting -------------------------------------------------
 //
 // An indirect ray dispatch cannot be serviced at record time when its argument
@@ -143,6 +145,8 @@ struct Dxr11PendingDispatch {
     bool                                         giScenesSet = false;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       giScenes;
     bool                                         giExact = false;
+    // Which scene each of the variant's scene slots traces (0.59.0).
+    gidx::SceneSel                               giSel;
     // Which build of each of those scenes it traces, the latest when it was
     // recorded: the table is made from exactly that build's instances at
     // submit (0.54.0).
@@ -346,7 +350,8 @@ private:
     // RayQuery pipeline is bound. See proxy/group_count.h.
     bool QueueStaleCompute(UINT x, UINT y, UINT z, const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
     bool QueueStaleRays(const D3D12_DISPATCH_RAYS_DESC& d,
-                        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
+                        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes,
+                        const gidx::SceneSel& sel);
     // A GeometryIndex() dispatch whose scene is in records in GPU memory:
     // copies of those recorded, the dispatch deferred to submit.
     bool QueueLocalRays(gidx::Info& gi, const D3D12_DISPATCH_RAYS_DESC& d);
@@ -354,10 +359,17 @@ private:
     // 1 all read (CPU-visible memory), 2 some in GPU memory, 0 unreadable.
     int ReadRecords(const D3D12_DISPATCH_RAYS_DESC& d, bool all, std::vector<uint8_t> out[3],
                     std::string* why);
-    // The scenes those records name through their local root signatures.
+    // The scenes those records name through their local root signatures;
+    // with `sel`, what each record names for each scene slot `sel` leaves to
+    // the records (0.59.0).
     bool RecordScenes(gidx::Info& gi, const Dxr11Bindings& b, const D3D12_DISPATCH_RAYS_DESC& d,
                       bool all, const std::vector<uint8_t> rec[3],
-                      std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why);
+                      std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why,
+                      gidx::SceneSel* sel = nullptr);
+    // Which scene each of the variant's scene slots traces, through the
+    // global root signature `b` binds; a slot that is not there is left to
+    // the records (-1).
+    void GlobalSel(gidx::Info& gi, const Dxr11Bindings& b, gidx::SceneSel* sel);
     // At submit: every range of `rec` still empty, read from CPU-visible
     // memory, or copied from GPU memory, submitted and waited for once. Only
     // with GPU-written arguments, whose ranges are not known before.
@@ -390,7 +402,8 @@ private:
     // record; `*defer` when that record is in GPU memory (or, with no `d`,
     // when the record is needed at all), for the caller to resolve at submit.
     bool GeometryIndexScenes(gidx::Info& gi, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs,
-                             const D3D12_DISPATCH_RAYS_DESC* d = nullptr, bool* defer = nullptr);
+                             const D3D12_DISPATCH_RAYS_DESC* d = nullptr, bool* defer = nullptr,
+                             gidx::SceneSel* sel = nullptr);
     // The same for a lowered RayQuery pipeline, counted and logged.
     bool RayQueryScenes(Dxr11RayQueryPso* rq, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out);
     ID3D12Device5* RealDevice();

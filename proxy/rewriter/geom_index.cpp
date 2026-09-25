@@ -314,6 +314,7 @@ bool LowerGeometryIndex(const std::string& in, std::string* out,
 
 bool RetraceToShimScene(const std::string& in,
                         const std::vector<std::pair<unsigned, unsigned>>& pairs, unsigned copies,
+                        const std::vector<unsigned>& slotOf, unsigned slots,
                         std::string* out, int* calls, std::string* why) {
     static const std::regex kTrace(
         R"RX(^(\s*)call void @dx\.op\.traceRay\.([^(]+)\(i32 157, %dx\.types\.Handle (%[\w.]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), (.*)$)RX");
@@ -334,19 +335,26 @@ bool RetraceToShimScene(const std::string& in,
     }
     const bool sm66 = IsSm66(in);
     const unsigned k = (unsigned)pairs.size();
-    // Copy c's global: @dxr11.tlas for copy 0, @dxr11.tlas.c after it.
-    auto global = [&](unsigned c) { return c ? G + "." + std::to_string(c) : G; };
-    // A handle on copy c's structure, named <t><suffix>.
+    if (!slots) slots = 1;
+    const unsigned C = copies ? copies : 1u;
+    // Slot j's structure c: @dxr11.tlas for slot 0 structure 0, @dxr11.tlas.c
+    // after it; @dxr11.tlas.sJ and @dxr11.tlas.sJ.c for slot j.
+    auto global = [&](unsigned j, unsigned c) {
+        const std::string b = j ? G + ".s" + std::to_string(j) : G;
+        return c ? b + "." + std::to_string(c) : b;
+    };
+    unsigned slot = 0;   // the call being rewritten's
+    // A handle on structure c of the current call's slot, named <t><suffix>.
     auto tlasHandle = [&](std::vector<std::string>* o, const std::string& t, const std::string& sfx,
                           unsigned c) {
         if (sm66) {
-            o->push_back("  " + t + ".v" + sfx + " = load " + H + ", " + H + "* " + global(c) + ", align 4");
+            o->push_back("  " + t + ".v" + sfx + " = load " + H + ", " + H + "* " + global(slot, c) + ", align 4");
             o->push_back("  " + t + ".l" + sfx + " = call " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " +
                           H + " " + t + ".v" + sfx + ")  ; CreateHandleForLib(Resource)");
             o->push_back("  " + t + ".h" + sfx + " = call " + H + " @dx.op.annotateHandle(i32 216, " + H + " " + t +
                          ".l" + sfx + ", " + P + " { i32 16, i32 0 })  ; AnnotateHandle(res,props)  resource: RTAccelerationStructure");
         } else {
-            o->push_back("  " + t + ".v" + sfx + " = load " + RAS + ", " + RAS + "* " + global(c) + ", align 4");
+            o->push_back("  " + t + ".v" + sfx + " = load " + RAS + ", " + RAS + "* " + global(slot, c) + ", align 4");
             o->push_back("  " + t + ".h" + sfx + " = call " + H +
                          " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32 160, " +
                          RAS + " " + t + ".v" + sfx + ")  ; CreateHandleForLib(Resource)");
@@ -379,6 +387,12 @@ bool RetraceToShimScene(const std::string& in,
             }
         }
         if (!std::regex_match(l, m, kTrace)) { cur.push_back(l); continue; }
+        if (!slotOf.empty() && (size_t)n >= slotOf.size()) {
+            *why = "more TraceRay calls than scene slots given";
+            return false;
+        }
+        slot = slotOf.empty() ? 0u : slotOf[(size_t)n];
+        if (slot >= slots) { *why = "a TraceRay's scene slot is out of range"; return false; }
         const std::string R = m[6].str(), M = m[7].str();
         const std::string t = "%st." + std::to_string(n);
         const std::string head = m[1].str() + "call void @dx.op.traceRay." + m[2].str() + "(i32 157, " + H + " ";
@@ -503,8 +517,9 @@ bool RetraceToShimScene(const std::string& in,
     const int at = (lastGlobal >= 0 ? lastGlobal : lastType + (int)types.size()) + 1;
     std::vector<std::string> g;
     if (lastGlobal < 0) g.push_back("");
-    for (unsigned c = 0; c < (copies ? copies : 1u); ++c)
-        g.push_back(global(c) + " = external constant " + (sm66 ? H : RAS) + ", align 4");
+    for (unsigned j = 0; j < slots; ++j)
+        for (unsigned c = 0; c < C; ++c)
+            g.push_back(global(j, c) + " = external constant " + (sm66 ? H : RAS) + ", align 4");
     if (copies) g.push_back(L + " = external constant " + (sm66 ? H : BAB) + ", align 4");
     lines.insert(lines.begin() + at, g.begin(), g.end());
 
@@ -559,16 +574,19 @@ bool RetraceToShimScene(const std::string& in,
         if (groups[0] != "null") have = SplitTrim(md[std::stoi(groups[0].substr(1))]);
     }
     const size_t first = have.size();
-    for (unsigned c = 0; c < (copies ? copies : 1u); ++c) {
-        const std::string name = global(c).substr(1);
-        const int rec = node("i32 " + std::to_string(first + c) + ", " + ref(RAS, global(c)) + ", !\"" + name +
-                             "\", i32 " + space + ", i32 " + std::to_string(c) + ", i32 1, i32 16, i32 0, !" +
-                             std::to_string(extra));
-        have.push_back("!" + std::to_string(rec));
-    }
+    for (unsigned j = 0; j < slots; ++j)
+        for (unsigned c = 0; c < C; ++c) {
+            const unsigned r = j * C + c;
+            const std::string name = global(j, c).substr(1);
+            const int rec = node("i32 " + std::to_string(first + r) + ", " + ref(RAS, global(j, c)) + ", !\"" +
+                                 name + "\", i32 " + space + ", i32 " + std::to_string(r) +
+                                 ", i32 1, i32 16, i32 0, !" + std::to_string(extra));
+            have.push_back("!" + std::to_string(rec));
+        }
     if (copies) {
-        const int rec = node("i32 " + std::to_string(first + copies) + ", " + ref(BAB, L) +
-                             ", !\"dxr11.lut\", i32 " + space + ", i32 " + std::to_string(copies) +
+        const unsigned r = slots * C;
+        const int rec = node("i32 " + std::to_string(first + r) + ", " + ref(BAB, L) +
+                             ", !\"dxr11.lut\", i32 " + space + ", i32 " + std::to_string(r) +
                              ", i32 1, i32 11, i32 0, null");
         have.push_back("!" + std::to_string(rec));
     }

@@ -153,6 +153,19 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.59.0: THE SHIM'S OWN LAYOUT TRACES SEVERAL SCENES; ITEM A'S LIST IS
+DONE.** Every place a TraceRay takes its scene from is a scene slot, each
+call traces its slot's copy (both rewriters, byte-identical, one slot
+unchanged), one copy per scene with a base in the hit group table, the scene
+per slot resolved per dispatch, globally or per record. `gitest --twoscenes`,
+`--twoconflict`; matrix 365 of 365, plus the root signature gate. **A local root signature past a size
+REMOVES THE DEVICE on the 1070** inside CreateRootSignature (constants + 2
+per root descriptor + 1 per table over 192 with up to 64 dwords of constants,
+less beyond; `tier11/lrsprobe.cpp`); that was 0.57.0's "128 structures". Every
+extension of an application's signature is now checked. Still refused by name
+for the shim's layout: a scene picked at run time from an array of several,
+and a scene not resolved at all. Next per the order: item b.
+
 **0.58.0: A LIBRARY'S OWN SUBOBJECTS, WHATEVER INCLUDES THEM.** The runtime's
 rules were MEASURED (35 cases, WARP and the 1070 alike): an export list
 includes a library's subobject only when it names it; associations use names

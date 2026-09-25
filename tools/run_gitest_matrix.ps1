@@ -97,6 +97,22 @@ $cfgs += ,@('--dxilassoc', '--stale')
 $cfgs += ,@('--dxildefault', '--gpuinst')
 $cfgs += ,@('--libhg', '--dynargs')
 $cfgs += ,@('--collections', '--dxildefault', '--dynargs')
+# Several scenes (0.59.0): the raygen traces two, the closest-hits the
+# second, or each hit record carries its own; --twoconflict makes the two
+# disagree about a record, so no table labelled for both can serve them.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($m in @('--twoscenes', '--twoconflict')) {
+        foreach ($x in @('', '--recurse', '--sm66')) { $cfgs += ,@(@($b, $m, $x) | Where-Object { $_ }) }
+        $cfgs += ,@(@($b, $m, '--localscene', '--recurse') | Where-Object { $_ })
+    }
+}
+$cfgs += ,@('--twoscenes', '--gpuinst')
+$cfgs += ,@('--twoconflict', '--stale')
+$cfgs += ,@('--twoscenes', '--indirectgpu')
+$cfgs += ,@('--twoconflict', '--localscene', '--recurse', '--gpusbt')
+$cfgs += ,@('--twoscenes', '--dynargs')
+$cfgs += ,@('--twoconflict', '--dynargs', '--norefine', '--perstruct', '8')
+$cfgs += ,@('--twoscenes', '--libhg')
 
 # A failure keeps its output and the shim's log, so an intermittent one can
 # be read afterwards rather than rerun in hope.
@@ -123,6 +139,16 @@ foreach ($c in $cfgs) {
         Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
     }
 }
+# Gate (0.59.0): a variant whose local root signature would pass the GTX
+# 1070's driver limit (two scenes of 64 structures, 129 root descriptors) is
+# refused by name, and the device lives on: before the check it was removed.
+$env:DXR_TIER11_LOG = Join-Path $keep 'gate_rootsig.log'
+Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
+$out = & .\gitest.exe --twoconflict --dynargs --norefine --perstruct 4 zero mult 2>&1
+$refused = Select-String -Path $env:DXR_TIER11_LOG -Pattern 'measured to survive' -Quiet
+$alive = -not (($out -join "`n") -match 'hardware failed')
+if ($refused -and $alive) { Write-Host "gate: an oversized local root signature is refused by name, the device lives" }
+else { Write-Host "gate FAILED: refused=$refused device alive=$alive"; $fail += '[gate: oversized local root signature]' }
 $env:DXR_TIER11_LOG = $prevLog
 Write-Host "gitest: $($cfgs.Count) configurations, $($cfgs.Count - $fail.Count) match WARP"
 foreach ($f in $fail) { Write-Host "  FAILED $f" }

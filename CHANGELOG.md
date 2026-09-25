@@ -24,6 +24,56 @@ not.
 
 ---
 
+## 0.59.0
+
+**The shim's own layout traces several scenes** (Tier 1.1 item a, "the
+variant with several scenes"). Its copy of the scene was one, so a
+`GeometryIndex()` dispatch whose `TraceRay` calls traced two scenes, or whose
+records carried different ones, was refused whenever it needed that layout.
+
+- **Measured on 0.58.0 first**, with the new `gitest --twoscenes` (the raygen
+  traces the scene, then a second one, the same instances in reverse order;
+  with `--recurse` the closest-hits trace the second; with `--localscene
+  --recurse` the hit records alternate between the two) and `--twoconflict`
+  (the second scene puts other geometries on the same records, so no table
+  labelled for both can serve them): every layout needing the shim's layout
+  NOT DRAWN, "its TraceRay calls trace different scenes, and the variant has
+  one scene copy"; with `--twoconflict` 6 of 7.
+- **Scene slots.** Every place a `TraceRay` takes its scene from (a register,
+  or a heap index in a cbuffer) is a slot; each call traces the copy of its
+  slot's scene. Both rewriters take the slot of each call, byte-identical,
+  and give slot j its own root descriptors (`@dxr11.tlas.sJ`); with one slot
+  the output is exactly what it was, checked against 0.58.0's.
+- **One copy per scene**, each with a part of the hit group table of its own:
+  a copy's contributions start at a base (the copy shader's fifth constant),
+  and the table is built one scene at a time.
+- **Which scene each slot traces is resolved per dispatch**: from the global
+  root signature, or per record from its local root signature, where every
+  record gets its own scene's addresses (the table shader reads a selection
+  per record).
+- **Measured:** `--twoscenes` and `--twoconflict` all match, alone, through
+  collections, grown, at 6.6, recursing, with the scene in the records, with
+  GPU-written instances, stale builds, indirect dispatch, run-time arguments
+  and library hit groups. `tools/run_gitest_matrix.ps1` 365 of 365, plus the root signature gate.
+  Sensitivity: `DXR_TIER11_SCENE_POISON=1` (every slot on the first scene)
+  diverges every layout where the two scenes differ.
+- **A driver limit found on the way, and it was 0.57.0's "128 structures".**
+  On the GTX 1070 a LOCAL root signature past a size removes the device
+  inside `CreateRootSignature` (DRIVER_INTERNAL_ERROR); WARP took 520 root
+  descriptors. Measured with the new `tier11/lrsprobe.cpp`: with at most 64
+  dwords of constants, constants + 2 per root descriptor + 1 per table up to
+  192 survives, 193 does not; with more constants the rest shrinks (a 100
+  dword parameter leaves 14 root descriptors). The shim extends applications'
+  local root signatures, so one near the limit could have been pushed past
+  it: every extension is now checked and refused by name beyond a rule that
+  covers every point measured. Two scenes of 64 structures each (129 root
+  descriptors) removed the device before the check and are refused after it;
+  a gate in the matrix holds that.
+- **Still refused by name, for the shim's own layout:** a `TraceRay` whose
+  scene is picked at run time from an array of several, and a dispatch whose
+  scene is not resolved at all (the table path still serves both where the
+  scenes agree).
+
 ## 0.58.0
 
 **A library's own subobjects, whatever includes them** (Tier 1.1 item a, "a

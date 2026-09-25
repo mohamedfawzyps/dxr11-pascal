@@ -100,6 +100,28 @@ struct Scenes {
 // Used for the application's own DXR libraries and for lowered RayQuery ones.
 void ScanScenes(const std::string& text, Scenes* out);
 
+// The variant's scene slots for a pipeline's scenes: each register, then
+// each heap index, one Scenes each (0.59.0).
+std::vector<Scenes> SceneSlots(const Scenes& sc);
+
+// Which scene each scene slot (Info::slots) of a GeometryIndex() dispatch
+// traces (0.59.0): `scenes` distinct; per slot an index into them, `fixed`,
+// or -1 when the slot's scene is in each record's local root signature, read
+// per record into rec[k] (k 0 raygen, 1 miss, 2 hit group table) at
+// [record * slots + slot], -1 where the record's shader does not name it.
+struct SceneSel {
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scenes;
+    std::vector<int> fixed;
+    std::vector<int> rec[3];
+    bool valid = false;
+    std::string why;   // not valid: why
+    int Add(D3D12_GPU_VIRTUAL_ADDRESS a) {
+        for (size_t i = 0; i < scenes.size(); ++i) if (scenes[i] == a) return (int)i;
+        scenes.push_back(a);
+        return (int)scenes.size() - 1;
+    }
+};
+
 // The local root signature of a raygen, miss or hit group, found by the
 // identifier its records start with: where a scene bound through it sits in
 // a record (0.55.0 raygens, 0.56.0 all three).
@@ -144,6 +166,11 @@ struct Info {
     // pair read at run time from a table the shim writes per dispatch, onto
     // one of N scene copies of 15 pairs each (0.57.0).
     UINT variantCopies = 0;
+    // The variant's SCENE SLOTS: every place a TraceRay takes its scene from
+    // (a register, or a heap index in a cbuffer), one each; a call traces the
+    // copy of its slot's scene, resolved per dispatch (0.59.0; until then
+    // the variant had one scene copy and every TraceRay had to trace it).
+    std::vector<Scenes> slots;
 
     // Every record's local root signature, found at the first dispatch that
     // needs one, and the pipeline's recursion depth.
@@ -260,11 +287,12 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
 
 // Records the variant's four tables, the hit group table in the shim's own
 // layout, into `cl`, and fills `mine` with them. The caller binds the
-// variant, dispatches, and binds the application's pipeline again.
+// variant, dispatches, and binds the application's pipeline again. `sel`:
+// which scene each of the variant's scene slots traces (0.59.0).
 bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
                    const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
-                   const void* owner, std::string* why);
+                   const SceneSel& sel, const void* owner, std::string* why);
 
 }  // namespace gidx

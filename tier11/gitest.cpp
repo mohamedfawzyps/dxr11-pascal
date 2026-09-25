@@ -152,6 +152,15 @@ static bool g_warpGlobal = false;
 // shim reads no constant at the dispatch, so every pair counts (its widest
 // layout, several scene structures).
 static bool g_dynArgs = false;
+// --twoscenes: the raygen traces the scene, then a SECOND scene (t1, the same
+// instances in reverse order) and folds both answers into its output; with
+// --recurse the closest-hits trace the second scene. With --localscene the
+// hit records carry their scene, alternately the first and the second, and
+// the miss record the second: the scene is the RECORD's. --twoconflict: the
+// second scene is one instance of B at contribution 1 instead (where the
+// layout has 3 records or more), so the two scenes put different geometries
+// on one record and no table labelled for both can serve them.
+static int g_twoScenes = 0;
 static int g_warpOnly = 0;
 static bool g_withHw = false;
 
@@ -171,6 +180,9 @@ RaytracingAccelerationStructure Scene : register(t0, space2);
 RaytracingAccelerationStructure Scene : register(t0);
 #endif
 RWStructuredBuffer<uint4> Out : register(u0);
+#if TWOSCENES
+RaytracingAccelerationStructure Scene2 : register(t1);
+#endif
 
 cbuffer Rec : register(b0, space1) { uint RecTag; };
 cbuffer Rec3 : register(b1, space1) { uint RecA; uint RecB; uint RecC; };
@@ -229,6 +241,15 @@ RayDesc MakeRay(uint2 p) {
     if (p.y >= H / 2) r.Origin.x = -5.0;   // misses: the miss shader traces it
 #endif
     TraceRay(Scene, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, r, pay);
+#if TWOSCENES
+    Pay q; q.v = NO_HIT;
+#if RECURSE
+    q.depth = 1;
+#endif
+    TraceRay(Scene2, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, MakeRay(p), q);
+    pay.v.x += 256 * (q.v.x & 0xFF);
+    pay.v.w += 65536 * (q.v.w & 0xFFFF);
+#endif
     Out[p.y * W + p.x] = pay.v;
 }
 
@@ -244,7 +265,11 @@ void Follow(inout Pay p) {
     r.Direction = float3(0, 0, -1);
     r.TMin = 0.0; r.TMax = 10.0;
     Pay q; q.v = NO_HIT; q.depth = 1;
+#if TWOSCENES && !LOCALSCENE
+    TraceRay(Scene2, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, r, q);
+#else
     TraceRay(Scene, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, r, q);
+#endif
     p.v.x += 16 * (q.v.x & 0xFF);
     p.v.w += 65536 * (q.v.w & 0xFFFF);
 }
@@ -307,6 +332,7 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit, const char* src = kLi
         dm = L"M_VAL=MDyn";
     }
     const wchar_t* dd = g_dynArgs ? L"DYNARGS=1" : L"DYNARGS=0";
+    const wchar_t* d2 = g_twoScenes ? L"TWOSCENES=1" : L"TWOSCENES=0";
     std::wstring da = std::wstring(L"ANYHIT=") + (anyhit ? L"1" : L"0");
     const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
     const std::wstring dls = L"LIBASSOC=" + std::to_wstring(g_libassoc);
@@ -316,7 +342,7 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit, const char* src = kLi
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
                                          L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc,
-                                         L"-D", dd };
+                                         L"-D", dd, L"-D", d2 };
     DxcBuffer buf{ src, std::strlen(src), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -605,6 +631,33 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     } else {
         tlas = BuildAS(g, tl, keep);
     }
+    // --twoscenes: the same instances in reverse order, so every position
+    // hits another structure on other records.
+    ComPtr<ID3D12Resource> scene2;
+    if (g_twoScenes) {
+        auto sb = Buffer(g.dev.Get(), ibBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        D3D12_RAYTRACING_INSTANCE_DESC* sd = nullptr;
+        HR(sb->Map(0, nullptr, (void**)&sd), "Map second scene instances");
+        const bool conflict = g_twoScenes == 2 && L.records >= 3;
+        const UINT n2 = conflict ? 1u : n;
+        for (UINT i = 0; i < n2; ++i) {
+            Inst x = L.inst[n - 1 - i];
+            if (conflict) { x.blas = kB; x.contribution = 1; }
+            std::memset(&sd[i], 0, sizeof(sd[i]));
+            sd[i].Transform[0][0] = sd[i].Transform[1][1] = sd[i].Transform[2][2] = 1.0f;
+            sd[i].Transform[0][3] = (float)i;
+            sd[i].InstanceID = 70 + i;
+            sd[i].InstanceMask = 0xFF;
+            sd[i].InstanceContributionToHitGroupIndex = x.contribution;
+            sd[i].AccelerationStructure = (x.blas == kA ? blasA : blasB)->GetGPUVirtualAddress();
+        }
+        sb->Unmap(0, nullptr);
+        keep.push_back(sb);
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS sl = tl;
+        sl.NumDescs = n2;
+        sl.InstanceDescs = sb->GetGPUVirtualAddress();
+        scene2 = BuildAS(g, sl, keep);
+    }
     // --table: a second live scene, instance A at contribution 2, which puts
     // different geometries on records the real scene uses.
     ComPtr<ID3D12Resource> decoy;
@@ -628,7 +681,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
 
     // Global: constants b0, TLAS t0, output u0. Local: one constant at
     // b0 space1, or three at b1 space1 for the second closest-hit.
-    D3D12_ROOT_PARAMETER gp[3]{};
+    D3D12_ROOT_PARAMETER gp[4]{};
     gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     gp[0].Constants.Num32BitValues = g_dynArgs ? 6 : 4;
     if (g_bindless == 1) gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -640,7 +693,9 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         gp[1].DescriptorTable = { 1, &tr };
     }
     gp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    D3D12_ROOT_SIGNATURE_DESC gd{ 3, gp, 0, nullptr,
+    gp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    gp[3].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC gd{ g_twoScenes ? 4u : 3u, gp, 0, nullptr,
         g_bindless ? D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
                    : D3D12_ROOT_SIGNATURE_FLAG_NONE };
     auto grs = RootSig(g.dev.Get(), gd);
@@ -968,9 +1023,12 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         uint8_t* tm = nullptr; HR(table->Map(0, nullptr, (void**)&tm), "Map table");
         std::memcpy(tm + idSz, &arg, 8);
         if (hitScene) {
-            std::memcpy(tm + 64 + idSz, &arg, 8);
+            // --twoscenes: the second scene's argument, in the same form.
+            uint64_t arg2 = arg;
+            if (g_twoScenes) arg2 = scene2->GetGPUVirtualAddress();
+            std::memcpy(tm + 64 + idSz, &arg2, 8);
             for (UINT i = 0; i < L.records; ++i)   // after 1 or 3 constants, 8-aligned
-                std::memcpy(tm + offHit + stride * i + (L.group[i] == 1 ? 48 : 40), &arg, 8);
+                std::memcpy(tm + offHit + stride * i + (L.group[i] == 1 ? 48 : 40), i & 1 ? &arg2 : &arg, 8);
         }
         table->Unmap(0, nullptr);
         rgBytes = idSz + 8;
@@ -990,6 +1048,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         tableAt = gt->GetGPUVirtualAddress();
     }
     g.cl->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
+    if (g_twoScenes) g.cl->SetComputeRootShaderResourceView(3, scene2->GetGPUVirtualAddress());
     D3D12_DISPATCH_RAYS_DESC dr{};
     const auto base = tableAt;
     dr.RayGenerationShaderRecord = { base, rgBytes };
@@ -1067,6 +1126,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--recurse")) g_recurse = true;
         else if (!std::strcmp(argv[i], "--warpglobal")) g_warpGlobal = true;
         else if (!std::strcmp(argv[i], "--dynargs")) g_dynArgs = true;
+        else if (!std::strcmp(argv[i], "--twoscenes")) g_twoScenes = 1;
+        else if (!std::strcmp(argv[i], "--twoconflict")) g_twoScenes = 2;
         else if (!std::strcmp(argv[i], "--warponly") && i + 1 < argc) g_warpOnly = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--withhw")) g_withHw = true;
         else if (!std::strcmp(argv[i], "--norefine"))
@@ -1076,6 +1137,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--perstruct") && i + 1 < argc)
             SetEnvironmentVariableA("DXR_TIER11_TARGS_PERSTRUCT", argv[++i]);
         else want.insert(argv[i]);
+    }
+    if (g_twoScenes && (g_table || g_bindless || g_localScene == 2)) {
+        std::printf("--twoscenes binds its second scene as a root SRV (or in root SRV records)\n");
+        return 2;
     }
     if (g_localScene && (g_table || g_bindless || g_libassoc)) {
         std::printf("--localscene binds the scene one way only\n");

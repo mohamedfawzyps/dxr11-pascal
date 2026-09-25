@@ -33,8 +33,14 @@ bool LowerGeometryIndex(const std::string& in, std::string* out,
 // from a table at tN, indexed by 16 * (R & 15) + (M & 15), and traces the
 // copy at t0..tN-1 the table names; `pairs` is unused. *calls receives how
 // many there were; a library with none comes back unchanged.
+// Several scenes (0.59.0): `slots` scene copies, call n tracing the copy of
+// slot slotOf[n] (all slot 0 when slotOf is empty). Slot j's structure c is
+// at t(j * C + c), C = max(copies, 1), and the table after them all, at
+// t(slots * C); slot 0 keeps the names @dxr11.tlas[.c], slot j > 0 is
+// @dxr11.tlas.sJ[.c]. With one slot the output is what it was.
 bool RetraceToShimScene(const std::string& in,
                         const std::vector<std::pair<unsigned, unsigned>>& pairs, unsigned copies,
+                        const std::vector<unsigned>& slotOf, unsigned slots,
                         std::string* out, int* calls, std::string* why);
 
 // The name a state object uses for a library function: DXC mangles

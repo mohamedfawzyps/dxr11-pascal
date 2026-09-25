@@ -18,23 +18,33 @@
 // when it has one (appended root descriptors: the scene copy's structures,
 // and with arguments computed at run time the pair table, 0.57.0).
 //
+// Several scenes (0.59.0): the addresses are `perSlot` structures of each of
+// `scenes` copies, then the table (`lut`). A record gets, for each of its
+// `slots` scene slots, the structures of the copy its selection names:
+// sel[selAt + a * selStride + slot], a the application's record (selStride 0:
+// one selection for every record). The hit group table is built one scene at
+// a time, each dispatch writing its scene's part of the table; r and the
+// contributions are that scene's.
+//
 //   meta, dwords: [0, 9 * groups)            identifier, offset
 //                 [.., + 17 * remaps)        from identifier, to identifier, insert offset
 //                 [.., + 2 * pairs)          R, M per pair
-//                 [.., + 2 * addrs)          the addresses, low dword first
+//                 [.., + 2 * addresses)      the addresses, low dword first
+//                 [selAt, ...)               the selections
 //
 // The compiled form is proxy/shim_table_cs.h, checked in. Regenerate with:
 //   C:\DW\DXC\bin\x64\dxc.exe -T cs_6_0 -E main -Vn g_shimTableCS
 //       -Fh proxy\shim_table_cs.h proxy\shim_table.hlsl
 
-#define RS "RootConstants(num32BitConstants=14, b0), SRV(t0), SRV(t1), SRV(t2), UAV(u0)"
+#define RS "RootConstants(num32BitConstants=19, b0), SRV(t0), SRV(t1), SRV(t2), UAV(u0)"
 
 cbuffer P : register(b0) {
     uint records; uint srcStride; uint dstStride; uint groups;
     uint remaps; uint mode; uint kc; uint gmax;
     uint appRecords; uint pairs; uint span; uint per;
     uint poison;   // DXR_TIER11_GI_POISON: write geometry 0, the sensitivity check
-    uint addrs;
+    uint slots; uint perSlot; uint scenes; uint lut;
+    uint selAt; uint selStride;
 };
 ByteAddressBuffer src : register(t0);
 ByteAddressBuffer meta : register(t1);
@@ -82,11 +92,21 @@ void main(uint r : SV_DispatchThreadID) {
         if (!Same(s, e)) continue;
         for (uint w = 0; w < 8; ++w) dst.Store(d + w * 4, meta.Load(e + 32 + w * 4));
         const uint at = meta.Load(e + 64);
-        if (at)
-            for (uint n = 0; n < addrs; ++n) {
-                dst.Store(d + at + n * 8, meta.Load(addrAt + n * 8));
-                dst.Store(d + at + n * 8 + 4, meta.Load(addrAt + n * 8 + 4));
+        if (at) {
+            for (uint j = 0; j < slots; ++j) {
+                const uint sc = meta.Load((selAt + a * selStride + j) * 4);
+                for (uint c = 0; c < perSlot; ++c) {
+                    const uint from = addrAt + (sc * perSlot + c) * 8, to = d + at + (j * perSlot + c) * 8;
+                    dst.Store(to, meta.Load(from));
+                    dst.Store(to + 4, meta.Load(from + 4));
+                }
             }
+            if (lut) {
+                const uint from = addrAt + scenes * perSlot * 8, to = d + at + slots * perSlot * 8;
+                dst.Store(to, meta.Load(from));
+                dst.Store(to + 4, meta.Load(from + 4));
+            }
+        }
         break;
     }
 }

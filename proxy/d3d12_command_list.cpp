@@ -867,10 +867,31 @@ int Dxr11CommandList::ReadRecords(const D3D12_DISPATCH_RAYS_DESC& d, bool all,
     return r;
 }
 
+void Dxr11CommandList::GlobalSel(gidx::Info& gi, const Dxr11Bindings& b, gidx::SceneSel* sel) {
+    *sel = gidx::SceneSel{};
+    sel->valid = true;
+    for (const auto& slot : gidx::SceneSlots(gi.scenes)) {
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> s;
+        std::string w;
+        bool needs = false;
+        if (ResolveBoundScenes(slot, &s, &w, &b, nullptr, &needs)) {
+            if (s.size() == 1) { sel->fixed.push_back(sel->Add(s[0])); continue; }
+            sel->valid = false;
+            sel->why = "a TraceRay whose scene is picked at run time from an array of several";
+            return;
+        }
+        if (needs) { sel->fixed.push_back(-1); continue; }
+        sel->valid = false;
+        sel->why = w;
+        return;
+    }
+}
+
 bool Dxr11CommandList::RecordScenes(gidx::Info& gi, const Dxr11Bindings& b,
                                     const D3D12_DISPATCH_RAYS_DESC& d, bool all,
                                     const std::vector<uint8_t> rec[3],
-                                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why) {
+                                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why,
+                                    gidx::SceneSel* sel) {
     static const uint8_t kNull[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scenes;
     std::set<std::string> seen;
@@ -908,6 +929,45 @@ bool Dxr11CommandList::RecordScenes(gidx::Info& gi, const Dxr11Bindings& b,
     }
     if (scenes.empty()) { *why = "no record names a scene"; return false; }
     *srvs = scenes;
+    // Per record, the scene of every slot the global root signature leaves
+    // to the records: a record carries its own (0.59.0).
+    if (sel && sel->valid) {
+        const auto slots = gidx::SceneSlots(gi.scenes);
+        const size_t S = slots.size();
+        bool any = false;
+        for (int f : sel->fixed) any = any || f < 0;
+        for (int k = 0; any && k < (all ? 3 : 1); ++k) {
+            const UINT64 size = rec[k].size();
+            UINT64 stride = k == 0 ? size : (k == 1 ? d.MissShaderTable : d.HitGroupTable).StrideInBytes;
+            if (!stride || stride > size) stride = size;
+            for (UINT64 off = 0; stride && off + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES <= size; off += stride) {
+                const uint8_t* r = rec[k].data() + off;
+                std::vector<int> row(S, -1);
+                const gidx::RecordLocal* rl =
+                    std::memcmp(r, kNull, sizeof(kNull)) ? gidx::RecordLocalOf(gi, r) : nullptr;
+                if (rl && rl->why.empty() && rl->desc) {
+                    gidx::LocalRecord lr;
+                    lr.desc = rl->desc;
+                    lr.record = r;
+                    lr.size = (UINT)(std::min)(stride, size - off);
+                    lr.lenient = true;
+                    for (size_t j = 0; j < S; ++j) {
+                        if (sel->fixed[j] >= 0) continue;
+                        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> s;
+                        std::string w;
+                        if (!ResolveBoundScenes(slots[j], &s, &w, &b, &lr, nullptr) || s.size() > 1) {
+                            sel->valid = false;
+                            sel->why = s.size() > 1 ? "a TraceRay whose scene is picked at run time "
+                                                      "from an array of several" : w;
+                            return true;
+                        }
+                        if (s.size() == 1) row[j] = sel->Add(s[0]);
+                    }
+                }
+                sel->rec[k].insert(sel->rec[k].end(), row.begin(), row.end());
+            }
+        }
+    }
     return true;
 }
 
@@ -1030,6 +1090,7 @@ bool Dxr11CommandList::RayQueryScenes(Dxr11RayQueryPso* rq,
 static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
                                   gidx::Info& gi, ID3D12StateObject* so,
                                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& srvs, bool exact,
+                                  const gidx::SceneSel& sel,
                                   const std::vector<std::pair<UINT, UINT>>& pairs,
                                   const void* owner, const D3D12_DISPATCH_RAYS_DESC& d,
                                   const std::function<void()>& restore) {
@@ -1042,7 +1103,7 @@ static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5*
         // the variant pipeline and the shim's copy of the scene.
         std::string vwhy;
         if (dev && shared && gidx::EnsureVariant(dev, gi, so, &vwhy) &&
-            gidx::RecordVariant(cl, dev, gi, pairs, d, &mine, srvs, exact, owner, &vwhy)) {
+            gidx::RecordVariant(cl, dev, gi, pairs, d, &mine, srvs, exact, sel, owner, &vwhy)) {
             restore();
             cl->SetPipelineState1(gi.variant.Get());
             cl->DispatchRays(&mine);
@@ -1083,10 +1144,12 @@ static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5*
 // another one, a heap-indexed one say, beside it.)
 bool Dxr11CommandList::GeometryIndexScenes(gidx::Info& gi,
                                            std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs,
-                                           const D3D12_DISPATCH_RAYS_DESC* d, bool* defer) {
+                                           const D3D12_DISPATCH_RAYS_DESC* d, bool* defer,
+                                           gidx::SceneSel* sel) {
     std::string swhy;
     bool needsLocal = false;
     if (defer) *defer = false;
+    if (sel) GlobalSel(gi, m_bindings, sel);
     if (ResolveBoundScenes(gi.scenes, srvs, &swhy, nullptr, nullptr, &needsLocal)) return true;
     // Not in the global root signature: the records' local ones, read now
     // when they are in CPU-visible memory, else at submit. The raygen's
@@ -1097,7 +1160,7 @@ bool Dxr11CommandList::GeometryIndexScenes(gidx::Info& gi,
         const bool all = recursion != 1;
         std::vector<uint8_t> rec[3];
         const int k = d ? ReadRecords(*d, all, rec, &swhy) : 2;
-        if (k == 1 && RecordScenes(gi, m_bindings, *d, all, rec, srvs, &swhy)) return true;
+        if (k == 1 && RecordScenes(gi, m_bindings, *d, all, rec, srvs, &swhy, sel)) return true;
         if (k == 2 && defer) {
             *defer = true;
             srvs->clear();
@@ -1118,7 +1181,8 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     if (!gi) { FWD(DispatchRays(d)); return; }
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
     bool defer = false;
-    const bool exact = GeometryIndexScenes(*gi, &srvs, d, &defer);
+    gidx::SceneSel sel;
+    const bool exact = GeometryIndexScenes(*gi, &srvs, d, &defer, &sel);
     // Its scene in its raygen record, in GPU memory: read at submit (0.55.0).
     if (defer && QueueLocalRays(*gi, *d)) return;
     // Its scene not read from its latest build: at submit that build has run
@@ -1127,19 +1191,21 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     // which bottom-level structures the instances point at, so one of
     // unknown geometry (deserialized) spilled into the next instance's
     // records, silently.
-    if (exact && !astrack::Current(srvs) && QueueStaleRays(*d, srvs)) return;
-    DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact,
+    if (exact && !astrack::Current(srvs) && QueueStaleRays(*d, srvs, sel)) return;
+    DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact, sel,
                           DispatchPairs(*gi, m_bindings, *d), this, *d,
                           [this] { RestoreComputeAfterCapture(); });
 }
 
 bool Dxr11CommandList::QueueStaleRays(const D3D12_DISPATCH_RAYS_DESC& d,
-                                      const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
+                                      const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes,
+                                      const gidx::SceneSel& sel) {
     if (!RealDevice() || !m_allocator || scenes.empty()) return false;
     Dxr11PendingDispatch pend;
     pend.giScenesSet = true;
     pend.giExact = true;
     pend.giScenes = scenes;
+    pend.giSel = sel;
     for (auto a : scenes) {
         pend.giBuilds.push_back(astrack::LatestBuild(a));
         if (!pend.giBuilds.back()) return false;   // never seen being built
@@ -1298,7 +1364,7 @@ bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     pend.bindings.Retain();
     if (std::shared_ptr<gidx::Info> gi = gidx::Get(m_bindings.stateObject)) {
         pend.giScenesSet = true;
-        pend.giExact = GeometryIndexScenes(*gi, &pend.giScenes, nullptr, &pend.giLocal);
+        pend.giExact = GeometryIndexScenes(*gi, &pend.giScenes, nullptr, &pend.giLocal, &pend.giSel);
         pend.giSerial = astrack::SerialNow();
         for (auto a : pend.giScenes) pend.giBuilds.push_back(astrack::LatestBuild(a));
     }
@@ -1513,7 +1579,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                                              (UINT)pend.giRecord[k]->GetDesc().Width, &rec[k]);
                 have = have && FillRecordsNow(queue, submit, evt, desc, all, rec, &lw);
                 std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
-                if (have && RecordScenes(*gi, pend.bindings, desc, all, rec, &srvs, &lw)) {
+                if (have) GlobalSel(*gi, pend.bindings, &pend.giSel);
+                if (have && RecordScenes(*gi, pend.bindings, desc, all, rec, &srvs, &lw, &pend.giSel)) {
                     bool later = false;
                     pend.giScenes = srvs;
                     pend.giExact = true;
@@ -1605,7 +1672,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 ID3D12GraphicsCommandList4* sl = slot->list.Get();
                 const Dxr11Bindings& pb = pend.bindings;
                 DispatchGeometryIndex(sl, dev5.Get(), *gi, pb.stateObject, pend.giScenes,
-                                      pend.giExact, DispatchPairs(*gi, pb, desc), sl, desc,
+                                      pend.giExact, pend.giSel, DispatchPairs(*gi, pb, desc), sl, desc,
                                       [sl, &pb] { pb.Replay(sl); });
             } else {
                 slot->list->DispatchRays(&desc);

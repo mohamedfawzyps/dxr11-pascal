@@ -74,12 +74,14 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
             const void* owner, std::string* why);
 
 // Structure c of a copy holds instance i at contribution
-// c * count * per + i * per, per = kc * gmax: pair q of a dispatch traces
-// structure q / kc with q % kc.
+// base + c * count * per + i * per, per = kc * gmax: pair q of a dispatch
+// traces structure q / kc with q % kc. `base` puts the copy's records after
+// another scene's, for a dispatch tracing several (0.59.0).
 struct Copy {
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> tlas;   // the shim's structures
     D3D12_GPU_VIRTUAL_ADDRESS contrib = 0;  // the application's contributions, one UINT per instance
     UINT count = 0, k = 0, kc = 0, gmax = 0;   // k pairs in all, kc per structure
+    UINT base = 0;
     std::vector<const void*> tlasRes;       // for gpu_hold
     const void* contribRes = nullptr;
 };
@@ -89,9 +91,10 @@ struct Copy {
 // build, or one this list built already, or a new one recorded into `cl`
 // from the saved instances or the CPU snapshot. A copy recorded here is this
 // list's alone: another list may run first. May replace the compute root
-// signature and pipeline; the CALLER restores them.
+// signature and pipeline; the CALLER restores them. `base` as in Copy; the
+// copies made with later builds of the scene take the base last asked for.
 bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
-            UINT k, const void* owner, Copy* out, std::string* why);
+            UINT k, UINT base, const void* owner, Copy* out, std::string* why);
 
 // The list was reset or destroyed: the copies it built are forgotten.
 void DropOwner(const void* owner);

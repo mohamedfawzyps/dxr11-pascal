@@ -16,15 +16,16 @@
 //
 // `copies` scene copies are written one after another, copy c's
 // contributions offset by c * count * stride: more than 15 TraceRay argument
-// pairs need more than one, since a multiplier has 4 bits (0.57.0).
+// pairs need more than one, since a multiplier has 4 bits (0.57.0). All of
+// them start at `base`, after another scene's records (0.59.0).
 //
 // The compiled form is proxy/shim_scene_cs.h, checked in. Regenerate with:
 //   C:\DW\DXC\bin\x64\dxc.exe -T cs_6_0 -E main -Vn g_shimSceneCS
 //       -Fh proxy\shim_scene_cs.h proxy\shim_scene.hlsl
 
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=5, b0), SRV(t0), UAV(u0), UAV(u1)"
 
-cbuffer C : register(b0) { uint count; uint stride; uint verbatim; uint copies; };
+cbuffer C : register(b0) { uint count; uint stride; uint verbatim; uint copies; uint base; };
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
 RWByteAddressBuffer contrib : register(u1);
@@ -38,7 +39,7 @@ void main(uint i : SV_DispatchThreadID) {
         uint v = src.Load(j * 64 + w * 4);
         if (w == 13 && !verbatim) {
             if (c == 0) contrib.Store(j * 4, v & 0xFFFFFFu);
-            v = (v & 0xFF000000u) | ((c * count * stride + j * stride) & 0xFFFFFFu);
+            v = (v & 0xFF000000u) | ((base + c * count * stride + j * stride) & 0xFFFFFFu);
         }
         dst.Store(i * 64 + w * 4, v);
     }

@@ -39,6 +39,14 @@ cl /nologo /EHsc /std:c++17 /O2 /W4 ^
    /link d3d12.lib dxgi.lib /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
+rem How large a local root signature the driver takes (0.59.0).
+cl /nologo /EHsc /std:c++17 /O2 /W4 ^
+   /I "%AGILITY%\build\native\include" ^
+   /Fo:"%OBJ%\\" ^
+   "%~dp0tier11\lrsprobe.cpp" /Fe:"%~dp0lrsprobe.exe" ^
+   /link d3d12.lib dxgi.lib /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
 echo.
-echo Built gitest.exe and libsubprobe.exe
+echo Built gitest.exe, libsubprobe.exe and lrsprobe.exe
 echo Run:  gitest.exe [--sm66] [layout ...]
