@@ -24,6 +24,73 @@ not.
 
 ---
 
+## 0.57.0
+
+**`TraceRay` arguments computed at run time are served** (Tier 1.1 item a,
+"runtime TraceRay arguments"). Until now a `GeometryIndex()` pipeline whose
+`RayContributionToHitGroupIndex` or multiplier was not a literal was refused
+at every dispatch, and so was one with more than 15 argument pairs.
+
+- **Measured on 0.56.0 first**, with the new `gitest --dynargs`: every
+  `TraceRay` takes its multiplier from the constants and its contribution as
+  a constant times the ray's column parity, and a new layout `perray` puts
+  odd columns on the next record. All 8 layouts, at 6.5 and 6.6, alone,
+  through collections and with `--recurse`: NOT DRAWN, "not known at pipeline
+  creation".
+- **Analysis** (`proxy/trace_args`). DXR uses 4 bits of each argument, so a
+  call can use at most 256 pairs. Each argument is followed back through the
+  shader: literals, cbuffer dwords, `select` and `phi` as either, integer
+  arithmetic exactly, `and` with a small mask and `urem` by a small divisor
+  as the values they can give, anything else every value. Evaluated at
+  creation with the constants unknown, and at each dispatch with them read
+  from what the application bound (root constants, a root CBV the CPU can
+  read, and for a raygen's calls its record's local root signature). A
+  pipeline whose arguments are all literals takes exactly the old path.
+- **The table path** labels its records with the pairs the dispatch can use,
+  so a constant-driven layout with no shared record stays on the fast path.
+- **The shim's own layout** reads each call's pair at run time from a table
+  of 256 entries the shim writes per dispatch, indexed by
+  `16 * (R & 15) + (M & 15)`: the block in the copy's layout, the multiplier,
+  and which structure of the copy to trace. Pairs that put every hit on the
+  same record share a block, and a pair no hit can use gets none. More than
+  15 pairs need a second structure (a multiplier has 4 bits), so a scene copy
+  is now one top-level build per 15 pairs, chosen by a `switch`; splitting
+  the call's block renames the `phi`s that named it, a loop's back edge
+  included. Both rewriters, byte-identical, validated at 6.5 and 6.6.
+- **Measured:** `gitest --dynargs` all layouts MATCH in every mode; with
+  `--norefine` (no constant read, so 27 to 90 blocks on up to 6 structures)
+  too. `tools/run_gitest_matrix.ps1` 298 of 298 on the final build. Two sensitivity
+  checks: `DXR_TIER11_TARGS_POISON=1` (every pair onto the first block)
+  diverges every layout that uses several blocks; `=2` (every structure's
+  descriptor the first structure) diverges `perray` with `--perstruct 4`,
+  the one that uses a second structure. The first check of the structure
+  choice passed for the wrong reason: every pair used landed on structure 0,
+  so the test knob `DXR_TIER11_TARGS_PERSTRUCT` (`gitest --perstruct`)
+  lowers the pairs per structure.
+- **Found on the way:** a variant of 128 structures (the knob at 2 pairs
+  each, 256 pairs) removed the device on the 1070, and 256 crashed the
+  process; 64 did not. The shim itself needs at most 18, and the knob stops
+  at 4.
+- **The shim's own layout is built when a dispatch first needs it** for
+  run-time arguments, not with the pipeline: a pipeline whose constants keep
+  it on the table path never pays for a second state object.
+- **The ground truth is what fails intermittently, now shown.** The first
+  full matrix had one failure (`--collections --localscene`, layout `zero`)
+  whose printed counts, which are WARP's, were 20480 hits where every other
+  run has 32768, with the shim's log identical to a passing run. So gitest
+  now runs WARP again on any divergence. The second full matrix had 5
+  failures in 5 unrelated configurations, and in all 5 WARP's two runs
+  differed while the hardware matched the second exactly (0 pixels). The
+  third: 298 of 298. WARP alone was stable in 630 runs, with or without the
+  shim loaded and after a hardware run through it (`gitest --warponly N
+  [--withhw]`); the shim never wraps a WARP device and its queue hook passes
+  WARP's lists through. Why WARP drops work only in the matrix is not known.
+  Such a layout now reports GROUND TRUTH UNSTABLE rather than failing, and
+  the matrix names it apart. 0.56.0's lost failure was probably the same.
+- **Assumed, as for the heap-indexed scene since 0.48.0:** a constant read at
+  record time is what the GPU reads. An upload buffer rewritten between
+  recording and execution would draw with the older value.
+
 ## 0.56.0
 
 **`TraceRay` in a closest-hit or miss shader works in the shim's own record

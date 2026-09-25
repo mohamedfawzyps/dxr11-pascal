@@ -48,6 +48,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "trace_args.h"
+
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -71,8 +73,9 @@ struct Group {
 };
 
 // An identifier the variant pipeline changed. `insert`, when nonzero, is
-// where in the record the shim scene's address goes: a raygen's appended root
-// descriptor.
+// where in the record the shim's appended root descriptors go: the scene
+// copy, or with arguments computed at run time the copies and the pair table
+// (Info::variantCopies).
 struct Remap {
     uint8_t from[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
     uint8_t to[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
@@ -113,9 +116,11 @@ struct Info {
     std::vector<Group> groups;
     UINT recordBytes = 0;          // the largest record an extended group needs
     // The (RayContributionToHitGroupIndex, Multiplier...) pairs the
-    // pipeline's TraceRay calls use, low 4 bits each.
+    // pipeline's TraceRay calls can use, low 4 bits each, every cbuffer dword
+    // taken as unknown; `args` gives the ones a dispatch uses (0.57.0).
     std::vector<std::pair<UINT, UINT>> traceArgs;
-    bool dynamicTraceArgs = false; // a TraceRay whose R or M is not a constant
+    targs::Args args;
+    bool dynamicTraceArgs = false; // a library that could not be read
     Scenes scenes;                 // where the TraceRay calls take their scene
 
     // The shim's own record layout, for when the application's shares a
@@ -135,6 +140,10 @@ struct Info {
     // The largest hit group and miss records the variant needs: a closest-hit
     // or miss that traces gets the shim scene's address too (0.56.0).
     UINT variantHitBytes = 0, variantMissBytes = 0;
+    // 0: every call's pair a literal, traced as (its index, k). N >= 1: the
+    // pair read at run time from a table the shim writes per dispatch, onto
+    // one of N scene copies of 15 pairs each (0.57.0).
+    UINT variantCopies = 0;
 
     // Every record's local root signature, found at the first dispatch that
     // needs one, and the pipeline's recursion depth.
@@ -220,6 +229,15 @@ bool PrepareRecordLocals(Info& info, ID3D12StateObject* app, UINT* recursion, st
 // The one whose identifier is `id`, null when none is.
 const RecordLocal* RecordLocalOf(Info& info, const uint8_t* id);
 
+// The (R, M) pairs a dispatch's TraceRay calls can use: the cbuffer dwords
+// their arguments are computed from read from the bound global root
+// signature (root constants, or a root CBV the CPU can read, at record time),
+// and for a raygen's calls from its record's local one when `raygen` is given.
+// A dword that cannot be read counts as every value.
+std::vector<std::pair<UINT, UINT>> TracePairs(const Info& info, ID3D12RootSignature* rs,
+                                              const std::vector<BoundRoot>& roots,
+                                              const LocalRecord* raygen);
+
 // Records the shim's copy of the application's hit group table into `cl`,
 // and returns the range the dispatch should use instead. Replaces the
 // compute root signature and pipeline; the CALLER restores them. `owner` is
@@ -228,7 +246,9 @@ const RecordLocal* RecordLocalOf(Info& info, const uint8_t* id);
 // exactly the ones it does (ResolveScenes), otherwise the bound root SRVs.
 // `*shared` is set when it failed because the application's layout shares a
 // record between geometries, which the variant serves.
+// `pairs`: the (R, M) pairs this dispatch's calls can use (TracePairs).
 bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& info,
+                 const std::vector<std::pair<UINT, UINT>>& pairs,
                  const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& app,
                  D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* shim,
                  const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
@@ -241,6 +261,7 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
 // layout, into `cl`, and fills `mine` with them. The caller binds the
 // variant, dispatches, and binds the application's pipeline again.
 bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
+                   const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                    const void* owner, std::string* why);

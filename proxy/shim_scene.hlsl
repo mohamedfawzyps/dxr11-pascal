@@ -14,13 +14,17 @@
 // contributions: the shim's SAVED copy of a build's GPU-written instances,
 // which the scene copy is built from later (0.51.0).
 //
+// `copies` scene copies are written one after another, copy c's
+// contributions offset by c * count * stride: more than 15 TraceRay argument
+// pairs need more than one, since a multiplier has 4 bits (0.57.0).
+//
 // The compiled form is proxy/shim_scene_cs.h, checked in. Regenerate with:
 //   C:\DW\DXC\bin\x64\dxc.exe -T cs_6_0 -E main -Vn g_shimSceneCS
 //       -Fh proxy\shim_scene_cs.h proxy\shim_scene.hlsl
 
-#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1)"
 
-cbuffer C : register(b0) { uint count; uint stride; uint verbatim; };
+cbuffer C : register(b0) { uint count; uint stride; uint verbatim; uint copies; };
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
 RWByteAddressBuffer contrib : register(u1);
@@ -28,12 +32,13 @@ RWByteAddressBuffer contrib : register(u1);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint i : SV_DispatchThreadID) {
-    if (i >= count) return;
+    if (i >= count * copies) return;
+    const uint c = i / count, j = i % count;
     for (uint w = 0; w < 16; ++w) {
-        uint v = src.Load(i * 64 + w * 4);
+        uint v = src.Load(j * 64 + w * 4);
         if (w == 13 && !verbatim) {
-            contrib.Store(i * 4, v & 0xFFFFFFu);
-            v = (v & 0xFF000000u) | ((i * stride) & 0xFFFFFFu);
+            if (c == 0) contrib.Store(j * 4, v & 0xFFFFFFu);
+            v = (v & 0xFF000000u) | ((c * count * stride + j * stride) & 0xFFFFFFu);
         }
         dst.Store(i * 64 + w * 4, v);
     }

@@ -313,73 +313,168 @@ bool LowerGeometryIndex(const std::string& in, std::string* out,
 // --- shimtrace.py -------------------------------------------------------------
 
 bool RetraceToShimScene(const std::string& in,
-                        const std::vector<std::pair<unsigned, unsigned>>& pairs,
+                        const std::vector<std::pair<unsigned, unsigned>>& pairs, unsigned copies,
                         std::string* out, int* calls, std::string* why) {
     static const std::regex kTrace(
         R"RX(^(\s*)call void @dx\.op\.traceRay\.([^(]+)\(i32 157, %dx\.types\.Handle (%[\w.]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), (.*)$)RX");
     static const std::regex kNum(R"RX(^-?\d+$)RX");
+    static const std::regex kLabel(R"RX(^([A-Za-z$._][\w$.]*):)RX");
     const std::string H = kHandle, RAS = "%struct.RaytracingAccelerationStructure",
-                      G = "@dxr11.tlas", P = kResProps;
+                      BAB = "%struct.ByteAddressBuffer", RR = "%dx.types.ResRet.i32",
+                      G = "@dxr11.tlas", L = "@dxr11.lut", P = kResProps;
     *calls = 0;
     auto lines = llm::SplitLines(in);
     bool any = false;
     for (const auto& l : lines) if (std::regex_match(l, kTrace)) { any = true; break; }
     if (!any) { *out = in; return true; }
-    if (in.find(G + " ") != std::string::npos) {
+    if (in.find(G + " ") != std::string::npos || in.find(G + ".") != std::string::npos ||
+        in.find(L + " ") != std::string::npos) {
         *why = "the library already defines " + G;
         return false;
     }
     const bool sm66 = IsSm66(in);
     const unsigned k = (unsigned)pairs.size();
+    // Copy c's global: @dxr11.tlas for copy 0, @dxr11.tlas.c after it.
+    auto global = [&](unsigned c) { return c ? G + "." + std::to_string(c) : G; };
+    // A handle on copy c's structure, named <t><suffix>.
+    auto tlasHandle = [&](std::vector<std::string>* o, const std::string& t, const std::string& sfx,
+                          unsigned c) {
+        if (sm66) {
+            o->push_back("  " + t + ".v" + sfx + " = load " + H + ", " + H + "* " + global(c) + ", align 4");
+            o->push_back("  " + t + ".l" + sfx + " = call " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " +
+                          H + " " + t + ".v" + sfx + ")  ; CreateHandleForLib(Resource)");
+            o->push_back("  " + t + ".h" + sfx + " = call " + H + " @dx.op.annotateHandle(i32 216, " + H + " " + t +
+                         ".l" + sfx + ", " + P + " { i32 16, i32 0 })  ; AnnotateHandle(res,props)  resource: RTAccelerationStructure");
+        } else {
+            o->push_back("  " + t + ".v" + sfx + " = load " + RAS + ", " + RAS + "* " + global(c) + ", align 4");
+            o->push_back("  " + t + ".h" + sfx + " = call " + H +
+                         " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32 160, " +
+                         RAS + " " + t + ".v" + sfx + ")  ; CreateHandleForLib(Resource)");
+        }
+    };
     std::vector<std::string> cur;
     int n = 0;
+    // Splitting a block moves its way out to the new join block: a phi
+    // naming the block as a predecessor then names the join (per function).
+    std::string chain;                       // the label the current block started with
+    std::map<std::string, std::string> renamed;
+    size_t fnStart = 0;
     for (const auto& l : lines) {
         std::smatch m;
+        if (StartsWith(l, "define ")) {
+            chain.clear();
+            renamed.clear();
+            fnStart = cur.size();
+        } else if (std::regex_search(l, m, kLabel)) {
+            chain = m[1].str();
+        } else if (l == "}" && !renamed.empty()) {
+            for (size_t i = fnStart; i < cur.size(); ++i) {
+                if (cur[i].find(" = phi ") == std::string::npos) continue;
+                for (const auto& r : renamed) {
+                    const std::string from = ", %" + r.first + " ]", to = ", %" + r.second + " ]";
+                    for (size_t at = cur[i].find(from); at != std::string::npos;
+                         at = cur[i].find(from, at + to.size()))
+                        cur[i].replace(at, from.size(), to);
+                }
+            }
+        }
         if (!std::regex_match(l, m, kTrace)) { cur.push_back(l); continue; }
         const std::string R = m[6].str(), M = m[7].str();
-        if (!std::regex_match(R, kNum) || !std::regex_match(M, kNum)) {
-            *why = "a TraceRay whose hit group arguments are computed at run time";
-            return false;
-        }
-        const std::pair<unsigned, unsigned> pr((unsigned)std::stol(R) & 15u,
-                                               (unsigned)std::stol(M) & 15u);
-        auto it = std::find(pairs.begin(), pairs.end(), pr);
-        if (it == pairs.end()) {
-            *why = "a TraceRay argument pair the pipeline did not list";
-            return false;
-        }
         const std::string t = "%st." + std::to_string(n);
-        if (sm66) {
-            cur.push_back("  " + t + ".v = load " + H + ", " + H + "* " + G + ", align 4");
-            cur.push_back("  " + t + ".l = call " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " +
-                          H + " " + t + ".v)  ; CreateHandleForLib(Resource)");
-            cur.push_back("  " + t + ".h = call " + H + " @dx.op.annotateHandle(i32 216, " + H + " " + t +
-                          ".l, " + P + " { i32 16, i32 0 })  ; AnnotateHandle(res,props)  resource: RTAccelerationStructure");
-        } else {
-            cur.push_back("  " + t + ".v = load " + RAS + ", " + RAS + "* " + G + ", align 4");
-            cur.push_back("  " + t + ".h = call " + H +
-                          " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32 160, " +
-                          RAS + " " + t + ".v)  ; CreateHandleForLib(Resource)");
+        const std::string head = m[1].str() + "call void @dx.op.traceRay." + m[2].str() + "(i32 157, " + H + " ";
+        const std::string mid = ", i32 " + m[4].str() + ", i32 " + m[5].str() + ", i32 ";
+        const std::string tail = m[8].str();
+        if (!copies) {
+            if (!std::regex_match(R, kNum) || !std::regex_match(M, kNum)) {
+                *why = "a TraceRay whose hit group arguments are computed at run time";
+                return false;
+            }
+            const std::pair<unsigned, unsigned> pr((unsigned)std::stol(R) & 15u,
+                                                   (unsigned)std::stol(M) & 15u);
+            auto it = std::find(pairs.begin(), pairs.end(), pr);
+            if (it == pairs.end()) {
+                *why = "a TraceRay argument pair the pipeline did not list";
+                return false;
+            }
+            tlasHandle(&cur, t, "", 0);
+            cur.push_back(head + t + ".h" + mid + std::to_string(it - pairs.begin()) + ", i32 " +
+                          std::to_string(k) + ", " + tail);
+            ++n;
+            continue;
         }
-        cur.push_back(m[1].str() + "call void @dx.op.traceRay." + m[2].str() + "(i32 157, " + H + " " + t +
-                      ".h, i32 " + m[4].str() + ", i32 " + m[5].str() + ", i32 " +
-                      std::to_string(it - pairs.begin()) + ", i32 " + std::to_string(k) + ", " + m[8].str());
+        // The pair read from the shim's table at 16 * (R & 15) + (M & 15):
+        // r in bits 0-7, the multiplier in 8-15, the scene copy in 16 up.
+        cur.push_back("  " + t + ".r = and i32 " + R + ", 15");
+        cur.push_back("  " + t + ".m = and i32 " + M + ", 15");
+        cur.push_back("  " + t + ".s = shl i32 " + t + ".r, 4");
+        cur.push_back("  " + t + ".k = or i32 " + t + ".s, " + t + ".m");
+        cur.push_back("  " + t + ".o = shl i32 " + t + ".k, 2");
+        if (sm66) {
+            cur.push_back("  " + t + ".lv = load " + H + ", " + H + "* " + L + ", align 4");
+            cur.push_back("  " + t + ".ll = call " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " +
+                          H + " " + t + ".lv)  ; CreateHandleForLib(Resource)");
+            cur.push_back("  " + t + ".lh = call " + H + " @dx.op.annotateHandle(i32 216, " + H + " " + t +
+                          ".ll, " + P + " { i32 11, i32 0 })  ; AnnotateHandle(res,props)  resource: ByteAddressBuffer");
+        } else {
+            cur.push_back("  " + t + ".lv = load " + BAB + ", " + BAB + "* " + L + ", align 4");
+            cur.push_back("  " + t + ".lh = call " + H + " @dx.op.createHandleForLib.struct.ByteAddressBuffer(i32 160, " +
+                          BAB + " " + t + ".lv)  ; CreateHandleForLib(Resource)");
+        }
+        cur.push_back("  " + t + ".lr = call " + RR + " @dx.op.rawBufferLoad.i32(i32 139, " + H + " " + t +
+                      ".lh, i32 " + t + ".o, i32 undef, i8 1, i32 4)  ; RawBufferLoad(srv,index,elementOffset,mask,alignment)");
+        cur.push_back("  " + t + ".e = extractvalue " + RR + " " + t + ".lr, 0");
+        cur.push_back("  " + t + ".q = and i32 " + t + ".e, 255");
+        cur.push_back("  " + t + ".x = lshr i32 " + t + ".e, 8");
+        cur.push_back("  " + t + ".kk = and i32 " + t + ".x, 255");
+        const std::string args = mid + t.substr(0) + ".q, i32 " + t + ".kk, " + tail;
+        if (copies == 1) {
+            tlasHandle(&cur, t, "", 0);
+            cur.push_back(head + t + ".h" + args);
+            ++n;
+            continue;
+        }
+        const std::string lab = "st." + std::to_string(n);
+        cur.push_back("  " + t + ".c = lshr i32 " + t + ".e, 16");
+        cur.push_back("  switch i32 " + t + ".c, label %" + lab + ".b0 [");
+        for (unsigned c = 1; c < copies; ++c)
+            cur.push_back("    i32 " + std::to_string(c) + ", label %" + lab + ".b" + std::to_string(c));
+        cur.push_back("  ]");
+        for (unsigned c = 0; c < copies; ++c) {
+            const std::string sfx = std::to_string(c);
+            cur.push_back("");
+            cur.push_back(lab + ".b" + sfx + ":");
+            tlasHandle(&cur, t, sfx, c);
+            cur.push_back(head + t + ".h" + sfx + args);
+            cur.push_back("  br label %" + lab + ".j");
+        }
+        cur.push_back("");
+        cur.push_back(lab + ".j:");
+        if (!chain.empty()) renamed[chain] = lab + ".j";
         ++n;
     }
     lines.swap(cur);
 
     const std::string body = llm::JoinLines(lines);
     std::vector<std::string> decls;
+    auto declare = [&](const std::string& name, const std::string& d) {
+        if (body.find(name) == std::string::npos) decls.push_back(d);
+    };
     if (sm66) {
-        if (body.find("declare " + H + " @dx.op.createHandleForLib.dx.types.Handle(") == std::string::npos)
-            decls.push_back("declare " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32, " + H + ") #RQRO");
-        if (body.find("declare " + H + " @dx.op.annotateHandle(") == std::string::npos)
-            decls.push_back("declare " + H + " @dx.op.annotateHandle(i32, " + H + ", " + P + ") #RQNONE");
-    } else if (body.find("declare " + H + " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(") ==
-               std::string::npos) {
-        decls.push_back("declare " + H + " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32, " +
-                        RAS + ") #RQRO");
+        declare("declare " + H + " @dx.op.createHandleForLib.dx.types.Handle(",
+                "declare " + H + " @dx.op.createHandleForLib.dx.types.Handle(i32, " + H + ") #RQRO");
+        declare("declare " + H + " @dx.op.annotateHandle(",
+                "declare " + H + " @dx.op.annotateHandle(i32, " + H + ", " + P + ") #RQNONE");
+    } else {
+        declare("declare " + H + " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(",
+                "declare " + H + " @dx.op.createHandleForLib.struct.RaytracingAccelerationStructure(i32, " +
+                    RAS + ") #RQRO");
+        if (copies)
+            declare("declare " + H + " @dx.op.createHandleForLib.struct.ByteAddressBuffer(",
+                    "declare " + H + " @dx.op.createHandleForLib.struct.ByteAddressBuffer(i32, " + BAB + ") #RQRO");
     }
+    if (copies)
+        declare("declare " + RR + " @dx.op.rawBufferLoad.i32(",
+                "declare " + RR + " @dx.op.rawBufferLoad.i32(i32, " + H + ", i32, i32, i8, i32) #RQRO");
     int lastDecl = -1;
     for (size_t i = 0; i < lines.size(); ++i) if (StartsWith(lines[i], "declare ")) lastDecl = (int)i;
     std::vector<std::string> ins;
@@ -394,6 +489,8 @@ bool RetraceToShimScene(const std::string& in,
     if (!haveType(H)) types.push_back(H + " = type { i8* }");
     if (sm66 && !haveType(P)) types.push_back(P + " = type { i32, i32 }");
     if (!haveType(RAS)) types.push_back(RAS + " = type { i32 }");
+    if (copies && !haveType(BAB)) types.push_back(BAB + " = type { i32 }");
+    if (copies && !haveType(RR)) types.push_back(RR + " = type { i32, i32, i32, i32, i32 }");
     static const std::regex kTypeLine(R"RX(^%[\w.]+ = type )RX");
     static const std::regex kGlobalLine(R"RX(^@[\w."\\?@]+ = )RX");
     int lastType = -1;
@@ -406,10 +503,13 @@ bool RetraceToShimScene(const std::string& in,
     const int at = (lastGlobal >= 0 ? lastGlobal : lastType + (int)types.size()) + 1;
     std::vector<std::string> g;
     if (lastGlobal < 0) g.push_back("");
-    g.push_back(G + " = external constant " + (sm66 ? H : RAS) + ", align 4");
+    for (unsigned c = 0; c < (copies ? copies : 1u); ++c)
+        g.push_back(global(c) + " = external constant " + (sm66 ? H : RAS) + ", align 4");
+    if (copies) g.push_back(L + " = external constant " + (sm66 ? H : BAB) + ", align 4");
     lines.insert(lines.begin() + at, g.begin(), g.end());
 
-    // Metadata: an SRV record, kind 16, in the resources' SRV group.
+    // Metadata: SRV records, kind 16 for each copy and 11 for the table, in
+    // the resources' SRV group.
     static const std::regex kNode(R"RX(^!(\d+) = (?:distinct )?!\{(.*)\}\s*$)RX");
     std::map<int, std::string> md;
     for (const auto& l : lines) {
@@ -428,7 +528,9 @@ bool RetraceToShimScene(const std::string& in,
         for (auto& l : lines)
             if (std::regex_match(l, pat)) l = "!" + std::to_string(nid) + " = !{" + b + "}";
     };
-    const std::string gref = sm66 ? RAS + "* bitcast (" + H + "* " + G + " to " + RAS + "*)" : RAS + "* " + G;
+    auto ref = [&](const std::string& ty, const std::string& gl) {
+        return sm66 ? ty + "* bitcast (" + H + "* " + gl + " to " + ty + "*)" : ty + "* " + gl;
+    };
     static const std::regex kEp(R"RX(^!dx\.entryPoints = !\{(.*)\}\s*$)RX");
     static const std::regex kRes(R"RX(^!dx\.resources = !\{!(\d+)\}\s*$)RX");
     int entry = -1, rid = -1;
@@ -437,8 +539,8 @@ bool RetraceToShimScene(const std::string& in,
         std::smatch m;
         if (std::regex_match(l, m, kEp)) {
             haveEp = true;
-            for (const auto& ref : SplitTrim(m[1].str())) {
-                const int nid = std::stoi(ref.substr(1));
+            for (const auto& r : SplitTrim(m[1].str())) {
+                const int nid = std::stoi(r.substr(1));
                 if (SplitTrim(md[nid])[0] == "null") entry = nid;
             }
         } else if (std::regex_match(l, m, kRes)) {
@@ -450,19 +552,31 @@ bool RetraceToShimScene(const std::string& in,
     auto fields = SplitTrim(md[entry]);
     const std::string space = std::to_string(kGeomIndexSpace);
     const int extra = node("i32 0, i32 4");
+    std::vector<std::string> have;
+    std::vector<std::string> groups;
     if (rid >= 0) {
-        auto groups = SplitTrim(md[rid]);
-        std::vector<std::string> have;
+        groups = SplitTrim(md[rid]);
         if (groups[0] != "null") have = SplitTrim(md[std::stoi(groups[0].substr(1))]);
-        const int rec = node("i32 " + std::to_string(have.size()) + ", " + gref + ", !\"dxr11.tlas\", i32 " +
-                             space + ", i32 0, i32 1, i32 16, i32 0, !" + std::to_string(extra));
+    }
+    const size_t first = have.size();
+    for (unsigned c = 0; c < (copies ? copies : 1u); ++c) {
+        const std::string name = global(c).substr(1);
+        const int rec = node("i32 " + std::to_string(first + c) + ", " + ref(RAS, global(c)) + ", !\"" + name +
+                             "\", i32 " + space + ", i32 " + std::to_string(c) + ", i32 1, i32 16, i32 0, !" +
+                             std::to_string(extra));
         have.push_back("!" + std::to_string(rec));
+    }
+    if (copies) {
+        const int rec = node("i32 " + std::to_string(first + copies) + ", " + ref(BAB, L) +
+                             ", !\"dxr11.lut\", i32 " + space + ", i32 " + std::to_string(copies) +
+                             ", i32 1, i32 11, i32 0, null");
+        have.push_back("!" + std::to_string(rec));
+    }
+    if (rid >= 0) {
         groups[0] = "!" + std::to_string(node(Join(have, ", ")));
         rewrite(rid, Join(groups, ", "));
     } else {
-        const int rec = node("i32 0, " + gref + ", !\"dxr11.tlas\", i32 " + space +
-                             ", i32 0, i32 1, i32 16, i32 0, !" + std::to_string(extra));
-        const int list = node("!" + std::to_string(rec));
+        const int list = node(Join(have, ", "));
         rid = node("!" + std::to_string(list) + ", null, null, null");
         for (size_t i = 0; i < lines.size(); ++i)
             if (StartsWith(lines[i], "!dx.entryPoints = ")) {

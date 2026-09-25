@@ -39,8 +39,15 @@
 namespace shimscene {
 
 // Switch the copies on, for pipelines tracing with up to `k` argument pairs.
+// Above 15 pairs a copy is several structures, 15 pairs each: a TraceRay
+// multiplier has 4 bits (0.57.0).
 void Activate(UINT k);
 bool Active();
+
+// The pairs one structure of a copy serves: 15, all a multiplier's 4 bits
+// allow. DXR_TIER11_TARGS_PERSTRUCT=n (4 to 15) lowers it: the check that a
+// dispatch picks the right structure, which otherwise needs 16 pairs.
+UINT PairsPerStructure();
 
 // Every top-level build, before Save and Record: whatever the shim held for
 // the structure's previous build no longer stands for it.
@@ -66,11 +73,14 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
             const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
             const void* owner, std::string* why);
 
+// Structure c of a copy holds instance i at contribution
+// c * count * per + i * per, per = kc * gmax: pair q of a dispatch traces
+// structure q / kc with q % kc.
 struct Copy {
-    D3D12_GPU_VIRTUAL_ADDRESS tlas = 0;     // the shim's structure
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> tlas;   // the shim's structures
     D3D12_GPU_VIRTUAL_ADDRESS contrib = 0;  // the application's contributions, one UINT per instance
-    UINT count = 0, k = 0, gmax = 0;
-    const void* tlasRes = nullptr;          // for gpu_hold
+    UINT count = 0, k = 0, kc = 0, gmax = 0;   // k pairs in all, kc per structure
+    std::vector<const void*> tlasRes;       // for gpu_hold
     const void* contribRes = nullptr;
 };
 

@@ -952,6 +952,42 @@ std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& tr
     return out;
 }
 
+std::vector<int> PairClasses(const std::vector<std::pair<UINT, UINT>>& pairs, UINT records,
+                             const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact) {
+    std::lock_guard<std::mutex> g(g_lock);
+    bool anyBound = exact;
+    for (auto a : bound) {
+        auto it = g_tlas.find(a);
+        if (it != g_tlas.end() && it->second.valid) anyBound = true;
+    }
+    std::vector<std::pair<UINT, UINT>> classes;
+    for (const auto& kv : g_tlas) {
+        const TlasInfo& t = kv.second;
+        if (!t.valid) continue;
+        if (anyBound ? std::find(bound.begin(), bound.end(), kv.first) == bound.end()
+                     : !LiveLocked(kv.first))
+            continue;
+        classes.insert(classes.end(), t.classes.begin(), t.classes.end());
+    }
+    std::map<std::vector<UINT>, int> ids;
+    std::vector<int> out;
+    for (const auto& rm : pairs) {
+        std::vector<UINT> sig;
+        bool some = false;
+        for (const auto& c : classes)
+            for (UINT gi = 0; gi < c.second; ++gi) {
+                const UINT64 idx = (UINT64)(rm.first & 15) + (UINT64)(rm.second & 15) * gi + c.first;
+                sig.push_back(idx < records ? (UINT)idx : UINT_MAX);
+                some = some || idx < records;
+            }
+        if (!some) { out.push_back(-1); continue; }
+        auto it = ids.find(sig);
+        if (it == ids.end()) it = ids.emplace(sig, (int)ids.size()).first;
+        out.push_back(it->second);
+    }
+    return out;
+}
+
 UINT MaxGeometryCount() {
     std::lock_guard<std::mutex> g(g_lock);
     UINT m = 1;

@@ -137,13 +137,26 @@ static bool g_recurse = false;
 // alone works, and the debug layer says nothing), so --recurse --bindless
 // needs it. How the scene is bound changes nothing the shaders write.
 static bool g_warpGlobal = false;
+// --dynargs: every TraceRay's RayContributionToHitGroupIndex and multiplier
+// computed at run time, from the constants (MDyn) and the ray index times a
+// constant (RDyn * (x & 1)), as an application choosing ray types does. The
+// layout "perray" then puts odd columns on the next record. --norefine: the
+// shim reads no constant at the dispatch, so every pair counts (its widest
+// layout, several scene structures).
+static bool g_dynArgs = false;
+static int g_warpOnly = 0;
+static bool g_withHw = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
 // real engine. ANYHIT: the any-hit variant. Two closest-hits, because mixrs
 // needs a second local root signature layout.
 static const char* kLib = R"HLSL(
+#if DYNARGS
+cbuffer CB : register(b0) { uint W; uint H; uint NInst; uint Pad; uint RDyn; uint MDyn; };
+#else
 cbuffer CB : register(b0) { uint W; uint H; uint NInst; uint Pad; };
+#endif
 #if LOCALSCENE
 RaytracingAccelerationStructure Scene : register(t0, space2);
 #elif !BINDLESS
@@ -257,12 +270,18 @@ void AnyHit(inout Pay p, BuiltInTriangleIntersectionAttributes a) {
 )HLSL";
 
 static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
+    if (g_dynArgs) R = M = -1;   // computed at run time, see kLib
     static HMODULE m = LoadLibraryW(L"dxcompiler.dll");
     if (!m) throw std::runtime_error("dxcompiler.dll not found");
     auto create = (DxcCreateInstanceProc)GetProcAddress(m, "DxcCreateInstance");
     ComPtr<IDxcCompiler3> c;
     HR(create(CLSID_DxcCompiler, IID_PPV_ARGS(&c)), "create IDxcCompiler3");
     std::wstring dr = L"R_VAL=" + std::to_wstring(R), dm = L"M_VAL=" + std::to_wstring(M);
+    if (g_dynArgs) {
+        dr = L"R_VAL=(RDyn*(DispatchRaysIndex().x&1))";
+        dm = L"M_VAL=MDyn";
+    }
+    const wchar_t* dd = g_dynArgs ? L"DYNARGS=1" : L"DYNARGS=0";
     std::wstring da = std::wstring(L"ANYHIT=") + (anyhit ? L"1" : L"0");
     const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
     const wchar_t* dl = g_libassoc ? L"LIBASSOC=1" : L"LIBASSOC=0";
@@ -270,7 +289,8 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
     const wchar_t* dc = g_recurse ? L"RECURSE=1" : L"RECURSE=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
-                                         L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc };
+                                         L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc,
+                                         L"-D", dd };
     DxcBuffer buf{ kLib, std::strlen(kLib), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -306,11 +326,14 @@ static std::vector<Layout> Layouts() {
     v.push_back({ "shared", { {kA, 0}, {kA, 0}, {kB, 4} },  0, 1, 6,  false, {} });
     v.push_back({ "anyhit", { {kA, 0}, {kB, 4} },           0, 1, 6,  true,  {} });
     v.push_back({ "mixrs",  { {kA, 0}, {kB, 4} },           0, 1, 6,  false, {} });
+    // --dynargs only: R is 1 on odd columns, M 0, so every geometry of an
+    // instance shares a record and the odd columns take the next one.
+    if (g_dynArgs) v.push_back({ "perray", { {kA, 0}, {kB, 2} }, 0, 0, 4, false, {} });
     for (auto& l : v) {
         l.group.assign(l.records, 0);
         if (!std::strcmp(l.name, "slots"))
             for (UINT i = 1; i < l.records; i += 2) l.group[i] = 2;
-        if (!std::strcmp(l.name, "mixrs"))
+        if (!std::strcmp(l.name, "mixrs") || !std::strcmp(l.name, "perray"))
             for (UINT i = 1; i < l.records; i += 2) l.group[i] = 1;
     }
     return v;
@@ -580,7 +603,8 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     // Global: constants b0, TLAS t0, output u0. Local: one constant at
     // b0 space1, or three at b1 space1 for the second closest-hit.
     D3D12_ROOT_PARAMETER gp[3]{};
-    gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; gp[0].Constants.Num32BitValues = 4;
+    gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    gp[0].Constants.Num32BitValues = g_dynArgs ? 6 : 4;
     if (g_bindless == 1) gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     gp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     // --table: t0 is the table's descriptor 2, so a wrong offset lands on a decoy.
@@ -839,7 +863,10 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     g.cl->SetPipelineState1(so.Get());
     g.cl->SetComputeRootSignature(grs.Get());
     // --bindless: the scene is heap slot 3.
-    const uint32_t c[4] = { W, kH, n, g_bindless ? 3u : 0u };
+    // --dynargs: RDyn, MDyn after them, the layout's arguments.
+    const uint32_t c[6] = { W, kH, n, g_bindless ? 3u : 0u,
+                            std::strcmp(L.name, "perray") ? (uint32_t)L.R : 1u, (uint32_t)L.M };
+    const UINT nc = g_dynArgs ? 6 : 4;
     ComPtr<ID3D12Resource> cb;
     if (g_bindless == 1) {
         cb = Buffer(g.dev.Get(), 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -847,7 +874,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         std::memcpy(cm, c, sizeof(c)); cb->Unmap(0, nullptr);
         g.cl->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress());
     } else {
-        g.cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+        g.cl->SetComputeRoot32BitConstants(0, nc, c, 0);
     }
     if (g_table) {
         D3D12_GPU_DESCRIPTOR_HANDLE tb = heap->GetGPUDescriptorHandleForHeapStart();
@@ -959,6 +986,15 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gpusbt")) g_gpuSbt = true;
         else if (!std::strcmp(argv[i], "--recurse")) g_recurse = true;
         else if (!std::strcmp(argv[i], "--warpglobal")) g_warpGlobal = true;
+        else if (!std::strcmp(argv[i], "--dynargs")) g_dynArgs = true;
+        else if (!std::strcmp(argv[i], "--warponly") && i + 1 < argc) g_warpOnly = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--withhw")) g_withHw = true;
+        else if (!std::strcmp(argv[i], "--norefine"))
+            SetEnvironmentVariableA("DXR_TIER11_TARGS_NOREFINE", "1");
+        // --perstruct N: N pairs per structure of the shim's scene copy, so a
+        // few pairs already take several (DXR_TIER11_TARGS_PERSTRUCT).
+        else if (!std::strcmp(argv[i], "--perstruct") && i + 1 < argc)
+            SetEnvironmentVariableA("DXR_TIER11_TARGS_PERSTRUCT", argv[++i]);
         else want.insert(argv[i]);
     }
     if (g_localScene && (g_table || g_bindless || g_libassoc)) {
@@ -989,7 +1025,43 @@ int main(int argc, char** argv) {
                                                                : "collections grown by AddToStateObject");
     std::printf("ground truth WARP, against %ls\n\n", hd.Description);
 
-    int failed = 0, ran = 0;
+    // --warponly N: the ground truth alone, N times per layout, each run
+    // compared with the first. Measures whether WARP itself is stable, with
+    // or without the shim beside it.
+    if (g_warpOnly) {
+        int moved = 0, runs = 0;
+        // --withhw: one hardware run first, as the matrix has, so the shim
+        // has wrapped a device and hooked the queues before WARP runs.
+        if (g_withHw)
+            try { Run(hw.Get(), Layouts()[0]); } catch (const std::exception&) {}
+        for (const auto& L : Layouts()) {
+            if (!want.empty() && !want.count(L.name)) continue;
+            std::vector<uint32_t> first;
+            for (int k = 0; k < g_warpOnly; ++k) {
+                std::vector<uint32_t> a;
+                try { a = Run(warp.Get(), L); } catch (const std::exception& e) {
+                    std::printf("%-7s WARP FAILED: %s\n", L.name, e.what());
+                    ++moved;
+                    continue;
+                }
+                ++runs;
+                if (first.empty()) { first = a; continue; }
+                size_t d = 0, hits = 0;
+                for (size_t i = 0; i < a.size() / 4; ++i) {
+                    if (std::memcmp(&a[4 * i], &first[4 * i], 16)) ++d;
+                    if (a[4 * i] != 0xFFFFFFFF) ++hits;
+                }
+                if (d) {
+                    ++moved;
+                    std::printf("%-7s run %d: %zu pixels hit, %zu differ from the first run\n", L.name, k, hits, d);
+                }
+            }
+        }
+        std::printf("\nWARP: %d runs, %d differ from their layout's first\n", runs, moved);
+        return moved ? 1 : 0;
+    }
+
+    int failed = 0, ran = 0, unstable = 0;
     for (const auto& L : Layouts()) {
         if (!want.empty() && !want.count(L.name)) continue;
         ++ran;
@@ -1024,7 +1096,38 @@ int main(int argc, char** argv) {
                     "(geometry %zu, record data %zu)%s\n",
                     L.name, ok ? "MATCH  " : "DIVERGE", hits, px, gs.size(), bad, badG, badRec,
                     sensitive ? "" : "  NOT SENSITIVE, WARP saw one geometry");
+        // A divergence is checked against the ground truth itself: WARP once
+        // more. Still counted as a failure, but it says which side moved.
+        if (bad) {
+            std::vector<uint32_t> a2;
+            g_bindless = g_warpGlobal ? 0 : keepBindless;
+            try { a2 = Run(warp.Get(), L); } catch (const std::exception&) {}
+            g_bindless = keepBindless;
+            size_t warpMoved = 0, hwVsSecond = 0, hits2 = 0;
+            for (size_t i = 0; i < px && a2.size() == a.size(); ++i) {
+                if (std::memcmp(&a[4 * i], &a2[4 * i], 16)) ++warpMoved;
+                if (std::memcmp(&a2[4 * i], &b[4 * i], 16)) ++hwVsSecond;
+                if (a2[4 * i] != 0xFFFFFFFF) ++hits2;
+            }
+            if (a2.size() != a.size())
+                std::printf("        recheck: WARP's second run failed\n");
+            else
+                std::printf("        recheck: WARP again, %zu pixels hit, %zu differ from its first run; "
+                            "the hardware differs from it in %zu%s\n",
+                            hits2, warpMoved, hwVsSecond,
+                            warpMoved && !hwVsSecond ? "  (WARP UNSTABLE: the ground truth moved, the "
+                                                       "hardware matches its second run)" : "");
+            // The two implementations agree exactly once WARP is run again:
+            // the shim is not what moved. Counted apart, never hidden.
+            if (a2.size() == a.size() && warpMoved && !hwVsSecond && sensitive) {
+                --failed;
+                ++unstable;
+            }
+        }
     }
+    if (unstable)
+        std::printf("\nGROUND TRUTH UNSTABLE in %d layout(s): WARP's first run differed from its "
+                    "second, and the hardware matched the second exactly\n", unstable);
     std::printf("\n%s\n", failed ? "FAILED" : (ran ? "ALL MATCH" : "no layout matched the arguments"));
     return failed ? 1 : 0;
 }

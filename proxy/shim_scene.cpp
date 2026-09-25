@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -56,11 +57,15 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, Held> g_copies;                       // bui
 std::map<std::pair<const void*, D3D12_GPU_VIRTUAL_ADDRESS>, Held> g_local;  // built at a dispatch
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, Saved> g_saved;
 
+bool Holds(const Copy& c, ID3D12Resource* r) {
+    return c.contribRes == r || std::find(c.tlasRes.begin(), c.tlasRes.end(), r) != c.tlasRes.end();
+}
+
 bool Latest(ID3D12Resource* r) {
     for (const auto& kv : g_copies)
-        if (kv.second.copy.tlasRes == r || kv.second.copy.contribRes == r) return true;
+        if (Holds(kv.second.copy, r)) return true;
     for (const auto& kv : g_local)
-        if (kv.second.copy.tlasRes == r || kv.second.copy.contribRes == r) return true;
+        if (Holds(kv.second.copy, r)) return true;
     for (const auto& kv : g_saved)
         if (kv.second.res == r) return true;
     return false;
@@ -132,14 +137,43 @@ bool EnsurePipeLocked(ID3D12Device5* dev, std::string* why) {
     return true;
 }
 
+// Caller holds g_lock. One structure of a copy, from instance descriptions
+// at `descs` the GPU can read, appended to `out`.
+bool BuildOneLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
+                    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS mine,
+                    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& pre,
+                    D3D12_GPU_VIRTUAL_ADDRESS descs, const void* owner, Copy* out, std::string* why) {
+    auto result = Acquire(dev, kResult, pre.ResultDataMaxSizeInBytes, owner);
+    auto scratch = Acquire(dev, kScratch, (std::max)(pre.ScratchDataSizeInBytes, (UINT64)256), owner);
+    if (!result || !scratch) {
+        *why = "could not create the scene copy buffers";
+        return false;
+    }
+    Transition(cl, scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    mine.InstanceDescs = descs;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC b{};
+    b.Inputs = mine;
+    b.DestAccelerationStructureData = result->GetGPUVirtualAddress();
+    b.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    cl->BuildRaytracingAccelerationStructure(&b, 0, nullptr);
+    D3D12_RESOURCE_BARRIER u{};
+    u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    u.UAV.pResource = result.Get();
+    cl->ResourceBarrier(1, &u);
+    out->tlas.push_back(result->GetGPUVirtualAddress());
+    out->tlasRes.push_back(result.Get());
+    return true;
+}
+
 // Caller holds g_lock. The shim's structure from `count` instance
 // descriptions at `src` (GPU memory, readable as an SRV), recorded into `cl`.
 bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
                  UINT count, UINT k, UINT gmaxFloor, const void* owner, Copy* out,
                  std::string* why) {
     const UINT gmax = (std::max)(astrack::MaxGeometryCount(), gmaxFloor);
-    const UINT64 stride = (UINT64)k * gmax;
-    if ((UINT64)count * stride > 0xFFFFFFull) {
+    const UINT kc = (std::min)(k, PairsPerStructure()), copies = (k + kc - 1) / kc;
+    const UINT64 stride = (UINT64)kc * gmax;
+    if ((UINT64)count * stride * copies > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
         return false;
     }
@@ -155,11 +189,9 @@ bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_V
         *why = "the driver gave no size for the scene copy";
         return false;
     }
-    auto result = Acquire(dev, kResult, pre.ResultDataMaxSizeInBytes, owner);
-    auto scratch = Acquire(dev, kScratch, (std::max)(pre.ScratchDataSizeInBytes, (UINT64)256), owner);
-    auto inst = Acquire(dev, kInstances, (UINT64)count * 64, owner);
+    auto inst = Acquire(dev, kInstances, (UINT64)count * copies * 64, owner);
     auto contrib = Acquire(dev, kContrib, (UINT64)count * 4, owner);
-    if (!result || !scratch || !inst || !contrib) {
+    if (!inst || !contrib) {
         *why = "could not create the scene copy buffers";
         return false;
     }
@@ -167,33 +199,26 @@ bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_V
     Transition(cl, contrib.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cl->SetComputeRootSignature(g_rs.Get());
     cl->SetPipelineState(g_pso.Get());
-    const UINT c[3] = { count, (UINT)stride, 0 };
-    cl->SetComputeRoot32BitConstants(0, 3, c, 0);
+    const UINT c[4] = { count, (UINT)stride, 0, copies };
+    cl->SetComputeRoot32BitConstants(0, 4, c, 0);
     cl->SetComputeRootShaderResourceView(1, src);
     cl->SetComputeRootUnorderedAccessView(2, inst->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(3, contrib->GetGPUVirtualAddress());
-    cl->Dispatch((count + 63) / 64, 1, 1);
+    cl->Dispatch((count * copies + 63) / 64, 1, 1);
     Transition(cl, inst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(cl, contrib.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Transition(cl, scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    mine.InstanceDescs = inst->GetGPUVirtualAddress();
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC b{};
-    b.Inputs = mine;
-    b.DestAccelerationStructureData = result->GetGPUVirtualAddress();
-    b.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
-    cl->BuildRaytracingAccelerationStructure(&b, 0, nullptr);
-    D3D12_RESOURCE_BARRIER u{};
-    u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    u.UAV.pResource = result.Get();
-    cl->ResourceBarrier(1, &u);
-    out->tlas = result->GetGPUVirtualAddress();
+    *out = Copy{};
+    for (UINT n = 0; n < copies; ++n)
+        if (!BuildOneLocked(cl, dev, mine, pre, inst->GetGPUVirtualAddress() + (UINT64)n * count * 64,
+                            owner, out, why))
+            return false;
     out->contrib = contrib->GetGPUVirtualAddress();
     out->count = count;
     out->k = k;
+    out->kc = kc;
     out->gmax = gmax;
-    out->tlasRes = result.Get();
     out->contribRes = contrib.Get();
     return true;
 }
@@ -205,8 +230,9 @@ bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     const UINT count = (UINT)descs.size();
     if (!count) { *why = "an empty scene"; return false; }
     const UINT gmax = (std::max)(astrack::MaxGeometryCount(), gmaxFloor);
-    const UINT64 stride = (UINT64)k * gmax;
-    if ((UINT64)count * stride > 0xFFFFFFull) {
+    const UINT kc = (std::min)(k, PairsPerStructure()), copies = (k + kc - 1) / kc;
+    const UINT64 stride = (UINT64)kc * gmax;
+    if ((UINT64)count * stride * copies > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
         return false;
     }
@@ -221,11 +247,9 @@ bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
         *why = "the driver gave no size for the scene copy";
         return false;
     }
-    auto result = Acquire(dev, kResult, pre.ResultDataMaxSizeInBytes, owner);
-    auto scratch = Acquire(dev, kScratch, (std::max)(pre.ScratchDataSizeInBytes, (UINT64)256), owner);
-    auto inst = Acquire(dev, kUploadInstances, (UINT64)count * 64, owner);
+    auto inst = Acquire(dev, kUploadInstances, (UINT64)count * copies * 64, owner);
     auto contrib = Acquire(dev, kUploadContrib, (UINT64)count * 4, owner);
-    if (!result || !scratch || !inst || !contrib) {
+    if (!inst || !contrib) {
         *why = "could not create the scene copy buffers";
         return false;
     }
@@ -237,30 +261,26 @@ bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
         *why = "could not map the scene copy buffers";
         return false;
     }
-    for (UINT i = 0; i < count; ++i) {
-        d[i] = descs[i];
-        c[i] = descs[i].InstanceContributionToHitGroupIndex;
-        d[i].InstanceContributionToHitGroupIndex = (UINT)((i * stride) & 0xFFFFFFu);
-    }
+    for (UINT n = 0; n < copies; ++n)
+        for (UINT i = 0; i < count; ++i) {
+            D3D12_RAYTRACING_INSTANCE_DESC& x = d[(size_t)n * count + i];
+            x = descs[i];
+            if (!n) c[i] = descs[i].InstanceContributionToHitGroupIndex;
+            x.InstanceContributionToHitGroupIndex =
+                (UINT)(((UINT64)n * count * stride + i * stride) & 0xFFFFFFu);
+        }
     inst->Unmap(0, nullptr);
     contrib->Unmap(0, nullptr);
-    Transition(cl, scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    mine.InstanceDescs = inst->GetGPUVirtualAddress();
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC b{};
-    b.Inputs = mine;
-    b.DestAccelerationStructureData = result->GetGPUVirtualAddress();
-    b.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
-    cl->BuildRaytracingAccelerationStructure(&b, 0, nullptr);
-    D3D12_RESOURCE_BARRIER u{};
-    u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    u.UAV.pResource = result.Get();
-    cl->ResourceBarrier(1, &u);
-    out->tlas = result->GetGPUVirtualAddress();
+    *out = Copy{};
+    for (UINT n = 0; n < copies; ++n)
+        if (!BuildOneLocked(cl, dev, mine, pre, inst->GetGPUVirtualAddress() + (UINT64)n * count * 64,
+                            owner, out, why))
+            return false;
     out->contrib = contrib->GetGPUVirtualAddress();
     out->count = count;
     out->k = k;
+    out->kc = kc;
     out->gmax = gmax;
-    out->tlasRes = result.Get();
     out->contribRes = contrib.Get();
     return true;
 }
@@ -274,6 +294,19 @@ void Activate(UINT k) {
                  "ON from the next top-level build, for up to %u TraceRay argument pair(s)\n", k);
     g_active = true;
     g_k = (std::max)(g_k, k);
+}
+
+UINT PairsPerStructure() {
+    static const UINT n = [] {
+        char b[8] = {};
+        const UINT v = GetEnvironmentVariableA("DXR_TIER11_TARGS_PERSTRUCT", b, sizeof(b))
+                           ? (UINT)std::atoi(b) : 15u;
+        // Not below 4: a variant of 128 structures (2 pairs each, 256
+        // pairs) removed the device on a GTX 1070, 64 did not. The shim
+        // itself never needs more than 18.
+        return v >= 4 && v <= 15 ? v : 15u;
+    }();
+    return n;
 }
 
 bool Active() {
@@ -336,8 +369,8 @@ bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cl->SetComputeRootSignature(g_rs.Get());
     cl->SetPipelineState(g_pso.Get());
-    const UINT c[3] = { in.NumDescs, 0, 1 };
-    cl->SetComputeRoot32BitConstants(0, 3, c, 0);
+    const UINT c[4] = { in.NumDescs, 0, 1, 1 };
+    cl->SetComputeRoot32BitConstants(0, 4, c, 0);
     cl->SetComputeRootShaderResourceView(1, in.InstanceDescs);
     cl->SetComputeRootUnorderedAccessView(2, saved->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(3, saved->GetGPUVirtualAddress());  // unwritten
@@ -398,8 +431,8 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     static LONG first = 0;
     if (InterlockedCompareExchange(&first, 1, 0) == 0)
         ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first copy of a scene, %u instances, "
-                 "%u records each (%u pair(s) x %u geometries)\n",
-                 in.NumDescs, h.copy.k * h.copy.gmax, h.copy.k, h.copy.gmax);
+                 "%u records each (%u pair(s) x %u geometries), %zu structure(s)\n",
+                 in.NumDescs, h.copy.kc * h.copy.gmax, h.copy.kc, h.copy.gmax, h.copy.tlas.size());
     return true;
 }
 
@@ -450,7 +483,8 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 4)
         ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): scene copy built at a dispatch from %s, "
-                 "%u instances, %u pair(s)\n", from, h.copy.count, h.copy.k);
+                 "%u instances, %u pair(s), %zu structure(s)\n", from, h.copy.count, h.copy.k,
+                 h.copy.tlas.size());
     return true;
 }
 

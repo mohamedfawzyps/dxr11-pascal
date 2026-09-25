@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include "shim_scene.h"
+#include "trace_args.h"
 #include "proxy_log.h"
 #include "command_signature.h"
 #include "rq_pipeline.h"
@@ -751,11 +752,9 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s)
     m_lastBoundStateObject = true;
     FWD(SetPipelineState1(s));
 }
-bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
-                                          std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
-                                          std::string* why, const Dxr11Bindings* with,
-                                          const gidx::LocalRecord* local, bool* needsLocal) {
-    const Dxr11Bindings& bb = with ? *with : m_bindings;
+namespace {
+// The compute root arguments as bound, for gidx.
+std::vector<gidx::BoundRoot> RootsOf(const Dxr11Bindings& bb) {
     std::vector<gidx::BoundRoot> roots(Dxr11Bindings::kMaxRootParams);
     for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i) {
         const auto& r = bb.roots[i];
@@ -767,8 +766,17 @@ bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
             roots[i].numConstants = (UINT)r.constants.size();
         }
     }
-    return gidx::ResolveScenes(sc, bb.rootSig, roots, bb.heaps.data(), (UINT)bb.heaps.size(), out,
-                               why, local, needsLocal);
+    return roots;
+}
+}  // namespace
+
+bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
+                                          std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
+                                          std::string* why, const Dxr11Bindings* with,
+                                          const gidx::LocalRecord* local, bool* needsLocal) {
+    const Dxr11Bindings& bb = with ? *with : m_bindings;
+    return gidx::ResolveScenes(sc, bb.rootSig, RootsOf(bb), bb.heaps.data(), (UINT)bb.heaps.size(),
+                               out, why, local, needsLocal);
 }
 
 namespace {
@@ -812,6 +820,34 @@ int ReadRange(D3D12_GPU_VIRTUAL_ADDRESS at, UINT bytes, std::vector<uint8_t>* ou
     D3D12_RANGE none{ 0, 0 };
     f.resource->Unmap(0, &none);
     return 1;
+}
+}  // namespace
+
+namespace {
+// The TraceRay argument pairs a GeometryIndex() dispatch can use: the
+// constants its arguments are computed from read as `b` binds them, and for
+// a raygen's calls from its record when the CPU can read it (0.57.0).
+std::vector<std::pair<UINT, UINT>> DispatchPairs(gidx::Info& gi, const Dxr11Bindings& b,
+                                                 const D3D12_DISPATCH_RAYS_DESC& d) {
+    if (targs::Literal(gi.args)) return gi.traceArgs;
+    std::vector<uint8_t> rec;
+    gidx::LocalRecord lr;
+    const gidx::LocalRecord* raygen = nullptr;
+    UINT recursion = 0;
+    std::string why;
+    if (RaygenRecordBytes(d) >= D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES &&
+        gidx::PrepareRecordLocals(gi, b.stateObject, &recursion, &why) &&
+        ReadRange(d.RayGenerationShaderRecord.StartAddress, RaygenRecordBytes(d), &rec) == 1 &&
+        rec.size() >= D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) {
+        const gidx::RecordLocal* x = gidx::RecordLocalOf(gi, rec.data());
+        if (x && x->why.empty() && x->desc) {
+            lr.desc = x->desc;
+            lr.record = rec.data();
+            lr.size = (UINT)rec.size();
+            raygen = &lr;
+        }
+    }
+    return gidx::TracePairs(gi, b.rootSig, RootsOf(b), raygen);
 }
 }  // namespace
 
@@ -994,18 +1030,19 @@ bool Dxr11CommandList::RayQueryScenes(Dxr11RayQueryPso* rq,
 static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
                                   gidx::Info& gi, ID3D12StateObject* so,
                                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& srvs, bool exact,
+                                  const std::vector<std::pair<UINT, UINT>>& pairs,
                                   const void* owner, const D3D12_DISPATCH_RAYS_DESC& d,
                                   const std::function<void()>& restore) {
     D3D12_DISPATCH_RAYS_DESC mine = d;
     std::string why;
     bool shared = false;
-    if (!dev || !gidx::RecordTable(cl, dev, gi, d.HitGroupTable, &mine.HitGroupTable,
+    if (!dev || !gidx::RecordTable(cl, dev, gi, pairs, d.HitGroupTable, &mine.HitGroupTable,
                                    srvs, exact, owner, &shared, &why)) {
         // A record several geometries reach: the shim's own layout, through
         // the variant pipeline and the shim's copy of the scene.
         std::string vwhy;
         if (dev && shared && gidx::EnsureVariant(dev, gi, so, &vwhy) &&
-            gidx::RecordVariant(cl, dev, gi, d, &mine, srvs, exact, owner, &vwhy)) {
+            gidx::RecordVariant(cl, dev, gi, pairs, d, &mine, srvs, exact, owner, &vwhy)) {
             restore();
             cl->SetPipelineState1(gi.variant.Get());
             cl->DispatchRays(&mine);
@@ -1091,7 +1128,8 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     // unknown geometry (deserialized) spilled into the next instance's
     // records, silently.
     if (exact && !astrack::Current(srvs) && QueueStaleRays(*d, srvs)) return;
-    DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact, this, *d,
+    DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact,
+                          DispatchPairs(*gi, m_bindings, *d), this, *d,
                           [this] { RestoreComputeAfterCapture(); });
 }
 
@@ -1567,7 +1605,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 ID3D12GraphicsCommandList4* sl = slot->list.Get();
                 const Dxr11Bindings& pb = pend.bindings;
                 DispatchGeometryIndex(sl, dev5.Get(), *gi, pb.stateObject, pend.giScenes,
-                                      pend.giExact, sl, desc, [sl, &pb] { pb.Replay(sl); });
+                                      pend.giExact, DispatchPairs(*gi, pb, desc), sl, desc,
+                                      [sl, &pb] { pb.Replay(sl); });
             } else {
                 slot->list->DispatchRays(&desc);
             }

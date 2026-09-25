@@ -174,6 +174,13 @@ std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& tr
                                     const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact,
                                     bool* read, bool* stale);
 
+// The same scenes, for the shim's own layout: per pair, an id it shares with
+// every pair that puts each (instance, geometry) on the same record below
+// `records`, so both can share the shim's records too; -1 for a pair that
+// puts none below it, which no hit can use (0.57.0).
+std::vector<int> PairClasses(const std::vector<std::pair<UINT, UINT>>& pairs, UINT records,
+                             const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact);
+
 // The instance descriptions of a top-level build, read from CPU-visible memory
 // at record time. Cheap path: no copy, no sync. They are also KEPT, as the
 // snapshot below, until the structure is built again.

@@ -9,6 +9,7 @@
 #include "res_tracker.h"
 #include "scene_bind.h"
 #include "shim_scene.h"
+#include "trace_args.h"
 #include "shim_table_cs.h"
 #include "state_object_cache.h"
 #include "rewriter/dxc_host.h"
@@ -195,23 +196,13 @@ void SceneRegs(const std::string& text, Scenes* sc) {
     }
 }
 
-// The TraceRay arguments of one disassembled library, and their scenes.
+// The TraceRay arguments of one disassembled library, and their scenes. An
+// argument computed at run time is followed back to what it can be
+// (proxy/trace_args.h, 0.57.0; until then such a pipeline was refused).
 void TraceArgs(const std::string& text, Info* info) {
     SceneRegs(text, &info->scenes);
-    // call void @dx.op.traceRay.T(i32 157, handle, flags, mask, R, M, miss, ...)
-    static const std::regex kTrace(
-        R"RX(@dx\.op\.traceRay\.[^(]+\(i32 157, [^,]+, [^,]+, [^,]+, i32 ([^,]+), i32 ([^,]+),)RX");
-    static const std::regex kNum(R"RX(^-?\d+$)RX");
-    for (std::sregex_iterator it(text.begin(), text.end(), kTrace), end; it != end; ++it) {
-        const std::string r = (*it)[1].str(), m = (*it)[2].str();
-        if (!std::regex_match(r, kNum) || !std::regex_match(m, kNum)) {
-            info->dynamicTraceArgs = true;
-            continue;
-        }
-        const std::pair<UINT, UINT> p((UINT)std::stol(r) & 15u, (UINT)std::stol(m) & 15u);
-        if (std::find(info->traceArgs.begin(), info->traceArgs.end(), p) == info->traceArgs.end())
-            info->traceArgs.push_back(p);
-    }
+    targs::Scan(text, &info->args);
+    info->traceArgs = targs::Pairs(info->args);
 }
 
 // The shader kinds a library defines, read from its RDAT function table, so a
@@ -512,9 +503,8 @@ void MergeCollections(const D3D12_STATE_OBJECT_DESC& in, Info* info) {
         const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(so.pDesc);
         auto ci = Get(c->pExistingCollection);
         if (!ci) continue;
-        for (const auto& p : ci->traceArgs)
-            if (std::find(info->traceArgs.begin(), info->traceArgs.end(), p) == info->traceArgs.end())
-                info->traceArgs.push_back(p);
+        targs::Merge(ci->args, &info->args);
+        info->traceArgs = targs::Pairs(info->args);
         info->dynamicTraceArgs = info->dynamicTraceArgs || ci->dynamicTraceArgs;
         info->scenes.unknown = info->scenes.unknown || ci->scenes.unknown;
         for (const auto& r : ci->scenes.regs) AddScene(&info->scenes, r);
@@ -554,24 +544,28 @@ UINT ArgsEnd(const D3D12_ROOT_SIGNATURE_DESC1& d) {
 }
 
 // An extended copy of a local root signature, or one holding only the
-// constant when `rs` is null. `offset` receives the constant's offset in the
-// record, identifier included.
-bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, bool srv,
+// additions when `rs` is null. `offset` receives the first addition's offset
+// in the record, identifier included.
+bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, UINT srvs,
             ComPtr<ID3D12RootSignature>* out, UINT* offset, std::string* why) {
-    // Either the geometry index, a constant at b0, or the shim scene, a root
-    // descriptor at t0, both in space kGeomIndexSpace.
-    D3D12_ROOT_PARAMETER1 extra{};
-    if (srv) {
-        extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        extra.Descriptor.ShaderRegister = 0;
-        extra.Descriptor.RegisterSpace = rq::kGeomIndexSpace;
-    } else {
-        extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        extra.Constants.ShaderRegister = 0;
-        extra.Constants.RegisterSpace = rq::kGeomIndexSpace;
-        extra.Constants.Num32BitValues = 1;
+    // Either the geometry index, a constant at b0, or `srvs` root
+    // descriptors at t0 up: the shim scene's copies, and with arguments
+    // computed at run time its pair table (0.57.0). All in kGeomIndexSpace.
+    std::vector<D3D12_ROOT_PARAMETER1> extras(srvs ? srvs : 1u);
+    for (UINT i = 0; i < extras.size(); ++i) {
+        D3D12_ROOT_PARAMETER1& extra = extras[i];
+        if (srvs) {
+            extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            extra.Descriptor.ShaderRegister = i;
+            extra.Descriptor.RegisterSpace = rq::kGeomIndexSpace;
+        } else {
+            extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            extra.Constants.ShaderRegister = 0;
+            extra.Constants.RegisterSpace = rq::kGeomIndexSpace;
+            extra.Constants.Num32BitValues = 1;
+        }
+        extra.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    extra.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
     v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
@@ -604,8 +598,8 @@ bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, bool srv,
     D3D12_ROOT_SIGNATURE_DESC1 before = v.Desc_1_1;
     before.NumParameters = (UINT)params.size();
     before.pParameters = params.data();
-    *offset = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + Align(ArgsEnd(before), srv ? 8 : 4);
-    params.push_back(extra);
+    *offset = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + Align(ArgsEnd(before), srvs ? 8 : 4);
+    params.insert(params.end(), extras.begin(), extras.end());
     v.Desc_1_1.NumParameters = (UINT)params.size();
     v.Desc_1_1.pParameters = params.data();
     ComPtr<ID3DBlob> blob, err;
@@ -646,15 +640,15 @@ private:
 };
 
 // Extends the local root signature of each unit (exports that must share one:
-// a hit group and its shaders, or a single raygen) with one parameter, the
-// geometry index constant or (`srv`) the shim scene's root descriptor, and
+// a hit group and its shaders, or a single raygen) with the geometry index
+// constant, or (`srvs` above 0) that many root descriptors for the shim, and
 // builds the new subobject array in `out`: libraries in `code` replaced,
 // EXISTING_COLLECTIONs in `colls` pointed at a replacement, associations to a
 // local root signature losing the extended exports (one left with none is
 // dropped rather than becoming a DEFAULT association, and a signature left
 // with no association is dropped rather than becoming a default one), and one
 // new signature plus association per original signature extended.
-// `offsets[u]` is the parameter's offset in unit u's records.
+// `offsets[u]` is the first added parameter's offset in unit u's records.
 template <class T>
 const void* Keep(Transformed* out, const T& v) {
     out->raw.emplace_back(sizeof(T));
@@ -994,7 +988,7 @@ bool BuildAssoc(const D3D12_STATE_OBJECT_DESC& in, const std::set<std::wstring>&
     return true;
 }
 
-bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
+bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
              const std::vector<std::vector<std::wstring>>& units,
              const std::map<UINT, const std::vector<uint8_t>*>& code,
              const std::map<UINT, ID3D12StateObject*>& colls,
@@ -1040,7 +1034,7 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
             }
             ComPtr<ID3D12RootSignature> rs;
             UINT offset = 0;
-            if (!Extend(dev, orig, srv, &rs, &offset, why)) return false;
+            if (!Extend(dev, orig, srvs, &rs, &offset, why)) return false;
             extended[idx] = { rs, offset };
         }
         offsets->push_back(extended[idx].second);
@@ -1506,7 +1500,7 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
     for (const auto& L : rewritten) code[L.index] = &L.code;
     std::vector<UINT> offsets;
     UINT signatures = 0;
-    if (!Rebuild(dev, in, false, units, code, {}, out, &offsets, &signatures, why))
+    if (!Rebuild(dev, in, 0, units, code, {}, out, &offsets, &signatures, why))
         return Outcome::kRefused;
     auto info = std::make_shared<Info>();
     for (size_t u = 0; u < unitGroup.size(); ++u) {
@@ -1534,9 +1528,13 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
     std::string fns;
     for (const auto& w : readers) fns += (fns.empty() ? "" : ", ") + Narrow(w);
     std::string trace;
-    for (const auto& p : info->traceArgs)
-        trace += (trace.empty() ? "" : ", ") + std::string("(") + std::to_string(p.first) + ", " +
-                 std::to_string(p.second) + ")";
+    if (targs::Literal(info->args))
+        for (const auto& p : info->traceArgs)
+            trace += (trace.empty() ? "" : ", ") + std::string("(") + std::to_string(p.first) + ", " +
+                     std::to_string(p.second) + ")";
+    else
+        trace = "computed at run time, " + std::to_string(info->traceArgs.size()) +
+                " pair(s) possible before the constants are read";
     out->summary = "GeometryIndex() read in " + fns + "; " + std::to_string(info->groups.size()) +
                    " hit group(s) extended, " + std::to_string(signatures) +
                    " local root signature(s), record " + std::to_string(info->recordBytes) +
@@ -1571,8 +1569,11 @@ void Attach(ID3D12Device* dev, ID3D12StateObject* so, const D3D12_STATE_OBJECT_D
     // the variant will be needed as soon as a structure holds two. Built now,
     // so the scene copies start with the next top-level build.
     if (desc.Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE && !info->groups.empty()) {
+        // Arguments computed at run time: only a dispatch can tell, so the
+        // variant waits for one that needs it (0.57.0).
         bool zero = false;
-        for (const auto& p : info->traceArgs) zero = zero || p.second == 0;
+        if (targs::Literal(info->args))
+            for (const auto& p : info->traceArgs) zero = zero || p.second == 0;
         std::string why;
         if (zero && !EnsureVariant(dev, *info, so, &why))
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): variant NOT built: %s\n", why.c_str());
@@ -1678,6 +1679,94 @@ void Gather(const D3D12_STATE_OBJECT_DESC& d, int depth, std::vector<Found>* out
 }
 
 }  // namespace
+
+namespace {
+
+// A dword at `addr`, application memory the CPU can read, as it is now.
+bool ReadCpuDword(D3D12_GPU_VIRTUAL_ADDRESS addr, uint32_t* v) {
+    const restrack::Found f = addr ? restrack::Find(addr) : restrack::Found{};
+    if (!f.resource || (f.heap != D3D12_HEAP_TYPE_UPLOAD && f.heap != D3D12_HEAP_TYPE_READBACK) ||
+        f.offset + 4 > f.resource->GetDesc().Width)
+        return false;
+    uint8_t* mp = nullptr;
+    D3D12_RANGE rr{ (SIZE_T)f.offset, (SIZE_T)f.offset + 4 };
+    if (FAILED(f.resource->Map(0, &rr, reinterpret_cast<void**>(&mp))) || !mp) return false;
+    std::memcpy(v, mp + f.offset, 4);
+    D3D12_RANGE none{ 0, 0 };
+    f.resource->Unmap(0, &none);
+    return true;
+}
+
+// `bytes` of local root parameter `param`'s argument, from `at` into it.
+bool LocalBytes(const LocalRecord& l, UINT param, UINT bytes, UINT at, void* v) {
+    UINT off = 0;
+    for (UINT i = 0; i <= param; ++i) {
+        const auto& p = l.desc->pParameters[i];
+        const bool c = p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        off = Align(off, c ? 4 : 8);
+        if (i == param) break;
+        off += c ? 4 * p.Constants.Num32BitValues : 8;
+    }
+    const UINT64 pos = (UINT64)D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + off + at;
+    if (pos + bytes > l.size) return false;
+    std::memcpy(v, l.record + pos, bytes);
+    return true;
+}
+
+}  // namespace
+
+std::vector<std::pair<UINT, UINT>> TracePairs(const Info& info, ID3D12RootSignature* rs,
+                                              const std::vector<BoundRoot>& roots,
+                                              const LocalRecord* raygen) {
+    if (targs::Literal(info.args) || targs::NoRefine()) return info.traceArgs;
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> des;
+    const D3D12_ROOT_SIGNATURE_DESC1* d = nullptr;
+    UINT size = 0;
+    if (rs && SUCCEEDED(rs->GetPrivateData(kBlobGuid, &size, nullptr)) && size) {
+        std::vector<uint8_t> blob(size);
+        rs->GetPrivateData(kBlobGuid, &size, blob.data());
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* v = nullptr;
+        if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(), blob.size(),
+                                                                    IID_PPV_ARGS(&des))) &&
+            SUCCEEDED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &v)) && v)
+            d = &v->Desc_1_1;
+    }
+    // A register the global signature declares is read there, whatever
+    // shader reads it; one it does not, from the raygen's record for a call
+    // in a raygen. Anything else is every value.
+    auto value = [&](const targs::Leaf& l, uint32_t kind, uint32_t* out) -> bool {
+        if (l.offset % 4) return false;
+        for (UINT p = 0; d && p < d->NumParameters; ++p) {
+            const auto& prm = d->pParameters[p];
+            const BoundRoot b = p < roots.size() ? roots[p] : BoundRoot{};
+            if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+                prm.Constants.RegisterSpace == l.space && prm.Constants.ShaderRegister == l.reg) {
+                if (l.offset / 4 >= b.numConstants || !b.constants) return false;
+                *out = b.constants[l.offset / 4];
+                return true;
+            }
+            if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                prm.Descriptor.RegisterSpace == l.space && prm.Descriptor.ShaderRegister == l.reg)
+                return b.cbv && ReadCpuDword(b.cbv + l.offset, out);
+        }
+        if (kind != 7 || !raygen || !raygen->desc) return false;
+        const auto& ld = *raygen->desc;
+        for (UINT p = 0; p < ld.NumParameters; ++p) {
+            const auto& prm = ld.pParameters[p];
+            if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+                prm.Constants.RegisterSpace == l.space && prm.Constants.ShaderRegister == l.reg)
+                return l.offset / 4 < prm.Constants.Num32BitValues &&
+                       LocalBytes(*raygen, p, 4, l.offset, out);
+            if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                prm.Descriptor.RegisterSpace == l.space && prm.Descriptor.ShaderRegister == l.reg) {
+                D3D12_GPU_VIRTUAL_ADDRESS cbv = 0;
+                return LocalBytes(*raygen, p, 8, 0, &cbv) && ReadCpuDword(cbv + l.offset, out);
+            }
+        }
+        return false;
+    };
+    return targs::Pairs(info.args, value);
+}
 
 bool PrepareRecordLocals(Info& info, ID3D12StateObject* app, UINT* recursion, std::string* why) {
     std::lock_guard<std::mutex> lk(info.localLock);
@@ -1791,14 +1880,14 @@ ComPtr<ID3D12Resource> Acquire(ID3D12Device* dev, D3D12_HEAP_TYPE type, UINT64 s
 }  // namespace
 
 bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& info,
+                 const std::vector<std::pair<UINT, UINT>>& pairs,
                  const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& app,
                  D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* shim,
                  const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                  const void* owner, bool* shared, std::string* why) {
     *shared = false;
     if (info.dynamicTraceArgs) {
-        *why = "a TraceRay whose hit group arguments are not known at pipeline creation "
-               "(computed at run time, or in a collection)";
+        *why = "a library whose TraceRay calls could not be read";
         return false;
     }
     if (!app.StrideInBytes) {
@@ -1814,7 +1903,7 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
     // the latest build itself, so it takes those (0.51.0).
     bool read = false, stale = false;
     const auto labels =
-        astrack::GeometryLabels(info.traceArgs, records, boundSrvs, exact, &read, &stale);
+        astrack::GeometryLabels(pairs, records, boundSrvs, exact, &read, &stale);
     if (read && !stale && astrack::UnknownBlas(boundSrvs, exact)) {
         *why = "an instance points at a bottom-level structure whose geometry the shim does "
                "not know (deserialized, or never seen built)";
@@ -1924,15 +2013,17 @@ struct Tracer {
 };
 
 // A variant of the object `d` describes: every library that traces has its
-// TraceRay calls pointed at the shim scene with (index of the pair, k), each
-// raygen's local root signature gets the scene's root descriptor appended,
-// and a linked collection that traces is replaced by its own variant.
+// TraceRay calls pointed at the shim scene with (index of the pair, k), or
+// with `copies` above 0 at a pair and structure read from the shim's table;
+// each tracing shader's local root signature gets the shim's root
+// descriptors appended, and a linked collection that traces is replaced by
+// its own variant.
 // `tracers` receives every export whose record carries the shim scene's
 // address, with its offset and kind (7 raygen, 11 miss, 3 hit group, 10 a
 // closest-hit whose hit group is defined outside this object), `names`
 // every export whose identifier may have changed, both as `d` exports them.
 bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
-               const std::vector<std::pair<UINT, UINT>>& pairs,
+               const std::vector<std::pair<UINT, UINT>>& pairs, UINT copies,
                ComPtr<ID3D12StateObject>* out,
                std::vector<Tracer>* tracers,
                std::vector<std::wstring>* names,
@@ -1974,7 +2065,7 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                 return false;
             }
             int calls = 0;
-            if (!rq::RetraceToShimScene(llm::Normalize(text), upairs, &lowered, &calls, why))
+            if (!rq::RetraceToShimScene(llm::Normalize(text), upairs, copies, &lowered, &calls, why))
                 return false;
             if (!calls) continue;
             codeStore.emplace_back();
@@ -2025,7 +2116,7 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
             std::vector<Tracer> subRg;
             std::vector<std::wstring> subNames;
             D3D12_STATE_OBJECT_DESC cd = ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
-            if (!VariantOf(dev, cd, pairs, &vc, &subRg, &subNames, parts, why)) return false;
+            if (!VariantOf(dev, cd, pairs, copies, &vc, &subRg, &subNames, parts, why)) return false;
             if (!vc) continue;
             parts->push_back(vc);
             colls[i] = vc.Get();
@@ -2066,7 +2157,8 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
     Transformed t;
     std::vector<UINT> offsets;
     UINT sigs = 0;
-    if (!Rebuild(dev, d, true, units, code, colls, &t, &offsets, &sigs, why)) return false;
+    if (!Rebuild(dev, d, copies ? copies + 1 : 1u, units, code, colls, &t, &offsets, &sigs, why))
+        return false;
     for (size_t u = 0; u < units.size(); ++u) tracers->push_back({ units[u][0], offsets[u], kinds[u] });
     ComPtr<ID3D12Device5> d5;
     HRESULT hr = dev->QueryInterface(IID_PPV_ARGS(&d5));
@@ -2098,14 +2190,22 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
     info.variantTried = true;
     auto fail = [&](const std::string& w) { info.variantWhy = w; *why = w; return false; };
     if (!info.store) return fail("the pipeline's subobjects were not kept");
-    if (info.dynamicTraceArgs) return fail("TraceRay arguments not known when the pipeline was created");
+    if (info.dynamicTraceArgs) return fail("a library whose TraceRay calls could not be read");
     if (info.traceArgs.empty()) return fail("the pipeline has no TraceRay");
-    if (info.traceArgs.size() > 15) return fail("more than 15 TraceRay argument pairs");
+    // Literal arguments, at most 15 pairs: each call traces (its pair's
+    // index, k). Otherwise each reads its pair and structure from the shim's
+    // table, and the copy has a structure per 15 pairs (0.57.0; until then
+    // both were refused).
+    const UINT per = shimscene::PairsPerStructure();
+    info.variantCopies = targs::Literal(info.args) && info.traceArgs.size() <= per
+                             ? 0u : (UINT)((info.traceArgs.size() + per - 1) / per);
+    const UINT addrs = info.variantCopies ? info.variantCopies + 1 : 1u;
     const D3D12_STATE_OBJECT_DESC d = info.store->Desc(info.type);
     std::vector<Tracer> tracers;
     std::vector<std::wstring> names;
     std::string w;
-    if (!VariantOf(dev, d, info.traceArgs, &info.variant, &tracers, &names, &info.variantParts, &w))
+    if (!VariantOf(dev, d, info.traceArgs, info.variantCopies, &info.variant, &tracers, &names,
+                   &info.variantParts, &w))
         return fail(w);
     ComPtr<ID3D12StateObjectProperties> pa, pv;
     if (FAILED(app->QueryInterface(IID_PPV_ARGS(&pa))) ||
@@ -2131,17 +2231,30 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
         if (m.insert) {
             UINT& bytes = kind == 3 ? info.variantHitBytes
                         : kind == 11 ? info.variantMissBytes : info.raygenBytes;
-            bytes = (std::max)(bytes, m.insert + 8);
+            bytes = (std::max)(bytes, m.insert + 8 * addrs);
         }
     }
-    shimscene::Activate((UINT)info.traceArgs.size());
+    // With a table, a dispatch sizes the copies to the pairs it uses.
+    shimscene::Activate(info.variantCopies ? 1u : (UINT)info.traceArgs.size());
     ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): VARIANT pipeline built, the shim's own "
              "record layout: %zu shader(s) tracing the shim scene, %zu identifier(s) remapped, "
-             "%zu collection(s) rebuilt\n", tracers.size(), info.remaps.size(), info.variantParts.size());
+             "%zu collection(s) rebuilt%s\n", tracers.size(), info.remaps.size(), info.variantParts.size(),
+             info.variantCopies ? (", TraceRay arguments computed at run time: pairs read from the "
+                                   "shim's table, up to " + std::to_string(info.variantCopies) +
+                                   " scene structure(s)").c_str() : "");
     return true;
 }
 
+namespace {
+bool StructurePoison() {
+    char pv[4] = {};
+    static const bool v = GetEnvironmentVariableA("DXR_TIER11_TARGS_POISON", pv, sizeof(pv)) && pv[0] == '2';
+    return v;
+}
+}  // namespace
+
 bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
+                   const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                    const void* owner, std::string* why) {
@@ -2160,15 +2273,70 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         *why = "its TraceRay calls trace different scenes, and the variant has one scene copy";
         return false;
     }
-    const UINT k = (UINT)info.traceArgs.size();
+    const UINT appStride = (UINT)app.HitGroupTable.StrideInBytes;
+    if (!appStride) { *why = "a hit group table with stride 0"; return false; }
+    const UINT appRecords = (UINT)(app.HitGroupTable.SizeInBytes / appStride);
+
+    // The pairs this dispatch traces with, a block of records each. With
+    // literal arguments the pipeline's list, as its calls were rewritten.
+    // With arguments computed at run time, the ones this dispatch can use,
+    // pairs that put every hit on the same record sharing a block, and a
+    // table the calls read theirs from, indexed by 16 * R + M (0.57.0).
+    const bool lut = info.variantCopies != 0;
+    std::vector<std::pair<UINT, UINT>> slots = info.traceArgs;
+    std::vector<int> keySlot;
+    if (lut) {
+        std::vector<std::pair<UINT, UINT>> all;
+        for (UINT r = 0; r < 16; ++r)
+            for (UINT q = 0; q < 16; ++q) all.push_back({ r, q });
+        const auto cls = astrack::PairClasses(all, appRecords, boundSrvs, exact);
+        std::map<int, int> slotOf;
+        slots.clear();
+        for (const auto& p : pairs) {
+            const int c = cls[(size_t)(p.first & 15) * 16 + (p.second & 15)];
+            if (c < 0 || slotOf.count(c)) continue;
+            slotOf[c] = (int)slots.size();
+            slots.push_back(p);
+        }
+        // No hit can use any of them: one block, which nothing reaches.
+        if (slots.empty()) slots.push_back({ 0, 0 });
+        // A pair this dispatch was not expected to use still finds its block
+        // when it shares one with a pair it was.
+        // DXR_TIER11_TARGS_POISON sends every pair to the first block: the
+        // sensitivity check, which must turn gitest --dynargs from MATCH to
+        // DIVERGE where a dispatch uses several.
+        // =2 instead gives every structure's descriptor the first structure.
+        char pv[4] = {};
+        static const int poisonKind =
+            GetEnvironmentVariableA("DXR_TIER11_TARGS_POISON", pv, sizeof(pv)) ? (pv[0] == '2' ? 2 : 1) : 0;
+        const bool lutPoison = poisonKind == 1;
+        keySlot.assign(256, 0);
+        for (size_t key = 0; key < 256 && !lutPoison; ++key) {
+            auto it = slotOf.find(cls[key]);
+            if (it != slotOf.end()) keySlot[key] = it->second;
+        }
+        const UINT per = shimscene::PairsPerStructure();
+        if ((slots.size() + per - 1) / per > info.variantCopies) {
+            *why = "more TraceRay argument pairs than the variant was built for";
+            return false;
+        }
+    }
+    const UINT k = (UINT)slots.size();
+    if (lut) shimscene::Activate(k);   // later builds make copies this size
     shimscene::Copy cp;
     std::string cw;
     if (!shimscene::Ensure(cl, dev, boundSrvs[0], k, owner, &cp, &cw)) {
         *why = "no copy of the scene this dispatch traces: " + cw;
         return false;
     }
-    gpuhold::Use(cp.tlasRes, owner);
+    for (const void* r : cp.tlasRes) gpuhold::Use(r, owner);
     gpuhold::Use(cp.contribRes, owner);
+    // The layout inside an instance's block: pair q at q % layoutK, on
+    // structure q / layoutK. Literal calls trace (q, k) on structure 0.
+    const UINT layoutK = lut ? cp.kc : k;
+    const UINT used = lut ? (k + cp.kc - 1) / cp.kc : 1;
+    const UINT per = cp.kc * cp.gmax;
+    const UINT span = cp.count * per;
 
     std::lock_guard<std::mutex> g(g_lock);
     if (g_tablePipe.device != dev || !g_tablePipe.pso) {
@@ -2188,8 +2356,30 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         }
         g_tablePipe = p;
     }
+    // The addresses a tracing record carries: the copy's structures (every
+    // one the variant has a descriptor for; past this copy's, its first,
+    // never picked), then with run-time arguments the pair table.
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> addrs;
+    for (UINT c = 0; c < (lut ? info.variantCopies : 1u); ++c)
+        addrs.push_back(c < cp.tlas.size() && !(lut && StructurePoison()) ? cp.tlas[c] : cp.tlas[0]);
+    if (lut) {
+        auto table = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, 1024, owner);
+        uint32_t* t = nullptr;
+        D3D12_RANGE none{ 0, 0 };
+        if (!table || FAILED(table->Map(0, &none, reinterpret_cast<void**>(&t)))) {
+            *why = "could not create the variant's pair table";
+            return false;
+        }
+        for (size_t key = 0; key < 256; ++key) {
+            const UINT s = (UINT)keySlot[key];
+            t[key] = (s % cp.kc) | (cp.kc << 8) | ((s / cp.kc) << 16);
+        }
+        table->Unmap(0, nullptr);
+        addrs.push_back(table->GetGPUVirtualAddress());
+    }
     const UINT groups = (UINT)info.groups.size(), remaps = (UINT)info.remaps.size();
-    const UINT metaDwords = groups * 9 + remaps * 17 + 2 * k;
+    const UINT na = (UINT)addrs.size();
+    const UINT metaDwords = groups * 9 + remaps * 17 + 2 * k + 2 * na;
     auto meta = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, (UINT64)metaDwords * 4, owner);
     if (!meta) { *why = "could not create the variant table metadata"; return false; }
     uint32_t* m = nullptr;
@@ -2208,9 +2398,14 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         std::memcpy(e + 8, info.remaps[y].to, 32);
         e[16] = info.remaps[y].insert;
     }
+    uint32_t* pm = m + groups * 9 + remaps * 17;
     for (UINT q = 0; q < k; ++q) {
-        m[groups * 9 + remaps * 17 + 2 * q] = info.traceArgs[q].first;
-        m[groups * 9 + remaps * 17 + 2 * q + 1] = info.traceArgs[q].second;
+        pm[2 * q] = slots[q].first & 15u;
+        pm[2 * q + 1] = slots[q].second & 15u;
+    }
+    for (UINT a = 0; a < na; ++a) {
+        pm[2 * k + 2 * a] = (uint32_t)(addrs[a] & 0xFFFFFFFFull);
+        pm[2 * k + 2 * a + 1] = (uint32_t)(addrs[a] >> 32);
     }
     meta->Unmap(0, nullptr);
 
@@ -2221,7 +2416,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     cl->SetComputeRootShaderResourceView(3, cp.contrib);
     // One table: the application's range in, the shim's out.
     auto table = [&](D3D12_GPU_VIRTUAL_ADDRESS src, UINT srcStride, UINT records, UINT dstStride,
-                     UINT mode, UINT appRecords, UINT per) -> ComPtr<ID3D12Resource> {
+                     UINT mode, UINT appRecs) -> ComPtr<ID3D12Resource> {
         auto dst = Acquire(dev, D3D12_HEAP_TYPE_DEFAULT, (UINT64)records * dstStride, owner);
         if (!dst) return nullptr;
         D3D12_RESOURCE_BARRIER b{};
@@ -2231,10 +2426,9 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         cl->ResourceBarrier(1, &b);
-        const UINT c[13] = { records, srcStride, dstStride, groups, remaps, mode, k, cp.gmax,
-                             appRecords, (UINT)(cp.tlas & 0xFFFFFFFFull), (UINT)(cp.tlas >> 32), per,
-                             poison ? 1u : 0u };
-        cl->SetComputeRoot32BitConstants(0, 13, c, 0);
+        const UINT c[14] = { records, srcStride, dstStride, groups, remaps, mode, layoutK, cp.gmax,
+                             appRecs, k, span, per, poison ? 1u : 0u, na };
+        cl->SetComputeRoot32BitConstants(0, 14, c, 0);
         cl->SetComputeRootShaderResourceView(1, src);
         cl->SetComputeRootUnorderedAccessView(4, dst->GetGPUVirtualAddress());
         cl->Dispatch((records + 63) / 64, 1, 1);
@@ -2246,15 +2440,15 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     *mine = app;
     const auto A32 = [](UINT64 v) { return (UINT)((v + 31) / 32 * 32); };
 
-    // Raygen: one record, the variant's identifier, the scene's address.
+    // Raygen: one record, the variant's identifier, the shim's addresses.
     const UINT rgSrc = (UINT)app.RayGenerationShaderRecord.SizeInBytes;
     const UINT rgDst = A32((std::max)((UINT64)rgSrc, (UINT64)info.raygenBytes));
-    auto rg = table(app.RayGenerationShaderRecord.StartAddress, rgSrc, 1, rgDst, 0, 1, 1);
+    auto rg = table(app.RayGenerationShaderRecord.StartAddress, rgSrc, 1, rgDst, 0, 1);
     if (!rg) { *why = "could not create the variant raygen record"; return false; }
     mine->RayGenerationShaderRecord = { rg->GetGPUVirtualAddress(), rgDst };
 
     // Miss and callable: identifiers remapped, layout unchanged.
-    // A miss that traces carries the shim scene's address after its own
+    // A miss that traces carries the shim's addresses after its own
     // arguments, so its records may grow (0.56.0).
     auto plain = [&](const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& in, UINT need,
                      D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* o) -> bool {
@@ -2262,7 +2456,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         const UINT stride = in.StrideInBytes ? (UINT)in.StrideInBytes : A32(in.SizeInBytes);
         const UINT recs = (UINT)(in.SizeInBytes / stride);
         const UINT out = A32((std::max)(stride, need));
-        auto t = table(in.StartAddress, stride, recs, out, 0, recs, 1);
+        auto t = table(in.StartAddress, stride, recs, out, 0, recs);
         if (!t) return false;
         *o = { t->GetGPUVirtualAddress(), (UINT64)recs * out, in.StrideInBytes ? out : 0 };
         return true;
@@ -2273,16 +2467,17 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         return false;
     }
 
-    // Hit groups: the shim's own layout.
-    const UINT appStride = (UINT)app.HitGroupTable.StrideInBytes;
-    if (!appStride) { *why = "a hit group table with stride 0"; return false; }
-    const UINT appRecords = (UINT)(app.HitGroupTable.SizeInBytes / appStride);
-    const UINT per = cp.k * cp.gmax;
-    const UINT records = cp.count * per;
+    // Hit groups: the shim's own layout, one span per structure used.
+    const UINT records = used * span;
     const UINT dstStride = A32((std::max)(appStride, (std::max)(info.recordBytes, info.variantHitBytes)));
-    auto hit = table(app.HitGroupTable.StartAddress, appStride, records, dstStride, 1, appRecords, per);
+    auto hit = table(app.HitGroupTable.StartAddress, appStride, records, dstStride, 1, appRecords);
     if (!hit) { *why = "could not create the variant hit group table"; return false; }
     mine->HitGroupTable = { hit->GetGPUVirtualAddress(), (UINT64)records * dstStride, dstStride };
+    static LONG n = 0;
+    if (lut && InterlockedIncrement(&n) <= 4)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): shim layout with TraceRay arguments "
+                 "computed at run time: %u pair block(s) this dispatch (of %zu the pipeline could "
+                 "use), %u structure(s)\n", k, info.traceArgs.size(), used);
     return true;
 }
 

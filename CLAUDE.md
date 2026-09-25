@@ -153,6 +153,21 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.57.0: TRACERAY ARGUMENTS COMPUTED AT RUN TIME.** Each call's R and M
+are followed back through the shader (`proxy/trace_args`) to literals,
+cbuffer dwords and unknowns, evaluated per dispatch with the constants read;
+the table labels records with those pairs, and the shim's own layout reads
+each call's pair from a 256-entry table the shim writes per dispatch, with a
+scene structure per 15 pairs. `gitest --dynargs` (layout `perray`),
+`--norefine`, `--perstruct`; matrix 298 of 298 on the final build. 0.56.0 refused all of it.
+128 structures removed the device, 64 did not; the shim needs at most 18.
+**gitest's WARP reference is intermittently wrong in the matrix** (5 layouts
+in one run of 298, the hardware equal to WARP's rerun in all 5; never in 630
+WARP-only runs): gitest reruns WARP on a divergence and reports GROUND TRUTH
+UNSTABLE, named apart by the matrix. Cause not known. Remaining for item a: a rewritten library with its own subobjects AND an
+export list, a library association to another library's subobject, and the
+variant with several scenes (one copy only).
+
 **0.56.0: TRACERAY IN A CLOSEST-HIT OR MISS, IN THE SHIM'S LAYOUT TOO.** The
 variant appends the shim scene's root descriptor to every shader that can
 trace (raygen; at depth above 1 miss and hit group), and at depth above 1 the

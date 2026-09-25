@@ -60,6 +60,25 @@ $cfgs += ,@('--recurse', '--localscene', '--indirectgpu', '--gpusbt')
 $cfgs += ,@('--recurse', '--localscenetable', '--stale', '--gpusbt', '--sm66')
 # The substitute ground truth agrees with WARP's own where WARP works.
 $cfgs += ,@('--bindless', '--warpglobal')
+# TraceRay arguments computed at run time (0.57.0): from the constants, read
+# at the dispatch; with --norefine not read, so every pair counts and the
+# shim's layout takes several scene structures; --perstruct 4 makes a few
+# pairs take several too.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($x in @('', '--gpuinst', '--indirect', '--indirectgpu', '--stale', '--table', '--recurse')) {
+        foreach ($s in @('', '--sm66')) { $cfgs += ,@(@($b, '--dynargs', $x, $s) | Where-Object { $_ }) }
+    }
+    foreach ($x in @('--bindless', '--bindlessrc')) { $cfgs += ,@(@($b, '--dynargs', $x) | Where-Object { $_ }) }
+    foreach ($x in @('', '--gpuinst', '--recurse')) {
+        $cfgs += ,@(@($b, '--dynargs', '--norefine', $x) | Where-Object { $_ })
+        $cfgs += ,@(@($b, '--dynargs', '--norefine', '--perstruct', '4', $x, '--sm66') | Where-Object { $_ })
+    }
+}
+$cfgs += ,@('--dynargs', '--libassoc')
+$cfgs += ,@('--dynargs', '--localscene', '--gpusbt')
+$cfgs += ,@('--dynargs', '--recurse', '--localscene')
+$cfgs += ,@('--dynargs', '--recurse', '--bindless', '--warpglobal')
+$cfgs += ,@('--dynargs', '--perstruct', '4', '--norefine', '--indirectgpu')
 
 # A failure keeps its output and the shim's log, so an intermittent one can
 # be read afterwards rather than rerun in hope.
@@ -67,6 +86,7 @@ $keep = Join-Path $env:TEMP 'gitest-matrix'
 New-Item -ItemType Directory -Force $keep | Out-Null
 $prevLog = $env:DXR_TIER11_LOG
 $fail = @()
+$unstable = @()
 $n = 0
 foreach ($c in $cfgs) {
     $n++
@@ -76,6 +96,11 @@ foreach ($c in $cfgs) {
         $fail += ('[' + ($c -join ' ') + ']')
         $out | Out-File (Join-Path $keep "run_$n.out") -Encoding utf8
         $out | Select-String 'DIVERGE|FAILED' | ForEach-Object { Write-Host "    run ${n}: $($_.Line)" }
+    } elseif (($out -join "`n") -match 'GROUND TRUTH UNSTABLE') {
+        # WARP differed from itself and the hardware matched its second run:
+        # not the shim, but kept and named.
+        $unstable += ('[' + ($c -join ' ') + ']')
+        $out | Out-File (Join-Path $keep "run_$n.out") -Encoding utf8
     } else {
         Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
     }
@@ -83,6 +108,10 @@ foreach ($c in $cfgs) {
 $env:DXR_TIER11_LOG = $prevLog
 Write-Host "gitest: $($cfgs.Count) configurations, $($cfgs.Count - $fail.Count) match WARP"
 foreach ($f in $fail) { Write-Host "  FAILED $f" }
+if ($unstable.Count) {
+    Write-Host "  ground truth unstable in $($unstable.Count) (WARP differed from itself, the hardware matched its second run):"
+    foreach ($u in $unstable) { Write-Host "    $u" }
+}
 if ($fail.Count) { Write-Host "  output and shim logs of the failures: $keep" }
 Pop-Location
 exit $fail.Count

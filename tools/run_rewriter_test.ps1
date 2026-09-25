@@ -311,6 +311,19 @@ foreach ($sm in @('lib_6_5', 'lib_6_6')) {
     $valid = $asm -match 'validated and signed ok'
     if ($same -and $valid) { Write-Host "  shimtrace $sm : PASS (byte-identical, validates and signs)" }
     else { Write-Host "  shimtrace $sm : FAIL (identical=$same valid=$valid)"; $failed++ }
+    # Arguments computed at run time (0.57.0): each call reads its pair from
+    # the shim's table; with 3 structures a switch splits the call's block.
+    $d = "phase5\out\shimdyn_$sm.ll"
+    & 'C:\DW\DXC\bin\x64\dxc.exe' -T $sm -Fc $d 'phase5\cases\shimtrace_dyn.hlsl' | Out-Null
+    foreach ($c in 1, 3) {
+        & python phase5\rewriter\shimtrace.py $d "phase5\out\shimdyn_${sm}_$c.py.ll" --copies $c | Out-Null
+        & .\phase5out\dxrw.exe shimtrace $d "phase5\out\shimdyn_${sm}_$c.cpp.ll" --copies $c | Out-Null
+        $same = (Get-FileHash "phase5\out\shimdyn_${sm}_$c.py.ll").Hash -eq (Get-FileHash "phase5\out\shimdyn_${sm}_$c.cpp.ll").Hash
+        $asm = (& .\phase5out\dxilrt.exe asm "phase5\out\shimdyn_${sm}_$c.py.ll" "phase5\out\shimdyn_${sm}_$c.dxil" 2>&1) -join "`n"
+        $valid = $asm -match 'validated and signed ok'
+        if ($same -and $valid) { Write-Host "  shimtrace $sm run-time arguments, $c structure(s) : PASS (byte-identical, validates and signs)" }
+        else { Write-Host "  shimtrace $sm run-time arguments, $c structure(s) : FAIL (identical=$same valid=$valid)"; $failed++ }
+    }
 }
 
 Write-Host ''

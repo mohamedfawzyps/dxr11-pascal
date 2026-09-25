@@ -87,17 +87,21 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc >= 4 && std::string(argv[1]) == "shimtrace") {
-        // The C++ half of phase5/rewriter/shimtrace.py: dxrw shimtrace in out R,M ...
+        // The C++ half of phase5/rewriter/shimtrace.py:
+        //   dxrw shimtrace in out R,M ...      literal pairs
+        //   dxrw shimtrace in out --copies N   pairs from the shim's table
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
         std::vector<std::pair<unsigned, unsigned>> pairs;
+        unsigned copies = 0;
         for (int i = 4; i < argc; ++i) {
             unsigned r = 0, m = 0;
-            if (std::sscanf(argv[i], "%u,%u", &r, &m) == 2) pairs.emplace_back(r, m);
+            if (std::string(argv[i]) == "--copies" && i + 1 < argc) copies = (unsigned)std::atoi(argv[++i]);
+            else if (std::sscanf(argv[i], "%u,%u", &r, &m) == 2) pairs.emplace_back(r, m);
         }
         std::string text, why;
         int calls = 0;
-        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, &text, &calls, &why)) {
+        if (!rq::RetraceToShimScene(llm::Normalize(raw), pairs, copies, &text, &calls, &why)) {
             std::printf("UNSUPPORTED: %s\n", why.c_str());
             return 2;
         }
