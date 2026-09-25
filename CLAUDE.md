@@ -153,6 +153,14 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.52.3 IN THE GAME (2026-09-25, 3 min 27 s): THE FIRST RUN WITH NOTHING
+REFUSED.** Clean end marker, 162 RayQuery shaders lowered, 332 of 332 state
+objects hr=0, 12853 lowered dispatches drawn (all indirect), REFUSED 0 of
+every kind, scene resolved 14304, not resolved 0. The record-1090 refusals
+of 0.52.2 are gone, which fits the address reuse 0.52.3 fixed (inferred:
+not the same route). Debug layer off; the cost of the per-build copy not
+measured.
+
 **0.52.2 IN THE GAME (2026-09-25, 5 min 18 s): 13689 drawn, 0 unread, but
 1190 refused in 40 s for a record two instances disagree about.** Traced
 offline to 0.52.0's own change: parsing at submit took each bottom-level
