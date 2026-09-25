@@ -97,10 +97,12 @@ struct Scenes {
 // Used for the application's own DXR libraries and for lowered RayQuery ones.
 void ScanScenes(const std::string& text, Scenes* out);
 
-// A raygen's local root signature, found by the identifier its record
-// starts with: where a scene bound through it sits in the record (0.55.0).
-struct RaygenLocal {
+// The local root signature of a raygen, miss or hit group, found by the
+// identifier its records start with: where a scene bound through it sits in
+// a record (0.55.0 raygens, 0.56.0 all three).
+struct RecordLocal {
     uint8_t id[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
+    uint32_t kind = 0;                            // 7 raygen, 11 miss, 3 hit group
     std::string why;                              // nonempty: its signature cannot be told
     Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> des;
     const D3D12_ROOT_SIGNATURE_DESC1* desc = nullptr;   // null: it has none
@@ -130,13 +132,16 @@ struct Info {
     std::vector<Microsoft::WRL::ComPtr<ID3D12StateObject>> variantParts;  // its collections
     std::vector<Remap> remaps;
     UINT raygenBytes = 0;          // the largest raygen record the variant needs
+    // The largest hit group and miss records the variant needs: a closest-hit
+    // or miss that traces gets the shim scene's address too (0.56.0).
+    UINT variantHitBytes = 0, variantMissBytes = 0;
 
-    // Every raygen's local root signature, found at the first dispatch that
-    // needs one (0.55.0), and the pipeline's recursion depth.
+    // Every record's local root signature, found at the first dispatch that
+    // needs one, and the pipeline's recursion depth.
     std::mutex localLock;
     bool localTried = false;
     std::string localWhy;
-    std::vector<RaygenLocal> raygenLocals;
+    std::vector<RecordLocal> recordLocals;
     UINT recursion = 0;
 };
 
@@ -194,21 +199,26 @@ struct BoundRoot {
 // RAYGEN's local one: with `local`, its record is read for it (0.55.0).
 // Without, `*needsLocal` says that is what failed.
 struct LocalRecord {
-    const D3D12_ROOT_SIGNATURE_DESC1* desc = nullptr;  // the raygen's local root signature
-    const uint8_t* record = nullptr;                   // its record, identifier first
+    const D3D12_ROOT_SIGNATURE_DESC1* desc = nullptr;  // the record's local root signature
+    const uint8_t* record = nullptr;                   // the record, identifier first
     UINT size = 0;
+    // A register in neither signature is skipped, not a failure: the record
+    // is a miss's or hit group's, whose shader then cannot use it (creating
+    // the pipeline fails for a register no signature declares).
+    bool lenient = false;
 };
 bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why,
                    const LocalRecord* local = nullptr, bool* needsLocal = nullptr);
 
-// The raygen whose identifier is `id` in the pipeline `app` (whose Info this
-// is): its local root signature. False with *why when it cannot be told, or
-// when the pipeline's recursion depth is above 1, where a closest-hit's or
-// miss's own local root signature could name another scene for its TraceRay.
-bool RaygenLocalOf(Info& info, ID3D12StateObject* app, const uint8_t* id,
-                   const RaygenLocal** out, std::string* why);
+// Finds, once, the local root signature of every raygen, miss and hit group
+// of the pipeline `app` (whose Info this is), through linked collections and
+// their renames. `*recursion`: the pipeline's depth; above 1 a closest-hit or
+// miss can trace, through its own records.
+bool PrepareRecordLocals(Info& info, ID3D12StateObject* app, UINT* recursion, std::string* why);
+// The one whose identifier is `id`, null when none is.
+const RecordLocal* RecordLocalOf(Info& info, const uint8_t* id);
 
 // Records the shim's copy of the application's hit group table into `cl`,
 // and returns the range the dispatch should use instead. Replaces the

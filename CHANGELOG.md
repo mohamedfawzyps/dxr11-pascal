@@ -24,6 +24,58 @@ not.
 
 ---
 
+## 0.56.0
+
+**`TraceRay` in a closest-hit or miss shader works in the shim's own record
+layout, and a scene bound through the local root signature of a miss or hit
+group record is resolved** (Tier 1.1 item a, "TraceRay in a closest-hit or
+miss in the shim's layout").
+
+- **Measured on 0.55.0 first**, with the new `gitest --recurse`: recursion
+  depth 2, each closest-hit reading `GeometryIndex()` traces a second ray and
+  folds its geometry and record into its answer, and the bottom half starts
+  off the scene so the miss traces the real ray. The layouts on the table path
+  already matched; the two needing the variant (`zero`, `zero1`) were refused,
+  "a closest-hit or miss shader that calls TraceRay". With `--localscene` too
+  (the scene in the hit groups' and miss's records as well), all 7 refused.
+- **The variant.** Every shader that can trace gets the shim scene's root
+  descriptor appended to its local root signature: a raygen, and at depth
+  above 1 a miss, and a closest-hit together with its hit group; a
+  closest-hit whose hit group a parent object defines is followed up to it.
+  The table shader already wrote the address into any remapped record, so hit
+  and miss records now grow to carry it.
+- **The scene in the records.** At depth above 1 the raygen record, every miss
+  record and every hit group record are read, each through its own local root
+  signature (`gidx::Gather`, the association rules at every level, through
+  renamed collections, hit groups taking their shaders' signature), and the
+  scenes they name are the dispatch's. A register a record's signatures do
+  not declare is skipped, not refused: creating the pipeline fails for a
+  register a shader uses and no signature declares. Records in GPU memory are
+  copied before the dispatch; with GPU-written arguments all three ranges are
+  read at submit behind ONE extra wait.
+- **Two defects found on the way.** The normaliser added a SECOND entry label
+  to a module it had already normalised, which the variant does to a library
+  the shim rewrote: "expected instruction opcode" at `bb0:`. Fixed in both
+  implementations, byte-identical, with a check that fails without the fix.
+  And the shim's own extended local root signatures did not carry their
+  serialized form, so a hit group that reads `GeometryIndex()` AND traces
+  could not be extended again.
+- **WARP removes its device when a closest-hit or miss traces a scene taken
+  from `ResourceDescriptorHeap`** (the raygen alone works, the debug layer is
+  silent; isolated by making either shader stop tracing). So for
+  `--recurse --bindless` the ground truth binds the scene globally
+  (`gitest --warpglobal`), which changes nothing the shaders write, and which
+  agrees with WARP's own where WARP works.
+- **Measured:** `tools/run_gitest_matrix.ps1` 227 of 227; it now keeps a
+  failure's output and log. ONE unexplained failure earlier, of
+  `--grow --localscene --gpuinst --sm66`, output lost, not reproduced in 36
+  further runs. Poisoning the variant's geometry index diverges `--recurse`'s
+  variant layouts. Dispatch suite 47 of 47 and every gate; rewriter suite
+  passes.
+- **Still refused, by name:** the variant traces ONE scene copy, so a pipeline
+  whose records name different scenes and whose records several geometries
+  share is not drawn.
+
 ## 0.55.0
 
 **The scene a `GeometryIndex()` dispatch traces is resolved through the

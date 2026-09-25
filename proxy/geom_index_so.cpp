@@ -619,6 +619,9 @@ bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, bool srv,
         *why = "could not create an extended local root signature";
         return false;
     }
+    // Kept on it like an application's, so the variant can extend it again:
+    // a hit group that reads GeometryIndex() and traces (0.56.0).
+    NoteRootSignature(out->Get(), blob->GetBufferPointer(), blob->GetBufferSize());
     return true;
 }
 
@@ -1273,6 +1276,7 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
                 }
             }
             if (!placed && !inLocal && !local && needsLocal) *needsLocal = true;
+            if (!placed && !inLocal && local && local->lenient) continue;
             if ((!placed && !inLocal) || !a) {
                 snprintf(buf, sizeof(buf), placed || inLocal
                              ? "the scene at t%u space%u is in a descriptor the shim saw no structure written to"
@@ -1350,6 +1354,7 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
             }
         }
         if (!placed && !local && needsLocal) *needsLocal = true;
+        if (!placed && local && local->lenient) continue;
         if (!have) {
             snprintf(buf, sizeof(buf), placed
                          ? "the heap index of the scene (b%u space%u, byte %u) is not readable on the "
@@ -1576,91 +1581,105 @@ void Attach(ID3D12Device* dev, ID3D12StateObject* so, const D3D12_STATE_OBJECT_D
 
 namespace {
 
-// `name`'s local root signature in `d`, serialized, empty when it has none:
-// in one of d's libraries, by the association rules, or in a linked
-// collection under its inner name. `*found` false when d does not export it.
-bool LocalRsOfExport(const D3D12_STATE_OBJECT_DESC& d, const std::wstring& name,
-                     std::vector<uint8_t>* blob, bool* found, std::string* why, int depth) {
-    *found = false;
+// An export with a record, or a shader a hit group names, and its local root
+// signature (serialized, empty when it has none) or why it cannot be told.
+struct Found {
+    std::wstring name;
+    uint32_t kind = 0;
+    std::string why;
+    std::vector<uint8_t> blob;
+};
+
+// Every export of `d` with its local root signature, by the spec's
+// association rules at each level: the libraries' shaders, what linked
+// collections export (under the names `d` gives them), and hit groups, which
+// take their shaders' signature.
+void Gather(const D3D12_STATE_OBJECT_DESC& d, int depth, std::vector<Found>* out) {
     const UINT n = d.NumSubobjects;
     const D3D12_STATE_SUBOBJECT* s = d.pSubobjects;
-    for (UINT i = 0; i < n; ++i) {
-        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !s[i].pDesc) continue;
-        bool here = false;
-        for (const auto& f : Exported(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc)))
-            here = here || f.first == name;
-        if (!here) continue;
-        Assoc a;
-        if (!BuildAssoc(d, {}, &a, why)) return false;
+    Assoc a;
+    std::string aw;
+    const bool haveAssoc = BuildAssoc(d, {}, &a, &aw);
+    auto signature = [&](const std::vector<std::wstring>& u, Found* f) {
         int idx = -1;
-        if (!a.Of({ name }, &idx)) {
-            *why = "cannot tell which local root signature " + Narrow(name) + " has";
-            return false;
-        }
-        *found = true;
-        blob->clear();
+        if (!haveAssoc) { f->why = aw.empty() ? "the associations cannot be read" : aw; return; }
+        if (!a.Of(u, &idx)) { f->why = "cannot tell which local root signature " + Narrow(u[0]) + " has"; return; }
         if (idx >= 0) {
             const auto* l = static_cast<const D3D12_LOCAL_ROOT_SIGNATURE*>(s[idx].pDesc);
             ID3D12RootSignature* rs = l ? l->pLocalRootSignature : nullptr;
             UINT size = 0;
             if (!rs || FAILED(rs->GetPrivateData(kBlobGuid, &size, nullptr)) || !size) {
-                *why = "a local root signature the shim did not see being created";
-                return false;
+                f->why = "a local root signature the shim did not see being created";
+                return;
             }
-            blob->resize(size);
-            rs->GetPrivateData(kBlobGuid, &size, blob->data());
+            f->blob.resize(size);
+            rs->GetPrivateData(kBlobGuid, &size, f->blob.data());
         } else if (idx <= -2) {
-            if (!SerializeRts0(a.libLrs[(size_t)(-2 - idx)].second, blob, why)) return false;
+            if (!SerializeRts0(a.libLrs[(size_t)(-2 - idx)].second, &f->blob, &f->why) && f->why.empty())
+                f->why = "a library's local root signature cannot be read";
         }
-        return true;
-    }
-    if (depth > 4) return true;
+    };
+    std::vector<Found> here;
+    std::set<std::wstring> libNames;
     for (UINT i = 0; i < n; ++i) {
-        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION || !s[i].pDesc) continue;
-        const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(s[i].pDesc);
-        std::wstring inner;
-        if (!c->NumExports) inner = name;
-        for (UINT e = 0; e < c->NumExports; ++e)
-            if (c->pExports[e].Name == name)
-                inner = c->pExports[e].ExportToRename ? c->pExports[e].ExportToRename : c->pExports[e].Name;
-        if (inner.empty()) continue;
-        auto ci = Get(c->pExistingCollection);
-        if (!ci || !ci->store) continue;
-        const D3D12_STATE_OBJECT_DESC cd = ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
-        if (!LocalRsOfExport(cd, inner, blob, found, why, depth + 1)) return false;
-        if (*found) return true;
-    }
-    return true;
-}
-
-// Every raygen `d` exports, by the names it exports them under.
-void RaygensOf(const D3D12_STATE_OBJECT_DESC& d, std::vector<std::wstring>* out, int depth) {
-    for (UINT i = 0; i < d.NumSubobjects; ++i) {
-        const auto& so = d.pSubobjects[i];
-        if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && so.pDesc) {
-            for (const auto& f : Exported(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(so.pDesc)))
-                if (f.second == 7) out->push_back(f.first);
-        } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION && so.pDesc && depth < 4) {
-            const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(so.pDesc);
+        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && s[i].pDesc) {
+            for (const auto& fn : Exported(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc))) {
+                Found f;
+                f.name = fn.first;
+                f.kind = fn.second;
+                signature({ fn.first }, &f);
+                libNames.insert(fn.first);
+                here.push_back(std::move(f));
+            }
+        } else if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION && s[i].pDesc && depth < 4) {
+            const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(s[i].pDesc);
             auto ci = Get(c->pExistingCollection);
             if (!ci || !ci->store) continue;
-            std::vector<std::wstring> inner;
-            RaygensOf(ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION), &inner, depth + 1);
-            for (const auto& w : inner) {
-                if (!c->NumExports) { out->push_back(w); continue; }
+            std::vector<Found> sub;
+            Gather(ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION), depth + 1, &sub);
+            for (auto& f : sub) {
+                if (!c->NumExports) { here.push_back(f); continue; }
                 for (UINT e = 0; e < c->NumExports; ++e)
                     if ((c->pExports[e].ExportToRename ? c->pExports[e].ExportToRename
-                                                       : c->pExports[e].Name) == w)
-                        out->push_back(c->pExports[e].Name);
+                                                       : c->pExports[e].Name) == f.name) {
+                        Found g = f;
+                        g.name = c->pExports[e].Name;
+                        here.push_back(std::move(g));
+                    }
             }
         }
     }
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[i].pDesc) continue;
+        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[i].pDesc);
+        if (!h->HitGroupExport) continue;
+        Found f;
+        f.name = h->HitGroupExport;
+        f.kind = 3;
+        std::vector<std::wstring> u{ h->HitGroupExport };
+        bool inLib = false;
+        const Found* inColl = nullptr;
+        for (LPCWSTR imp : { h->ClosestHitShaderImport, h->AnyHitShaderImport, h->IntersectionShaderImport }) {
+            if (!imp) continue;
+            u.push_back(imp);
+            if (libNames.count(imp)) inLib = true;
+            for (const auto& x : here)
+                if (!inColl && x.name == imp && !libNames.count(imp)) inColl = &x;
+        }
+        if (inLib || !inColl) {
+            signature(u, &f);
+        } else {
+            f.why = inColl->why;
+            f.blob = inColl->blob;
+        }
+        here.push_back(std::move(f));
+    }
+    for (auto& f : here) out->push_back(std::move(f));
 }
 
 }  // namespace
 
-bool RaygenLocalOf(Info& info, ID3D12StateObject* app, const uint8_t* id,
-                   const RaygenLocal** out, std::string* why) {
+bool PrepareRecordLocals(Info& info, ID3D12StateObject* app, UINT* recursion, std::string* why) {
     std::lock_guard<std::mutex> lk(info.localLock);
     if (!info.localTried) {
         info.localTried = true;
@@ -1672,48 +1691,40 @@ bool RaygenLocalOf(Info& info, ID3D12StateObject* app, const uint8_t* id,
         } else {
             const D3D12_STATE_OBJECT_DESC d = info.store->Desc(info.type);
             info.recursion = Recursion(d);
-            std::vector<std::wstring> names;
-            RaygensOf(d, &names, 0);
-            for (const auto& name : names) {
-                void* p = props->GetShaderIdentifier(name.c_str());
+            std::vector<Found> all;
+            Gather(d, 0, &all);
+            for (const auto& f : all) {
+                if (f.kind != 7 && f.kind != 11 && f.kind != 3) continue;
+                void* p = props->GetShaderIdentifier(f.name.c_str());
                 if (!p) continue;
-                RaygenLocal r;
+                RecordLocal r;
                 std::memcpy(r.id, p, sizeof(r.id));
-                std::vector<uint8_t> blob;
-                bool found = false;
-                if (!LocalRsOfExport(d, name, &blob, &found, &r.why, 0)) {
-                    if (r.why.empty()) r.why = "its local root signature cannot be told";
-                } else if (!found) {
-                    r.why = "the raygen " + Narrow(name) + " was not found in the pipeline";
-                } else if (!blob.empty()) {
+                r.kind = f.kind;
+                r.why = f.why;
+                if (r.why.empty() && !f.blob.empty()) {
                     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* v = nullptr;
-                    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(), blob.size(),
+                    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(f.blob.data(), f.blob.size(),
                                                                              IID_PPV_ARGS(&r.des))) ||
                         FAILED(r.des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &v)) ||
                         !v)
-                        r.why = "could not read back the raygen's local root signature";
+                        r.why = "could not read back the local root signature of " + Narrow(f.name);
                     else
                         r.desc = &v->Desc_1_1;
                 }
-                info.raygenLocals.push_back(std::move(r));
+                info.recordLocals.push_back(std::move(r));
             }
         }
     }
+    *recursion = info.recursion;
     if (!info.localWhy.empty()) { *why = info.localWhy; return false; }
-    if (info.recursion != 1) {
-        *why = "the scene is in a local root signature and the pipeline's recursion depth is " +
-               std::to_string(info.recursion) + ", where a closest-hit or miss could trace another "
-               "scene through its own";
-        return false;
-    }
-    for (const auto& r : info.raygenLocals)
-        if (!std::memcmp(r.id, id, sizeof(r.id))) {
-            if (!r.why.empty()) { *why = r.why; return false; }
-            *out = &r;
-            return true;
-        }
-    *why = "the raygen record's identifier is not one of the pipeline's raygens";
-    return false;
+    return true;
+}
+
+const RecordLocal* RecordLocalOf(Info& info, const uint8_t* id) {
+    std::lock_guard<std::mutex> lk(info.localLock);
+    for (const auto& r : info.recordLocals)
+        if (!std::memcmp(r.id, id, sizeof(r.id))) return &r;
+    return nullptr;
 }
 
 std::shared_ptr<Info> Get(ID3D12StateObject* so) {
@@ -1906,16 +1917,24 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
 
 namespace {
 
+struct Tracer {
+    std::wstring name;
+    UINT offset = 0;
+    uint32_t kind = 0;
+};
+
 // A variant of the object `d` describes: every library that traces has its
 // TraceRay calls pointed at the shim scene with (index of the pair, k), each
 // raygen's local root signature gets the scene's root descriptor appended,
 // and a linked collection that traces is replaced by its own variant.
-// `raygens` receives (name, offset of the descriptor in its record), `names`
+// `tracers` receives every export whose record carries the shim scene's
+// address, with its offset and kind (7 raygen, 11 miss, 3 hit group, 10 a
+// closest-hit whose hit group is defined outside this object), `names`
 // every export whose identifier may have changed, both as `d` exports them.
 bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                const std::vector<std::pair<UINT, UINT>>& pairs,
                ComPtr<ID3D12StateObject>* out,
-               std::vector<std::pair<std::wstring, UINT>>* raygens,
+               std::vector<Tracer>* tracers,
                std::vector<std::wstring>* names,
                std::vector<ComPtr<ID3D12StateObject>>* parts, std::string* why) {
     const UINT n = d.NumSubobjects;
@@ -1925,6 +1944,7 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
     std::map<UINT, const std::vector<uint8_t>*> code;
     std::map<UINT, ID3D12StateObject*> colls;
     std::vector<std::vector<std::wstring>> units;
+    std::vector<uint32_t> kinds;   // per unit, as Tracer::kind
     std::vector<std::pair<unsigned, unsigned>> upairs(pairs.begin(), pairs.end());
     bool any = false;
     for (UINT i = 0; i < n; ++i) {
@@ -1957,18 +1977,42 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
             if (!rq::RetraceToShimScene(llm::Normalize(text), upairs, &lowered, &calls, why))
                 return false;
             if (!calls) continue;
-            if (tracingOther) {
-                *why = "a closest-hit or miss shader that calls TraceRay (recursion above 1)";
-                return false;
-            }
             codeStore.emplace_back();
             if (!dxch::AssembleAndSign(lowered, &codeStore.back(), &err)) {
                 *why = "the variant library did not assemble: " + err;
                 return false;
             }
             code[i] = &codeStore.back();
-            for (const auto& f : fns)
-                if (f.second == 7) units.push_back({ f.first });
+            // Every shader here that can trace gets the scene's root
+            // descriptor: a raygen; with a recursion depth above 1, a miss,
+            // and a closest-hit with its hit group, whose shaders share one
+            // local root signature (0.56.0; until then refused).
+            for (const auto& f : fns) {
+                if (f.second == 7 || (f.second == 11 && tracingOther)) {
+                    units.push_back({ f.first });
+                    kinds.push_back(f.second);
+                } else if (f.second == 10 && tracingOther) {
+                    bool grouped = false;
+                    for (UINT j = 0; j < n; ++j) {
+                        if (s[j].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[j].pDesc) continue;
+                        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[j].pDesc);
+                        if (!h->ClosestHitShaderImport || f.first != h->ClosestHitShaderImport ||
+                            !h->HitGroupExport)
+                            continue;
+                        std::vector<std::wstring> u{ h->HitGroupExport };
+                        for (LPCWSTR imp : { h->ClosestHitShaderImport, h->AnyHitShaderImport,
+                                             h->IntersectionShaderImport })
+                            if (imp) u.push_back(imp);
+                        units.push_back(u);
+                        kinds.push_back(3);
+                        grouped = true;
+                    }
+                    if (!grouped) {
+                        units.push_back({ f.first });
+                        kinds.push_back(10);
+                    }
+                }
+            }
             any = true;
         } else if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION && s[i].pDesc) {
             const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(s[i].pDesc);
@@ -1978,7 +2022,7 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                          ci && ci->store ? 1 : 0, ci ? ci->traceArgs.size() : (size_t)0);
             if (!ci || !ci->store || (ci->traceArgs.empty() && !ci->dynamicTraceArgs)) continue;
             ComPtr<ID3D12StateObject> vc;
-            std::vector<std::pair<std::wstring, UINT>> subRg;
+            std::vector<Tracer> subRg;
             std::vector<std::wstring> subNames;
             D3D12_STATE_OBJECT_DESC cd = ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
             if (!VariantOf(dev, cd, pairs, &vc, &subRg, &subNames, parts, why)) return false;
@@ -1996,8 +2040,19 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
             for (const auto& w : subNames) as(w, names);
             for (const auto& r : subRg) {
                 std::vector<std::wstring> o;
-                as(r.first, &o);
-                for (const auto& w : o) raygens->emplace_back(w, r.second);
+                as(r.name, &o);
+                for (const auto& w : o) {
+                    tracers->push_back({ w, r.offset, r.kind });
+                    // A closest-hit whose hit group this object defines: the
+                    // group's records carry the address where the shader's do.
+                    if (r.kind != 10) continue;
+                    for (UINT j = 0; j < n; ++j) {
+                        if (s[j].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[j].pDesc) continue;
+                        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[j].pDesc);
+                        if (h->ClosestHitShaderImport && w == h->ClosestHitShaderImport && h->HitGroupExport)
+                            tracers->push_back({ h->HitGroupExport, r.offset, 3 });
+                    }
+                }
             }
             any = true;
         }
@@ -2012,7 +2067,7 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
     std::vector<UINT> offsets;
     UINT sigs = 0;
     if (!Rebuild(dev, d, true, units, code, colls, &t, &offsets, &sigs, why)) return false;
-    for (size_t u = 0; u < units.size(); ++u) raygens->emplace_back(units[u][0], offsets[u]);
+    for (size_t u = 0; u < units.size(); ++u) tracers->push_back({ units[u][0], offsets[u], kinds[u] });
     ComPtr<ID3D12Device5> d5;
     HRESULT hr = dev->QueryInterface(IID_PPV_ARGS(&d5));
     if (SUCCEEDED(hr)) hr = d5->CreateStateObject(&t.desc, IID_PPV_ARGS(out->GetAddressOf()));
@@ -2047,10 +2102,10 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
     if (info.traceArgs.empty()) return fail("the pipeline has no TraceRay");
     if (info.traceArgs.size() > 15) return fail("more than 15 TraceRay argument pairs");
     const D3D12_STATE_OBJECT_DESC d = info.store->Desc(info.type);
-    std::vector<std::pair<std::wstring, UINT>> raygens;
+    std::vector<Tracer> tracers;
     std::vector<std::wstring> names;
     std::string w;
-    if (!VariantOf(dev, d, info.traceArgs, &info.variant, &raygens, &names, &info.variantParts, &w))
+    if (!VariantOf(dev, d, info.traceArgs, &info.variant, &tracers, &names, &info.variantParts, &w))
         return fail(w);
     ComPtr<ID3D12StateObjectProperties> pa, pv;
     if (FAILED(app->QueryInterface(IID_PPV_ARGS(&pa))) ||
@@ -2060,8 +2115,8 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
     }
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
-    for (const auto& r : raygens)
-        if (std::find(names.begin(), names.end(), r.first) == names.end()) names.push_back(r.first);
+    for (const auto& r : tracers)
+        if (std::find(names.begin(), names.end(), r.name) == names.end()) names.push_back(r.name);
     for (const auto& name : names) {
         void* from = pa->GetShaderIdentifier(name.c_str());
         void* to = pv->GetShaderIdentifier(name.c_str());
@@ -2069,15 +2124,20 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
         Remap m;
         std::memcpy(m.from, from, sizeof(m.from));
         std::memcpy(m.to, to, sizeof(m.to));
-        for (const auto& r : raygens)
-            if (r.first == name) m.insert = r.second;
+        uint32_t kind = 0;
+        for (const auto& r : tracers)
+            if (r.name == name) { m.insert = r.offset; kind = r.kind; }
         if (m.insert || std::memcmp(m.from, m.to, sizeof(m.from)) != 0) info.remaps.push_back(m);
-        if (m.insert) info.raygenBytes = (std::max)(info.raygenBytes, m.insert + 8);
+        if (m.insert) {
+            UINT& bytes = kind == 3 ? info.variantHitBytes
+                        : kind == 11 ? info.variantMissBytes : info.raygenBytes;
+            bytes = (std::max)(bytes, m.insert + 8);
+        }
     }
     shimscene::Activate((UINT)info.traceArgs.size());
     ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): VARIANT pipeline built, the shim's own "
-             "record layout: %zu raygen(s) tracing the shim scene, %zu identifier(s) remapped, "
-             "%zu collection(s) rebuilt\n", raygens.size(), info.remaps.size(), info.variantParts.size());
+             "record layout: %zu shader(s) tracing the shim scene, %zu identifier(s) remapped, "
+             "%zu collection(s) rebuilt\n", tracers.size(), info.remaps.size(), info.variantParts.size());
     return true;
 }
 
@@ -2194,18 +2254,21 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     mine->RayGenerationShaderRecord = { rg->GetGPUVirtualAddress(), rgDst };
 
     // Miss and callable: identifiers remapped, layout unchanged.
-    auto plain = [&](const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& in,
+    // A miss that traces carries the shim scene's address after its own
+    // arguments, so its records may grow (0.56.0).
+    auto plain = [&](const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& in, UINT need,
                      D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* o) -> bool {
         if (!in.SizeInBytes) return true;
         const UINT stride = in.StrideInBytes ? (UINT)in.StrideInBytes : A32(in.SizeInBytes);
         const UINT recs = (UINT)(in.SizeInBytes / stride);
-        auto t = table(in.StartAddress, stride, recs, stride, 0, recs, 1);
+        const UINT out = A32((std::max)(stride, need));
+        auto t = table(in.StartAddress, stride, recs, out, 0, recs, 1);
         if (!t) return false;
-        *o = { t->GetGPUVirtualAddress(), (UINT64)recs * stride, in.StrideInBytes };
+        *o = { t->GetGPUVirtualAddress(), (UINT64)recs * out, in.StrideInBytes ? out : 0 };
         return true;
     };
-    if (!plain(app.MissShaderTable, &mine->MissShaderTable) ||
-        !plain(app.CallableShaderTable, &mine->CallableShaderTable)) {
+    if (!plain(app.MissShaderTable, info.variantMissBytes, &mine->MissShaderTable) ||
+        !plain(app.CallableShaderTable, 0, &mine->CallableShaderTable)) {
         *why = "could not create the variant miss or callable table";
         return false;
     }
@@ -2216,7 +2279,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
     const UINT appRecords = (UINT)(app.HitGroupTable.SizeInBytes / appStride);
     const UINT per = cp.k * cp.gmax;
     const UINT records = cp.count * per;
-    const UINT dstStride = A32((std::max)(appStride, info.recordBytes));
+    const UINT dstStride = A32((std::max)(appStride, (std::max)(info.recordBytes, info.variantHitBytes)));
     auto hit = table(app.HitGroupTable.StartAddress, appStride, records, dstStride, 1, appRecords, per);
     if (!hit) { *why = "could not create the variant hit group table"; return false; }
     mine->HitGroupTable = { hit->GetGPUVirtualAddress(), (UINT64)records * dstStride, dstStride };

@@ -73,6 +73,15 @@
 // --gpusbt puts the shader table in GPU memory, copied there on the GPU, so
 // the raygen record cannot be read on the CPU at record time.
 //
+// --recurse makes the pipeline's recursion depth 2 and traces from the hit
+// and miss shaders too: each closest-hit that reads GeometryIndex() traces a
+// second ray beside its hit and folds that ray's geometry and record into
+// its own answer, and the bottom half of the image starts its rays off the
+// scene, so the miss shader traces the real ray. The shim has to give those
+// TraceRay calls the same scene and records as the raygen's. With
+// --localscene too, the hit groups' and the miss's local root signatures
+// carry the scene as well, so it has to be read from their records.
+//
 // Exit code 0 only when every layout matches WARP.
 
 #include <windows.h>
@@ -121,6 +130,13 @@ static bool g_libassoc = false;
 static bool g_gpuinst = false, g_stale = false, g_deserialize = false;
 static int g_localScene = 0;   // 1 a root SRV in the raygen's record, 2 a descriptor table
 static bool g_gpuSbt = false;
+static bool g_recurse = false;
+// --warpglobal: WARP draws the ground truth with the scene through the global
+// root SRV instead of the heap. Measured: WARP removes its device when a
+// closest-hit or miss traces a scene from ResourceDescriptorHeap (the raygen
+// alone works, and the debug layer says nothing), so --recurse --bindless
+// needs it. How the scene is bound changes nothing the shaders write.
+static bool g_warpGlobal = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -144,35 +160,90 @@ SubobjectToExportsAssociation AssocRec = { "LrsRec", "HitGroup;HitGroupOther" };
 SubobjectToExportsAssociation AssocRec3 = { "LrsRec3", "HitGroup3" };
 #endif
 
-struct Pay { uint4 v; };
-
-[shader("raygeneration")] void RayGen() {
-    uint2 p = DispatchRaysIndex().xy;
-#if BINDLESS
-    RaytracingAccelerationStructure Scene = ResourceDescriptorHeap[Pad];
+struct Pay {
+    uint4 v;
+#if RECURSE
+    uint depth;
 #endif
+};
+
+#if BINDLESS
+#define SCENE_DECL RaytracingAccelerationStructure Scene = ResourceDescriptorHeap[Pad];
+#else
+#define SCENE_DECL
+#endif
+#if ANYHIT
+#define TRACE_FLAGS RAY_FLAG_NONE
+#else
+#define TRACE_FLAGS RAY_FLAG_FORCE_OPAQUE
+#endif
+#define NO_HIT uint4(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+
+RayDesc MakeRay(uint2 p) {
     RayDesc r;
     r.Origin = float3((p.x + 0.5) / W * NInst, (p.y + 0.5) / H, 1.0);
     r.Direction = float3(0, 0, -1);
     r.TMin = 0.0; r.TMax = 10.0;
-    Pay pay; pay.v = uint4(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
-#if ANYHIT
-    TraceRay(Scene, RAY_FLAG_NONE, 0xFF, R_VAL, M_VAL, 0, r, pay);
-#else
-    TraceRay(Scene, RAY_FLAG_FORCE_OPAQUE, 0xFF, R_VAL, M_VAL, 0, r, pay);
+    return r;
+}
+
+[shader("raygeneration")] void RayGen() {
+    uint2 p = DispatchRaysIndex().xy;
+    SCENE_DECL
+    RayDesc r = MakeRay(p);
+    Pay pay; pay.v = NO_HIT;
+#if RECURSE
+    pay.depth = 0;
+    if (p.y >= H / 2) r.Origin.x = -5.0;   // misses: the miss shader traces it
 #endif
+    TraceRay(Scene, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, r, pay);
     Out[p.y * W + p.x] = pay.v;
 }
 
-[shader("miss")] void Miss(inout Pay p) { p.v = uint4(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF); }
+#if RECURSE
+// A second ray from beside the hit, traced from the closest-hit; its geometry
+// and record folded into this hit's answer.
+void Follow(inout Pay p) {
+    if (p.depth != 0) return;
+    SCENE_DECL
+    float3 h = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+    RayDesc r;
+    r.Origin = float3(h.x + 0.3, h.y, 1.0);
+    r.Direction = float3(0, 0, -1);
+    r.TMin = 0.0; r.TMax = 10.0;
+    Pay q; q.v = NO_HIT; q.depth = 1;
+    TraceRay(Scene, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, r, q);
+    p.v.x += 16 * (q.v.x & 0xFF);
+    p.v.w += 65536 * (q.v.w & 0xFFFF);
+}
+#endif
+
+[shader("miss")] void Miss(inout Pay p) {
+#if RECURSE
+    if (p.depth == 0) {
+        SCENE_DECL
+        Pay q; q.v = NO_HIT; q.depth = 1;
+        TraceRay(Scene, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, MakeRay(DispatchRaysIndex().xy), q);
+        p.v = q.v + uint4(0, 0, 0, 5000);
+        return;
+    }
+#endif
+    p.v = NO_HIT;
+}
 
 [shader("closesthit")]
 void ClosestHit(inout Pay p, BuiltInTriangleIntersectionAttributes a) {
     p.v = uint4(GeometryIndex(), InstanceIndex(), PrimitiveIndex(), RecTag);
+#if RECURSE
+    Follow(p);
+#endif
 }
 [shader("closesthit")]
 void ClosestHit3(inout Pay p, BuiltInTriangleIntersectionAttributes a) {
     p.v = uint4(GeometryIndex() + 100, InstanceIndex(), PrimitiveIndex(), RecA + RecB * 7 + RecC * 31);
+#if RECURSE
+    Follow(p);
+#endif
 }
 // Never reads GeometryIndex: the shim must leave it, and its records, alone.
 [shader("closesthit")]
@@ -196,9 +267,10 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
     const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
     const wchar_t* dl = g_libassoc ? L"LIBASSOC=1" : L"LIBASSOC=0";
     const wchar_t* ds = g_localScene ? L"LOCALSCENE=1" : L"LOCALSCENE=0";
+    const wchar_t* dc = g_recurse ? L"RECURSE=1" : L"RECURSE=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
-                                         L"-D", db, L"-D", dl, L"-D", ds };
+                                         L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc };
     DxcBuffer buf{ kLib, std::strlen(kLib), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -522,13 +594,26 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         g_bindless ? D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
                    : D3D12_ROOT_SIGNATURE_FLAG_NONE };
     auto grs = RootSig(g.dev.Get(), gd);
-    D3D12_ROOT_PARAMETER lp1{}; lp1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    lp1.Constants.Num32BitValues = 1; lp1.Constants.RegisterSpace = 1;
-    D3D12_ROOT_SIGNATURE_DESC ld1{ 1, &lp1, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
+    // --recurse --localscene: the hit groups trace too, so their signatures
+    // carry the scene after their constants.
+    const bool hitScene = g_recurse && g_localScene;
+    D3D12_ROOT_PARAMETER lp1[2]{}; lp1[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    lp1[0].Constants.Num32BitValues = 1; lp1[0].Constants.RegisterSpace = 1;
+    D3D12_ROOT_PARAMETER lp3[2]{}; lp3[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    lp3[0].Constants.Num32BitValues = 3; lp3[0].Constants.ShaderRegister = 1; lp3[0].Constants.RegisterSpace = 1;
+    D3D12_DESCRIPTOR_RANGE hsr{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 2, 2 };
+    for (D3D12_ROOT_PARAMETER* q : { &lp1[1], &lp3[1] }) {
+        if (g_localScene == 2) {
+            q->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            q->DescriptorTable = { 1, &hsr };
+        } else {
+            q->ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            q->Descriptor.RegisterSpace = 2;
+        }
+    }
+    D3D12_ROOT_SIGNATURE_DESC ld1{ hitScene ? 2u : 1u, lp1, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
     auto lrs1 = RootSig(g.dev.Get(), ld1);
-    D3D12_ROOT_PARAMETER lp3{}; lp3.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    lp3.Constants.Num32BitValues = 3; lp3.Constants.ShaderRegister = 1; lp3.Constants.RegisterSpace = 1;
-    D3D12_ROOT_SIGNATURE_DESC ld3{ 1, &lp3, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
+    D3D12_ROOT_SIGNATURE_DESC ld3{ hitScene ? 2u : 1u, lp3, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
     auto lrs3 = RootSig(g.dev.Get(), ld3);
     // --localscene: the raygen's own signature carries the scene, t0 space2,
     // as the table's descriptor 2 in --localscenetable.
@@ -544,7 +629,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     D3D12_ROOT_SIGNATURE_DESC lds{ 1, &lps, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
     auto lrsS = RootSig(g.dev.Get(), lds);
     D3D12_LOCAL_ROOT_SIGNATURE lsubS{ lrsS.Get() };
-    const wchar_t* sExports[] = { L"RayGen" };
+    const wchar_t* sExports[] = { L"RayGen", L"Miss" };
 
     auto lib = Compile(L.R, L.M, L.anyhit);
     D3D12_DXIL_LIBRARY_DESC libd{};
@@ -558,8 +643,8 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         hg[k].ClosestHitShaderImport = chName[k];
         if (L.anyhit && k == 0) hg[k].AnyHitShaderImport = L"AnyHit";
     }
-    D3D12_RAYTRACING_SHADER_CONFIG sc{ 16, 8 };
-    D3D12_RAYTRACING_PIPELINE_CONFIG pc{ 1 };
+    D3D12_RAYTRACING_SHADER_CONFIG sc{ g_recurse ? 20u : 16u, 8 };
+    D3D12_RAYTRACING_PIPELINE_CONFIG pc{ g_recurse ? 2u : 1u };
     D3D12_GLOBAL_ROOT_SIGNATURE gsub{ grs.Get() };
     D3D12_LOCAL_ROOT_SIGNATURE lsub1{ lrs1.Get() }, lsub3{ lrs3.Get() };
     std::vector<D3D12_STATE_SUBOBJECT> sub;
@@ -581,7 +666,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         a3.pSubobjectToAssociate = &sub.back();
         sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a3 });
     }
-    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION aS{ nullptr, 1, sExports };
+    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION aS{ nullptr, hitScene ? 2u : 1u, sExports };
     if (g_localScene) {
         sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsubS });
         aS.pSubobjectToAssociate = &sub.back();
@@ -619,7 +704,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
             rS = &rs.back();
         }
         const wchar_t* rgName[] = { L"RayGen" }; const wchar_t* msName[] = { L"Miss" };
-        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION ra{ rS, 1, rgName }, rm{ r0, 1, msName };
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION ra{ rS, 1, rgName }, rm{ hitScene ? rS : r0, 1, msName };
         rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &ra });
         rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &rm });
         D3D12_STATE_OBJECT_DESC rd{ D3D12_STATE_OBJECT_TYPE_COLLECTION, (UINT)rs.size(), rs.data() };
@@ -780,6 +865,11 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         if (g_localScene == 2) arg = heap->GetGPUDescriptorHandleForHeapStart().ptr + inc;
         uint8_t* tm = nullptr; HR(table->Map(0, nullptr, (void**)&tm), "Map table");
         std::memcpy(tm + idSz, &arg, 8);
+        if (hitScene) {
+            std::memcpy(tm + 64 + idSz, &arg, 8);
+            for (UINT i = 0; i < L.records; ++i)   // after 1 or 3 constants, 8-aligned
+                std::memcpy(tm + offHit + stride * i + (L.group[i] == 1 ? 48 : 40), &arg, 8);
+        }
         table->Unmap(0, nullptr);
         rgBytes = idSz + 8;
     }
@@ -801,7 +891,8 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     D3D12_DISPATCH_RAYS_DESC dr{};
     const auto base = tableAt;
     dr.RayGenerationShaderRecord = { base, rgBytes };
-    dr.MissShaderTable = { base + 64, idSz, idSz };
+    dr.MissShaderTable = hitScene ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, 64, 64 }
+                                  : D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, idSz, idSz };
     dr.HitGroupTable = { base + offHit, stride * L.records, stride };
     dr.Width = W; dr.Height = kH; dr.Depth = 1;
     ComPtr<ID3D12CommandSignature> sig;   // alive until the list has run
@@ -866,9 +957,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--localscene")) g_localScene = 1;
         else if (!std::strcmp(argv[i], "--localscenetable")) g_localScene = 2;
         else if (!std::strcmp(argv[i], "--gpusbt")) g_gpuSbt = true;
+        else if (!std::strcmp(argv[i], "--recurse")) g_recurse = true;
+        else if (!std::strcmp(argv[i], "--warpglobal")) g_warpGlobal = true;
         else want.insert(argv[i]);
     }
-    if (g_localScene && (g_table || g_bindless)) {
+    if (g_localScene && (g_table || g_bindless || g_libassoc)) {
         std::printf("--localscene binds the scene one way only\n");
         return 2;
     }
@@ -901,8 +994,16 @@ int main(int argc, char** argv) {
         if (!want.empty() && !want.count(L.name)) continue;
         ++ran;
         std::vector<uint32_t> a, b;
+        const int keepBindless = g_bindless;
+        if (g_warpGlobal) g_bindless = 0;
+        bool warpOk = true;
         try { a = Run(warp.Get(), L); }
-        catch (const std::exception& e) { std::printf("%-7s WARP FAILED: %s\n", L.name, e.what()); ++failed; continue; }
+        catch (const std::exception& e) {
+            std::printf("%-7s WARP FAILED: %s\n", L.name, e.what());
+            warpOk = false;
+        }
+        g_bindless = keepBindless;
+        if (!warpOk) { ++failed; continue; }
         try { b = Run(hw.Get(), L); }
         catch (const std::exception& e) { std::printf("%-7s DIVERGE: hardware failed: %s\n", L.name, e.what()); ++failed; continue; }
         size_t px = a.size() / 4, bad = 0, hits = 0, badG = 0, badRec = 0;

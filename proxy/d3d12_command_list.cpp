@@ -8,6 +8,7 @@
 #include "d3d12_command_list.h"
 #include "geom_index_so.h"
 
+#include <set>
 #include <functional>
 #include "shim_scene.h"
 #include "proxy_log.h"
@@ -787,14 +788,18 @@ bool ReadBackBytes(ID3D12Resource* rb, UINT bytes, std::vector<uint8_t>* out) {
 }
 }  // namespace
 
-int Dxr11CommandList::ReadRaygenRecord(const D3D12_DISPATCH_RAYS_DESC& d, std::vector<uint8_t>* rec,
-                                       std::string* why) {
-    UINT bytes = RaygenRecordBytes(d);
-    if (bytes < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) {
-        *why = "the raygen record is shorter than a shader identifier";
-        return 0;
-    }
-    const restrack::Found f = restrack::Find(d.RayGenerationShaderRecord.StartAddress);
+namespace {
+// Range k of a dispatch's records: 0 the raygen record, 1 the miss table, 2
+// the hit group table. A table is read whole, up to what one copy can move.
+void RecordRange(const D3D12_DISPATCH_RAYS_DESC& d, int k, D3D12_GPU_VIRTUAL_ADDRESS* at, UINT* bytes) {
+    if (k == 0) { *at = d.RayGenerationShaderRecord.StartAddress; *bytes = RaygenRecordBytes(d); return; }
+    const auto& t = k == 1 ? d.MissShaderTable : d.HitGroupTable;
+    *at = t.StartAddress;
+    *bytes = (UINT)((std::min)(t.SizeInBytes, (UINT64)(16u << 20)) & ~3ull);
+}
+// 1 read from CPU-visible memory, 2 not (GPU memory, or not a tracked buffer).
+int ReadRange(D3D12_GPU_VIRTUAL_ADDRESS at, UINT bytes, std::vector<uint8_t>* out) {
+    const restrack::Found f = restrack::Find(at);
     if (!f.resource || (f.heap != D3D12_HEAP_TYPE_UPLOAD && f.heap != D3D12_HEAP_TYPE_READBACK))
         return 2;
     const UINT64 width = f.resource->GetDesc().Width;
@@ -803,38 +808,95 @@ int Dxr11CommandList::ReadRaygenRecord(const D3D12_DISPATCH_RAYS_DESC& d, std::v
     uint8_t* p = nullptr;
     D3D12_RANGE rr{ (SIZE_T)f.offset, (SIZE_T)(f.offset + bytes) };
     if (FAILED(f.resource->Map(0, &rr, reinterpret_cast<void**>(&p))) || !p) return 2;
-    rec->assign(p + f.offset, p + f.offset + bytes);
+    out->assign(p + f.offset, p + f.offset + bytes);
     D3D12_RANGE none{ 0, 0 };
     f.resource->Unmap(0, &none);
     return 1;
 }
+}  // namespace
 
-bool Dxr11CommandList::LocalScenes(gidx::Info& gi, const Dxr11Bindings& b,
-                                   const std::vector<uint8_t>& rec,
-                                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why) {
-    const gidx::RaygenLocal* rl = nullptr;
-    if (rec.size() < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES ||
-        !gidx::RaygenLocalOf(gi, b.stateObject, rec.data(), &rl, why))
-        return false;
-    gidx::LocalRecord lr;
-    lr.desc = rl->desc;
-    lr.record = rec.data();
-    lr.size = (UINT)rec.size();
-    return ResolveBoundScenes(gi.scenes, srvs, why, &b, &lr, nullptr);
+int Dxr11CommandList::ReadRecords(const D3D12_DISPATCH_RAYS_DESC& d, bool all,
+                                  std::vector<uint8_t> out[3], std::string* why) {
+    if (RaygenRecordBytes(d) < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) {
+        *why = "the raygen record is shorter than a shader identifier";
+        return 0;
+    }
+    int r = 1;
+    for (int k = 0; k < (all ? 3 : 1); ++k) {
+        D3D12_GPU_VIRTUAL_ADDRESS at = 0;
+        UINT bytes = 0;
+        RecordRange(d, k, &at, &bytes);
+        if (bytes && ReadRange(at, bytes, &out[k]) == 2) r = 2;
+    }
+    return r;
 }
 
-bool Dxr11CommandList::QueueLocalRays(const D3D12_DISPATCH_RAYS_DESC& d) {
+bool Dxr11CommandList::RecordScenes(gidx::Info& gi, const Dxr11Bindings& b,
+                                    const D3D12_DISPATCH_RAYS_DESC& d, bool all,
+                                    const std::vector<uint8_t> rec[3],
+                                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why) {
+    static const uint8_t kNull[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scenes;
+    std::set<std::string> seen;
+    // One record: its signature, and the scenes it names. At a recursion
+    // depth above 1 every record is lenient: a register one shader does not
+    // declare is another shader's.
+    auto one = [&](const uint8_t* r, UINT size, bool lenient) -> bool {
+        if (size < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) {
+            *why = "a record shorter than a shader identifier";
+            return false;
+        }
+        if (!std::memcmp(r, kNull, sizeof(kNull))) return true;   // a null record runs nothing
+        if (!seen.insert(std::string(reinterpret_cast<const char*>(r), size)).second) return true;
+        const gidx::RecordLocal* rl = gidx::RecordLocalOf(gi, r);
+        if (!rl) { *why = "a record whose identifier is not one of the pipeline's"; return false; }
+        if (!rl->why.empty()) { *why = rl->why; return false; }
+        gidx::LocalRecord lr;
+        lr.desc = rl->desc;
+        lr.record = r;
+        lr.size = size;
+        lr.lenient = lenient;
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> s;
+        if (!ResolveBoundScenes(gi.scenes, &s, why, &b, &lr, nullptr)) return false;
+        for (auto a : s)
+            if (std::find(scenes.begin(), scenes.end(), a) == scenes.end()) scenes.push_back(a);
+        return true;
+    };
+    if (!one(rec[0].data(), (UINT)rec[0].size(), all)) return false;
+    for (int k = 1; all && k < 3; ++k) {
+        const UINT64 size = rec[k].size();
+        UINT64 stride = (k == 1 ? d.MissShaderTable : d.HitGroupTable).StrideInBytes;
+        if (!stride || stride > size) stride = size;
+        for (UINT64 off = 0; off + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES <= size; off += stride)
+            if (!one(rec[k].data() + off, (UINT)(std::min)(stride, size - off), true)) return false;
+    }
+    if (scenes.empty()) { *why = "no record names a scene"; return false; }
+    *srvs = scenes;
+    return true;
+}
+
+bool Dxr11CommandList::QueueLocalRays(gidx::Info& gi, const D3D12_DISPATCH_RAYS_DESC& d) {
     ID3D12Device5* dev = RealDevice();
-    const UINT bytes = RaygenRecordBytes(d);
-    if (!dev || !m_allocator || bytes < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) return false;
-    Dxr11PendingDispatch pend;
+    UINT recursion = 0;
     std::string why;
-    if (!shimscene::CopyBytes(m_real, dev, d.RayGenerationShaderRecord.StartAddress, bytes,
-                              &pend.giRecord, &pend.giRecordScratch, &why)) {
-        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the raygen record could not be copied "
-                 "(%s)\n", why.c_str());
-        RestoreComputeAfterCapture();
+    if (!dev || !m_allocator || RaygenRecordBytes(d) < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES ||
+        !gidx::PrepareRecordLocals(gi, m_bindings.stateObject, &recursion, &why))
         return false;
+    Dxr11PendingDispatch pend;
+    // A copy of each range in GPU memory, recorded before the dispatch; the
+    // CPU-visible ones are read at submit.
+    for (int k = 0; k < (recursion != 1 ? 3 : 1); ++k) {
+        D3D12_GPU_VIRTUAL_ADDRESS at = 0;
+        UINT bytes = 0;
+        RecordRange(d, k, &at, &bytes);
+        std::vector<uint8_t> probe;
+        if (!bytes || ReadRange(at, bytes, &probe) == 1) continue;
+        if (!shimscene::CopyBytes(m_real, dev, at, bytes, &pend.giRecord[k], &pend.giRecordScratch[k], &why)) {
+            ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): a shader record range could not be "
+                     "copied (%s)\n", why.c_str());
+            RestoreComputeAfterCapture();
+            return false;
+        }
     }
     RestoreComputeAfterCapture();
     pend.giScenesSet = true;
@@ -848,23 +910,35 @@ bool Dxr11CommandList::QueueLocalRays(const D3D12_DISPATCH_RAYS_DESC& d) {
     static LONG once = 0;
     if (InterlockedCompareExchange(&once, 1, 0) == 0)
         ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch deferred to submit: its scene "
-                 "is in the raygen's record, in GPU memory\n");
+                 "is in shader records in GPU memory\n");
     return true;
 }
 
-bool Dxr11CommandList::ReadGpuNow(ID3D12CommandQueue* queue, SubmitFn submit, HANDLE evt,
-                                  D3D12_GPU_VIRTUAL_ADDRESS src, UINT bytes,
-                                  std::vector<uint8_t>* out, std::string* why) {
+bool Dxr11CommandList::FillRecordsNow(ID3D12CommandQueue* queue, SubmitFn submit, HANDLE evt,
+                                      const D3D12_DISPATCH_RAYS_DESC& d, bool all,
+                                      std::vector<uint8_t> rec[3], std::string* why) {
     ID3D12Device5* dev = RealDevice();
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> al;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cl;
-    if (!dev || FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&al))) ||
-        FAILED(dev->CreateCommandList(0, m_real->GetType(), al.Get(), nullptr, IID_PPV_ARGS(&cl)))) {
-        *why = "could not create a list to read the raygen record";
-        return false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> rb[3], scratch[3];
+    UINT sizes[3] = { 0, 0, 0 };
+    bool any = false;
+    for (int k = 0; k < (all ? 3 : 1); ++k) {
+        D3D12_GPU_VIRTUAL_ADDRESS at = 0;
+        UINT bytes = 0;
+        RecordRange(d, k, &at, &bytes);
+        if (!bytes || !rec[k].empty() || ReadRange(at, bytes, &rec[k]) == 1) continue;
+        if (!cl && (!dev || FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&al))) ||
+                    FAILED(dev->CreateCommandList(0, m_real->GetType(), al.Get(), nullptr,
+                                                  IID_PPV_ARGS(&cl))))) {
+            *why = "could not create a list to read the shader records";
+            return false;
+        }
+        if (!shimscene::CopyBytes(cl.Get(), dev, at, bytes, &rb[k], &scratch[k], why)) return false;
+        sizes[k] = bytes;
+        any = true;
     }
-    Microsoft::WRL::ComPtr<ID3D12Resource> rb, scratch;
-    if (!shimscene::CopyBytes(cl.Get(), dev, src, bytes, &rb, &scratch, why)) return false;
+    if (!any) return true;
     if (FAILED(cl->Close())) { *why = "could not close the record copy"; return false; }
     ID3D12CommandList* one[] = { cl.Get() };
     submit(queue, 1, one);
@@ -874,10 +948,14 @@ bool Dxr11CommandList::ReadGpuNow(ID3D12CommandQueue* queue, SubmitFn submit, HA
         m_fence->SetEventOnCompletion(m_fenceValue, evt);
         WaitForSingleObject(evt, INFINITE);
     }
-    if (!ReadBackBytes(rb.Get(), bytes, out)) { *why = "could not read the record copy"; return false; }
+    for (int k = 0; k < 3; ++k)
+        if (sizes[k] && !ReadBackBytes(rb[k].Get(), sizes[k], &rec[k])) {
+            *why = "could not read the record copy";
+            return false;
+        }
     static LONG once = 0;
     if (InterlockedCompareExchange(&once, 1, 0) == 0)
-        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): raygen record in GPU memory with "
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): shader records in GPU memory with "
                  "GPU-written arguments, read at submit with one extra wait\n");
     return true;
 }
@@ -973,12 +1051,16 @@ bool Dxr11CommandList::GeometryIndexScenes(gidx::Info& gi,
     bool needsLocal = false;
     if (defer) *defer = false;
     if (ResolveBoundScenes(gi.scenes, srvs, &swhy, nullptr, nullptr, &needsLocal)) return true;
-    // Not in the global root signature: the raygen's local one, read from its
-    // record now when that is in CPU-visible memory, else at submit (0.55.0).
-    if (needsLocal) {
-        std::vector<uint8_t> rec;
-        const int k = d ? ReadRaygenRecord(*d, &rec, &swhy) : 2;
-        if (k == 1 && LocalScenes(gi, m_bindings, rec, srvs, &swhy)) return true;
+    // Not in the global root signature: the records' local ones, read now
+    // when they are in CPU-visible memory, else at submit. The raygen's
+    // (0.55.0), and at a recursion depth above 1 every miss and hit group
+    // record too, whose shaders can trace (0.56.0).
+    UINT recursion = 0;
+    if (needsLocal && gidx::PrepareRecordLocals(gi, m_bindings.stateObject, &recursion, &swhy)) {
+        const bool all = recursion != 1;
+        std::vector<uint8_t> rec[3];
+        const int k = d ? ReadRecords(*d, all, rec, &swhy) : 2;
+        if (k == 1 && RecordScenes(gi, m_bindings, *d, all, rec, srvs, &swhy)) return true;
         if (k == 2 && defer) {
             *defer = true;
             srvs->clear();
@@ -1001,7 +1083,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     bool defer = false;
     const bool exact = GeometryIndexScenes(*gi, &srvs, d, &defer);
     // Its scene in its raygen record, in GPU memory: read at submit (0.55.0).
-    if (defer && QueueLocalRays(*d)) return;
+    if (defer && QueueLocalRays(*gi, *d)) return;
     // Its scene not read from its latest build: at submit that build has run
     // and is read exactly, as a RayQuery dispatch has been since 0.52.0.
     // Until 0.54.0 the variant drew it from the GPU copy without knowing
@@ -1382,19 +1464,18 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             // the copy recorded before it, or the record itself, can be read.
             if (!pend.rq && pend.giScenesSet && pend.giLocal) {
                 std::shared_ptr<gidx::Info> gi = gidx::Get(pend.bindings.stateObject);
-                std::vector<uint8_t> rec;
+                std::vector<uint8_t> rec[3];
                 std::string lw;
-                bool have = false;
-                if (pend.giRecord) {
-                    have = ReadBackBytes(pend.giRecord.Get(), (UINT)pend.giRecord->GetDesc().Width, &rec);
-                } else {
-                    const int k = ReadRaygenRecord(desc, &rec, &lw);
-                    have = k == 1 || (k == 2 && ReadGpuNow(queue, submit, evt,
-                                                           desc.RayGenerationShaderRecord.StartAddress,
-                                                           RaygenRecordBytes(desc), &rec, &lw));
-                }
+                UINT recursion = 0;
+                bool have = gi && gidx::PrepareRecordLocals(*gi, pend.bindings.stateObject, &recursion, &lw);
+                const bool all = recursion != 1;
+                for (int k = 0; have && k < 3; ++k)
+                    if (pend.giRecord[k])
+                        have = ReadBackBytes(pend.giRecord[k].Get(),
+                                             (UINT)pend.giRecord[k]->GetDesc().Width, &rec[k]);
+                have = have && FillRecordsNow(queue, submit, evt, desc, all, rec, &lw);
                 std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
-                if (gi && have && LocalScenes(*gi, pend.bindings, rec, &srvs, &lw)) {
+                if (have && RecordScenes(*gi, pend.bindings, desc, all, rec, &srvs, &lw)) {
                     bool later = false;
                     pend.giScenes = srvs;
                     pend.giExact = true;
@@ -1417,8 +1498,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                     pend.giExact = false;
                     static LONG n = 0;
                     if (InterlockedIncrement(&n) <= 4)
-                        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene in the raygen's "
-                                 "record is not resolved at submit (%s); judged over every live "
+                        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene in the shader "
+                                 "records is not resolved at submit (%s); judged over every live "
                                  "scene\n", lw.empty() ? "the record could not be read" : lw.c_str());
                 }
             }

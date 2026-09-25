@@ -208,6 +208,19 @@ def main():
     if os.path.isfile(IDS):
         ok.append(expect_ok('rayquery_ids (instance + primitive)', load(IDS)))
 
+    # Normalising twice must change nothing. A library the shim rewrote is
+    # disassembled and normalised again (the GeometryIndex() variant), and
+    # until 0.56.0 an entry block a phi names got its label a second time,
+    # which the assembler refuses as "expected instruction opcode".
+    entryphi = os.path.join('phase5', 'cases', 'rayquery_entryphi.ll')
+    if os.path.isfile(entryphi):
+        once = load(entryphi)
+        good = normalize(once) == once and once.count('\nbb0:') == 1
+        print('  %-8s %-34s %s' % ('ok' if good else 'FAIL', 'normalise twice',
+                                   'idempotent, one entry label' if good
+                                   else 'the second pass changed the module'))
+        ok.append(good)
+
     print('\n-- cases the brief says have no valid lowering --')
 
     # RayQuery in a pixel shader: DispatchRays only launches raygen.

@@ -70,6 +70,11 @@ def normalize(text):
             out.append(line)
             continue
 
+        # Already normalised (a library the shim rewrote, disassembled
+        # again): its entry label is kept, never added a second time.
+        if line.startswith('bb0:'):
+            saw_entry_label = True
+
         # Block definitions. The preds list is only a comment, but leaving it
         # stale would make the file misleading to read, so rename it too.
         m = _LABEL.match(line)

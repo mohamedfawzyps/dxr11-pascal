@@ -151,14 +151,15 @@ struct Dxr11PendingDispatch {
     // from its latest build (0.54.0): its arguments, no readback.
     bool                                         giDirect = false;
     D3D12_DISPATCH_RAYS_DESC                     giDesc{};
-    // Its scene is in the RAYGEN's record, through the raygen's local root
-    // signature, which could not be read when it was recorded (0.55.0): read
-    // at submit, from `giRecord` (a copy recorded before it) or the record
-    // itself. `giSerial`: the build serial then, so a build of the scene
-    // recorded after it is told apart.
+    // Its scene is in its records, through their local root signatures: the
+    // raygen record (0.55.0), and with a recursion depth above 1 the miss and
+    // hit tables (0.56.0), which could not all be read when it was recorded.
+    // Read at submit, from `giRecord[k]` (copies recorded before it, k 0
+    // raygen, 1 miss, 2 hit) or the memory itself. `giSerial`: the build
+    // serial then, so a build of the scene recorded after it is told apart.
     bool                                         giLocal = false;
     UINT64                                       giSerial = 0;
-    Microsoft::WRL::ComPtr<ID3D12Resource>       giRecord, giRecordScratch;
+    Microsoft::WRL::ComPtr<ID3D12Resource>       giRecord[3], giRecordScratch[3];
 };
 
 // A closed segment, followed by the dispatches that could not be recorded until
@@ -346,21 +347,23 @@ private:
     bool QueueStaleCompute(UINT x, UINT y, UINT z, const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
     bool QueueStaleRays(const D3D12_DISPATCH_RAYS_DESC& d,
                         const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
-    // A GeometryIndex() dispatch whose scene is in its raygen record, in GPU
-    // memory: a copy of the record recorded, the dispatch deferred to submit.
-    bool QueueLocalRays(const D3D12_DISPATCH_RAYS_DESC& d);
-    // The raygen record of `d`: 1 read (CPU-visible memory), 2 in GPU memory,
-    // 0 unreadable, with *why.
-    int ReadRaygenRecord(const D3D12_DISPATCH_RAYS_DESC& d, std::vector<uint8_t>* rec,
-                         std::string* why);
-    // The scenes resolved with the raygen's local root signature and record.
-    bool LocalScenes(gidx::Info& gi, const Dxr11Bindings& b, const std::vector<uint8_t>& rec,
-                     std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why);
-    // At submit: `bytes` at `src` in GPU memory, copied, submitted and waited
-    // for. Only for a raygen record in GPU memory with GPU-written arguments.
-    bool ReadGpuNow(ID3D12CommandQueue* queue, SubmitFn submit, HANDLE evt,
-                    D3D12_GPU_VIRTUAL_ADDRESS src, UINT bytes, std::vector<uint8_t>* out,
+    // A GeometryIndex() dispatch whose scene is in records in GPU memory:
+    // copies of those recorded, the dispatch deferred to submit.
+    bool QueueLocalRays(gidx::Info& gi, const D3D12_DISPATCH_RAYS_DESC& d);
+    // The raygen record of `d` and, with `all`, its miss and hit tables:
+    // 1 all read (CPU-visible memory), 2 some in GPU memory, 0 unreadable.
+    int ReadRecords(const D3D12_DISPATCH_RAYS_DESC& d, bool all, std::vector<uint8_t> out[3],
                     std::string* why);
+    // The scenes those records name through their local root signatures.
+    bool RecordScenes(gidx::Info& gi, const Dxr11Bindings& b, const D3D12_DISPATCH_RAYS_DESC& d,
+                      bool all, const std::vector<uint8_t> rec[3],
+                      std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why);
+    // At submit: every range of `rec` still empty, read from CPU-visible
+    // memory, or copied from GPU memory, submitted and waited for once. Only
+    // with GPU-written arguments, whose ranges are not known before.
+    bool FillRecordsNow(ID3D12CommandQueue* queue, SubmitFn submit, HANDLE evt,
+                        const D3D12_DISPATCH_RAYS_DESC& d, bool all, std::vector<uint8_t> rec[3],
+                        std::string* why);
     bool QueueIndirectCompute(ID3D12CommandSignature* sig, ID3D12Resource* args,
                               UINT64 argOffset);
     // Gets the instance descriptions of a top-level build to the CPU, so the

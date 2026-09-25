@@ -41,13 +41,48 @@ $cfgs += ,@('--localscene', '--indirectgpu', '--gpusbt')
 $cfgs += ,@('--localscenetable', '--indirectgpu', '--gpusbt', '--sm66')
 $cfgs += ,@('--localscene', '--stale', '--gpusbt')
 $cfgs += ,@('--collections', '--localscene', '--indirectgpu', '--gpusbt')
-
-$fail = @()
-foreach ($c in $cfgs) {
-    & .\gitest.exe $c 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { $fail += ('[' + ($c -join ' ') + ']') }
+# Recursion depth 2: the closest-hits and the miss trace too (0.56.0), with
+# the scene in the global root signature, or in every record's local one.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($x in @('', '--gpuinst', '--indirect', '--indirectgpu', '--stale', '--table')) {
+        foreach ($s in @('', '--sm66')) { $cfgs += ,@(@($b, '--recurse', $x, $s) | Where-Object { $_ }) }
+    }
+    # WARP removes its device when a closest-hit or miss traces a scene from
+    # the heap, so its ground truth binds the scene globally (--warpglobal).
+    foreach ($x in @('--bindless', '--bindlessrc')) { $cfgs += ,@(@($b, '--recurse', $x, '--warpglobal') | Where-Object { $_ }) }
+    foreach ($l in @('--localscene', '--localscenetable')) {
+        foreach ($x in @('', '--gpusbt', '--indirectgpu', '--gpuinst', '--stale')) {
+            foreach ($s in @('', '--sm66')) { $cfgs += ,@(@($b, '--recurse', $l, $x, $s) | Where-Object { $_ }) }
+        }
+    }
 }
+$cfgs += ,@('--recurse', '--localscene', '--indirectgpu', '--gpusbt')
+$cfgs += ,@('--recurse', '--localscenetable', '--stale', '--gpusbt', '--sm66')
+# The substitute ground truth agrees with WARP's own where WARP works.
+$cfgs += ,@('--bindless', '--warpglobal')
+
+# A failure keeps its output and the shim's log, so an intermittent one can
+# be read afterwards rather than rerun in hope.
+$keep = Join-Path $env:TEMP 'gitest-matrix'
+New-Item -ItemType Directory -Force $keep | Out-Null
+$prevLog = $env:DXR_TIER11_LOG
+$fail = @()
+$n = 0
+foreach ($c in $cfgs) {
+    $n++
+    $env:DXR_TIER11_LOG = Join-Path $keep "run_$n.log"
+    $out = & .\gitest.exe $c 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $fail += ('[' + ($c -join ' ') + ']')
+        $out | Out-File (Join-Path $keep "run_$n.out") -Encoding utf8
+        $out | Select-String 'DIVERGE|FAILED' | ForEach-Object { Write-Host "    run ${n}: $($_.Line)" }
+    } else {
+        Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
+    }
+}
+$env:DXR_TIER11_LOG = $prevLog
 Write-Host "gitest: $($cfgs.Count) configurations, $($cfgs.Count - $fail.Count) match WARP"
 foreach ($f in $fail) { Write-Host "  FAILED $f" }
+if ($fail.Count) { Write-Host "  output and shim logs of the failures: $keep" }
 Pop-Location
 exit $fail.Count

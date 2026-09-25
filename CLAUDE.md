@@ -153,6 +153,19 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.56.0: TRACERAY IN A CLOSEST-HIT OR MISS, IN THE SHIM'S LAYOUT TOO.** The
+variant appends the shim scene's root descriptor to every shader that can
+trace (raygen; at depth above 1 miss and hit group), and at depth above 1 the
+scene is read from every raygen, miss and hit record through its own local
+root signature (`gidx::Gather`). `gitest --recurse` (and `--warpglobal`,
+because WARP removes its device on a heap-indexed scene traced from a
+closest-hit or miss). Matrix 227 of 227, one unexplained intermittent failure
+before it, now kept if it recurs. The normaliser labelled an entry block twice
+on a second pass; fixed in both implementations. Remaining for item a:
+runtime TraceRay arguments, a rewritten library with its own subobjects AND an
+export list, a library association to another library's subobject, and the
+variant with several scenes (one copy only).
+
 **0.55.0: THE SCENE IN THE RAYGEN'S LOCAL ROOT SIGNATURE IS RESOLVED.** The
 raygen is found by its record's identifier, its local root signature by the
 association rules (`Assoc`, lifted out of the variant's rebuild, followed into

@@ -148,6 +148,9 @@ std::string Normalize(const std::string& text) {
         }
         if (!inBody) { out.push_back(line); continue; }
 
+        // Already normalised (a library the shim rewrote, disassembled
+        // again): its entry label is kept, never added a second time.
+        if (line.rfind("bb0:", 0) == 0) sawEntryLabel = true;
         std::smatch m;
         if (std::regex_match(line, m, kLabelPred)) {
             if (m[1].str() == "0") sawEntryLabel = true;
