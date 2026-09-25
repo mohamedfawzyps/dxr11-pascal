@@ -31,6 +31,7 @@
 #pragma once
 
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <string>
 #include <vector>
@@ -84,5 +85,15 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
 
 // The list was reset or destroyed: the copies it built are forgotten.
 void DropOwner(const void* owner);
+
+// Records into `cl` a copy of `bytes` (a multiple of 4) at `src`, application
+// memory the shim holds no reference to, readable as an SRV (a shader table),
+// into a new READBACK buffer `*readback`, readable once `cl` has run. Kept by
+// the caller with `*scratch`, the buffer between the two, until then.
+// Replaces the compute root signature and pipeline; the CALLER restores them
+// (0.55.0: a raygen record in GPU memory).
+bool CopyBytes(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
+               UINT bytes, Microsoft::WRL::ComPtr<ID3D12Resource>* readback,
+               Microsoft::WRL::ComPtr<ID3D12Resource>* scratch, std::string* why);
 
 }  // namespace shimscene

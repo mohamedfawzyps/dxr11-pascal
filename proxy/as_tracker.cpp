@@ -619,6 +619,11 @@ UINT64 LatestBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     return b == g_lastBuilt.end() ? 0 : b->second;
 }
 
+UINT64 SerialNow() {
+    std::lock_guard<std::mutex> g(g_lock);
+    return g_tlasSerial;
+}
+
 bool Current(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
     std::lock_guard<std::mutex> g(g_lock);
     for (auto a : scenes)

@@ -24,6 +24,44 @@ not.
 
 ---
 
+## 0.55.0
+
+**The scene a `GeometryIndex()` dispatch traces is resolved through the
+RAYGEN's local root signature** (Tier 1.1 item a, "a scene through a local
+root signature").
+
+- **The gap.** The shim found the scene only through the global root
+  signature. One bound in the raygen's shader record was not resolved, so the
+  dispatch was judged over every live scene: right with one, refused when two
+  disagree, and never served by the variant, which needs the exact scene.
+- **Measured on 0.54.0 first**, with the new `gitest --localscene` (a root SRV
+  at t0 space2 in the raygen's record) and `--localscenetable` (a descriptor
+  table there), a conflicting decoy in the global root SRV: all 7 layouts
+  refused, "hit group record 2 is reached by two different geometries".
+- **The fix.** When a TraceRay's register is not in the global signature, the
+  raygen being dispatched is found by the identifier its record starts with,
+  its local root signature by the spec's association rules (lifted out of the
+  variant's rebuild into `Assoc`, followed into renamed collections), and the
+  scene's address or descriptor table read from the record, as is a heap index
+  in its root constants or root CBV. Where the record is read, by cost:
+  - in CPU-visible memory, at record time, no wait;
+  - in GPU memory, a copy of the record by address (`proxy/shim_copy.hlsl`)
+    recorded before the dispatch, which waits for submit and joins the one
+    wait a deferred dispatch already costs;
+  - in GPU memory with GPU-written arguments, whose record address is known
+    only at submit: one extra copy and wait there, logged once.
+  A build of the scene recorded after the dispatch but before its submit is
+  NOT DRAWN, by name.
+- **Only at recursion depth 1**, where only the raygen traces. Deeper, a
+  closest-hit's or miss's own local root signature could name another scene,
+  so that stays judged over every live scene, by name; it belongs to the next
+  gap, TraceRay in a closest-hit or miss.
+- **Measured:** the local scene cases match WARP in both forms, with the
+  shader table and the arguments in CPU or GPU memory, instances GPU-written
+  or stale, through collections and AddToStateObject, at 6.5 and 6.6. The
+  matrix, now `tools/run_gitest_matrix.ps1`, 122 of 122 (46 before). Dispatch
+  suite 47 of 47 and every gate.
+
 ## 0.54.0
 
 **A `GeometryIndex()` dispatch on a scene not read from its latest build is

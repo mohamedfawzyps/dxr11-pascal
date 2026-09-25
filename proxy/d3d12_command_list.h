@@ -151,6 +151,14 @@ struct Dxr11PendingDispatch {
     // from its latest build (0.54.0): its arguments, no readback.
     bool                                         giDirect = false;
     D3D12_DISPATCH_RAYS_DESC                     giDesc{};
+    // Its scene is in the RAYGEN's record, through the raygen's local root
+    // signature, which could not be read when it was recorded (0.55.0): read
+    // at submit, from `giRecord` (a copy recorded before it) or the record
+    // itself. `giSerial`: the build serial then, so a build of the scene
+    // recorded after it is told apart.
+    bool                                         giLocal = false;
+    UINT64                                       giSerial = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource>       giRecord, giRecordScratch;
 };
 
 // A closed segment, followed by the dispatches that could not be recorded until
@@ -177,7 +185,7 @@ struct Dxr11DispatchList {
 extern const GUID IID_Dxr11CommandList;
 
 class Dxr11RayQueryPso;
-namespace gidx { struct Scenes; struct Info; }
+namespace gidx { struct Scenes; struct Info; struct LocalRecord; }
 
 class Dxr11CommandList : public ID3D12GraphicsCommandList10 {
 public:
@@ -338,6 +346,21 @@ private:
     bool QueueStaleCompute(UINT x, UINT y, UINT z, const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
     bool QueueStaleRays(const D3D12_DISPATCH_RAYS_DESC& d,
                         const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
+    // A GeometryIndex() dispatch whose scene is in its raygen record, in GPU
+    // memory: a copy of the record recorded, the dispatch deferred to submit.
+    bool QueueLocalRays(const D3D12_DISPATCH_RAYS_DESC& d);
+    // The raygen record of `d`: 1 read (CPU-visible memory), 2 in GPU memory,
+    // 0 unreadable, with *why.
+    int ReadRaygenRecord(const D3D12_DISPATCH_RAYS_DESC& d, std::vector<uint8_t>* rec,
+                         std::string* why);
+    // The scenes resolved with the raygen's local root signature and record.
+    bool LocalScenes(gidx::Info& gi, const Dxr11Bindings& b, const std::vector<uint8_t>& rec,
+                     std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why);
+    // At submit: `bytes` at `src` in GPU memory, copied, submitted and waited
+    // for. Only for a raygen record in GPU memory with GPU-written arguments.
+    bool ReadGpuNow(ID3D12CommandQueue* queue, SubmitFn submit, HANDLE evt,
+                    D3D12_GPU_VIRTUAL_ADDRESS src, UINT bytes, std::vector<uint8_t>* out,
+                    std::string* why);
     bool QueueIndirectCompute(ID3D12CommandSignature* sig, ID3D12Resource* args,
                               UINT64 argOffset);
     // Gets the instance descriptions of a top-level build to the CPU, so the
@@ -355,10 +378,16 @@ private:
     void RestoreComputeAfterCapture();
     // The scenes `sc` names, resolved through the bound compute root
     // signature (gidx::ResolveScenes). False with *why when not resolved.
+    // `with`: bindings other than the list's current ones (a queued dispatch's).
     bool ResolveBoundScenes(const gidx::Scenes& sc, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
-                            std::string* why);
-    // The same for a GeometryIndex() pipeline, logged when not resolved.
-    bool GeometryIndexScenes(const gidx::Info& gi, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs);
+                            std::string* why, const Dxr11Bindings* with = nullptr,
+                            const gidx::LocalRecord* local = nullptr, bool* needsLocal = nullptr);
+    // The same for a GeometryIndex() pipeline, logged when not resolved. With
+    // `d`, a scene in the raygen's local root signature is read from its
+    // record; `*defer` when that record is in GPU memory (or, with no `d`,
+    // when the record is needed at all), for the caller to resolve at submit.
+    bool GeometryIndexScenes(gidx::Info& gi, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs,
+                             const D3D12_DISPATCH_RAYS_DESC* d = nullptr, bool* defer = nullptr);
     // The same for a lowered RayQuery pipeline, counted and logged.
     bool RayQueryScenes(Dxr11RayQueryPso* rq, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out);
     ID3D12Device5* RealDevice();

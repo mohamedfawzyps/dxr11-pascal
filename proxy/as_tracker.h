@@ -229,6 +229,10 @@ TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);
 // what a read carries; 0 when it was never seen being built.
 UINT64 LatestBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas);
 
+// The serial the next top-level build will exceed: a build whose LatestBuild
+// is at most this was recorded before now.
+UINT64 SerialNow();
+
 // Were these structures' instances read from their LATEST builds? A table
 // built from an older read can be wrong for the scene as it is now: that was
 // the RayQuery path until 0.52.0, drawn wrong after an in-place rebuild.

@@ -853,19 +853,60 @@ bool CarryLibrarySubobjects(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in
     return true;
 }
 
-bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
-             const std::vector<std::vector<std::wstring>>& units,
-             const std::map<UINT, const std::vector<uint8_t>*>& code,
-             const std::map<UINT, ID3D12StateObject*>& colls,
-             Transformed* out, std::vector<UINT>* offsets, UINT* signatures, std::string* why) {
-    const UINT n = in.NumSubobjects;
-    const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
-    std::set<std::wstring> affected;
-    for (const auto& u : units) for (const auto& w : u) affected.insert(w);
-
+// Which local root signature each export of a state object description has,
+// by the spec's association rules (see Rebuild). Also used at a dispatch, to
+// find where a raygen's record carries its scene (0.55.0).
+struct Assoc {
     std::map<std::wstring, UINT> explicitLrs;   // export -> subobject index
     std::vector<UINT> defaults;                 // default local root signatures
-    std::vector<int> refs(n, 0);
+    std::vector<int> refs;                      // associations naming each subobject
+    std::vector<std::pair<std::wstring, std::vector<uint8_t>>> libLrs;
+    std::map<std::wstring, int> libExplicit;    // export -> -2 - k
+    std::map<std::wstring, int> libDefaultOf;   // export -> -2 - k
+    std::map<UINT, LibSubobjects> libSubs;      // library subobject index -> its subobjects
+
+    // The first name decides when it is associated; the others must agree.
+    // The state object's explicit associations, then its default, then a
+    // library's explicit association, then a library's default. `*idx`: a
+    // subobject index, -1 none, -2 - k the library signature libLrs[k].
+    bool Of(const std::vector<std::wstring>& u, int* idx) const {
+    *idx = -1;
+    auto it = explicitLrs.find(u[0]);
+    if (it != explicitLrs.end()) { *idx = (int)it->second; return true; }
+    for (size_t k = 1; k < u.size(); ++k) {
+        auto jt = explicitLrs.find(u[k]);
+        if (jt == explicitLrs.end()) continue;
+        if (*idx >= 0 && *idx != (int)jt->second) return false;
+        *idx = (int)jt->second;
+    }
+    if (*idx >= 0) return true;
+    if (defaults.size() > 1) return false;
+    if (defaults.size() == 1) { *idx = (int)defaults[0]; return true; }
+    for (const std::map<std::wstring, int>* m : { &libExplicit, &libDefaultOf }) {
+        bool found = false;
+        for (const auto& w : u) {
+            auto jt = m->find(w);
+            if (jt == m->end()) continue;
+            if (found && *idx != jt->second) return false;
+            *idx = jt->second;
+            found = true;
+        }
+        if (found) return true;
+    }
+    return true;
+    }
+};
+
+// `affected`: exports that must not have a subobject associated from inside a
+// library (refused, not handled yet).
+bool BuildAssoc(const D3D12_STATE_OBJECT_DESC& in, const std::set<std::wstring>& affected,
+                Assoc* A, std::string* why) {
+    const UINT n = in.NumSubobjects;
+    const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
+    auto& explicitLrs = A->explicitLrs;
+    auto& defaults = A->defaults;
+    A->refs.assign(n, 0);
+    auto& refs = A->refs;
     for (UINT i = 0; i < n; ++i) {
         if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION && s[i].pDesc) {
             const auto* a = static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
@@ -902,10 +943,10 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
     // a library (a signature nothing in the library associates, or an
     // association with no exports) reaches that library's exports only.
     // Keyed -2 - k in `extended` below.
-    std::vector<std::pair<std::wstring, std::vector<uint8_t>>> libLrs;
-    std::map<std::wstring, int> libExplicit;    // export -> -2 - k
-    std::map<std::wstring, int> libDefaultOf;   // export -> -2 - k
-    std::map<UINT, LibSubobjects> libSubs;      // library subobject index -> its subobjects
+    auto& libLrs = A->libLrs;
+    auto& libExplicit = A->libExplicit;
+    auto& libDefaultOf = A->libDefaultOf;
+    auto& libSubs = A->libSubs;
     auto keyOf = [&](const std::wstring& name, const std::vector<uint8_t>& blob) {
         for (size_t k = 0; k < libLrs.size(); ++k)
             if (libLrs[k].first == name) return -2 - (int)k;
@@ -947,35 +988,25 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
         libSubs[i] = std::move(so);
     }
 
-    // The first name decides when it is associated; the others must agree.
-    // The state object's explicit associations, then its default, then a
-    // library's explicit association, then a library's default.
-    auto lrsOf = [&](const std::vector<std::wstring>& u, int* idx) -> bool {
-        *idx = -1;
-        auto it = explicitLrs.find(u[0]);
-        if (it != explicitLrs.end()) { *idx = (int)it->second; return true; }
-        for (size_t k = 1; k < u.size(); ++k) {
-            auto jt = explicitLrs.find(u[k]);
-            if (jt == explicitLrs.end()) continue;
-            if (*idx >= 0 && *idx != (int)jt->second) return false;
-            *idx = (int)jt->second;
-        }
-        if (*idx >= 0) return true;
-        if (defaults.size() > 1) return false;
-        if (defaults.size() == 1) { *idx = (int)defaults[0]; return true; }
-        for (const std::map<std::wstring, int>* m : { &libExplicit, &libDefaultOf }) {
-            bool found = false;
-            for (const auto& w : u) {
-                auto jt = m->find(w);
-                if (jt == m->end()) continue;
-                if (found && *idx != jt->second) return false;
-                *idx = jt->second;
-                found = true;
-            }
-            if (found) return true;
-        }
-        return true;
-    };
+    return true;
+}
+
+bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
+             const std::vector<std::vector<std::wstring>>& units,
+             const std::map<UINT, const std::vector<uint8_t>*>& code,
+             const std::map<UINT, ID3D12StateObject*>& colls,
+             Transformed* out, std::vector<UINT>* offsets, UINT* signatures, std::string* why) {
+    const UINT n = in.NumSubobjects;
+    const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
+    std::set<std::wstring> affected;
+    for (const auto& u : units) for (const auto& w : u) affected.insert(w);
+
+    Assoc A;
+    if (!BuildAssoc(in, affected, &A, why)) return false;
+    auto& refs = A.refs;
+    auto& libLrs = A.libLrs;
+    auto& libSubs = A.libSubs;
+    auto lrsOf = [&](const std::vector<std::wstring>& u, int* idx) { return A.Of(u, idx); };
 
     // One extended signature per original (or per "none", keyed -1).
     std::map<int, std::pair<ComPtr<ID3D12RootSignature>, UINT>> extended;
@@ -1120,8 +1151,26 @@ void ScanScenes(const std::string& text, Scenes* out) { SceneRegs(text, out); }
 
 bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
-                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why) {
+                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why,
+                   const LocalRecord* local, bool* needsLocal) {
     out->clear();
+    if (needsLocal) *needsLocal = false;
+    // A parameter of the raygen's local root signature: its argument's
+    // offset in the record, identifier included; false when past its end.
+    auto localArg = [&](UINT param, UINT bytes, UINT at, void* v) -> bool {
+        UINT off = 0;
+        for (UINT i = 0; i <= param; ++i) {
+            const auto& p = local->desc->pParameters[i];
+            const bool c = p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            off = Align(off, c ? 4 : 8);
+            if (i == param) break;
+            off += c ? 4 * p.Constants.Num32BitValues : 8;
+        }
+        const UINT64 pos = (UINT64)D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + off + at;
+        if (pos + bytes > local->size) return false;
+        std::memcpy(v, local->record + pos, bytes);
+        return true;
+    };
     if (sc.unknown) {
         *why = "a TraceRay whose scene comes from a descriptor heap index, or could not be traced "
                "back to a declared resource";
@@ -1189,10 +1238,46 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
                     }
                 }
             }
-            if (!placed || !a) {
-                snprintf(buf, sizeof(buf), placed
+            // Not in the global signature: the raygen's local one, read from
+            // its record (0.55.0).
+            bool inLocal = false;
+            if (!placed && local && local->desc) {
+                const auto& ld = *local->desc;
+                for (UINT p = 0; p < ld.NumParameters && !inLocal; ++p) {
+                    const auto& prm = ld.pParameters[p];
+                    if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+                        if (prm.Descriptor.RegisterSpace == reg.space && prm.Descriptor.ShaderRegister == r) {
+                            inLocal = true;
+                            if (!localArg(p, 8, 0, &a)) a = 0;
+                        }
+                        continue;
+                    }
+                    if (prm.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+                    UINT64 running = 0;
+                    for (UINT k = 0; k < prm.DescriptorTable.NumDescriptorRanges && !inLocal; ++k) {
+                        const auto& rg = prm.DescriptorTable.pDescriptorRanges[k];
+                        const UINT64 off = rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                               ? running : rg.OffsetInDescriptorsFromTableStart;
+                        const UINT64 num = rg.NumDescriptors == UINT_MAX ? (1ull << 32) : rg.NumDescriptors;
+                        running = off + num;
+                        if (rg.RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_SRV || rg.RegisterSpace != reg.space ||
+                            r < rg.BaseShaderRegister || r - rg.BaseShaderRegister >= num)
+                            continue;
+                        inLocal = true;
+                        UINT64 table = 0;
+                        if (localArg(p, 8, 0, &table) && table) {
+                            D3D12_GPU_DESCRIPTOR_HANDLE h{ table + (off + (r - rg.BaseShaderRegister)) * inc };
+                            a = scenebind::Lookup(heaps, numHeaps, h);
+                        }
+                    }
+                }
+            }
+            if (!placed && !inLocal && !local && needsLocal) *needsLocal = true;
+            if ((!placed && !inLocal) || !a) {
+                snprintf(buf, sizeof(buf), placed || inLocal
                              ? "the scene at t%u space%u is in a descriptor the shim saw no structure written to"
-                             : "the scene at t%u space%u is not in the global root signature (a local one?)",
+                             : local ? "the scene at t%u space%u is in neither the global root signature nor the raygen's local one"
+                                     : "the scene at t%u space%u is not in the global root signature (a local one?)",
                          r, reg.space);
                 *why = buf;
                 return false;
@@ -1233,6 +1318,38 @@ bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<
                 }
             }
         }
+        // Not in the global signature: the raygen's local one (0.55.0).
+        if (!placed && local && local->desc) {
+            const auto& ld = *local->desc;
+            for (UINT p = 0; p < ld.NumParameters && !placed; ++p) {
+                const auto& prm = ld.pParameters[p];
+                if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+                    prm.Constants.RegisterSpace == hs.space && prm.Constants.ShaderRegister == hs.reg) {
+                    placed = true;
+                    if (hs.offset % 4 == 0 && hs.offset / 4 < prm.Constants.Num32BitValues)
+                        have = localArg(p, 4, hs.offset, &slot);
+                } else if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                           prm.Descriptor.RegisterSpace == hs.space &&
+                           prm.Descriptor.ShaderRegister == hs.reg) {
+                    placed = true;
+                    D3D12_GPU_VIRTUAL_ADDRESS cbv = 0;
+                    const restrack::Found f = localArg(p, 8, 0, &cbv) && cbv
+                                                  ? restrack::Find(cbv + hs.offset) : restrack::Found{};
+                    if (f.resource &&
+                        (f.heap == D3D12_HEAP_TYPE_UPLOAD || f.heap == D3D12_HEAP_TYPE_READBACK)) {
+                        uint8_t* mp = nullptr;
+                        D3D12_RANGE rr{ (SIZE_T)f.offset, (SIZE_T)f.offset + 4 };
+                        if (SUCCEEDED(f.resource->Map(0, &rr, reinterpret_cast<void**>(&mp))) && mp) {
+                            std::memcpy(&slot, mp + f.offset, 4);
+                            have = true;
+                            D3D12_RANGE none{ 0, 0 };
+                            f.resource->Unmap(0, &none);
+                        }
+                    }
+                }
+            }
+        }
+        if (!placed && !local && needsLocal) *needsLocal = true;
         if (!have) {
             snprintf(buf, sizeof(buf), placed
                          ? "the heap index of the scene (b%u space%u, byte %u) is not readable on the "
@@ -1455,6 +1572,148 @@ void Attach(ID3D12Device* dev, ID3D12StateObject* so, const D3D12_STATE_OBJECT_D
         if (zero && !EnsureVariant(dev, *info, so, &why))
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): variant NOT built: %s\n", why.c_str());
     }
+}
+
+namespace {
+
+// `name`'s local root signature in `d`, serialized, empty when it has none:
+// in one of d's libraries, by the association rules, or in a linked
+// collection under its inner name. `*found` false when d does not export it.
+bool LocalRsOfExport(const D3D12_STATE_OBJECT_DESC& d, const std::wstring& name,
+                     std::vector<uint8_t>* blob, bool* found, std::string* why, int depth) {
+    *found = false;
+    const UINT n = d.NumSubobjects;
+    const D3D12_STATE_SUBOBJECT* s = d.pSubobjects;
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !s[i].pDesc) continue;
+        bool here = false;
+        for (const auto& f : Exported(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc)))
+            here = here || f.first == name;
+        if (!here) continue;
+        Assoc a;
+        if (!BuildAssoc(d, {}, &a, why)) return false;
+        int idx = -1;
+        if (!a.Of({ name }, &idx)) {
+            *why = "cannot tell which local root signature " + Narrow(name) + " has";
+            return false;
+        }
+        *found = true;
+        blob->clear();
+        if (idx >= 0) {
+            const auto* l = static_cast<const D3D12_LOCAL_ROOT_SIGNATURE*>(s[idx].pDesc);
+            ID3D12RootSignature* rs = l ? l->pLocalRootSignature : nullptr;
+            UINT size = 0;
+            if (!rs || FAILED(rs->GetPrivateData(kBlobGuid, &size, nullptr)) || !size) {
+                *why = "a local root signature the shim did not see being created";
+                return false;
+            }
+            blob->resize(size);
+            rs->GetPrivateData(kBlobGuid, &size, blob->data());
+        } else if (idx <= -2) {
+            if (!SerializeRts0(a.libLrs[(size_t)(-2 - idx)].second, blob, why)) return false;
+        }
+        return true;
+    }
+    if (depth > 4) return true;
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION || !s[i].pDesc) continue;
+        const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(s[i].pDesc);
+        std::wstring inner;
+        if (!c->NumExports) inner = name;
+        for (UINT e = 0; e < c->NumExports; ++e)
+            if (c->pExports[e].Name == name)
+                inner = c->pExports[e].ExportToRename ? c->pExports[e].ExportToRename : c->pExports[e].Name;
+        if (inner.empty()) continue;
+        auto ci = Get(c->pExistingCollection);
+        if (!ci || !ci->store) continue;
+        const D3D12_STATE_OBJECT_DESC cd = ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
+        if (!LocalRsOfExport(cd, inner, blob, found, why, depth + 1)) return false;
+        if (*found) return true;
+    }
+    return true;
+}
+
+// Every raygen `d` exports, by the names it exports them under.
+void RaygensOf(const D3D12_STATE_OBJECT_DESC& d, std::vector<std::wstring>* out, int depth) {
+    for (UINT i = 0; i < d.NumSubobjects; ++i) {
+        const auto& so = d.pSubobjects[i];
+        if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && so.pDesc) {
+            for (const auto& f : Exported(static_cast<const D3D12_DXIL_LIBRARY_DESC*>(so.pDesc)))
+                if (f.second == 7) out->push_back(f.first);
+        } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION && so.pDesc && depth < 4) {
+            const auto* c = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(so.pDesc);
+            auto ci = Get(c->pExistingCollection);
+            if (!ci || !ci->store) continue;
+            std::vector<std::wstring> inner;
+            RaygensOf(ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION), &inner, depth + 1);
+            for (const auto& w : inner) {
+                if (!c->NumExports) { out->push_back(w); continue; }
+                for (UINT e = 0; e < c->NumExports; ++e)
+                    if ((c->pExports[e].ExportToRename ? c->pExports[e].ExportToRename
+                                                       : c->pExports[e].Name) == w)
+                        out->push_back(c->pExports[e].Name);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool RaygenLocalOf(Info& info, ID3D12StateObject* app, const uint8_t* id,
+                   const RaygenLocal** out, std::string* why) {
+    std::lock_guard<std::mutex> lk(info.localLock);
+    if (!info.localTried) {
+        info.localTried = true;
+        ComPtr<ID3D12StateObjectProperties> props;
+        if (!info.store) {
+            info.localWhy = "the pipeline's subobjects were not kept";
+        } else if (!app || FAILED(app->QueryInterface(IID_PPV_ARGS(&props)))) {
+            info.localWhy = "no state object properties";
+        } else {
+            const D3D12_STATE_OBJECT_DESC d = info.store->Desc(info.type);
+            info.recursion = Recursion(d);
+            std::vector<std::wstring> names;
+            RaygensOf(d, &names, 0);
+            for (const auto& name : names) {
+                void* p = props->GetShaderIdentifier(name.c_str());
+                if (!p) continue;
+                RaygenLocal r;
+                std::memcpy(r.id, p, sizeof(r.id));
+                std::vector<uint8_t> blob;
+                bool found = false;
+                if (!LocalRsOfExport(d, name, &blob, &found, &r.why, 0)) {
+                    if (r.why.empty()) r.why = "its local root signature cannot be told";
+                } else if (!found) {
+                    r.why = "the raygen " + Narrow(name) + " was not found in the pipeline";
+                } else if (!blob.empty()) {
+                    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* v = nullptr;
+                    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(), blob.size(),
+                                                                             IID_PPV_ARGS(&r.des))) ||
+                        FAILED(r.des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &v)) ||
+                        !v)
+                        r.why = "could not read back the raygen's local root signature";
+                    else
+                        r.desc = &v->Desc_1_1;
+                }
+                info.raygenLocals.push_back(std::move(r));
+            }
+        }
+    }
+    if (!info.localWhy.empty()) { *why = info.localWhy; return false; }
+    if (info.recursion != 1) {
+        *why = "the scene is in a local root signature and the pipeline's recursion depth is " +
+               std::to_string(info.recursion) + ", where a closest-hit or miss could trace another "
+               "scene through its own";
+        return false;
+    }
+    for (const auto& r : info.raygenLocals)
+        if (!std::memcmp(r.id, id, sizeof(r.id))) {
+            if (!r.why.empty()) { *why = r.why; return false; }
+            *out = &r;
+            return true;
+        }
+    *why = "the raygen record's identifier is not one of the pipeline's raygens";
+    return false;
 }
 
 std::shared_ptr<Info> Get(ID3D12StateObject* so) {

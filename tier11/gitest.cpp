@@ -63,6 +63,16 @@
 // knows has four geometries any more. A deserialized structure's geometry is
 // driver-opaque, so the shim must refuse, by name, every layout reaching it.
 //
+// --localscene binds the scene through the RAYGEN's LOCAL root signature, a
+// root SRV at t0 space2 in its shader record; --localscenetable through a
+// descriptor table there, over the same heap and decoys as --table. The
+// global root SRV holds the conflicting decoy scene, so a shim that resolves
+// the scene anywhere else draws the wrong one, and one that cannot resolve it
+// judges both scenes live and refuses.
+//
+// --gpusbt puts the shader table in GPU memory, copied there on the GPU, so
+// the raygen record cannot be read on the CPU at record time.
+//
 // Exit code 0 only when every layout matches WARP.
 
 #include <windows.h>
@@ -109,6 +119,8 @@ static int g_bindless = 0;   // 1 index in a root CBV, 2 in root constants
 static int g_indirect = 0;   // 1 arguments in upload memory, 2 in GPU memory
 static bool g_libassoc = false;
 static bool g_gpuinst = false, g_stale = false, g_deserialize = false;
+static int g_localScene = 0;   // 1 a root SRV in the raygen's record, 2 a descriptor table
+static bool g_gpuSbt = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -116,7 +128,9 @@ static bool g_gpuinst = false, g_stale = false, g_deserialize = false;
 // needs a second local root signature layout.
 static const char* kLib = R"HLSL(
 cbuffer CB : register(b0) { uint W; uint H; uint NInst; uint Pad; };
-#if !BINDLESS
+#if LOCALSCENE
+RaytracingAccelerationStructure Scene : register(t0, space2);
+#elif !BINDLESS
 RaytracingAccelerationStructure Scene : register(t0);
 #endif
 RWStructuredBuffer<uint4> Out : register(u0);
@@ -181,9 +195,10 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
     std::wstring da = std::wstring(L"ANYHIT=") + (anyhit ? L"1" : L"0");
     const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
     const wchar_t* dl = g_libassoc ? L"LIBASSOC=1" : L"LIBASSOC=0";
+    const wchar_t* ds = g_localScene ? L"LOCALSCENE=1" : L"LOCALSCENE=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
-                                         L"-D", db, L"-D", dl };
+                                         L"-D", db, L"-D", dl, L"-D", ds };
     DxcBuffer buf{ kLib, std::strlen(kLib), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -472,7 +487,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     // --table: a second live scene, instance A at contribution 2, which puts
     // different geometries on records the real scene uses.
     ComPtr<ID3D12Resource> decoy;
-    if (g_table || g_bindless) {
+    if (g_table || g_bindless || g_localScene) {
         auto db = Buffer(g.dev.Get(), sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_HEAP_TYPE_UPLOAD,
                          D3D12_RESOURCE_STATE_GENERIC_READ);
         D3D12_RAYTRACING_INSTANCE_DESC* dd = nullptr;
@@ -515,6 +530,21 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     lp3.Constants.Num32BitValues = 3; lp3.Constants.ShaderRegister = 1; lp3.Constants.RegisterSpace = 1;
     D3D12_ROOT_SIGNATURE_DESC ld3{ 1, &lp3, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
     auto lrs3 = RootSig(g.dev.Get(), ld3);
+    // --localscene: the raygen's own signature carries the scene, t0 space2,
+    // as the table's descriptor 2 in --localscenetable.
+    D3D12_ROOT_PARAMETER lps{};
+    D3D12_DESCRIPTOR_RANGE lsr{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 2, 2 };
+    if (g_localScene == 2) {
+        lps.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        lps.DescriptorTable = { 1, &lsr };
+    } else {
+        lps.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        lps.Descriptor.RegisterSpace = 2;
+    }
+    D3D12_ROOT_SIGNATURE_DESC lds{ 1, &lps, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
+    auto lrsS = RootSig(g.dev.Get(), lds);
+    D3D12_LOCAL_ROOT_SIGNATURE lsubS{ lrsS.Get() };
+    const wchar_t* sExports[] = { L"RayGen" };
 
     auto lib = Compile(L.R, L.M, L.anyhit);
     D3D12_DXIL_LIBRARY_DESC libd{};
@@ -551,6 +581,12 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         a3.pSubobjectToAssociate = &sub.back();
         sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a3 });
     }
+    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION aS{ nullptr, 1, sExports };
+    if (g_localScene) {
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsubS });
+        aS.pSubobjectToAssociate = &sub.back();
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &aS });
+    }
     D3D12_STATE_OBJECT_DESC sd{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, (UINT)sub.size(), sub.data() };
     ComPtr<ID3D12StateObject> so;
     if (g_mode == 0) {
@@ -577,8 +613,13 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
         rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub0 });
         const D3D12_STATE_SUBOBJECT* r0 = &rs.back();
+        const D3D12_STATE_SUBOBJECT* rS = r0;
+        if (g_localScene) {
+            rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsubS });
+            rS = &rs.back();
+        }
         const wchar_t* rgName[] = { L"RayGen" }; const wchar_t* msName[] = { L"Miss" };
-        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION ra{ r0, 1, rgName }, rm{ r0, 1, msName };
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION ra{ rS, 1, rgName }, rm{ r0, 1, msName };
         rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &ra });
         rs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &rm });
         D3D12_STATE_OBJECT_DESC rd{ D3D12_STATE_OBJECT_TYPE_COLLECTION, (UINT)rs.size(), rs.data() };
@@ -675,7 +716,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     ComPtr<ID3D12DescriptorHeap> heap, staging;
     const UINT inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    if (g_table || g_bindless) {
+    if (g_table || g_bindless || g_localScene == 2) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{ D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6,
                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
         HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap");
@@ -728,12 +769,38 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         tb.ptr += inc;
         g.cl->SetComputeRootDescriptorTable(1, tb);
     } else {
-        g.cl->SetComputeRootShaderResourceView(1, (g_bindless ? decoy : tlas)->GetGPUVirtualAddress());
+        g.cl->SetComputeRootShaderResourceView(
+            1, (g_bindless || g_localScene ? decoy : tlas)->GetGPUVirtualAddress());
+    }
+    // --localscene: the scene's argument in the raygen record, after the
+    // identifier: its address, or the table's start (slot 1, so t0 is slot 3).
+    UINT64 rgBytes = idSz;
+    if (g_localScene) {
+        uint64_t arg = tlas->GetGPUVirtualAddress();
+        if (g_localScene == 2) arg = heap->GetGPUDescriptorHandleForHeapStart().ptr + inc;
+        uint8_t* tm = nullptr; HR(table->Map(0, nullptr, (void**)&tm), "Map table");
+        std::memcpy(tm + idSz, &arg, 8);
+        table->Unmap(0, nullptr);
+        rgBytes = idSz + 8;
+    }
+    // --gpusbt: the table copied into GPU memory on the GPU.
+    D3D12_GPU_VIRTUAL_ADDRESS tableAt = table->GetGPUVirtualAddress();
+    if (g_gpuSbt) {
+        auto gt = Buffer(g.dev.Get(), total, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.cl->CopyBufferRegion(gt.Get(), 0, table.Get(), 0, total);
+        D3D12_RESOURCE_BARRIER tb{}; tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = gt.Get();
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g.cl->ResourceBarrier(1, &tb);
+        keep.push_back(gt);
+        tableAt = gt->GetGPUVirtualAddress();
     }
     g.cl->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
     D3D12_DISPATCH_RAYS_DESC dr{};
-    const auto base = table->GetGPUVirtualAddress();
-    dr.RayGenerationShaderRecord = { base, idSz };
+    const auto base = tableAt;
+    dr.RayGenerationShaderRecord = { base, rgBytes };
     dr.MissShaderTable = { base + 64, idSz, idSz };
     dr.HitGroupTable = { base + offHit, stride * L.records, stride };
     dr.Width = W; dr.Height = kH; dr.Depth = 1;
@@ -796,7 +863,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gpuinst")) g_gpuinst = true;
         else if (!std::strcmp(argv[i], "--stale")) g_stale = g_gpuinst = true;
         else if (!std::strcmp(argv[i], "--deserialize")) g_deserialize = true;
+        else if (!std::strcmp(argv[i], "--localscene")) g_localScene = 1;
+        else if (!std::strcmp(argv[i], "--localscenetable")) g_localScene = 2;
+        else if (!std::strcmp(argv[i], "--gpusbt")) g_gpuSbt = true;
         else want.insert(argv[i]);
+    }
+    if (g_localScene && (g_table || g_bindless)) {
+        std::printf("--localscene binds the scene one way only\n");
+        return 2;
     }
     if (g_libassoc && g_mode != 0) {
         // Collections include the library with an EXPORT LIST, and the spec

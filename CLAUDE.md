@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.55.0: THE SCENE IN THE RAYGEN'S LOCAL ROOT SIGNATURE IS RESOLVED.** The
+raygen is found by its record's identifier, its local root signature by the
+association rules (`Assoc`, lifted out of the variant's rebuild, followed into
+renamed collections), and the scene read from the record: at record time from
+CPU-visible memory; from GPU memory by a copy recorded before the dispatch,
+resolved at submit; with GPU-written arguments too, by one extra wait at
+submit. Recursion depth 1 only; deeper stays judged over every live scene
+and goes with the next gap. `gitest --localscene` / `--localscenetable` /
+`--gpusbt`; `tools/run_gitest_matrix.ps1` 122 of 122. Remaining for item a:
+TraceRay in a closest-hit or miss in the shim's layout (with a local-root
+scene at depth above 1), runtime TraceRay arguments, a rewritten library with
+its own subobjects AND an export list, and a library association to another
+library's subobject.
+
 **0.54.0: `GeometryIndex()` ON AN UNREAD SCENE WAITS FOR SUBMIT; THE VARIANT
 DREW A DESERIALIZED STRUCTURE WRONG, SILENTLY.** The variant served a scene
 not read from its latest build from the GPU copy, blind to which bottom-level

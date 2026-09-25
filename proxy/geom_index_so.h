@@ -97,6 +97,15 @@ struct Scenes {
 // Used for the application's own DXR libraries and for lowered RayQuery ones.
 void ScanScenes(const std::string& text, Scenes* out);
 
+// A raygen's local root signature, found by the identifier its record
+// starts with: where a scene bound through it sits in the record (0.55.0).
+struct RaygenLocal {
+    uint8_t id[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
+    std::string why;                              // nonempty: its signature cannot be told
+    Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> des;
+    const D3D12_ROOT_SIGNATURE_DESC1* desc = nullptr;   // null: it has none
+};
+
 // What DispatchRays needs, attached to the state object.
 struct Info {
     std::vector<Group> groups;
@@ -121,6 +130,14 @@ struct Info {
     std::vector<Microsoft::WRL::ComPtr<ID3D12StateObject>> variantParts;  // its collections
     std::vector<Remap> remaps;
     UINT raygenBytes = 0;          // the largest raygen record the variant needs
+
+    // Every raygen's local root signature, found at the first dispatch that
+    // needs one (0.55.0), and the pipeline's recursion depth.
+    std::mutex localLock;
+    bool localTried = false;
+    std::string localWhy;
+    std::vector<RaygenLocal> raygenLocals;
+    UINT recursion = 0;
 };
 
 // Owns everything the transformed desc points at.
@@ -172,9 +189,26 @@ struct BoundRoot {
 // the index read from root constants or a root CBV in CPU-visible memory at
 // record time, and that heap slot. True, with `*out` exactly those
 // addresses, when every register resolves; false with *why otherwise.
+//
+// A register the global root signature does not declare may be in the
+// RAYGEN's local one: with `local`, its record is read for it (0.55.0).
+// Without, `*needsLocal` says that is what failed.
+struct LocalRecord {
+    const D3D12_ROOT_SIGNATURE_DESC1* desc = nullptr;  // the raygen's local root signature
+    const uint8_t* record = nullptr;                   // its record, identifier first
+    UINT size = 0;
+};
 bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
-                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why);
+                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why,
+                   const LocalRecord* local = nullptr, bool* needsLocal = nullptr);
+
+// The raygen whose identifier is `id` in the pipeline `app` (whose Info this
+// is): its local root signature. False with *why when it cannot be told, or
+// when the pipeline's recursion depth is above 1, where a closest-hit's or
+// miss's own local root signature could name another scene for its TraceRay.
+bool RaygenLocalOf(Info& info, ID3D12StateObject* app, const uint8_t* id,
+                   const RaygenLocal** out, std::string* why);
 
 // Records the shim's copy of the application's hit group table into `cl`,
 // and returns the range the dispatch should use instead. Replaces the

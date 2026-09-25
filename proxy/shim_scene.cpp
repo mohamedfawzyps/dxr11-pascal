@@ -5,6 +5,7 @@
 #include "gpu_hold.h"
 #include "proxy_log.h"
 #include "shim_scene_cs.h"
+#include "shim_copy_cs.h"
 
 #include <wrl/client.h>
 
@@ -458,6 +459,62 @@ void DropOwner(const void* owner) {
     for (auto it = g_local.begin(); it != g_local.end();)
         if (it->first.first == owner) it = g_local.erase(it);
         else ++it;
+}
+
+bool CopyBytes(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
+               UINT bytes, ComPtr<ID3D12Resource>* readback, ComPtr<ID3D12Resource>* scratch,
+               std::string* why) {
+    if (!bytes || bytes % 4) { *why = "a copy that is not whole words"; return false; }
+    static std::mutex lock;
+    static ID3D12Device* device = nullptr;
+    static ComPtr<ID3D12RootSignature> rs;
+    static ComPtr<ID3D12PipelineState> pso;
+    {
+        std::lock_guard<std::mutex> g(lock);
+        if (device != dev || !pso) {
+            ComPtr<ID3D12RootSignature> r;
+            ComPtr<ID3D12PipelineState> p;
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            if (FAILED(dev->CreateRootSignature(0, g_shimCopyCS, sizeof(g_shimCopyCS), IID_PPV_ARGS(&r)))) {
+                *why = "could not create the copy root signature";
+                return false;
+            }
+            pd.pRootSignature = r.Get();
+            pd.CS.pShaderBytecode = g_shimCopyCS;
+            pd.CS.BytecodeLength = sizeof(g_shimCopyCS);
+            if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&p)))) {
+                *why = "could not create the copy pipeline";
+                return false;
+            }
+            rs = r; pso = p; device = dev;
+        }
+    }
+    auto buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>* out) {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = type;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = type == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                                   : D3D12_RESOURCE_FLAG_NONE;
+        return SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
+                                                      IID_PPV_ARGS(out->ReleaseAndGetAddressOf())));
+    };
+    if (!buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, scratch) ||
+        !buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, readback)) {
+        *why = "could not create the copy buffers";
+        return false;
+    }
+    cl->SetComputeRootSignature(rs.Get());
+    cl->SetPipelineState(pso.Get());
+    const UINT dwords = bytes / 4;
+    cl->SetComputeRoot32BitConstants(0, 1, &dwords, 0);
+    cl->SetComputeRootShaderResourceView(1, src);
+    cl->SetComputeRootUnorderedAccessView(2, (*scratch)->GetGPUVirtualAddress());
+    cl->Dispatch((dwords + 63) / 64, 1, 1);
+    Transition(cl, scratch->Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cl->CopyBufferRegion(readback->Get(), 0, scratch->Get(), 0, bytes);
+    return true;
 }
 
 }  // namespace shimscene

@@ -752,10 +752,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s)
 }
 bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
                                           std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
-                                          std::string* why) {
+                                          std::string* why, const Dxr11Bindings* with,
+                                          const gidx::LocalRecord* local, bool* needsLocal) {
+    const Dxr11Bindings& bb = with ? *with : m_bindings;
     std::vector<gidx::BoundRoot> roots(Dxr11Bindings::kMaxRootParams);
     for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i) {
-        const auto& r = m_bindings.roots[i];
+        const auto& r = bb.roots[i];
         if (r.kind == Dxr11RootParam::SRV) roots[i].srv = r.address;
         if (r.kind == Dxr11RootParam::CBV) roots[i].cbv = r.address;
         if (r.kind == Dxr11RootParam::Table) roots[i].table = r.table.ptr;
@@ -764,8 +766,120 @@ bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
             roots[i].numConstants = (UINT)r.constants.size();
         }
     }
-    return gidx::ResolveScenes(sc, m_bindings.rootSig, roots, m_bindings.heaps.data(),
-                               (UINT)m_bindings.heaps.size(), out, why);
+    return gidx::ResolveScenes(sc, bb.rootSig, roots, bb.heaps.data(), (UINT)bb.heaps.size(), out,
+                               why, local, needsLocal);
+}
+
+namespace {
+// How much of a raygen record is read: all of it, up to the largest local
+// root arguments a record can carry, in whole words.
+UINT RaygenRecordBytes(const D3D12_DISPATCH_RAYS_DESC& d) {
+    return (UINT)((std::min)(d.RayGenerationShaderRecord.SizeInBytes, (UINT64)4096) & ~3ull);
+}
+bool ReadBackBytes(ID3D12Resource* rb, UINT bytes, std::vector<uint8_t>* out) {
+    void* p = nullptr;
+    D3D12_RANGE all{ 0, bytes };
+    if (!rb || FAILED(rb->Map(0, &all, &p)) || !p) return false;
+    out->assign(static_cast<uint8_t*>(p), static_cast<uint8_t*>(p) + bytes);
+    D3D12_RANGE none{ 0, 0 };
+    rb->Unmap(0, &none);
+    return true;
+}
+}  // namespace
+
+int Dxr11CommandList::ReadRaygenRecord(const D3D12_DISPATCH_RAYS_DESC& d, std::vector<uint8_t>* rec,
+                                       std::string* why) {
+    UINT bytes = RaygenRecordBytes(d);
+    if (bytes < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) {
+        *why = "the raygen record is shorter than a shader identifier";
+        return 0;
+    }
+    const restrack::Found f = restrack::Find(d.RayGenerationShaderRecord.StartAddress);
+    if (!f.resource || (f.heap != D3D12_HEAP_TYPE_UPLOAD && f.heap != D3D12_HEAP_TYPE_READBACK))
+        return 2;
+    const UINT64 width = f.resource->GetDesc().Width;
+    if (f.offset >= width) return 2;
+    if (f.offset + bytes > width) bytes = (UINT)((width - f.offset) & ~3ull);
+    uint8_t* p = nullptr;
+    D3D12_RANGE rr{ (SIZE_T)f.offset, (SIZE_T)(f.offset + bytes) };
+    if (FAILED(f.resource->Map(0, &rr, reinterpret_cast<void**>(&p))) || !p) return 2;
+    rec->assign(p + f.offset, p + f.offset + bytes);
+    D3D12_RANGE none{ 0, 0 };
+    f.resource->Unmap(0, &none);
+    return 1;
+}
+
+bool Dxr11CommandList::LocalScenes(gidx::Info& gi, const Dxr11Bindings& b,
+                                   const std::vector<uint8_t>& rec,
+                                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs, std::string* why) {
+    const gidx::RaygenLocal* rl = nullptr;
+    if (rec.size() < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES ||
+        !gidx::RaygenLocalOf(gi, b.stateObject, rec.data(), &rl, why))
+        return false;
+    gidx::LocalRecord lr;
+    lr.desc = rl->desc;
+    lr.record = rec.data();
+    lr.size = (UINT)rec.size();
+    return ResolveBoundScenes(gi.scenes, srvs, why, &b, &lr, nullptr);
+}
+
+bool Dxr11CommandList::QueueLocalRays(const D3D12_DISPATCH_RAYS_DESC& d) {
+    ID3D12Device5* dev = RealDevice();
+    const UINT bytes = RaygenRecordBytes(d);
+    if (!dev || !m_allocator || bytes < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) return false;
+    Dxr11PendingDispatch pend;
+    std::string why;
+    if (!shimscene::CopyBytes(m_real, dev, d.RayGenerationShaderRecord.StartAddress, bytes,
+                              &pend.giRecord, &pend.giRecordScratch, &why)) {
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the raygen record could not be copied "
+                 "(%s)\n", why.c_str());
+        RestoreComputeAfterCapture();
+        return false;
+    }
+    RestoreComputeAfterCapture();
+    pend.giScenesSet = true;
+    pend.giLocal = true;
+    pend.giSerial = astrack::SerialNow();
+    pend.giDirect = true;
+    pend.giDesc = d;
+    pend.bindings = m_bindings;
+    pend.bindings.Retain();
+    m_openPendings.push_back(pend);
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch deferred to submit: its scene "
+                 "is in the raygen's record, in GPU memory\n");
+    return true;
+}
+
+bool Dxr11CommandList::ReadGpuNow(ID3D12CommandQueue* queue, SubmitFn submit, HANDLE evt,
+                                  D3D12_GPU_VIRTUAL_ADDRESS src, UINT bytes,
+                                  std::vector<uint8_t>* out, std::string* why) {
+    ID3D12Device5* dev = RealDevice();
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> al;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cl;
+    if (!dev || FAILED(dev->CreateCommandAllocator(m_real->GetType(), IID_PPV_ARGS(&al))) ||
+        FAILED(dev->CreateCommandList(0, m_real->GetType(), al.Get(), nullptr, IID_PPV_ARGS(&cl)))) {
+        *why = "could not create a list to read the raygen record";
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Resource> rb, scratch;
+    if (!shimscene::CopyBytes(cl.Get(), dev, src, bytes, &rb, &scratch, why)) return false;
+    if (FAILED(cl->Close())) { *why = "could not close the record copy"; return false; }
+    ID3D12CommandList* one[] = { cl.Get() };
+    submit(queue, 1, one);
+    ++m_fenceValue;
+    queue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue) {
+        m_fence->SetEventOnCompletion(m_fenceValue, evt);
+        WaitForSingleObject(evt, INFINITE);
+    }
+    if (!ReadBackBytes(rb.Get(), bytes, out)) { *why = "could not read the record copy"; return false; }
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): raygen record in GPU memory with "
+                 "GPU-written arguments, read at submit with one extra wait\n");
+    return true;
 }
 
 // The scene a lowered RayQuery dispatch traces. Resolved, its table is built
@@ -852,10 +966,25 @@ static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5*
 // that was fine but never draws wrong. (Until 0.48.0 a bound root SRV that
 // was a known scene counted as THE scene; wrong when the shader traces
 // another one, a heap-indexed one say, beside it.)
-bool Dxr11CommandList::GeometryIndexScenes(const gidx::Info& gi,
-                                           std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs) {
+bool Dxr11CommandList::GeometryIndexScenes(gidx::Info& gi,
+                                           std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs,
+                                           const D3D12_DISPATCH_RAYS_DESC* d, bool* defer) {
     std::string swhy;
-    if (ResolveBoundScenes(gi.scenes, srvs, &swhy)) return true;
+    bool needsLocal = false;
+    if (defer) *defer = false;
+    if (ResolveBoundScenes(gi.scenes, srvs, &swhy, nullptr, nullptr, &needsLocal)) return true;
+    // Not in the global root signature: the raygen's local one, read from its
+    // record now when that is in CPU-visible memory, else at submit (0.55.0).
+    if (needsLocal) {
+        std::vector<uint8_t> rec;
+        const int k = d ? ReadRaygenRecord(*d, &rec, &swhy) : 2;
+        if (k == 1 && LocalScenes(gi, m_bindings, rec, srvs, &swhy)) return true;
+        if (k == 2 && defer) {
+            *defer = true;
+            srvs->clear();
+            return false;
+        }
+    }
     srvs->clear();
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 4)
@@ -869,7 +998,10 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     std::shared_ptr<gidx::Info> gi = d ? gidx::Get(m_bindings.stateObject) : nullptr;
     if (!gi) { FWD(DispatchRays(d)); return; }
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
-    const bool exact = GeometryIndexScenes(*gi, &srvs);
+    bool defer = false;
+    const bool exact = GeometryIndexScenes(*gi, &srvs, d, &defer);
+    // Its scene in its raygen record, in GPU memory: read at submit (0.55.0).
+    if (defer && QueueLocalRays(*d)) return;
     // Its scene not read from its latest build: at submit that build has run
     // and is read exactly, as a RayQuery dispatch has been since 0.52.0.
     // Until 0.54.0 the variant drew it from the GPU copy without knowing
@@ -1046,7 +1178,8 @@ bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     pend.bindings.Retain();
     if (std::shared_ptr<gidx::Info> gi = gidx::Get(m_bindings.stateObject)) {
         pend.giScenesSet = true;
-        pend.giExact = GeometryIndexScenes(*gi, &pend.giScenes);
+        pend.giExact = GeometryIndexScenes(*gi, &pend.giScenes, nullptr, &pend.giLocal);
+        pend.giSerial = astrack::SerialNow();
         for (auto a : pend.giScenes) pend.giBuilds.push_back(astrack::LatestBuild(a));
     }
     m_openPendings.push_back(pend);
@@ -1244,6 +1377,50 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 D3D12_RANGE noWrite{ 0, 0 };
                 pend.readback->Unmap(0, &noWrite);
             }
+            }
+            // Its scene in the raygen record (0.55.0): the segment has run, so
+            // the copy recorded before it, or the record itself, can be read.
+            if (!pend.rq && pend.giScenesSet && pend.giLocal) {
+                std::shared_ptr<gidx::Info> gi = gidx::Get(pend.bindings.stateObject);
+                std::vector<uint8_t> rec;
+                std::string lw;
+                bool have = false;
+                if (pend.giRecord) {
+                    have = ReadBackBytes(pend.giRecord.Get(), (UINT)pend.giRecord->GetDesc().Width, &rec);
+                } else {
+                    const int k = ReadRaygenRecord(desc, &rec, &lw);
+                    have = k == 1 || (k == 2 && ReadGpuNow(queue, submit, evt,
+                                                           desc.RayGenerationShaderRecord.StartAddress,
+                                                           RaygenRecordBytes(desc), &rec, &lw));
+                }
+                std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
+                if (gi && have && LocalScenes(*gi, pend.bindings, rec, &srvs, &lw)) {
+                    bool later = false;
+                    pend.giScenes = srvs;
+                    pend.giExact = true;
+                    pend.giBuilds.clear();
+                    for (auto a : srvs) {
+                        const UINT64 b = astrack::LatestBuild(a);
+                        later = later || b > pend.giSerial;
+                        pend.giBuilds.push_back(b);
+                    }
+                    if (later) {
+                        static LONG n = 0;
+                        if (InterlockedIncrement(&n) <= 16)
+                            ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch NOT DRAWN at "
+                                     "submit: its scene was built again after it was recorded, "
+                                     "before it was submitted\n");
+                        continue;
+                    }
+                } else {
+                    pend.giScenes.clear();
+                    pend.giExact = false;
+                    static LONG n = 0;
+                    if (InterlockedIncrement(&n) <= 4)
+                        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene in the raygen's "
+                                 "record is not resolved at submit (%s); judged over every live "
+                                 "scene\n", lw.empty() ? "the record could not be read" : lw.c_str());
+                }
             }
             // A GeometryIndex() dispatch: the segment has run, so the build
             // its scene had when it was recorded has too, and is read now.
