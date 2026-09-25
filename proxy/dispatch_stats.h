@@ -27,6 +27,9 @@ enum Counter {
     kTlasNew,             // instance data read for a new address
     kTlasChanged,         // re-read, and the layout changed
     kTlasSame,            // re-read, and nothing changed
+    kSceneResolved,       // the dispatch's scene resolved through its root signature
+    kSceneUnresolved,     // not resolved: judged over every live structure
+    kRefusedUnread,       // resolved to a structure whose instances are not read yet
     kCount
 };
 

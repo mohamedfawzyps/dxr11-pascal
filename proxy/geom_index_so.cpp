@@ -52,16 +52,16 @@ std::string GlobalAt(const std::string& l, size_t at) {
     return l.substr(at, e - at);
 }
 
-void AddHeapScene(Info* info, const Info::SceneHeap& h) {
-    for (const auto& x : info->heapScenes)
+void AddHeapScene(Scenes* sc, const Scenes::Heap& h) {
+    for (const auto& x : sc->heap)
         if (x.space == h.space && x.reg == h.reg && x.offset == h.offset) return;
-    info->heapScenes.push_back(h);
+    sc->heap.push_back(h);
 }
 
-void AddScene(Info* info, const Info::SceneReg& r) {
-    for (const auto& x : info->scenes)
+void AddScene(Scenes* sc, const Scenes::Reg& r) {
+    for (const auto& x : sc->regs)
         if (x.space == r.space && x.lower == r.lower && x.count == r.count) return;
-    info->scenes.push_back(r);
+    sc->regs.push_back(r);
 }
 
 // The scene register of every TraceRay in one disassembled library: its
@@ -69,7 +69,7 @@ void AddScene(Info* info, const Info::SceneReg& r) {
 // load of a resource global, maybe through a getelementptr into an array,
 // and that global's record in !dx.resources. Shapes read off DXC at lib_6_5
 // and lib_6_6. Anything else, a descriptor heap index above all, is unknown.
-void SceneRegs(const std::string& text, Info* info) {
+void SceneRegs(const std::string& text, Scenes* sc) {
     struct Rec { UINT space; UINT lower; int size; };
     std::map<std::string, Rec> recs, anyRecs;   // structures; every resource
     static const std::regex kAnyFields(R"RX(, !"[^"]*", i32 (-?\d+), i32 (-?\d+), i32 (-?\d+),)RX");
@@ -153,11 +153,11 @@ void SceneRegs(const std::string& text, Info* info) {
                 }
                 auto r = anyRecs.find(g);
                 if (r == anyRecs.end()) break;
-                Info::SceneHeap sh;
+                Scenes::Heap sh;
                 sh.space = r->second.space;
                 sh.reg = r->second.lower;
                 sh.offset = row * 16 + comp * 4;
-                AddHeapScene(info, sh);
+                AddHeapScene(sc, sh);
                 done = true;
                 break;
             }
@@ -180,7 +180,7 @@ void SceneRegs(const std::string& text, Info* info) {
             }
             auto r = recs.find(g);
             if (r == recs.end()) break;
-            Info::SceneReg sr;
+            Scenes::Reg sr;
             sr.space = r->second.space;
             if (dynamic) {
                 sr.lower = r->second.lower;
@@ -188,16 +188,16 @@ void SceneRegs(const std::string& text, Info* info) {
             } else {
                 sr.lower = r->second.lower + (elem.empty() ? 0u : (UINT)std::stoul(elem));
             }
-            AddScene(info, sr);
+            AddScene(sc, sr);
             done = true;
         }
-        if (!done) info->sceneUnknown = true;
+        if (!done) sc->unknown = true;
     }
 }
 
 // The TraceRay arguments of one disassembled library, and their scenes.
 void TraceArgs(const std::string& text, Info* info) {
-    SceneRegs(text, info);
+    SceneRegs(text, &info->scenes);
     // call void @dx.op.traceRay.T(i32 157, handle, flags, mask, R, M, miss, ...)
     static const std::regex kTrace(
         R"RX(@dx\.op\.traceRay\.[^(]+\(i32 157, [^,]+, [^,]+, [^,]+, i32 ([^,]+), i32 ([^,]+),)RX");
@@ -316,7 +316,7 @@ void LibraryTraceArgs(const D3D12_DXIL_LIBRARY_DESC* ld, UINT recursion, Info* i
                           &err))
         TraceArgs(text, info);
     else
-        info->dynamicTraceArgs = info->sceneUnknown = true;
+        info->dynamicTraceArgs = info->scenes.unknown = true;
 }
 
 // What the collections this object links already know: their TraceRay
@@ -333,9 +333,9 @@ void MergeCollections(const D3D12_STATE_OBJECT_DESC& in, Info* info) {
             if (std::find(info->traceArgs.begin(), info->traceArgs.end(), p) == info->traceArgs.end())
                 info->traceArgs.push_back(p);
         info->dynamicTraceArgs = info->dynamicTraceArgs || ci->dynamicTraceArgs;
-        info->sceneUnknown = info->sceneUnknown || ci->sceneUnknown;
-        for (const auto& r : ci->scenes) AddScene(info, r);
-        for (const auto& h : ci->heapScenes) AddHeapScene(info, h);
+        info->scenes.unknown = info->scenes.unknown || ci->scenes.unknown;
+        for (const auto& r : ci->scenes.regs) AddScene(&info->scenes, r);
+        for (const auto& h : ci->scenes.heap) AddHeapScene(&info->scenes, h);
         for (const auto& g : ci->groups) {
             std::vector<std::wstring> as;
             if (!c->NumExports) as.push_back(g.name);
@@ -646,16 +646,18 @@ void NoteRootSignature(ID3D12RootSignature* rs, const void* blob, size_t size) {
     if (rs && blob && size) rs->SetPrivateData(kBlobGuid, (UINT)size, blob);
 }
 
-bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
+void ScanScenes(const std::string& text, Scenes* out) { SceneRegs(text, out); }
+
+bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why) {
     out->clear();
-    if (info.sceneUnknown) {
+    if (sc.unknown) {
         *why = "a TraceRay whose scene comes from a descriptor heap index, or could not be traced "
                "back to a declared resource";
         return false;
     }
-    if (info.scenes.empty() && info.heapScenes.empty()) {
+    if (sc.regs.empty() && sc.heap.empty()) {
         *why = "no TraceRay scene register was found";
         return false;
     }
@@ -679,7 +681,7 @@ bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<
     const UINT64 inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const auto& d = v->Desc_1_1;
     char buf[160];
-    for (const auto& reg : info.scenes) {
+    for (const auto& reg : sc.regs) {
         if (!reg.count) {
             snprintf(buf, sizeof(buf), "TraceRay on an unbounded array of scenes at t%u space%u",
                      reg.lower, reg.space);
@@ -728,7 +730,7 @@ bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<
             if (std::find(out->begin(), out->end(), a) == out->end()) out->push_back(a);
         }
     }
-    for (const auto& hs : info.heapScenes) {
+    for (const auto& hs : sc.heap) {
         // The heap index: a root constant, or a dword of a root CBV the CPU
         // can read. Read at record time, as the instance descriptions of an
         // upload heap are: what the application wrote before recording.
@@ -1344,7 +1346,7 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         *why = "its TraceRay calls trace different scenes, and the variant has one scene copy";
         return false;
     }
-    if (!exact && info.scenes.size() > 1) {
+    if (!exact && info.scenes.regs.size() + info.scenes.heap.size() > 1) {
         *why = "its TraceRay calls may trace different scenes, and the variant has one scene copy";
         return false;
     }

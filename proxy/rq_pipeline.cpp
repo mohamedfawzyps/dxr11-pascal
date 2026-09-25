@@ -54,6 +54,7 @@ struct Xform {
     UINT payloadBytes = kPayloadBytes;   // grows with values the payload carries
     int carried = 0;
     int threads[3] = { 1, 1, 1 };
+    gidx::Scenes scenes;   // where the lowered TraceRay calls take their scene
 };
 
 // What the shim decided about this shader, in one line, so sotest can rebuild
@@ -92,6 +93,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     x->appends = l.appends;
     x->payloadBytes = (UINT)l.payloadBytes;
     x->carried = l.carried;
+    gidx::ScanScenes(l.text, &x->scenes);
     *out = l.text;
     return true;
 }
@@ -637,6 +639,7 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     self->m_hasIntersection = x.hasIntersection;
     self->m_needsBoth = x.needsBoth;
     self->m_recordConstants = x.needsRecordConstants;
+    self->m_scenes = x.scenes;
     self->m_localRs = b.localRs;   // owned now, released in the destructor
     std::memcpy(self->m_idRay, b.idRay, kIdSize);
     std::memcpy(self->m_idMiss, b.idMiss, kIdSize);
@@ -886,7 +889,8 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
 void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
                                       UINT gx, UINT gy, UINT gz,
                                       const std::vector<uint8_t>& recordKinds,
-                                      const void* owner) {
+                                      const void* owner,
+                                      const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* scenes) {
     if (!cl) return;
 
     // Command lists are recorded on several threads and this can rebuild both
@@ -902,7 +906,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
     // geometry index and instance contribution a hit on that record reports.
     std::vector<rq::RecordPair> recPairs;
     if (m_recordConstants && !recordKinds.empty()) {
-        const std::vector<astrack::RecordConstants> consts = astrack::RecordConstantsTable();
+        const std::vector<astrack::RecordConstants> consts = astrack::RecordConstantsTable(scenes);
         recPairs.resize(recordKinds.size());
         for (size_t i = 0; i < recPairs.size() && i < consts.size(); ++i)
             recPairs[i] = { consts[i].geometryIndex, consts[i].instanceContribution };

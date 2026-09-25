@@ -153,6 +153,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.49.0: THE RAYQUERY PATH JUDGES THE ONE SCENE A DISPATCH TRACES.** The
+lowered library's scenes are scanned at creation, the scene is resolved at
+`Dispatch` (and for an indirect one at record time), and the table, record
+constants and refusal come from that scene alone. This is the 0.40.0 "two
+live structures disagree" refusal, which drew nothing. All 64 dumped Unreal
+lowered libraries have the recognised shape (heap index from b0 space0). New
+dispatch cases `decoy` and `bindlessrq`; with resolution off both are
+refused. The `stats:` line now counts resolved and unresolved scenes, so the
+next Escher run settles whether Unreal's b0 is CPU-readable (INFERRED).
+
 **0.48.0: THE BINDLESS SCENE IS RESOLVED (item a, part 3).** All 64 Unreal
 scene handles in the dumps are `ResourceDescriptorHeap[i]` with `i` a dword
 of b0 space0, which Unreal binds as a root CBV in upload memory. The scan
@@ -3398,6 +3408,10 @@ anything.
 - `--move`, with `--geom --contrib`, moves the scene to a new top-level
   structure at a new address with a different layout, built 4 times, as
   Unreal does when its structure outgrows its buffer.
+- `--decoy`, with `--geom`, keeps a SECOND live top-level structure whose
+  layout conflicts with the real one. `--bindless` does the same with the
+  scene at descriptor heap slot 3 (for `rayquery_geom_bindless_sm66.hlsl`),
+  the index in the root CBV, the decoy around it and at t0.
 - `--table` binds a four-entry UAV descriptor table with the real output at
   slot 2 and decoys at 0, 1 and 3, so a shader that resolves the wrong index
   writes nowhere visible. **Both** sides honour it now; until dynamic indexing

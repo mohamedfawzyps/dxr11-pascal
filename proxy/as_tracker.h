@@ -247,15 +247,20 @@ bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap);
 // agreement and its silence says nothing. The safe direction above rests on
 // measurement against WARP on one driver, not on the specification.
 //
-// Judged over EVERY top-level structure read, not the one the shader is about
-// to trace against, because which structure that is is not knowable here when
-// it arrives through a descriptor table. So this can refuse a dispatch that
+// With `only`, judged over exactly those structures: the scene the dispatch
+// traces, resolved through its root signature (gidx::ResolveScenes, 0.49.0).
+// Without, over EVERY live structure read, which can refuse a dispatch that
 // would in fact have been fine. Refusing is the safe direction.
 //
 // It can also only see what has been READ. When the descriptions live in GPU
 // memory the answer arrives a submission late, so the first dispatch of a run
 // may not be covered.
-bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why);
+bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
+                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = nullptr);
+
+// True when at least one of `scenes` is a top-level structure whose instance
+// data has been read.
+bool AnyRead(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
 
 // The live top-level structures in one line, for the periodic stats line:
 // address, instances, records, and how many top-level builds ago each was
@@ -276,17 +281,17 @@ std::string DescribeLive();
 // structure read. The result's size is the number of records the table needs;
 // empty means nothing has been read and one record will do.
 //
-// Aggregated rather than per-structure for the same reason the refusal is:
-// which structure a dispatch traces against is not knowable at the dispatch
-// when it arrives through a descriptor table. Aggregating can only ever ask
-// for MORE records of MORE types than one scene needs, which costs a few
-// wasted slots and never a wrong one.
-std::vector<uint8_t> RecordKinds();
+// With `only`, over exactly those structures, the scene the dispatch traces.
+// Without, aggregated over every live one: that can only ever ask for MORE
+// records of MORE types than one scene needs, which costs a few wasted slots
+// and never a wrong one.
+std::vector<uint8_t> RecordKinds(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = nullptr);
 
 // The per-record constants, merged over every top-level structure read so far,
 // sized to the largest. Slots nothing reaches keep {0,0}, which is harmless:
 // a record nothing resolves to is never executed.
-std::vector<RecordConstants> RecordConstantsTable();
+std::vector<RecordConstants> RecordConstantsTable(
+    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = nullptr);
 
 // How many bottom-level structures have been seen, and of what kinds. For the
 // log and for tests, so the tracking can be shown to work before anything

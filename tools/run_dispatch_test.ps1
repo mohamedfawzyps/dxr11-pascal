@@ -239,6 +239,15 @@ $cases = @(
     # mismatches here, two bursts of refusals per Escher session.
     @{ name = 'move'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--move');
        desc = 'top-level structure moved to a new address with a different layout' },
+    # A second LIVE top-level structure whose layout conflicts with the real
+    # one. Judged over every live structure this is refused; the shim has to
+    # resolve the scene the dispatch traces (0.49.0). And the same with the
+    # scene taken from the descriptor heap, Unreal's bindless form, the index
+    # in the root CBV and the decoy in the neighbouring slots and at t0.
+    @{ name = 'decoy'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--decoy');
+       desc = 'a second live structure with a conflicting layout, scene resolved through the root SRV' },
+    @{ name = 'bindlessrq'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom_bindless_sm66.hlsl', '--geom', '--contrib', '--bindless');
+       desc = 'the scene from the descriptor heap, index in the root CBV, conflicting decoy beside it' },
     # A Proceed loop that APPENDS a record per candidate, the MegaLights and
     # Lumen shape. The records land in traversal order, which is undefined, so
     # raytest sorts them into <out>.append and those must be identical too.

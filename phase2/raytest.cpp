@@ -328,6 +328,14 @@ static bool g_churnFlush = false;
 // as live; while it does count, the two disagree about records and the shim
 // refuses, which draws nothing.
 static bool g_move = false;
+// --decoy, with --geom: a SECOND live top-level structure whose layout puts
+// different (contribution, geometry) pairs on the records the real one uses.
+// Judged over every live structure, the lowered dispatch is refused; the shim
+// has to know which one the dispatch traces. --bindless does the same with
+// the scene at descriptor heap slot 3 (ResourceDescriptorHeap[i], i in the
+// cbuffer), the decoy in the slots around it and in the root SRV at t0.
+static bool g_decoy = false;
+static bool g_bindless = false;
 // --append: bind a RWStructuredBuffer<uint> WITH A UAV COUNTER at u1 through a
 // descriptor table, root parameter 4, for a shader whose Proceed loop appends
 // a record per candidate. After the dispatch the counter and the records are
@@ -771,7 +779,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
-    if (g_churn || g_move) { s.inst = instBuf; s.instCount = 1; }
+    if (g_churn || g_move || g_decoy || g_bindless) { s.inst = instBuf; s.instCount = 1; }
     return s;
 }
 
@@ -970,9 +978,12 @@ static ComPtr<ID3D12RootSignature> MakeRootSig(ID3D12Device* dev) {
     params[4].DescriptorTable.NumDescriptorRanges = 1;
     params[4].DescriptorTable.pDescriptorRanges = &logRange;
     D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = g_append ? 5 : 4; rd.pParameters = params;
+    if (g_bindless) rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
     ComPtr<ID3DBlob> blob, err;
-    HRESULT hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
-        &blob, &err);
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrd{};
+    vrd.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    vrd.Desc_1_0 = rd;
+    HRESULT hr = D3D12SerializeVersionedRootSignature(&vrd, &blob, &err);
     if (FAILED(hr)) {
         if (err) std::fprintf(stderr, "root sig: %.*s\n", (int)err->GetBufferSize(),
                               (const char*)err->GetBufferPointer());
@@ -1175,6 +1186,70 @@ static void ReadAppendLog(Gpu& g, ID3D12Resource* logBuf, ID3D12Resource* counte
     std::printf("        %u records appended, written sorted to %s\n", n, path.c_str());
 }
 
+// --decoy / --bindless: the second live structure, the scene's one instance
+// with its contribution raised by one, so record contribution + 1 means
+// geometry 1 in the real scene and geometry 0 in this one.
+static ComPtr<ID3D12Resource> BuildDecoyTlas(Gpu& g, const Scene& s,
+                                             std::vector<ComPtr<ID3D12Resource>>& keep) {
+    D3D12_RAYTRACING_INSTANCE_DESC inst{};
+    D3D12_RANGE none{ 0, 0 };
+    void* p = nullptr;
+    HR(s.inst->Map(0, nullptr, &p), "map inst for decoy");
+    std::memcpy(&inst, p, sizeof(inst));
+    s.inst->Unmap(0, &none);
+    inst.InstanceContributionToHitGroupIndex += 1;
+    auto ib = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ);
+    HR(ib->Map(0, &none, &p), "map decoy inst");
+    std::memcpy(p, &inst, sizeof(inst));
+    ib->Unmap(0, nullptr);
+    keep.push_back(ib);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
+    ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    ti.NumDescs = 1; ti.InstanceDescs = ib->GetGPUVirtualAddress();
+    return BuildAS(g, ti);
+}
+
+// --bindless: slot 3 of a shader-visible heap holds the real scene, copied
+// there from a staging heap over a decoy written first; slots 1, 2 and 4
+// hold the decoy. The same arrangement tier11/gitest.cpp uses.
+static ComPtr<ID3D12DescriptorHeap> MakeSceneHeap(ID3D12Device* dev, ID3D12Resource* real,
+        ID3D12Resource* decoy, ComPtr<ID3D12DescriptorHeap>& staging) {
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ComPtr<ID3D12DescriptorHeap> heap;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{ D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6,
+                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "scene heap");
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE; hd.NumDescriptors = 2;
+    HR(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&staging)), "scene staging heap");
+    auto srv = [&](ID3D12Resource* as, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.RaytracingAccelerationStructure.Location = as->GetGPUVirtualAddress();
+        dev->CreateShaderResourceView(nullptr, &sd, at);
+    };
+    auto at = [&](ID3D12DescriptorHeap* h, UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += (SIZE_T)i * inc;
+        return c;
+    };
+    srv(decoy, at(staging.Get(), 0));
+    srv(real, at(staging.Get(), 1));
+    srv(decoy, at(heap.Get(), 3));
+    dev->CopyDescriptorsSimple(1, at(heap.Get(), 1), at(staging.Get(), 0),
+                               D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    dev->CopyDescriptorsSimple(1, at(heap.Get(), 2), at(staging.Get(), 0),
+                               D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE dst[2] = { at(heap.Get(), 3), at(heap.Get(), 4) };
+    D3D12_CPU_DESCRIPTOR_HANDLE src[2] = { at(staging.Get(), 1), at(staging.Get(), 0) };
+    UINT ones[2] = { 1, 1 };
+    dev->CopyDescriptors(2, dst, ones, 2, src, ones, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return heap;
+}
+
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
     // --table has to reach this side too, or a shader written against a
@@ -1248,6 +1323,15 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
     }
 
     auto mask = MakeAlphaMask(g.device.Get());
+    std::vector<ComPtr<ID3D12Resource>> decoyKeep;
+    ComPtr<ID3D12Resource> decoyTlas;
+    ComPtr<ID3D12DescriptorHeap> sceneHeap, sceneStaging;
+    if ((g_decoy || g_bindless) && s.inst) {
+        decoyTlas = BuildDecoyTlas(g, s, decoyKeep);
+        std::printf("        a second live top-level structure, its records conflicting\n");
+    }
+    if (g_bindless && decoyTlas)
+        sceneHeap = MakeSceneHeap(g.device.Get(), s.tlas.Get(), decoyTlas.Get(), sceneStaging);
     ComPtr<ID3D12DescriptorHeap> heap;
     ComPtr<ID3D12Resource> decoy;
     if (g_table) heap = MakeTableHeap(g.device.Get(), out, decoy);
@@ -1301,9 +1385,15 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
             ID3D12DescriptorHeap* heaps[] = { logHeap.Get() };
             g.list->SetDescriptorHeaps(1, heaps);
         }
+        if (sceneHeap) {
+            ID3D12DescriptorHeap* heaps[] = { sceneHeap.Get() };
+            g.list->SetDescriptorHeaps(1, heaps);
+        }
+        // --bindless: the root SRV at t0 holds the DECOY; the shader never
+        // reads t0, so only a shim that guesses from root SRVs would use it.
         BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
-                  s.tlas->GetGPUVirtualAddress(), out->GetGPUVirtualAddress(),
-                  mask->GetGPUVirtualAddress());
+                  (sceneHeap ? decoyTlas : s.tlas)->GetGPUVirtualAddress(),
+                  out->GetGPUVirtualAddress(), mask->GetGPUVirtualAddress());
         if (logHeap)
             g.list->SetComputeRootDescriptorTable(
                 4, logHeap->GetGPUDescriptorHandleForHeapStart());
@@ -1672,6 +1762,10 @@ static void RunTrial(Adapter adapter, Method method, Pattern pattern, const char
 
     // Constant buffer.
     SceneCB cbData{ kWidth, kHeight, kHalfExtent, kCamZ, kTMin, kTMax, 0, 0 };
+    if (g_bindless) {   // the scene's heap slot, as a uint in _pad.x
+        const uint32_t slot = 3;
+        std::memcpy(&cbData.pad0, &slot, 4);
+    }
     UINT64 cbSize = (sizeof(SceneCB) + 255) & ~255ull;
     auto cb = CreateBuffer(device.Get(), cbSize, D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -1832,6 +1926,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--append") == 0) {
                 g_append = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--decoy") == 0 || std::strcmp(argv[i], "--bindless") == 0) {
+                (argv[i][2] == 'd' ? g_decoy : g_bindless) = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

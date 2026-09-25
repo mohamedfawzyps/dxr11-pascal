@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "as_tracker.h"
+#include "geom_index_so.h"
 
 namespace rq {
 // A hit group record's (geometryIndex, instanceContribution).
@@ -99,6 +100,11 @@ public:
     // both kinds at once, whichever else it handles.
     bool CommitsProcedural() const { return m_servesProc; }
 
+    // Where the lowered library's TraceRay calls take their scene from, read
+    // off the lowered text, so a dispatch can be judged against the ONE scene
+    // it traces (gidx::ResolveScenes) instead of every live one.
+    const gidx::Scenes& Scenes() const { return m_scenes; }
+
     // Issue the work the application asked for as Dispatch. The ray grid is
     // the thread group count times the shader's numthreads, because the
     // lowered raygen reads DispatchRaysIndex where the original read
@@ -111,12 +117,17 @@ public:
     //
     // Empty means nothing has been read yet, and one record will do.
     //
+    // `scenes`, when the dispatch's scene was resolved, are exactly the
+    // structures it traces, and the record constants come from them alone;
+    // null means every live structure.
+    //
     // The table is rebuilt whenever this changes, not merely when it grows:
     // a slot can go from holding the real hit group to holding a rejecting one
     // without the count moving at all.
     void DispatchAsRays(ID3D12GraphicsCommandList4* cl, UINT gx, UINT gy, UINT gz,
                         const std::vector<uint8_t>& recordKinds,
-                        const void* owner);
+                        const void* owner,
+                        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* scenes = nullptr);
 
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override;
@@ -164,6 +175,7 @@ private:
     // local root signature crashes the Pascal driver, see
     // phase5/cases/driver-crash/README.md.
     bool m_recordConstants = false;
+    gidx::Scenes m_scenes;
     ID3D12RootSignature* m_localRs = nullptr;   // owned; null without record data
     // What the current table's records point at, one pair per record.
     std::vector<rq::RecordPair> m_recPairs;

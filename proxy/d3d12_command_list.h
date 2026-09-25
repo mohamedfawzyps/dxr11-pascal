@@ -18,6 +18,7 @@
 
 #include <d3d12.h>
 #include <wrl/client.h>
+#include <string>
 #include <vector>
 
 // --- command list splitting -------------------------------------------------
@@ -125,6 +126,10 @@ struct Dxr11PendingDispatch {
     class Dxr11RayQueryPso*                      rq = nullptr;
     Microsoft::WRL::ComPtr<ID3D12PipelineState>  rqRef;
     Microsoft::WRL::ComPtr<ID3D12Resource>       counts;
+    // The scene it traces, resolved when it was recorded; `rqExact` false
+    // means not resolved, judged over every live structure.
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       rqScenes;
+    bool                                         rqExact = false;
 };
 
 // A closed segment, followed by the dispatches that could not be recorded until
@@ -151,6 +156,7 @@ struct Dxr11DispatchList {
 extern const GUID IID_Dxr11CommandList;
 
 class Dxr11RayQueryPso;
+namespace gidx { struct Scenes; }
 
 class Dxr11CommandList : public ID3D12GraphicsCommandList10 {
 public:
@@ -323,6 +329,12 @@ private:
     void WorkBarrier() { if (!m_openPendings.empty()) FlushQueuedSplit(); }
     // After a capture borrowed the compute bindings: put them back.
     void RestoreComputeAfterCapture();
+    // The scenes `sc` names, resolved through the bound compute root
+    // signature (gidx::ResolveScenes). False with *why when not resolved.
+    bool ResolveBoundScenes(const gidx::Scenes& sc, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
+                            std::string* why);
+    // The same for a lowered RayQuery pipeline, counted and logged.
+    bool RayQueryScenes(Dxr11RayQueryPso* rq, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out);
     ID3D12Device5* RealDevice();
 
     ID3D12GraphicsCommandList4* m_real;

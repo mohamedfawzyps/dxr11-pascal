@@ -67,6 +67,24 @@ struct Remap {
     UINT insert = 0;
 };
 
+// Where a library's TraceRay calls take their scene from, so a dispatch can be
+// told WHICH scene it traces (ResolveScenes). `regs`: declared registers,
+// `count` 0 an unbounded array. `heap`: ResourceDescriptorHeap[i] (SM 6.6,
+// Unreal's bindless), `i` a dword of the cbuffer at (space, reg), byte
+// `offset`. `unknown`: a TraceRay whose scene handle could not be traced back
+// to either.
+struct Scenes {
+    struct Reg { UINT space = 0, lower = 0, count = 1; };
+    struct Heap { UINT space = 0, reg = 0, offset = 0; };
+    std::vector<Reg> regs;
+    std::vector<Heap> heap;
+    bool unknown = false;
+};
+
+// Adds the scenes of every TraceRay in one disassembled library to `*out`.
+// Used for the application's own DXR libraries and for lowered RayQuery ones.
+void ScanScenes(const std::string& text, Scenes* out);
+
 // What DispatchRays needs, attached to the state object.
 struct Info {
     std::vector<Group> groups;
@@ -75,17 +93,7 @@ struct Info {
     // pipeline's TraceRay calls use, low 4 bits each.
     std::vector<std::pair<UINT, UINT>> traceArgs;
     bool dynamicTraceArgs = false; // a TraceRay whose R or M is not a constant
-    // The registers the TraceRay calls take their scene from, so a dispatch
-    // can be told WHICH scene it traces (ResolveScenes). `count` 0 is an
-    // unbounded array. `heapScenes`: a scene taken from the descriptor heap
-    // (SM 6.6 ResourceDescriptorHeap[i], Unreal's bindless) at an index read
-    // from the cbuffer at (space, reg), byte `offset`. `sceneUnknown`: a
-    // TraceRay whose scene handle could not be traced back to either.
-    struct SceneReg { UINT space = 0, lower = 0, count = 1; };
-    std::vector<SceneReg> scenes;
-    struct SceneHeap { UINT space = 0, reg = 0, offset = 0; };
-    std::vector<SceneHeap> heapScenes;
-    bool sceneUnknown = false;
+    Scenes scenes;                 // where the TraceRay calls take their scene
 
     // The shim's own record layout, for when the application's shares a
     // record between geometries: a VARIANT pipeline tracing the shim's copy
@@ -151,7 +159,7 @@ struct BoundRoot {
 // the index read from root constants or a root CBV in CPU-visible memory at
 // record time, and that heap slot. True, with `*out` exactly those
 // addresses, when every register resolves; false with *why otherwise.
-bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
+bool ResolveScenes(const Scenes& sc, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
                    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why);
 

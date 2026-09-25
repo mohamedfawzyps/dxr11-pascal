@@ -24,6 +24,39 @@ not.
 
 ---
 
+## 0.49.0
+
+**The lowered RayQuery path judges a dispatch against the ONE scene it
+traces.** Until now `rq_pipeline` built its table, its record constants and
+its refusal from every live top-level structure together, so two live scenes
+that disagree about a record refused the dispatch: the 0.40.0 Escher runs'
+"two live structures disagree", which drew nothing for that pass. It now uses
+the resolution 0.47.0 and 0.48.0 built for `GeometryIndex()`.
+
+- **At creation** the lowered library's scenes are read off its text
+  (`gidx::ScanScenes`, the same scan, now shared: the scene fields moved into
+  `gidx::Scenes`). Checked on the 64 lowered Unreal libraries from the Escher
+  dumps: every one traces `ResourceDescriptorHeap[i]` with `i` read from the
+  cbuffer at b0 space0, the shape the scan recognises.
+- **At `Dispatch`** the scene is resolved through the bound compute root
+  signature, and `TableWouldBeWrong`, `RecordKinds` and `RecordConstantsTable`
+  take that scene alone (`only`). An indirect dispatch is resolved when
+  recorded and judged at submit. Not resolved: every live scene, as before.
+- **A resolved scene whose instances are not read yet is REFUSED**, as the
+  `GeometryIndex()` path already does, rather than drawn from other scenes'
+  data. Transient: GPU-written instance descriptions arrive a submission late.
+- **Counted**, in the `stats:` line: scene resolved, not resolved, and
+  refused because the scene is not read yet. The next Escher run says whether
+  Unreal's b0 really is a CPU-readable root CBV, which is INFERRED from its
+  source (`LooseParameterCBVIndex = 0`), not measured in the game.
+- **Measured:** two new dispatch cases, `decoy` (a second live structure with
+  a conflicting layout, scene through the root SRV) and `bindlessrq` (the
+  scene from the heap, index in the root CBV, the decoy in the neighbouring
+  slots and at t0): both bit-exact against WARP. With resolution switched off
+  both are refused, 13872 hits missing; with the heap slot read one off,
+  `bindlessrq` diverges by 4624. Dispatch suite all pass, 38 cases.
+  `raytest` takes `--decoy` and `--bindless`.
+
 ## 0.48.0
 
 Tier 1.1 item a, part 3 of the remaining list: **a scene reached through the

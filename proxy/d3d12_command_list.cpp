@@ -275,8 +275,21 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         // right for this scene. If it cannot, refuse rather than draw a wrong
         // image: a silently wrong result is the one failure mode this project
         // will not ship.
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scenes;
+        const bool exact = RayQueryScenes(m_rqPso, &scenes);
+        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = exact ? &scenes : nullptr;
+        if (exact && !astrack::AnyRead(scenes)) {
+            // Its instances arrive a submission late when the GPU wrote them.
+            dstats::Add(dstats::kRefusedUnread);
+            static LONG onceUnread = 0;
+            if (InterlockedCompareExchange(&onceUnread, 1, 0) == 0)
+                ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: the scene "
+                         "it traces (0x%llX) has not been read yet. Nothing is drawn for it.\n",
+                         (unsigned long long)scenes[0]);
+            return;
+        }
         std::string why;
-        if (astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why)) {
+        if (astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why, only)) {
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
@@ -286,7 +299,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         // What geometry reaches each hit group record index, read from the
         // instance descriptions. Empty until a top-level structure has been
         // seen, which is the right answer for a scene that has none.
-        m_rqPso->DispatchAsRays(m_real, x, y, z, astrack::RecordKinds(), this);
+        m_rqPso->DispatchAsRays(m_real, x, y, z, astrack::RecordKinds(only), this, only);
         return;
     }
     FWD(Dispatch(x, y, z));
@@ -677,6 +690,44 @@ void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s)
     m_lastBoundStateObject = true;
     FWD(SetPipelineState1(s));
 }
+bool Dxr11CommandList::ResolveBoundScenes(const gidx::Scenes& sc,
+                                          std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
+                                          std::string* why) {
+    std::vector<gidx::BoundRoot> roots(Dxr11Bindings::kMaxRootParams);
+    for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i) {
+        const auto& r = m_bindings.roots[i];
+        if (r.kind == Dxr11RootParam::SRV) roots[i].srv = r.address;
+        if (r.kind == Dxr11RootParam::CBV) roots[i].cbv = r.address;
+        if (r.kind == Dxr11RootParam::Table) roots[i].table = r.table.ptr;
+        if (r.kind == Dxr11RootParam::Constants) {
+            roots[i].constants = r.constants.data();
+            roots[i].numConstants = (UINT)r.constants.size();
+        }
+    }
+    return gidx::ResolveScenes(sc, m_bindings.rootSig, roots, m_bindings.heaps.data(),
+                               (UINT)m_bindings.heaps.size(), out, why);
+}
+
+// The scene a lowered RayQuery dispatch traces. Resolved, its table is built
+// from that scene alone; otherwise from every live one, as before 0.49.0,
+// which can refuse a dispatch two live scenes disagree about but never draws
+// one wrong.
+bool Dxr11CommandList::RayQueryScenes(Dxr11RayQueryPso* rq,
+                                      std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out) {
+    std::string why;
+    if (ResolveBoundScenes(rq->Scenes(), out, &why)) {
+        dstats::Add(dstats::kSceneResolved);
+        return true;
+    }
+    out->clear();
+    dstats::Add(dstats::kSceneUnresolved);
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 8)
+        ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch: the scene it traces is not "
+                 "resolved (%s); judged over every live scene\n", why.c_str());
+    return false;
+}
+
 // A pipeline whose hit shaders read GeometryIndex() dispatches against the
 // shim's copy of the hit group table, which carries each record's geometry
 // index; see proxy/geom_index_so.h. A dispatch that copy cannot serve is NOT
@@ -696,20 +747,8 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     // SRV that was a known scene counted as THE scene; wrong when the shader
     // traces another one, a heap-indexed one say, beside it.)
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
-    std::vector<gidx::BoundRoot> roots(Dxr11Bindings::kMaxRootParams);
-    for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i) {
-        const auto& r = m_bindings.roots[i];
-        if (r.kind == Dxr11RootParam::SRV) roots[i].srv = r.address;
-        if (r.kind == Dxr11RootParam::CBV) roots[i].cbv = r.address;
-        if (r.kind == Dxr11RootParam::Table) roots[i].table = r.table.ptr;
-        if (r.kind == Dxr11RootParam::Constants) {
-            roots[i].constants = r.constants.data();
-            roots[i].numConstants = (UINT)r.constants.size();
-        }
-    }
     std::string swhy;
-    const bool exact = gidx::ResolveScenes(*gi, m_bindings.rootSig, roots, m_bindings.heaps.data(),
-                                           (UINT)m_bindings.heaps.size(), &srvs, &swhy);
+    const bool exact = ResolveBoundScenes(gi->scenes, &srvs, &swhy);
     if (!exact) {
         srvs.clear();
         static LONG n = 0;
@@ -942,6 +981,8 @@ bool Dxr11CommandList::QueueIndirectCompute(ID3D12CommandSignature* sig,
     pend.counts = cap.counts;
     pend.rq = m_rqPso;
     pend.rqRef = static_cast<ID3D12PipelineState*>(m_rqPso);
+    // Resolved now, from the bindings as recorded; judged at submit.
+    if (m_rqPso) pend.rqExact = RayQueryScenes(m_rqPso, &pend.rqScenes);
     pend.bindings = m_bindings;
     pend.bindings.Retain();
     m_openPendings.push_back(pend);
@@ -1041,8 +1082,14 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                                  groups[0], groups[1], groups[2]);
                     continue;
                 }
+                const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only =
+                    pend.rqExact ? &pend.rqScenes : nullptr;
+                if (only && !astrack::AnyRead(*only)) {
+                    dstats::Add(dstats::kRefusedUnread);
+                    continue;
+                }
                 std::string why;
-                if (astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why)) {
+                if (astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why, only)) {
                     static LONG onceWrong = 0;
                     if (InterlockedCompareExchange(&onceWrong, 1, 0) == 0)
                         ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
@@ -1093,7 +1140,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             if (pend.rq) dstats::Add(dstats::kIndirect);
             if (pend.rq)
                 pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
-                                        astrack::RecordKinds(), slot->list.Get());
+                                        astrack::RecordKinds(pend.rqExact ? &pend.rqScenes : nullptr),
+                                        slot->list.Get(), pend.rqExact ? &pend.rqScenes : nullptr);
             else
                 slot->list->DispatchRays(&desc);
             if (FAILED(slot->list->Close())) {

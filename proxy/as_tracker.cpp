@@ -42,6 +42,14 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_buildCount;
 // after a newer one has four builds, where the window alone gave it 64.
 const UINT64 kSupersedeBuilds = 4;
 
+bool LiveLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas);
+
+// Caller holds g_lock. The structures a table is judged over: exactly `only`
+// when the dispatch's scene is known, every live one otherwise.
+bool CountsLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only) {
+    return only ? std::find(only->begin(), only->end(), tlas) != only->end() : LiveLocked(tlas);
+}
+
 // Caller holds g_lock.
 bool LiveLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     auto it = g_lastBuilt.find(tlas);
@@ -500,7 +508,17 @@ TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address) {
     return it == g_tlas.end() ? TlasInfo() : it->second;
 }
 
-bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
+bool AnyRead(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (auto a : scenes) {
+        auto it = g_tlas.find(a);
+        if (it != g_tlas.end() && it->second.valid) return true;
+    }
+    return false;
+}
+
+bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
+                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only) {
     // Nonzero contributions are not a refusal: the table is sized to the scene
     // and each slot carries a record of the right TYPE, so a hit resolves to a
     // usable record whichever slot the application chose.
@@ -520,7 +538,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
         std::vector<D3D12_GPU_VIRTUAL_ADDRESS> from;   // which structure set merged[i]
         for (const auto& kv : g_tlas) {
             const TlasInfo& t = kv.second;
-            if (!t.valid || !LiveLocked(kv.first)) continue;
+            if (!t.valid || !CountsLocked(kv.first, only)) continue;
             if (t.constantsConflict) {
                 dstats::Add(dstats::kRefusedOneTlas);
                 if (why)
@@ -588,7 +606,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
     std::lock_guard<std::mutex> g(g_lock);
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
-        if (!t.valid || !LiveLocked(kv.first)) continue;
+        if (!t.valid || !CountsLocked(kv.first, only)) continue;
         for (size_t i = 0; i < t.reach.size(); ++i) {
             if ((t.reach[i] & kReachTriangles) && (t.reach[i] & kReachProcedural)) {
                 dstats::Add(dstats::kRefusedProcedural);
@@ -604,12 +622,13 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why) {
     return false;
 }
 
-std::vector<RecordConstants> RecordConstantsTable() {
+std::vector<RecordConstants> RecordConstantsTable(
+    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only) {
     std::lock_guard<std::mutex> g(g_lock);
     std::vector<RecordConstants> out;
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
-        if (!t.valid || !LiveLocked(kv.first)) continue;
+        if (!t.valid || !CountsLocked(kv.first, only)) continue;
         if (out.size() < t.constants.size()) out.resize(t.constants.size());
         for (size_t i = 0; i < t.constants.size(); ++i)
             if (t.constants[i].assigned && !out[i].assigned) out[i] = t.constants[i];
@@ -657,12 +676,12 @@ UINT MaxGeometryCount() {
     return m;
 }
 
-std::vector<uint8_t> RecordKinds() {
+std::vector<uint8_t> RecordKinds(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only) {
     std::lock_guard<std::mutex> g(g_lock);
     std::vector<uint8_t> out;
     for (const auto& kv : g_tlas) {
         const TlasInfo& t = kv.second;
-        if (!t.valid || !LiveLocked(kv.first)) continue;
+        if (!t.valid || !CountsLocked(kv.first, only)) continue;
         if (out.size() < t.reach.size()) out.resize(t.reach.size(), kReachNone);
         for (size_t i = 0; i < t.reach.size(); ++i) out[i] |= t.reach[i];
     }
