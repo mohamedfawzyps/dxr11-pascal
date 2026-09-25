@@ -30,4 +30,10 @@ void NoteCopy(ID3D12Device* real, UINT numDst, const D3D12_CPU_DESCRIPTOR_HANDLE
 D3D12_GPU_VIRTUAL_ADDRESS Lookup(ID3D12DescriptorHeap* const* heaps, UINT n,
                                  D3D12_GPU_DESCRIPTOR_HANDLE gpu);
 
+// The same for ResourceDescriptorHeap[slot]: the bound shader-visible
+// CBV_SRV_UAV heap's slot. `*inHeap` false when no such heap is bound or the
+// slot is past its end.
+D3D12_GPU_VIRTUAL_ADDRESS LookupSlot(ID3D12DescriptorHeap* const* heaps, UINT n, UINT slot,
+                                     bool* inHeap);
+
 }  // namespace scenebind

@@ -37,6 +37,12 @@
 // real descriptor arrives by CopyDescriptors from a staging heap, over a
 // decoy written there first. The shim has to find WHICH scene is traced.
 //
+// --bindless traces ResourceDescriptorHeap[i] instead, Unreal's bindless
+// form (lib_6_6), with i in a root CBV in upload memory as Unreal binds its
+// uniform buffers; --bindlessrc puts i in root constants. The same heap and
+// decoys as --table, and the decoy scene bound as a root SRV beside it, so a
+// shim that took a bound root SRV for the scene draws the wrong one.
+//
 // Exit code 0 only when every layout matches WARP.
 
 #include <windows.h>
@@ -79,6 +85,7 @@ static bool g_sm66 = false;
 // collection linked by AddToStateObject, how Unreal grows its pipeline).
 static int g_mode = 0;
 static bool g_table = false;
+static int g_bindless = 0;   // 1 index in a root CBV, 2 in root constants
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -86,7 +93,9 @@ static bool g_table = false;
 // needs a second local root signature layout.
 static const char* kLib = R"HLSL(
 cbuffer CB : register(b0) { uint W; uint H; uint NInst; uint Pad; };
+#if !BINDLESS
 RaytracingAccelerationStructure Scene : register(t0);
+#endif
 RWStructuredBuffer<uint4> Out : register(u0);
 
 cbuffer Rec : register(b0, space1) { uint RecTag; };
@@ -96,6 +105,9 @@ struct Pay { uint4 v; };
 
 [shader("raygeneration")] void RayGen() {
     uint2 p = DispatchRaysIndex().xy;
+#if BINDLESS
+    RaytracingAccelerationStructure Scene = ResourceDescriptorHeap[Pad];
+#endif
     RayDesc r;
     r.Origin = float3((p.x + 0.5) / W * NInst, (p.y + 0.5) / H, 1.0);
     r.Direction = float3(0, 0, -1);
@@ -138,8 +150,10 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
     HR(create(CLSID_DxcCompiler, IID_PPV_ARGS(&c)), "create IDxcCompiler3");
     std::wstring dr = L"R_VAL=" + std::to_wstring(R), dm = L"M_VAL=" + std::to_wstring(M);
     std::wstring da = std::wstring(L"ANYHIT=") + (anyhit ? L"1" : L"0");
+    const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
-                                         L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str() };
+                                         L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
+                                         L"-D", db };
     DxcBuffer buf{ kLib, std::strlen(kLib), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -294,7 +308,10 @@ static ComPtr<ID3D12Resource> BuildBlas(Gpu& g, Blas which, bool opaque,
 
 static ComPtr<ID3D12RootSignature> RootSig(ID3D12Device* dev, const D3D12_ROOT_SIGNATURE_DESC& d) {
     ComPtr<ID3DBlob> b, e;
-    HR(D3D12SerializeRootSignature(&d, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e), "serialize RS");
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
+    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    v.Desc_1_0 = d;
+    HR(D3D12SerializeVersionedRootSignature(&v, &b, &e), "serialize RS");
     ComPtr<ID3D12RootSignature> rs;
     HR(dev->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&rs)),
        "CreateRootSignature");
@@ -332,7 +349,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     // --table: a second live scene, instance A at contribution 2, which puts
     // different geometries on records the real scene uses.
     ComPtr<ID3D12Resource> decoy;
-    if (g_table) {
+    if (g_table || g_bindless) {
         auto db = Buffer(g.dev.Get(), sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_HEAP_TYPE_UPLOAD,
                          D3D12_RESOURCE_STATE_GENERIC_READ);
         D3D12_RAYTRACING_INSTANCE_DESC* dd = nullptr;
@@ -354,6 +371,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     // b0 space1, or three at b1 space1 for the second closest-hit.
     D3D12_ROOT_PARAMETER gp[3]{};
     gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; gp[0].Constants.Num32BitValues = 4;
+    if (g_bindless == 1) gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     gp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     // --table: t0 is the table's descriptor 2, so a wrong offset lands on a decoy.
     D3D12_DESCRIPTOR_RANGE tr{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 2 };
@@ -362,7 +380,9 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         gp[1].DescriptorTable = { 1, &tr };
     }
     gp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    D3D12_ROOT_SIGNATURE_DESC gd{ 3, gp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    D3D12_ROOT_SIGNATURE_DESC gd{ 3, gp, 0, nullptr,
+        g_bindless ? D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                   : D3D12_ROOT_SIGNATURE_FLAG_NONE };
     auto grs = RootSig(g.dev.Get(), gd);
     D3D12_ROOT_PARAMETER lp1{}; lp1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     lp1.Constants.Num32BitValues = 1; lp1.Constants.RegisterSpace = 1;
@@ -528,13 +548,9 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     const UINT W = kWPer * n;
     auto out = Buffer(g.dev.Get(), (UINT64)W * kH * 16, D3D12_HEAP_TYPE_DEFAULT,
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-    g.cl->SetPipelineState1(so.Get());
-    g.cl->SetComputeRootSignature(grs.Get());
-    const uint32_t c[4] = { W, kH, n, 0 };
-    g.cl->SetComputeRoot32BitConstants(0, 4, c, 0);
     ComPtr<ID3D12DescriptorHeap> heap, staging;
-    if (g_table) {
-        const UINT inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (g_table || g_bindless) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{ D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6,
                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
         HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap");
@@ -568,11 +584,26 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         g.dev->CopyDescriptors(2, dst, ones, 2, src, ones, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         ID3D12DescriptorHeap* hs[] = { heap.Get() };
         g.cl->SetDescriptorHeaps(1, hs);
+    }
+    g.cl->SetPipelineState1(so.Get());
+    g.cl->SetComputeRootSignature(grs.Get());
+    // --bindless: the scene is heap slot 3.
+    const uint32_t c[4] = { W, kH, n, g_bindless ? 3u : 0u };
+    ComPtr<ID3D12Resource> cb;
+    if (g_bindless == 1) {
+        cb = Buffer(g.dev.Get(), 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* cm = nullptr; HR(cb->Map(0, nullptr, &cm), "Map cb");
+        std::memcpy(cm, c, sizeof(c)); cb->Unmap(0, nullptr);
+        g.cl->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress());
+    } else {
+        g.cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+    }
+    if (g_table) {
         D3D12_GPU_DESCRIPTOR_HANDLE tb = heap->GetGPUDescriptorHandleForHeapStart();
         tb.ptr += inc;
         g.cl->SetComputeRootDescriptorTable(1, tb);
     } else {
-        g.cl->SetComputeRootShaderResourceView(1, tlas->GetGPUVirtualAddress());
+        g.cl->SetComputeRootShaderResourceView(1, (g_bindless ? decoy : tlas)->GetGPUVirtualAddress());
     }
     g.cl->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
     D3D12_DISPATCH_RAYS_DESC dr{};
@@ -606,6 +637,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--collections")) g_mode = 1;
         else if (!std::strcmp(argv[i], "--grow")) g_mode = 2;
         else if (!std::strcmp(argv[i], "--table")) g_table = true;
+        else if (!std::strcmp(argv[i], "--bindless")) g_bindless = 1, g_sm66 = true;
+        else if (!std::strcmp(argv[i], "--bindlessrc")) g_bindless = 2, g_sm66 = true;
         else want.insert(argv[i]);
     }
     ComPtr<IDXGIFactory6> fac;
@@ -615,7 +648,9 @@ int main(int argc, char** argv) {
     fac->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&hw));
     DXGI_ADAPTER_DESC1 hd{}; hw->GetDesc1(&hd);
     std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s%s, %s\n",
-                g_sm66 ? "lib_6_6" : "lib_6_5", g_table ? ", scene through a descriptor table" : "",
+                g_sm66 ? "lib_6_6" : "lib_6_5", g_table ? ", scene through a descriptor table"
+                : g_bindless == 1 ? ", scene through the heap, index in a root CBV"
+                : g_bindless == 2 ? ", scene through the heap, index in root constants" : "",
                 g_mode == 0 ? "one state object" : g_mode == 1 ? "collections"
                                                                : "collections grown by AddToStateObject");
     std::printf("ground truth WARP, against %ls\n\n", hd.Description);

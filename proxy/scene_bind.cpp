@@ -132,4 +132,26 @@ D3D12_GPU_VIRTUAL_ADDRESS Lookup(ID3D12DescriptorHeap* const* heaps, UINT n,
     return 0;
 }
 
+D3D12_GPU_VIRTUAL_ADDRESS LookupSlot(ID3D12DescriptorHeap* const* heaps, UINT n, UINT slot,
+                                     bool* inHeap) {
+    *inHeap = false;
+    for (UINT i = 0; i < n; ++i) {
+        ID3D12DescriptorHeap* h = heaps[i];
+        if (!h) continue;
+        const D3D12_DESCRIPTOR_HEAP_DESC d = h->GetDesc();
+        if (d.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            !(d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+            continue;
+        if (slot >= d.NumDescriptors) return 0;
+        ID3D12Device* dev = nullptr;
+        if (FAILED(h->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return 0;
+        const UINT64 inc = Increment(dev);
+        dev->Release();
+        *inHeap = true;
+        D3D12_GPU_DESCRIPTOR_HANDLE g{ h->GetGPUDescriptorHandleForHeapStart().ptr + slot * inc };
+        return Lookup(&h, 1, g);
+    }
+    return 0;
+}
+
 }  // namespace scenebind

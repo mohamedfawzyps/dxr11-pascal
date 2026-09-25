@@ -690,26 +690,32 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     D3D12_DISPATCH_RAYS_DESC mine = *d;
     std::string why;
     // The scene the dispatch traces: resolved through the bound root
-    // signature when every TraceRay's register can be, root SRV or descriptor
-    // table. Otherwise the bound root SRVs, and failing those every live
-    // scene, which can refuse a layout that was fine but never draws wrong.
+    // signature when every TraceRay's scene can be, root SRV, descriptor
+    // table or heap index. Otherwise every live scene, which can refuse a
+    // layout that was fine but never draws wrong. (Until 0.48.0 a bound root
+    // SRV that was a known scene counted as THE scene; wrong when the shader
+    // traces another one, a heap-indexed one say, beside it.)
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
     std::vector<gidx::BoundRoot> roots(Dxr11Bindings::kMaxRootParams);
     for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i) {
         const auto& r = m_bindings.roots[i];
         if (r.kind == Dxr11RootParam::SRV) roots[i].srv = r.address;
+        if (r.kind == Dxr11RootParam::CBV) roots[i].cbv = r.address;
         if (r.kind == Dxr11RootParam::Table) roots[i].table = r.table.ptr;
+        if (r.kind == Dxr11RootParam::Constants) {
+            roots[i].constants = r.constants.data();
+            roots[i].numConstants = (UINT)r.constants.size();
+        }
     }
     std::string swhy;
     const bool exact = gidx::ResolveScenes(*gi, m_bindings.rootSig, roots, m_bindings.heaps.data(),
                                            (UINT)m_bindings.heaps.size(), &srvs, &swhy);
     if (!exact) {
-        for (const auto& r : m_bindings.roots)
-            if (r.kind == Dxr11RootParam::SRV && r.address) srvs.push_back(r.address);
+        srvs.clear();
         static LONG n = 0;
         if (InterlockedIncrement(&n) <= 4)
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene this dispatch traces is not "
-                     "resolved (%s); judged over the bound root SRVs, or every live scene\n", swhy.c_str());
+                     "resolved (%s); judged over every live scene\n", swhy.c_str());
     }
     bool shared = false;
     if (!dev || !gidx::RecordTable(m_real, dev, *gi, d->HitGroupTable, &mine.HitGroupTable,

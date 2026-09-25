@@ -156,11 +156,10 @@ struct TlasInfo {
 //
 // With `exact`, `bound` are exactly the scenes the dispatch traces (resolved
 // through its root signature, gidx::ResolveScenes) and only they count;
-// `*read` is false unless one of them has been read. Otherwise `bound` are the
-// root SRVs the dispatch has bound: when one is a top-level structure that has
-// been read, only those count; if none is, every live one does, which can
-// only find MORE collisions, and `*read` is false when no top-level structure
-// has been read at all.
+// `*read` is false unless one of them has been read. Otherwise `bound` is
+// empty (since 0.48.0; it used to be the bound root SRVs) and every live one
+// counts, which can only find MORE collisions, and `*read` is false when no
+// top-level structure has been read at all.
 std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& traceArgs,
                                     UINT records,
                                     const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact,

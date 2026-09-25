@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.48.0: THE BINDLESS SCENE IS RESOLVED (item a, part 3).** All 64 Unreal
+scene handles in the dumps are `ResourceDescriptorHeap[i]` with `i` a dword
+of b0 space0, which Unreal binds as a root CBV in upload memory. The scan
+recognises that chain, the dispatch reads `i` (root constants, or the root
+CBV's memory at record time) and looks the slot up. `gitest.exe --bindless`
+and `--bindlessrc`: 7 of 7 in all modes, one slot off diverges. The 0.44.0
+rule "a bound root SRV that is a known scene is THE scene" is REMOVED: it drew
+the wrong scene when the shader traced another one beside it. One
+unexplained FAILED in 57 runs of `--bindlessrc`, output lost. Remaining for
+item a: a local root signature scene, TraceRay in a closest-hit or miss,
+runtime TraceRay arguments, indirect DispatchRays, the first dispatch before
+a GPU-built scene's copy exists, associations from inside a library. The
+RayQuery path (`rq_pipeline`) could use the same resolution for Unreal's 64.
+
 **0.47.0: THE SCENE A DISPATCH TRACES IS RESOLVED THROUGH DESCRIPTOR TABLES
 (item a, part 2 of the list).** Each TraceRay's register is read off the
 disassembly, descriptor writes and copies are followed (`proxy/scene_bind`),

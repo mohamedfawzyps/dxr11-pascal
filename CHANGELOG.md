@@ -24,6 +24,48 @@ not.
 
 ---
 
+## 0.48.0
+
+Tier 1.1 item a, part 3 of the remaining list: **a scene reached through the
+descriptor heap, Unreal's bindless form.** Read off the Escher dumps first:
+all 64 of Unreal's scene handles are `ResourceDescriptorHeap[i]`, with `i` a
+dword of the cbuffer at b0 space0 at a constant row (seven different
+offsets), and Unreal binds b0 as a root CBV in upload memory
+(`D3D12RayTracing.cpp`, `LooseParameterCBVIndex = 0`).
+
+- **The scan** follows a TraceRay's handle through `createHandleFromHeap` to
+  `extractvalue` of `cbufferLoadLegacy` at a constant row, and back to the
+  cbuffer's resource record: (space, register, byte offset). Shape read off
+  DXC at lib_6_6.
+- **At the dispatch** the index is read from the bound root constants, or
+  from the root CBV's memory when the CPU can read it (upload or readback
+  heap, at record time, as the shim already reads upload-heap instance
+  descriptions), and the heap slot is looked up in the bound shader-visible
+  heap (`scenebind::LookupSlot`).
+- **The root SRV rule is gone.** Since 0.44.0 a bound root SRV that was a
+  known scene counted as THE scene whenever resolution failed. That is wrong
+  when the shader traces another scene, a heap-indexed one say, and the
+  application binds a different structure as a root SRV beside it. An
+  unresolved scene is now judged over every live scene, which can refuse but
+  never draws wrong.
+- **Measured:** `gitest.exe --bindless` (index in a root CBV in upload
+  memory, Unreal's way) and `--bindlessrc` (index in root constants), with
+  the conflicting decoy scene in the neighbouring heap slots AND bound as a
+  root SRV: 7 of 7 layouts bit-exact in all three construction modes, and the
+  root SRV, table and 6.5 runs unchanged: 126 of 126. Reading the slot one
+  off draws the decoy and diverges in all 7, both modes. Six cold-cache
+  trials clean. Dispatch suite all pass.
+- **Open, not explained:** one `--bindlessrc` run reported FAILED, the first
+  run of that mode after the build, with its output cut off, so which layout
+  and why are not known. 56 runs since, 6 of them with NVIDIA's shader cache
+  cleared first, are all clean.
+- **Still not resolved, and then judged over every live scene:** the index in
+  a cbuffer in GPU-only memory, in a descriptor table CBV or a local root
+  signature, or computed by arithmetic rather than read.
+- **Not yet used by the RayQuery path:** the 64 dumped Unreal compute shaders
+  lower through `rq_pipeline`, which still judges their layout over every live
+  scene (the 0.40.0 "two live structures disagree" refusals).
+
 ## 0.47.0
 
 Tier 1.1 item a, part 2 of the remaining list: **a scene bound through a

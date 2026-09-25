@@ -6,6 +6,7 @@
 #include "geom_table_cs.h"
 #include "gpu_hold.h"
 #include "proxy_log.h"
+#include "res_tracker.h"
 #include "scene_bind.h"
 #include "shim_scene.h"
 #include "shim_table_cs.h"
@@ -51,6 +52,12 @@ std::string GlobalAt(const std::string& l, size_t at) {
     return l.substr(at, e - at);
 }
 
+void AddHeapScene(Info* info, const Info::SceneHeap& h) {
+    for (const auto& x : info->heapScenes)
+        if (x.space == h.space && x.reg == h.reg && x.offset == h.offset) return;
+    info->heapScenes.push_back(h);
+}
+
 void AddScene(Info* info, const Info::SceneReg& r) {
     for (const auto& x : info->scenes)
         if (x.space == r.space && x.lower == r.lower && x.count == r.count) return;
@@ -64,7 +71,11 @@ void AddScene(Info* info, const Info::SceneReg& r) {
 // and lib_6_6. Anything else, a descriptor heap index above all, is unknown.
 void SceneRegs(const std::string& text, Info* info) {
     struct Rec { UINT space; UINT lower; int size; };
-    std::map<std::string, Rec> recs;
+    std::map<std::string, Rec> recs, anyRecs;   // structures; every resource
+    static const std::regex kAnyFields(R"RX(, !"[^"]*", i32 (-?\d+), i32 (-?\d+), i32 (-?\d+),)RX");
+    static const std::regex kHeap(R"RX(\(i32 218, i32 (%[^,]+), i1 false,)RX");
+    static const std::regex kExtract(R"RX(extractvalue %dx\.types\.CBufRet\.i32 (%[^,]+), (\d+)$)RX");
+    static const std::regex kCbLoad(R"RX(@dx\.op\.cbufferLoadLegacy\.i32\(i32 59, %dx\.types\.Handle (%[^,]+), i32 (\d+)\))RX");
     static const std::regex kFields(R"RX(, !"[^"]*", i32 (-?\d+), i32 (-?\d+), i32 (-?\d+), i32 16,)RX");
     static const std::regex kTrace(R"RX(@dx\.op\.traceRay\.[^(]+\(i32 157, %[^ ]+ (%[^,]+),)RX");
     static const std::regex kOperand(R"RX(\(i32 \d+, %[^ ]+ (%[^,)]+))RX");
@@ -81,6 +92,13 @@ void SceneRegs(const std::string& text, Info* info) {
         at = e + 1;
     }
     std::smatch m;
+    for (const auto& l : lines)
+        if (l.rfind("!", 0) == 0 && l.find('@') != std::string::npos && std::regex_search(l, m, kAnyFields)) {
+            const std::string g = GlobalAt(l, l.find('@'));
+            if (!g.empty())
+                anyRecs[g] = { (UINT)std::stol(m[1].str()), (UINT)std::stol(m[2].str()),
+                               (int)std::stol(m[3].str()) };
+        }
     for (const auto& l : lines)
         if (l.rfind("!", 0) == 0 && l.find("RaytracingAccelerationStructure") != std::string::npos &&
             std::regex_search(l, m, kFields)) {
@@ -107,6 +125,41 @@ void SceneRegs(const std::string& text, Info* info) {
                 if (!std::regex_search(d, m, kOperand)) break;
                 v = m[1].str();
                 continue;
+            }
+            if (d.find("@dx.op.createHandleFromHeap(") != std::string::npos) {
+                // ResourceDescriptorHeap[i], i a dword of a cbuffer at a
+                // constant row: Unreal's bindless scene, all 64 dumped.
+                if (!std::regex_search(d, m, kHeap)) break;
+                auto ei = defs.find(m[1].str());
+                if (ei == defs.end() || !std::regex_search(*ei->second, m, kExtract)) break;
+                const UINT comp = (UINT)std::stoul(m[2].str());
+                auto li = defs.find(m[1].str());
+                if (li == defs.end() || !std::regex_search(*li->second, m, kCbLoad)) break;
+                const UINT row = (UINT)std::stoul(m[2].str());
+                std::string h = m[1].str(), g;
+                for (int k = 0; k < 4; ++k) {
+                    auto hi = defs.find(h);
+                    if (hi == defs.end()) break;
+                    const std::string& hd = *hi->second;
+                    if (hd.find("@dx.op.annotateHandle(") != std::string::npos ||
+                        hd.find("@dx.op.createHandleForLib") != std::string::npos) {
+                        if (!std::regex_search(hd, m, kOperand)) break;
+                        h = m[1].str();
+                        continue;
+                    }
+                    if (hd.find("= load ") != std::string::npos && hd.find('@') != std::string::npos)
+                        g = GlobalAt(hd, hd.find('@'));
+                    break;
+                }
+                auto r = anyRecs.find(g);
+                if (r == anyRecs.end()) break;
+                Info::SceneHeap sh;
+                sh.space = r->second.space;
+                sh.reg = r->second.lower;
+                sh.offset = row * 16 + comp * 4;
+                AddHeapScene(info, sh);
+                done = true;
+                break;
             }
             if (d.find("= load ") == std::string::npos) break;
             // The global, and the element when it is an array.
@@ -282,6 +335,7 @@ void MergeCollections(const D3D12_STATE_OBJECT_DESC& in, Info* info) {
         info->dynamicTraceArgs = info->dynamicTraceArgs || ci->dynamicTraceArgs;
         info->sceneUnknown = info->sceneUnknown || ci->sceneUnknown;
         for (const auto& r : ci->scenes) AddScene(info, r);
+        for (const auto& h : ci->heapScenes) AddHeapScene(info, h);
         for (const auto& g : ci->groups) {
             std::vector<std::wstring> as;
             if (!c->NumExports) as.push_back(g.name);
@@ -601,7 +655,10 @@ bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<
                "back to a declared resource";
         return false;
     }
-    if (info.scenes.empty()) { *why = "no TraceRay scene register was found"; return false; }
+    if (info.scenes.empty() && info.heapScenes.empty()) {
+        *why = "no TraceRay scene register was found";
+        return false;
+    }
     if (!rs) { *why = "no compute root signature is bound"; return false; }
     UINT size = 0;
     if (FAILED(rs->GetPrivateData(kBlobGuid, &size, nullptr)) || !size) {
@@ -670,6 +727,60 @@ bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<
             }
             if (std::find(out->begin(), out->end(), a) == out->end()) out->push_back(a);
         }
+    }
+    for (const auto& hs : info.heapScenes) {
+        // The heap index: a root constant, or a dword of a root CBV the CPU
+        // can read. Read at record time, as the instance descriptions of an
+        // upload heap are: what the application wrote before recording.
+        bool have = false, placed = false;
+        UINT slot = 0;
+        for (UINT p = 0; p < d.NumParameters && !placed; ++p) {
+            const auto& prm = d.pParameters[p];
+            const BoundRoot b = p < roots.size() ? roots[p] : BoundRoot{};
+            if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+                prm.Constants.RegisterSpace == hs.space && prm.Constants.ShaderRegister == hs.reg) {
+                placed = true;
+                if (hs.offset % 4 == 0 && hs.offset / 4 < b.numConstants && b.constants) {
+                    slot = b.constants[hs.offset / 4];
+                    have = true;
+                }
+            } else if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                       prm.Descriptor.RegisterSpace == hs.space && prm.Descriptor.ShaderRegister == hs.reg) {
+                placed = true;
+                const restrack::Found f = b.cbv ? restrack::Find(b.cbv + hs.offset) : restrack::Found{};
+                if (f.resource &&
+                    (f.heap == D3D12_HEAP_TYPE_UPLOAD || f.heap == D3D12_HEAP_TYPE_READBACK)) {
+                    uint8_t* mp = nullptr;
+                    D3D12_RANGE rr{ (SIZE_T)f.offset, (SIZE_T)f.offset + 4 };
+                    if (SUCCEEDED(f.resource->Map(0, &rr, reinterpret_cast<void**>(&mp))) && mp) {
+                        std::memcpy(&slot, mp + f.offset, 4);
+                        have = true;
+                        D3D12_RANGE none{ 0, 0 };
+                        f.resource->Unmap(0, &none);
+                    }
+                }
+            }
+        }
+        if (!have) {
+            snprintf(buf, sizeof(buf), placed
+                         ? "the heap index of the scene (b%u space%u, byte %u) is not readable on the "
+                           "CPU (a cbuffer in GPU-only memory, or unset)"
+                         : "the heap index of the scene is in b%u space%u, not a root constant or root "
+                           "CBV (a descriptor table, or a local root signature)",
+                     hs.reg, hs.space, hs.offset);
+            *why = buf;
+            return false;
+        }
+        bool inHeap = false;
+        const D3D12_GPU_VIRTUAL_ADDRESS a = scenebind::LookupSlot(heaps, numHeaps, slot, &inHeap);
+        if (!a) {
+            snprintf(buf, sizeof(buf), inHeap
+                         ? "descriptor heap slot %u holds no structure the shim saw written"
+                         : "descriptor heap slot %u is not in a bound shader-visible heap", slot);
+            *why = buf;
+            return false;
+        }
+        if (std::find(out->begin(), out->end(), a) == out->end()) out->push_back(a);
     }
     return true;
 }

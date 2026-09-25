@@ -22,14 +22,15 @@
 //   3. A record several geometries reach: a VARIANT pipeline in the shim's
 //      own record layout, tracing the shim's copy of the scene (0.46.0).
 //      Which scene a dispatch traces is resolved through its root signature,
-//      root SRV or descriptor table (ResolveScenes, 0.47.0).
+//      root SRV or descriptor table (ResolveScenes, 0.47.0), or a heap index
+//      in root constants or a CPU-visible root CBV (0.48.0).
 //
 // Not yet built, and each refused BY NAME rather than drawn wrong: TraceRay
 // arguments computed at run time, TraceRay in a closest-hit or miss in the
 // shim's layout, an indirect DispatchRays, local root signatures associated
-// from inside a library. A scene reached through a heap index or a local
-// root signature is judged over every live scene, which can refuse but not
-// draw wrong.
+// from inside a library. A scene not resolved (a heap index in GPU-only
+// memory or a descriptor table, a local root signature) is judged over every
+// live scene, which can refuse but not draw wrong.
 #pragma once
 
 #include <d3d12.h>
@@ -76,10 +77,14 @@ struct Info {
     bool dynamicTraceArgs = false; // a TraceRay whose R or M is not a constant
     // The registers the TraceRay calls take their scene from, so a dispatch
     // can be told WHICH scene it traces (ResolveScenes). `count` 0 is an
-    // unbounded array. `sceneUnknown`: a TraceRay whose scene handle is not a
-    // declared resource (a descriptor heap index) or could not be traced back.
+    // unbounded array. `heapScenes`: a scene taken from the descriptor heap
+    // (SM 6.6 ResourceDescriptorHeap[i], Unreal's bindless) at an index read
+    // from the cbuffer at (space, reg), byte `offset`. `sceneUnknown`: a
+    // TraceRay whose scene handle could not be traced back to either.
     struct SceneReg { UINT space = 0, lower = 0, count = 1; };
     std::vector<SceneReg> scenes;
+    struct SceneHeap { UINT space = 0, reg = 0, offset = 0; };
+    std::vector<SceneHeap> heapScenes;
     bool sceneUnknown = false;
 
     // The shim's own record layout, for when the application's shares a
@@ -133,11 +138,18 @@ std::shared_ptr<Info> Get(ID3D12StateObject* so);
 
 // One root argument as bound at the dispatch: a root SRV's address, or a
 // descriptor table's GPU handle, 0 when the parameter is neither.
-struct BoundRoot { D3D12_GPU_VIRTUAL_ADDRESS srv = 0; UINT64 table = 0; };
+struct BoundRoot {
+    D3D12_GPU_VIRTUAL_ADDRESS srv = 0, cbv = 0;
+    UINT64 table = 0;
+    const UINT* constants = nullptr;   // root constants as set, and how many
+    UINT numConstants = 0;
+};
 
 // The scenes the dispatch's TraceRay calls trace, resolved through the bound
 // global root signature: a root SRV, or a descriptor table entry the shim saw
-// a structure written to (proxy/scene_bind.h). True, with `*out` exactly those
+// a structure written to (proxy/scene_bind.h); or for a heap-indexed scene,
+// the index read from root constants or a root CBV in CPU-visible memory at
+// record time, and that heap slot. True, with `*out` exactly those
 // addresses, when every register resolves; false with *why otherwise.
 bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
                    ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
