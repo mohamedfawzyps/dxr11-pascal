@@ -46,12 +46,13 @@ bool Active();
 void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas);
 
 // After the application's top-level build is recorded into `cl`, when its
-// instances are in GPU-only memory: records the verbatim copy. Replaces the
-// compute root signature and pipeline; the CALLER restores them. `owner` is
-// the recording list.
+// instances are in GPU-only memory: records the verbatim copy, and a copy of
+// that into a new readback buffer, returned with a reference in *readback
+// (null if it could not be made). Replaces the compute root signature and
+// pipeline; the CALLER restores them. `owner` is the recording list.
 bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
           const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
-          const void* owner, std::string* why);
+          const void* owner, ID3D12Resource** readback, std::string* why);
 
 // After the application's top-level build is recorded into `cl`, while
 // switched on: records the copy. Same contract as Save.

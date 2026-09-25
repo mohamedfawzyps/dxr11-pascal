@@ -283,7 +283,7 @@ void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas) {
 
 bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
           const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& app,
-          const void* owner, std::string* why) {
+          const void* owner, ID3D12Resource** readback, std::string* why) {
     const auto& in = app.Inputs;
     if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL || !in.NumDescs ||
         !in.InstanceDescs)
@@ -308,8 +308,33 @@ bool Save(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     cl->SetComputeRootUnorderedAccessView(2, saved->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(3, saved->GetGPUVirtualAddress());  // unwritten
     cl->Dispatch((in.NumDescs + 63) / 64, 1, 1);
-    Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // And a copy the CPU can read once this has run, for the table of a
+    // lowered RayQuery dispatch (0.52.0). Its own buffer each time: the
+    // tracker holds it until it is read.
+    const UINT64 bytes = (UINT64)in.NumDescs * 64;
+    ComPtr<ID3D12Resource> rb;
+    if (readback) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))))
+            rb.Reset();
+    }
+    if (rb) {
+        Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->CopyBufferRegion(rb.Get(), 0, saved.Get(), 0, bytes);
+        Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        *readback = rb.Detach();
+    } else {
+        Transition(cl, saved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     Saved s;
     s.res = saved.Get();
     s.count = in.NumDescs;

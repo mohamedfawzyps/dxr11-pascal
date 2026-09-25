@@ -364,6 +364,11 @@ static bool g_stream = false;
 // correct answer for GeometryIndex is 0 and a lowering that returned a
 // constant would pass. That is the whole reason this scene exists.
 static bool g_geom = false;
+// --gpuinst: every top-level build takes its instance descriptions from GPU
+// memory, copied there on the GPU just before the build, as Unreal writes
+// them. The shim cannot read those at record time: it reads them back, a
+// submission late. With --rebuild that makes what it read the OLDER build.
+static bool g_gpuinst = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
@@ -478,6 +483,7 @@ struct Dxc {
 };
 
 // --- small D3D12 helpers ---------------------------------------------------
+static std::vector<ComPtr<ID3D12Resource>>& UploadRegistry();
 static ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* dev, UINT64 size,
         D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
         D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
@@ -490,7 +496,42 @@ static ComPtr<ID3D12Resource> CreateBuffer(ID3D12Device* dev, UINT64 size,
     ComPtr<ID3D12Resource> r;
     HR(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state,
         nullptr, IID_PPV_ARGS(&r)), "CreateCommittedResource");
+    if (g_gpuinst && heap == D3D12_HEAP_TYPE_UPLOAD) UploadRegistry().push_back(r);
     return r;
+}
+
+// --gpuinst: every upload buffer, so a top-level build's instance address can
+// be traced back to the buffer it lives in, and the GPU copies made of them.
+static std::vector<ComPtr<ID3D12Resource>> g_uploads, g_gpuInstCopies;
+static std::vector<ComPtr<ID3D12Resource>>& UploadRegistry() { return g_uploads; }
+
+// Records one acceleration structure build. With --gpuinst a top-level one
+// first has its instance descriptions copied into GPU memory, on the GPU.
+static void RecordBuild(ID3D12Device* dev, ID3D12GraphicsCommandList4* list,
+                        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc) {
+    const auto& in = desc.Inputs;
+    if (g_gpuinst && in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+        in.NumDescs) {
+        const UINT64 bytes = (UINT64)in.NumDescs * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+        ID3D12Resource* src = nullptr;
+        for (auto& u : g_uploads) {
+            const auto a = u->GetGPUVirtualAddress();
+            if (in.InstanceDescs >= a && in.InstanceDescs + bytes <= a + u->GetDesc().Width) src = u.Get();
+        }
+        if (!src) throw std::runtime_error("--gpuinst: instance buffer not found");
+        auto gb = CreateBuffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(gb.Get(), 0, src, in.InstanceDescs - src->GetGPUVirtualAddress(), bytes);
+        D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = gb.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        list->ResourceBarrier(1, &b);
+        desc.Inputs.InstanceDescs = gb->GetGPUVirtualAddress();
+        g_gpuInstCopies.push_back(gb);
+    }
+    list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
 }
 static void UavBarrier(ID3D12GraphicsCommandList* cl, ID3D12Resource* r) {
     D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -569,7 +610,7 @@ static ComPtr<ID3D12Resource> BuildAS(Gpu& g,
     desc.Inputs = inputs;
     desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     desc.DestAccelerationStructureData = result->GetGPUVirtualAddress();
-    g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+    RecordBuild(g.device.Get(), g.list.Get(), desc);
     UavBarrier(g.list.Get(), result.Get());
     g.flush();  // scratch stays alive until here
     return result;
@@ -779,7 +820,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
-    if (g_churn || g_move || g_decoy || g_bindless) { s.inst = instBuf; s.instCount = 1; }
+    if (g_churn || g_move || g_decoy || g_bindless || g_rebuild) { s.inst = instBuf; s.instCount = 1; }
     return s;
 }
 
@@ -859,7 +900,7 @@ static void RebuildTlasInPlace(Gpu& g, Scene& s) {
     desc.Inputs = ti;
     desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     desc.DestAccelerationStructureData = s.tlas->GetGPUVirtualAddress();
-    g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+    RecordBuild(g.device.Get(), g.list.Get(), desc);
     UavBarrier(g.list.Get(), s.tlas.Get());
     g.flush();
 }
@@ -899,7 +940,7 @@ static void MoveTlas(Gpu& g, Scene& s) {
             desc.Inputs = ti;
             desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
             desc.DestAccelerationStructureData = moved->GetGPUVirtualAddress();
-            g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+            RecordBuild(g.device.Get(), g.list.Get(), desc);
             UavBarrier(g.list.Get(), moved.Get());
             g.flush();
         }
@@ -1137,7 +1178,7 @@ static void Churn(Gpu& g, Scene& s, ID3D12PipelineState* pso, ID3D12RootSignatur
         desc.Inputs = ti;
         desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
         desc.DestAccelerationStructureData = s.tlas->GetGPUVirtualAddress();
-        g.list->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+        RecordBuild(g.device.Get(), g.list.Get(), desc);
         UavBarrier(g.list.Get(), s.tlas.Get());
 
         BindRoots(g.list.Get(), rs, cb, s.tlas->GetGPUVirtualAddress(),
@@ -1908,6 +1949,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--geom") == 0) {
                 g_geom = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--gpuinst") == 0) {
+                g_gpuinst = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

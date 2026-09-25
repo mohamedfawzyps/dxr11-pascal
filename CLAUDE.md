@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.52.0: THE RAYQUERY PATH DREW FROM AN OLDER BUILD'S TABLE AFTER THE SCENE
+CHANGED, SILENTLY; FIXED.** Measured with the new `raytest --gpuinst`
+(instances written on the GPU, as Unreal does): `--geom --contrib --rebuild
+--gpuinst` was 9248 hit/miss mismatches on 0.51.0, nothing logged. Every
+GPU-written build is now read (save pass plus readback), a dispatch records
+which build it traces, and a direct one whose scene is not read from that
+build is deferred to submit, where the build has run and is read on demand
+(`astrack::BringToBuild`). Also ends the first-dispatch "scene not read yet"
+refusal. Suite 41 of 41 with `stalegpu`, `churngpu`, `indirectgpuinst`;
+gitest 46 of 46. **In Unreal every frame rebuilds its structure from GPU
+data, so until 0.52.0 every lowered dispatch used the previous frame's read;
+right while the layout held still, wrong the frame it changed.** Game run
+pending.
+
 **0.51.0: A `GeometryIndex()` TABLE BUILT FROM AN OLDER BUILD OF THE SCENE
 WAS DRAWN WRONG, SILENTLY; FIXED.** GPU-written instances are read every 8
 builds and a submission late, and the table used that read without asking

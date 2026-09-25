@@ -239,6 +239,20 @@ $cases = @(
     # mismatches here, two bursts of refusals per Escher session.
     @{ name = 'move'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--move');
        desc = 'top-level structure moved to a new address with a different layout' },
+    # The instances in GPU memory, as Unreal writes them, and the scene rebuilt
+    # in place with a different layout. The shim reads GPU-written instances
+    # a submission late, so at the dispatch it knows only the OLDER build:
+    # 0.51.0 drew from that build's table, 9248 hit/miss and 4624 value
+    # mismatches, nothing logged. The dispatch now waits for submit and takes
+    # the table from exactly the build it traces.
+    @{ name = 'stalegpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--rebuild', '--gpuinst');
+       desc = 'GPU-written instances, scene rebuilt in place with a new layout' },
+    # The same, twelve layouts in one list after the real dispatch: each
+    # deferred dispatch needs ITS build's instances, not the latest.
+    @{ name = 'churngpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--churn', '12', '--gpuinst');
+       desc = 'GPU-written instances, twelve layouts in one list' },
+    @{ name = 'indirectgpuinst'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--rebuild', '--indirect', '--gpuinst');
+       desc = 'GPU-written instances, rebuilt in place, indirect dispatch' },
     # A second LIVE top-level structure whose layout conflicts with the real
     # one. Judged over every live structure this is refused; the shim has to
     # resolve the scene the dispatch traces (0.49.0). And the same with the

@@ -183,7 +183,8 @@ bool InstanceSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas,
 void DropSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas);
 
 // A GPU copy of those descriptions, recorded into the application's own list
-// but not readable until it has run. Expensive path. `owner` is the list that
+// but not readable until it has run. Since 0.52.0 every build with GPU-
+// written instances has one (shimscene::Save), carrying the build it copies. `owner` is the list that
 // recorded the copy: only ITS submission may stamp the read, see AfterSubmit.
 void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                           ID3D12Resource* readback, UINT count,
@@ -210,6 +211,23 @@ void DropUnsubmitted(const void* owner);
 
 // What is known about the top-level structure at this address.
 TlasInfo LookupTlas(D3D12_GPU_VIRTUAL_ADDRESS address);
+
+// Which build of this structure is the latest, as a serial comparable with
+// what a read carries; 0 when it was never seen being built.
+UINT64 LatestBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas);
+
+// Were these structures' instances read from their LATEST builds? A table
+// built from an older read can be wrong for the scene as it is now: that was
+// the RayQuery path until 0.52.0, drawn wrong after an in-place rebuild.
+bool Current(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
+// The same, over every live structure that has been read.
+bool LiveCurrent();
+
+// At a split, once the GPU has run a segment: make what is known about `tlas`
+// the instances of build `build`, reading them back now if that build's read
+// is still pending. Its read has run if `list` (the list being split) recorded
+// it, or its fence has passed. False when it cannot be had.
+bool BringToBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list);
 
 // Should the instance data of this top-level build be read? Called once per
 // build, AFTER NoteBuild. Up to 0.39.0 the answer was "once per destination

@@ -316,9 +316,9 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
                          static_cast<unsigned>(restrack::Count()));
             } else {
                 ProxyLog("[dxr-tier-11-proxy-log] top-level AS build seen, %u instances. "
-                         "Instance buffer at 0x%llX did NOT resolve to any of %u "
-                         "tracked buffers, so the contributions cannot be "
-                         "copied; the table assumes zero.\n",
+                         "Instance buffer at 0x%llX is not in any of %u "
+                         "tracked buffers; its descriptions are read back by "
+                         "address on the GPU.\n",
                          in.NumDescs,
                          static_cast<unsigned long long>(in.InstanceDescs),
                          static_cast<unsigned>(restrack::Count()));
@@ -489,9 +489,15 @@ void AfterSubmit(ID3D12CommandQueue* queue,
         void* p = nullptr;
         D3D12_RANGE readRange{ 0, bytes };
         if (SUCCEEDED(pr.readback->Map(0, &readRange, &p)) && p) {
-            ParseLocked(pr.tlas,
-                        static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count);
-            g_readOf[pr.tlas] = pr.build;
+            // An older build's read never replaces a newer one's: since
+            // 0.52.0 every build is read, and one may have been parsed on
+            // demand at a split (BringToBuild).
+            auto r = g_readOf.find(pr.tlas);
+            if (r == g_readOf.end() || r->second <= pr.build) {
+                ParseLocked(pr.tlas,
+                            static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count);
+                g_readOf[pr.tlas] = pr.build;
+            }
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
         } else {
@@ -502,6 +508,59 @@ void AfterSubmit(ID3D12CommandQueue* queue,
         // Dropped either way; a failed map will not start succeeding.
     }
     g_pending.swap(still);
+}
+
+UINT64 LatestBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
+    std::lock_guard<std::mutex> g(g_lock);
+    auto b = g_lastBuilt.find(tlas);
+    return b == g_lastBuilt.end() ? 0 : b->second;
+}
+
+bool Current(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (auto a : scenes)
+        if (!CurrentLocked(a)) return false;
+    return true;
+}
+
+bool LiveCurrent() {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (const auto& kv : g_tlas)
+        if (kv.second.valid && LiveLocked(kv.first) && !CurrentLocked(kv.first)) return false;
+    return true;
+}
+
+bool BringToBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list) {
+    std::lock_guard<std::mutex> g(g_lock);
+    auto r = g_readOf.find(tlas);
+    if (r != g_readOf.end() && r->second == build) return true;
+    for (auto it = g_pending.begin(); it != g_pending.end(); ++it) {
+        PendingRead& pr = *it;
+        if (pr.tlas != tlas || pr.build != build) continue;
+        // Run already: recorded into the list being split, in a segment the
+        // split has waited for; or stamped on a queue whose fence has passed.
+        bool done = pr.owner == list;
+        if (!done && pr.fenceValue) {
+            auto f = g_fences.find(pr.queue);
+            done = f != g_fences.end() && f->second.fence &&
+                   f->second.fence->GetCompletedValue() >= pr.fenceValue;
+        }
+        if (!done) return false;
+        const SIZE_T bytes = static_cast<SIZE_T>(pr.count) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+        void* p = nullptr;
+        D3D12_RANGE readRange{ 0, bytes };
+        bool ok = false;
+        if (SUCCEEDED(pr.readback->Map(0, &readRange, &p)) && p) {
+            ParseLocked(tlas, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count);
+            g_readOf[tlas] = build;
+            D3D12_RANGE noWrite{ 0, 0 };
+            pr.readback->Unmap(0, &noWrite);
+            ok = true;
+        }
+        g_pending.erase(it);
+        return ok;
+    }
+    return false;
 }
 
 bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap) {

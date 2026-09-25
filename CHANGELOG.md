@@ -24,6 +24,54 @@ not.
 
 ---
 
+## 0.52.0
+
+**FIXED: a lowered RayQuery dispatch after the scene changed was drawn from
+the OLDER build's table, silently.** The gap 0.51.0 found in the
+`GeometryIndex()` table, in the RayQuery path, which is what Escher draws.
+
+- **Measured first.** `raytest --gpuinst` (new) puts every top-level build's
+  instances in GPU memory, copied there on the GPU, as Unreal writes them.
+  `--geom --contrib --rebuild --gpuinst` rebuilds the scene in place with a
+  new layout: 0.51.0 drew the second dispatch from the first build's table,
+  **9248 hit/miss and 4624 value mismatches, no refusal logged.** The same
+  case with upload-heap instances matches. `--multi --contrib --rebuild
+  --gpuinst` also drew from the older table (1 record where 2 are reached)
+  and matched only because that shader never reads the contribution.
+- **Why.** GPU-written instances were copied out every 8 builds of a
+  structure and parsed a submission late, so at a dispatch what the shim knew
+  was usually an older build's scene. For a scene that never changes the two
+  agree, which is why nothing showed.
+- **The fix.** Every such build's instances are read now, by the 0.51.0 save
+  pass plus a copy into a readback buffer, and each read carries its build.
+  A dispatch remembers which build of its scene it traces. A direct one
+  whose scene is not read from that build is deferred to submit like an
+  indirect one; at the split the build has run, and its instances are read
+  there and then (`astrack::BringToBuild`). An older read never overwrites a
+  newer one. This also ends the refusal of the FIRST dispatch on a
+  GPU-written scene ("scene not read yet", 1 in the 0.49.0 Escher run): it
+  is drawn now.
+- **Measured:** the stale case and the first dispatch match, and so do, with
+  GPU-written instances, the indirect and upload-indirect forms, the moved
+  scene, decoy, bindless, mixed geometry and churn (12 layouts in one list,
+  each deferred dispatch needing its own build). New dispatch suite cases
+  `stalegpu`, `churngpu`, `indirectgpuinst`: all 41 cases pass, the gates
+  behave. The gitest matrix 46 of 46; the Phase 4 probe matches with
+  `-gpuinst`, `-gpuinst -debug`, `-openlist`, `-gfxsplit`, `-batchsplit`.
+- **Cost.** Per top-level build with GPU-written instances: the save pass, a
+  copy of 64 bytes per instance to a new readback buffer. A DIRECT lowered
+  dispatch recorded after such a build, before its read arrives, costs a
+  split and one CPU wait at submit (shared by consecutive dispatches), where
+  it used to draw from the older read. Escher's lowered dispatches were all
+  indirect, which already wait.
+- **Refused by name:** a dispatch whose scene is not resolved while a live
+  scene is not read from its latest build (0 unresolved in Escher).
+- **Left unused:** `groupcount::RecordRawCopy` and `instance_copy.hlsl`, the
+  old every-8-builds copy.
+- A log line claimed an instance buffer outside the tracked resources made
+  "the table assume zero". Untrue since 0.39.2 (the copy is by address);
+  reworded.
+
 ## 0.51.0
 
 **FIXED: a `GeometryIndex()` table built from an OLDER build of the scene was

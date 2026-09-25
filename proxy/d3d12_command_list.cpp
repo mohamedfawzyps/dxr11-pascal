@@ -282,14 +282,31 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scenes;
         const bool exact = RayQueryScenes(m_rqPso, &scenes);
         const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = exact ? &scenes : nullptr;
-        if (exact && !astrack::AnyRead(scenes)) {
-            // Its instances arrive a submission late when the GPU wrote them.
+        if (exact && !astrack::Current(scenes)) {
+            // What is known about its scene is not the latest build's: GPU-
+            // written instances are read back a submission late. Until
+            // 0.52.0 an unread scene was refused and a STALE one drawn from
+            // the older build's table, wrong after the scene changed. Now
+            // the dispatch waits for submit, when that build has run and its
+            // instances can be read, exactly as an indirect one does.
+            if (!QueueStaleCompute(x, y, z, scenes)) {
+                dstats::Add(dstats::kRefusedUnread);
+                static LONG onceUnread = 0;
+                if (InterlockedCompareExchange(&onceUnread, 1, 0) == 0)
+                    ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: the "
+                             "scene it traces (0x%llX) is not read from its latest build, and the "
+                             "dispatch could not be deferred. Nothing is drawn for it.\n",
+                             (unsigned long long)scenes[0]);
+            }
+            return;
+        }
+        if (!exact && !astrack::LiveCurrent()) {
             dstats::Add(dstats::kRefusedUnread);
-            static LONG onceUnread = 0;
-            if (InterlockedCompareExchange(&onceUnread, 1, 0) == 0)
+            static LONG onceStale = 0;
+            if (InterlockedCompareExchange(&onceStale, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: the scene "
-                         "it traces (0x%llX) has not been read yet. Nothing is drawn for it.\n",
-                         (unsigned long long)scenes[0]);
+                         "it traces is not resolved, and a live scene is not read from its "
+                         "latest build. Nothing is drawn for it.\n");
             return;
         }
         std::string why;
@@ -687,11 +704,19 @@ void STDMETHODCALLTYPE Dxr11CommandList::BuildRaytracingAccelerationStructure(co
     if (!cpuVisible && dev && d->Inputs.NumDescs) {
         std::string why;
         replaced = true;
-        if (!shimscene::Save(m_real, dev, *d, this, &why)) {
+        ID3D12Resource* rb = nullptr;
+        if (!shimscene::Save(m_real, dev, *d, this, &rb, &why)) {
             static LONG k = 0;
             if (InterlockedIncrement(&k) <= 8)
                 ProxyLog("[dxr-tier-11-proxy-log] top-level AS: instances not saved: %s\n",
                          why.c_str());
+        }
+        // Every build's instances, readable once it has run: read a
+        // submission late, or at a split on demand (astrack::BringToBuild).
+        if (rb) {
+            astrack::NotePendingInstances(d->DestAccelerationStructureData, rb,
+                                          d->Inputs.NumDescs, this);
+            rb->Release();
         }
     }
     if (shimscene::Active()) {
@@ -887,8 +912,11 @@ void Dxr11CommandList::CaptureInstances(
     const bool cheap = src.resource &&
         (src.heap == D3D12_HEAP_TYPE_UPLOAD || src.heap == D3D12_HEAP_TYPE_READBACK);
 
-    // Read again when the structure may have changed. See WantInstances for
-    // what once-per-address did to a level load.
+    // Produced on the GPU: every build's are read back by the save pass
+    // right after it (BuildRaytracingAccelerationStructure, 0.52.0). Until
+    // then they were copied out here every 8 builds, so what was known could
+    // be an older build's.
+    if (!cheap) return;
     if (!astrack::WantInstances(desc->DestAccelerationStructureData, in.NumDescs, cheap))
         return;
 
@@ -909,29 +937,6 @@ void Dxr11CommandList::CaptureInstances(
         return;
     }
 
-    // Produced on the GPU, so they do not exist yet. Copy them out by ADDRESS,
-    // through a root SRV, into buffers the shim owns, and let the queue hook
-    // read them once the submission has run. No resource is looked up and
-    // none is transitioned: 0.39.1 recorded a barrier and a copy on whatever
-    // the tracker held at that address, which during a level load can be a
-    // resource the application already freed, and the list then failed Close
-    // with E_INVALIDARG. See proxy/instance_copy.hlsl.
-    ID3D12Device5* dev = RealDevice();
-    if (!dev) return;
-    groupcount::Capture cap;
-    std::string why;
-    const UINT dwords = in.NumDescs *
-        static_cast<UINT>(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) / sizeof(UINT));
-    if (!groupcount::RecordRawCopy(m_real, dev, in.InstanceDescs, dwords, &cap, &why)) {
-        static LONG once = 0;
-        if (InterlockedCompareExchange(&once, 1, 0) == 0)
-            ProxyLog("[dxr-tier-11-proxy-log] top-level AS: instance copy not recorded: %s\n",
-                     why.c_str());
-        return;
-    }
-    RestoreComputeAfterCapture();
-    astrack::NotePendingInstances(desc->DestAccelerationStructureData,
-                                  cap.readback.Get(), in.NumDescs, this, cap.counts.Get());
 }
 
 void Dxr11CommandList::RestoreComputeAfterCapture() {
@@ -1028,11 +1033,39 @@ bool Dxr11CommandList::QueueIndirectCompute(ID3D12CommandSignature* sig,
     pend.counts = cap.counts;
     pend.rq = m_rqPso;
     pend.rqRef = static_cast<ID3D12PipelineState*>(m_rqPso);
-    // Resolved now, from the bindings as recorded; judged at submit.
+    // Resolved now, from the bindings as recorded; judged at submit, from the
+    // builds that are the latest now.
     if (m_rqPso) pend.rqExact = RayQueryScenes(m_rqPso, &pend.rqScenes);
+    for (auto a : pend.rqScenes) pend.rqBuilds.push_back(astrack::LatestBuild(a));
     pend.bindings = m_bindings;
     pend.bindings.Retain();
     m_openPendings.push_back(pend);
+    return true;
+}
+
+// A direct Dispatch of a lowered pipeline whose scene is not read from its
+// latest build: queued like an indirect one, so at submit that build has run
+// and its instances can be read (0.52.0).
+bool Dxr11CommandList::QueueStaleCompute(UINT x, UINT y, UINT z,
+                                         const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
+    if (!RealDevice() || !m_allocator || !m_rqPso) return false;
+    Dxr11PendingDispatch pend;
+    pend.rq = m_rqPso;
+    pend.rqRef = static_cast<ID3D12PipelineState*>(m_rqPso);
+    pend.rqExact = true;
+    pend.rqScenes = scenes;
+    for (auto a : scenes) pend.rqBuilds.push_back(astrack::LatestBuild(a));
+    for (auto b : pend.rqBuilds)
+        if (!b) return false;   // never seen being built
+    pend.rqDirect = true;
+    pend.rqGroups[0] = x; pend.rqGroups[1] = y; pend.rqGroups[2] = z;
+    pend.bindings = m_bindings;
+    pend.bindings.Retain();
+    m_openPendings.push_back(pend);
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch deferred to submit: its "
+                 "scene's latest build is not read yet\n");
     return true;
 }
 
@@ -1119,7 +1152,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 // An indirect compute dispatch of a lowered pipeline. Zeros are
                 // a legitimately empty dispatch: no group ran, nothing to do.
                 groupcount::Capture cap; cap.readback = pend.readback;
-                if (!groupcount::Read(cap, groups) ||
+                if (pend.rqDirect) std::memcpy(groups, pend.rqGroups, sizeof(groups));
+                if ((!pend.rqDirect && !groupcount::Read(cap, groups)) ||
                     !groups[0] || !groups[1] || !groups[2]) {
                     dstats::Add(dstats::kIndirectEmpty);
                     static LONG onceEmpty = 0;
@@ -1131,8 +1165,20 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 }
                 const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only =
                     pend.rqExact ? &pend.rqScenes : nullptr;
-                if (only && !astrack::AnyRead(*only)) {
+                // The segment has run, so the build each scene had when the
+                // dispatch was recorded has too: its table comes from exactly
+                // those instances.
+                bool haveBuilds = true;
+                for (size_t k = 0; only && k < pend.rqScenes.size(); ++k)
+                    haveBuilds = haveBuilds && k < pend.rqBuilds.size() &&
+                                 astrack::BringToBuild(pend.rqScenes[k], pend.rqBuilds[k], this);
+                if (!haveBuilds || (!only && !astrack::LiveCurrent())) {
                     dstats::Add(dstats::kRefusedUnread);
+                    static LONG onceNoBuild = 0;
+                    if (InterlockedCompareExchange(&onceNoBuild, 1, 0) == 0)
+                        ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED at "
+                                 "submit: the instances of the build its scene had could not be "
+                                 "read. Nothing is drawn for it.\n");
                     continue;
                 }
                 std::string why;
@@ -1184,7 +1230,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             }
 
             pend.bindings.Replay(slot->list.Get());
-            if (pend.rq) dstats::Add(dstats::kIndirect);
+            if (pend.rq && !pend.rqDirect) dstats::Add(dstats::kIndirect);
             if (pend.rq)
                 pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
                                         astrack::RecordKinds(pend.rqExact ? &pend.rqScenes : nullptr),

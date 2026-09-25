@@ -130,6 +130,14 @@ struct Dxr11PendingDispatch {
     // means not resolved, judged over every live structure.
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       rqScenes;
     bool                                         rqExact = false;
+    // Which build of each of those scenes the dispatch traces (the latest
+    // when it was recorded): its table is made from exactly that build's
+    // instances at submit (0.52.0).
+    std::vector<UINT64>                          rqBuilds;
+    // A DIRECT Dispatch deferred to submit because what was known about its
+    // scene was an older build's (0.52.0): its group counts, no readback.
+    bool                                         rqDirect = false;
+    UINT                                         rqGroups[3] = { 0, 0, 0 };
     // An indirect DispatchRays of a GeometryIndex() pipeline: the scene it
     // traces, resolved when recorded, for the shim's table at submit.
     bool                                         giScenesSet = false;
@@ -319,6 +327,7 @@ private:
     bool QueueSplit(ID3D12Resource* args, UINT64 argOffset);
     // The same, for ExecuteIndirect with a DISPATCH signature while a lowered
     // RayQuery pipeline is bound. See proxy/group_count.h.
+    bool QueueStaleCompute(UINT x, UINT y, UINT z, const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
     bool QueueIndirectCompute(ID3D12CommandSignature* sig, ID3D12Resource* args,
                               UINT64 argOffset);
     // Gets the instance descriptions of a top-level build to the CPU, so the
