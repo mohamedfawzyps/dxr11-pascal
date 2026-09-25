@@ -153,6 +153,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.52.2 IN THE GAME (2026-09-25, 5 min 18 s): 13689 drawn, 0 unread, but
+1190 refused in 40 s for a record two instances disagree about.** Traced
+offline to 0.52.0's own change: parsing at submit took each bottom-level
+structure's geometry count from the latest build RECORDED at its address,
+which an engine streaming geometry has often reused already. `raytest
+--blasreuse`: 9248 mismatches drawn, silently. 0.52.3 parses against the
+structures as of the top-level build (a per-address build history).
+**When a read moves later in time, everything it is interpreted against has
+to move back to the moment it stands for.**
+
 **0.52.1 IN THE GAME (2026-09-25, 2 min 21 s, debug layer on):** clean,
 1680 lowered dispatches drawn, the shim's debug layer errors gone, ONE
 refused: the open world's first frame builds its scene with 0 instances,

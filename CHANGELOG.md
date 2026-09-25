@@ -24,6 +24,43 @@ not.
 
 ---
 
+## 0.52.3
+
+**FIXED: a lowered RayQuery dispatch drawn WRONG, silently, when a
+bottom-level address was reused after it.** Found from the 0.52.2 Escher run.
+
+- **In the game at 0.52.2 (2026-09-25, 5 min 18 s):** clean end marker,
+  13689 lowered dispatches drawn, 0 "scene not read yet" (0.52.2's fix
+  held). But **1190 refused in about 40 s** (09:32:11 to 09:32:52) as "one
+  structure disagrees": two instances with different (contribution,
+  geometry) pairs on hit group record 1090. Unreal assigns contributions as
+  a running sum of geometry counts, so its instances should not collide.
+- **The cause, reproduced offline before any change.** A top-level build's
+  instances say which bottom-level structure each points at, by ADDRESS;
+  the shim takes that structure's geometry count from its build. Since
+  0.52.0 GPU-written instances are parsed at submit, and it took the LATEST
+  build recorded at that address. An engine streaming geometry records the
+  next frame ahead of the GPU and reuses addresses, so the count could come
+  from a structure the dispatch never traced. `raytest --blasreuse` (new)
+  rebuilds the structure at the same address with 1 geometry instead of 4,
+  after the dispatch, in a list submitted after it: 0.52.2 drew it from a
+  3-record table where 6 are reached, 4624 hits against 13872, **9248
+  mismatches, nothing logged.** Too FEW geometries draws wrong; too many
+  makes false collisions like record 1090. (That the Escher refusals were
+  this is inferred, not shown: the log names only the record.)
+- **The fix.** Every structure build gets a serial in recorded order; each
+  bottom-level address keeps the builds it has had, pruned only past what a
+  not-yet-parsed top-level build could need; a top-level build's instances
+  are parsed against the bottom-level structures as of that build, which is
+  what the CPU-visible path always saw. The `GeometryIndex()` variant's
+  record blocks likewise never use fewer geometries than the largest known
+  when the build was recorded.
+- **The refusal now names who collides:** the pair on the record, the
+  instance bringing the other, its structure and geometry count.
+- Suite case `blasreuse`: 44 of 44 and every gate. gitest 46 of 46; the
+  Phase 4 probe matches in every mode. Not covered by its own test: the
+  variant's geometry floor.
+
 ## 0.52.2
 
 **IN THE GAME at 0.52.1 (2026-09-25, 2 min 21 s, debug layer forced on):**

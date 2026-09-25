@@ -377,6 +377,15 @@ static bool g_empty = false;
 // command list, submitted in the same ExecuteCommandLists call as the
 // dispatch, just before it. Engines submit many lists at once.
 static bool g_sameEcl = false;
+// --blasreuse, with --geom, direct dispatch: AFTER the dispatch is recorded,
+// the bottom-level structure is rebuilt at the SAME address with one geometry
+// instead of four, in a second list submitted after the dispatch's, in the
+// same ExecuteCommandLists call. The dispatch runs first, so it traces four
+// geometries. A shim that takes a structure's geometry count from the latest
+// build RECORDED, rather than the one before the dispatch, gets one. Unreal
+// streams geometry in and out, reusing addresses, while it records the next
+// frame ahead of the GPU.
+static bool g_blasReuse = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
@@ -594,17 +603,32 @@ struct Gpu {
         preOpen = true;
         return pre.Get();
     }
+    // --blasreuse: a list submitted just AFTER `list`, in the same call.
+    ComPtr<ID3D12CommandAllocator> postAlloc;
+    ComPtr<ID3D12GraphicsCommandList4> post;
+    bool postOpen = false;
+    ID3D12GraphicsCommandList4* Post() {
+        if (!post) {
+            HR(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&postAlloc)), "CreateCommandAllocator post");
+            HR(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, postAlloc.Get(),
+                nullptr, IID_PPV_ARGS(&post)), "CreateCommandList post");
+        } else if (!postOpen) {
+            HR(postAlloc->Reset(), "post allocator Reset");
+            HR(post->Reset(postAlloc.Get(), nullptr), "post Reset");
+        }
+        postOpen = true;
+        return post.Get();
+    }
     void flush() {
         HR(list->Close(), "cmdlist Close");
-        if (preOpen) {
-            HR(pre->Close(), "pre Close");
-            ID3D12CommandList* both[] = { pre.Get(), list.Get() };
-            queue->ExecuteCommandLists(2, both);
-            preOpen = false;
-        } else {
-            ID3D12CommandList* lists[] = { list.Get() };
-            queue->ExecuteCommandLists(1, lists);
-        }
+        ID3D12CommandList* lists[3];
+        UINT n = 0;
+        if (preOpen) { HR(pre->Close(), "pre Close"); lists[n++] = pre.Get(); }
+        lists[n++] = list.Get();
+        if (postOpen) { HR(post->Close(), "post Close"); lists[n++] = post.Get(); }
+        queue->ExecuteCommandLists(n, lists);
+        preOpen = postOpen = false;
         HR(queue->Signal(fence.Get(), ++fenceVal), "queue Signal");
         if (fence->GetCompletedValue() < fenceVal) {
             HR(fence->SetEventOnCompletion(fenceVal, evt), "SetEventOnCompletion");
@@ -1508,6 +1532,32 @@ static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         g.list->Dispatch(gx, gy, 1);
         UavBarrier(g.list.Get(), out);
         std::vector<ComPtr<ID3D12Resource>> keep;
+        if (g_blasReuse && s.blas && s.vb) {
+            // The same address, one geometry: the first quadrant only.
+            D3D12_RAYTRACING_GEOMETRY_DESC geo{};
+            geo.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            geo.Triangles.VertexBuffer.StartAddress = s.vb->GetGPUVirtualAddress();
+            geo.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+            geo.Triangles.VertexCount = 6;
+            geo.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            geo.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
+            bi.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            bi.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            bi.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+            bi.NumDescs = 1; bi.pGeometryDescs = &geo;
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+            g.device->GetRaytracingAccelerationStructurePrebuildInfo(&bi, &info);
+            auto scratch = CreateBuffer(g.device.Get(), info.ScratchDataSizeInBytes,
+                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            keep.push_back(scratch);
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC d{};
+            d.Inputs = bi;
+            d.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+            d.DestAccelerationStructureData = s.blas->GetGPUVirtualAddress();
+            g.Post()->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        }
         if (g_churn && s.inst && !g_table)
             Churn(g, const_cast<Scene&>(s), pso.Get(), rs.Get(), cb->GetGPUVirtualAddress(),
                   mask->GetGPUVirtualAddress(), out->GetDesc().Width, gx, gy, keep);
@@ -1990,6 +2040,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--geom") == 0) {
                 g_geom = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--blasreuse") == 0) {
+                g_blasReuse = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

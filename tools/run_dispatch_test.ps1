@@ -260,6 +260,14 @@ $cases = @(
        desc = 'rebuild in another list of the same submission, GPU-written instances' },
     @{ name = 'sameeclind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--rebuild', '--sameecl', '--gpuinst', '--indirect');
        desc = 'the same, indirect dispatch' },
+    # After the dispatch, the bottom-level structure is rebuilt at the SAME
+    # address with one geometry instead of four, in a list submitted after
+    # the dispatch's. The dispatch traces four. 0.52.2 parsed the instances
+    # at submit against the latest structure RECORDED there: a 3-record table
+    # where 6 are reached, 9248 hit/miss mismatches, drawn, nothing logged.
+    # Unreal reuses addresses as it streams geometry, recording ahead.
+    @{ name = 'blasreuse'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--blasreuse', '--gpuinst');
+       desc = 'bottom-level address reused by a later-recorded build, GPU-written instances' },
     # A second LIVE top-level structure whose layout conflicts with the real
     # one. Judged over every live structure this is refused; the shim has to
     # resolve the scene the dispatch traces (0.49.0). And the same with the

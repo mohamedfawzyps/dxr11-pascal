@@ -125,6 +125,9 @@ struct TlasInfo {
     // geometry counts precisely so records do not collide.
     bool constantsConflict = false;
     UINT conflictSlot = 0;
+    // Who collides there, for the log: the pair already on the record, and
+    // the instance that brought the other one, with its structure.
+    std::string conflictDetail;
     // Which geometry types the instances actually reach. Both true is the
     // mixed case the shim cannot yet build a table for.
     bool anyTriangles = false;

@@ -19,6 +19,29 @@ namespace {
 
 std::mutex g_lock;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, BlasInfo> g_blas;
+// Every acceleration structure build advances this, in the order recorded.
+// Per bottom-level address, the builds it has had, oldest first; per
+// top-level address, the serial of its latest build. A top-level build's
+// instances are parsed against the bottom-level structures as they were when
+// it was RECORDED: since 0.52.0 GPU-written ones are parsed at submit, when
+// an engine streaming geometry has often recorded the next frame already and
+// reused an address for a structure with a different geometry count. Parsed
+// against the latest, the table was wrong, silently (0.52.3).
+UINT64 g_asSerial = 0;
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<std::pair<UINT64, BlasInfo>>> g_blasHist;
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_tlasAsSerial;
+
+// Caller holds g_lock. The bottom-level structure at `blas` as the build
+// recorded at `asOf` saw it: its latest build recorded before that. Null
+// when none was.
+const BlasInfo* BlasAtLocked(D3D12_GPU_VIRTUAL_ADDRESS blas, UINT64 asOf) {
+    auto h = g_blasHist.find(blas);
+    if (h == g_blasHist.end()) return nullptr;
+    const BlasInfo* found = nullptr;
+    for (const auto& e : h->second)
+        if (e.first < asOf) found = &e.second;
+    return found;
+}
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, TlasInfo> g_tlas;
 
 // Every top-level build advances this. Per address: the build that last wrote
@@ -95,6 +118,7 @@ struct PendingRead {
     Microsoft::WRL::ComPtr<ID3D12Resource> keepAlive;   // the copy's own UAV
     UINT   count = 0;
     UINT64 build = 0;                      // the build it copies, see g_readOf
+    UINT64 asOf = 0;                       // that build's g_asSerial
     const void* owner = nullptr;           // the list that recorded the copy
     ID3D12CommandQueue* queue = nullptr;   // set when stamped
     UINT64 fenceValue = 0;                 // 0 until its list is submitted
@@ -114,9 +138,11 @@ struct QueueFence {
 std::map<ID3D12CommandQueue*, QueueFence> g_fences;
 
 // Fills in a TlasInfo from the descriptions themselves. Caller holds g_lock,
-// because this reads g_blas to learn what each instance points at.
+// because this reads the bottom-level history to learn what each instance
+// points at, as of `asOf`, the serial of the top-level build (0: now).
 void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
-                 const D3D12_RAYTRACING_INSTANCE_DESC* d, UINT count) {
+                 const D3D12_RAYTRACING_INSTANCE_DESC* d, UINT count, UINT64 asOf) {
+    if (!asOf) asOf = g_asSerial + 1;
     TlasInfo t;
     t.valid = true;
     t.instanceCount = count;
@@ -126,9 +152,9 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     // A structure never seen being built counts as one, which is what this did
     // before geometry ever entered the index.
     auto geometriesOf = [&](D3D12_GPU_VIRTUAL_ADDRESS blas) -> UINT {
-        auto it = g_blas.find(blas);
-        if (it == g_blas.end()) return 1;
-        return it->second.geometryCount ? it->second.geometryCount : 1;
+        const BlasInfo* b = BlasAtLocked(blas, asOf);
+        if (!b) return 1;
+        return b->geometryCount ? b->geometryCount : 1;
     };
 
     for (UINT i = 0; i < count; ++i) {
@@ -144,9 +170,9 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     for (UINT i = 0; i < count; ++i) {
         const UINT ic = d[i].InstanceContributionToHitGroupIndex;
         uint8_t bits = kReachNone;
-        auto it = g_blas.find(d[i].AccelerationStructure);
-        if (it == g_blas.end()) { ++t.unknownBlas; continue; }
-        switch (it->second.kind) {
+        const BlasInfo* bi = BlasAtLocked(d[i].AccelerationStructure, asOf);
+        if (!bi) { ++t.unknownBlas; continue; }
+        switch (bi->kind) {
             case Kind::kTriangles:  bits = kReachTriangles; break;
             case Kind::kProcedural: bits = kReachProcedural; break;
             case Kind::kMixed:      bits = kReachTriangles | kReachProcedural; break;
@@ -166,7 +192,21 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
             if (rc.assigned) {
                 // Same slot, different meaning. Detected, never averaged.
                 if (rc.geometryIndex != gi || rc.instanceContribution != ic) {
-                    if (!t.constantsConflict) t.conflictSlot = slot;
+                    if (!t.constantsConflict) {
+                        t.conflictSlot = slot;
+                        const BlasInfo* bi2 = BlasAtLocked(d[i].AccelerationStructure, asOf);
+                        auto h = g_blasHist.find(d[i].AccelerationStructure);
+                        char buf[400];
+                        std::snprintf(buf, sizeof(buf),
+                            " (already: contribution %u geometry %u; then instance %u of %u, "
+                            "contribution %u geometry %u, structure 0x%llX with %u geometries "
+                            "as of this build, %zu build(s) of that address remembered)",
+                            rc.instanceContribution, rc.geometryIndex, i, count, ic, gi,
+                            (unsigned long long)d[i].AccelerationStructure,
+                            bi2 ? bi2->geometryCount : 0u,
+                            h == g_blasHist.end() ? (size_t)0 : h->second.size());
+                        t.conflictDetail = buf;
+                    }
                     t.constantsConflict = true;
                 }
             } else {
@@ -297,6 +337,7 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
         const restrack::Found src = restrack::Find(in.InstanceDescs);
 
         std::lock_guard<std::mutex> g(g_lock);
+        g_tlasAsSerial[desc->DestAccelerationStructureData] = ++g_asSerial;
         ++g_summary.tlasCount;
         g_lastBuilt[desc->DestAccelerationStructureData] = ++g_tlasSerial;
         g_firstBuilt.emplace(desc->DestAccelerationStructureData, g_tlasSerial);
@@ -357,6 +398,21 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
     std::lock_guard<std::mutex> g(g_lock);
     const bool isNew = g_blas.find(desc->DestAccelerationStructureData) == g_blas.end();
     g_blas[desc->DestAccelerationStructureData] = info;
+    // The history: an entry older than every top-level build a pending read
+    // may still be parsed as of can go, but the latest before that stays.
+    {
+        UINT64 floor = g_asSerial + 1;
+        for (const PendingRead& pr : g_pending)
+            if (pr.asOf && pr.asOf < floor) floor = pr.asOf;
+        for (const auto& kv : g_tlasAsSerial)
+            if (kv.second < floor && !CurrentLocked(kv.first)) floor = kv.second;
+        auto& h = g_blasHist[desc->DestAccelerationStructureData];
+        h.emplace_back(++g_asSerial, info);
+        size_t keepFrom = 0;
+        for (size_t i = 0; i + 1 < h.size(); ++i)
+            if (h[i + 1].first < floor) keepFrom = i + 1;
+        if (keepFrom) h.erase(h.begin(), h.begin() + keepFrom);
+    }
     if (!isNew) return;   // a rebuild of the same structure, already counted
 
     ++g_summary.blasCount;
@@ -387,7 +443,7 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                    const D3D12_RAYTRACING_INSTANCE_DESC* descs, UINT count) {
     if (!tlas || !descs || !count) return;
     std::lock_guard<std::mutex> g(g_lock);
-    ParseLocked(tlas, descs, count);
+    ParseLocked(tlas, descs, count, g_tlasAsSerial[tlas]);
     auto b = g_lastBuilt.find(tlas);
     if (b != g_lastBuilt.end()) g_readOf[tlas] = b->second;
     g_snapshots[tlas].assign(descs, descs + count);
@@ -396,7 +452,7 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
 void NoteEmpty(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     if (!tlas) return;
     std::lock_guard<std::mutex> g(g_lock);
-    ParseLocked(tlas, nullptr, 0);
+    ParseLocked(tlas, nullptr, 0, 0);
     auto b = g_lastBuilt.find(tlas);
     if (b != g_lastBuilt.end()) g_readOf[tlas] = b->second;
     g_snapshots[tlas].clear();
@@ -429,6 +485,8 @@ void NotePendingInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     std::lock_guard<std::mutex> g(g_lock);
     auto b = g_lastBuilt.find(tlas);
     pr.build = b != g_lastBuilt.end() ? b->second : 0;
+    auto a = g_tlasAsSerial.find(tlas);
+    pr.asOf = a != g_tlasAsSerial.end() ? a->second : 0;
     g_pending.push_back(pr);
 }
 
@@ -504,7 +562,8 @@ void AfterSubmit(ID3D12CommandQueue* queue,
             auto r = g_readOf.find(pr.tlas);
             if (r == g_readOf.end() || r->second <= pr.build) {
                 ParseLocked(pr.tlas,
-                            static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count);
+                            static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count,
+                            pr.asOf);
                 g_readOf[pr.tlas] = pr.build;
             }
             D3D12_RANGE noWrite{ 0, 0 };
@@ -560,7 +619,8 @@ bool BringToBuild(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void* list
         D3D12_RANGE readRange{ 0, bytes };
         bool ok = false;
         if (SUCCEEDED(pr.readback->Map(0, &readRange, &p)) && p) {
-            ParseLocked(tlas, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count);
+            ParseLocked(tlas, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count,
+                        pr.asOf);
             g_readOf[tlas] = build;
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
@@ -631,7 +691,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                 if (why)
                     *why = "two instances put different (contribution, geometry) "
                            "pairs on hit group record " +
-                           std::to_string(t.conflictSlot) +
+                           std::to_string(t.conflictSlot) + t.conflictDetail +
                            ", so that record cannot carry the geometry index for "
                            "both. One record answers once";
                 return true;

@@ -46,6 +46,11 @@ ComPtr<ID3D12RootSignature> g_rs;
 ComPtr<ID3D12PipelineState> g_pso;
 std::vector<Slot> g_pool;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_builds;                    // builds of each structure
+// The most geometries any bottom-level structure had when each top-level
+// build was RECORDED. A copy made later from that build's instances never
+// uses fewer: a structure streamed out and its address reused for a smaller
+// one would otherwise shrink every instance's block of records (0.52.3).
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> g_buildGmax;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, Held> g_copies;                       // built with the build
 std::map<std::pair<const void*, D3D12_GPU_VIRTUAL_ADDRESS>, Held> g_local;  // built at a dispatch
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, Saved> g_saved;
@@ -129,8 +134,9 @@ bool EnsurePipeLocked(ID3D12Device5* dev, std::string* why) {
 // Caller holds g_lock. The shim's structure from `count` instance
 // descriptions at `src` (GPU memory, readable as an SRV), recorded into `cl`.
 bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
-                 UINT count, UINT k, const void* owner, Copy* out, std::string* why) {
-    const UINT gmax = astrack::MaxGeometryCount();
+                 UINT count, UINT k, UINT gmaxFloor, const void* owner, Copy* out,
+                 std::string* why) {
+    const UINT gmax = (std::max)(astrack::MaxGeometryCount(), gmaxFloor);
     const UINT64 stride = (UINT64)k * gmax;
     if ((UINT64)count * stride > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
@@ -194,10 +200,10 @@ bool BuildLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_V
 // Caller holds g_lock. The same, from instance descriptions on the CPU.
 bool BuildFromCpuLocked(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
                         const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs, UINT k,
-                        const void* owner, Copy* out, std::string* why) {
+                        UINT gmaxFloor, const void* owner, Copy* out, std::string* why) {
     const UINT count = (UINT)descs.size();
     if (!count) { *why = "an empty scene"; return false; }
-    const UINT gmax = astrack::MaxGeometryCount();
+    const UINT gmax = (std::max)(astrack::MaxGeometryCount(), gmaxFloor);
     const UINT64 stride = (UINT64)k * gmax;
     if ((UINT64)count * stride > 0xFFFFFFull) {
         *why = "the shim's layout needs more than 2^24 hit group records";
@@ -275,8 +281,10 @@ bool Active() {
 }
 
 void NoteBuild(D3D12_GPU_VIRTUAL_ADDRESS appTlas) {
+    const UINT gmax = astrack::MaxGeometryCount();
     std::lock_guard<std::mutex> g(g_lock);
     ++g_builds[appTlas];
+    g_buildGmax[appTlas] = gmax;
     g_copies.erase(appTlas);
     g_saved.erase(appTlas);
 }
@@ -357,7 +365,8 @@ bool Record(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
     if (!g_active) return true;
     Held h;
     h.build = g_builds[app.DestAccelerationStructureData];
-    if (!BuildLocked(cl, dev, in.InstanceDescs, in.NumDescs, g_k ? g_k : 1, owner, &h.copy, why))
+    if (!BuildLocked(cl, dev, in.InstanceDescs, in.NumDescs, g_k ? g_k : 1,
+                     g_buildGmax[app.DestAccelerationStructureData], owner, &h.copy, why))
         return false;
     g_copies[app.DestAccelerationStructureData] = h;
     static LONG first = 0;
@@ -398,11 +407,11 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
     const char* from = "";
     if (s != g_saved.end() && s->second.build == build) {
         gpuhold::Use(s->second.res, owner);
-        ok = BuildLocked(cl, dev, s->second.res->GetGPUVirtualAddress(), s->second.count, kk, owner,
-                         &h.copy, why);
+        ok = BuildLocked(cl, dev, s->second.res->GetGPUVirtualAddress(), s->second.count, kk,
+                         g_buildGmax[appTlas], owner, &h.copy, why);
         from = "the saved instances";
     } else if (haveSnap) {
-        ok = BuildFromCpuLocked(cl, dev, snap, kk, owner, &h.copy, why);
+        ok = BuildFromCpuLocked(cl, dev, snap, kk, g_buildGmax[appTlas], owner, &h.copy, why);
         from = "the CPU snapshot";
     } else {
         *why = "neither the instances nor a snapshot of the scene's latest build were kept "
