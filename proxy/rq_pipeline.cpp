@@ -847,8 +847,13 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     m_desc.RayGenerationShaderRecord.StartAddress = base + 0 * slot;
     m_desc.RayGenerationShaderRecord.SizeInBytes = kIdSize;
     m_desc.MissShaderTable.StartAddress = base + 1 * slot;
+    // The miss record is the identifier alone. Its stride is its own, not
+    // the hit records': with record data those are 64 bytes, and a 32-byte
+    // table at stride 64 is invalid (debug layer #1161, 1731 times in the
+    // 0.49.0 Escher run with the layer forced on; harmless on the 1070,
+    // since the lowered raygen only ever uses miss index 0).
     m_desc.MissShaderTable.SizeInBytes = kIdSize;
-    m_desc.MissShaderTable.StrideInBytes = stride;
+    m_desc.MissShaderTable.StrideInBytes = kIdSize;
     m_desc.HitGroupTable.StartAddress = base + 2 * slot;
     m_desc.HitGroupTable.SizeInBytes = stride * tableRecords;
     m_desc.HitGroupTable.StrideInBytes = stride;

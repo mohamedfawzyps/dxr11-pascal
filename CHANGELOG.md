@@ -24,6 +24,28 @@ not.
 
 ---
 
+## 0.52.1
+
+Two D3D12 debug layer errors the shim caused, found in an Escher run
+(2026-09-25, 2 min 31 s, the layer forced on; that run was still shim
+0.49.0, the newer DLL not copied in). Neither changed what was drawn.
+
+- **#1161, every lowered RayQuery dispatch that reads record data:** the
+  miss table was declared at the HIT records' stride, 64 bytes, around a
+  32-byte record. Invalid per the API; the 1070 ran it correctly because
+  the lowered raygen only ever uses miss index 0. 1731 errors, one per
+  dispatch drawn. The miss table now has its own 32-byte stride. Reproduced
+  offline first with `DXR_TIER11_DEBUGLAYER=1 raytest ... --geom --contrib`,
+  and gone after.
+- **#901, 5 times:** the resource tracker asked every new buffer for its
+  heap, reserved ones included, where D3D12 does not allow the question.
+  Reserved buffers are now recorded as GPU-only without asking.
+- Everything else the layer said in that run is Unreal's own: duplicate
+  barrier descriptors (the shim records only single ones), overlapping
+  resources at one address, zero-group dispatches, and the 24 native 16-bit
+  compute shaders known since 0.36.
+- Dispatch suite 41 of 41; gitest `--indirectgpu` and `--stale --sm66` match.
+
 ## 0.52.0
 
 **FIXED: a lowered RayQuery dispatch after the scene changed was drawn from

@@ -27,7 +27,7 @@ namespace restrack {
 
 // Remember a freshly created buffer. Anything that is not a buffer, or has no
 // virtual address, is ignored.
-void Note(ID3D12Resource* resource);
+void Note(ID3D12Resource* resource, bool reserved = false);
 
 struct Found {
     ID3D12Resource* resource = nullptr;

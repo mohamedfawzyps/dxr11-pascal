@@ -17,7 +17,7 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, Entry> g_buffers;   // keyed by start addres
 
 }  // namespace
 
-void Note(ID3D12Resource* resource) {
+void Note(ID3D12Resource* resource, bool reserved) {
     if (!resource) return;
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     // Only buffers have a useful address range here, and only buffers are ever
@@ -28,8 +28,12 @@ void Note(ID3D12Resource* resource) {
 
     D3D12_HEAP_PROPERTIES hp{};
     D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
+    // A reserved resource has no heap of its own, and asking is a debug layer
+    // error (#901); its tiles live in whatever heaps it is mapped to, which
+    // the CPU cannot read through it.
     const D3D12_HEAP_TYPE heap =
-        SUCCEEDED(resource->GetHeapProperties(&hp, &hf)) ? hp.Type : D3D12_HEAP_TYPE_DEFAULT;
+        !reserved && SUCCEEDED(resource->GetHeapProperties(&hp, &hf)) ? hp.Type
+                                                                       : D3D12_HEAP_TYPE_DEFAULT;
 
     std::lock_guard<std::mutex> g(g_lock);
     g_buffers[va] = Entry{ desc.Width, resource, heap };   // replaces on address reuse

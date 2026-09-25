@@ -660,7 +660,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource(const D3D12_RESOUR
     if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
         ID3D12Resource* res = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
-            restrack::Note(res);
+            restrack::Note(res, true);
             res->Release();   // the tracker holds no reference
         }
     }
@@ -839,7 +839,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateReservedResource1(const D3D12_RESOU
     if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
         ID3D12Resource* res = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res)))) {
-            restrack::Note(res);
+            restrack::Note(res, true);
             res->Release();   // the tracker holds no reference
         }
     }
