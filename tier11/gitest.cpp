@@ -57,6 +57,12 @@
 // structure swapped, submits, then builds it again IN PLACE with the real
 // ones, so what the shim read is the older build's scene.
 //
+// --deserialize puts every A instance on a DESERIALIZED copy of A, as Unreal
+// loads offline structures, and then rebuilds A's own address with B's two
+// geometries, as a streaming engine reuses memory. So no structure the shim
+// knows has four geometries any more. A deserialized structure's geometry is
+// driver-opaque, so the shim must refuse, by name, every layout reaching it.
+//
 // Exit code 0 only when every layout matches WARP.
 
 #include <windows.h>
@@ -102,7 +108,7 @@ static bool g_table = false;
 static int g_bindless = 0;   // 1 index in a root CBV, 2 in root constants
 static int g_indirect = 0;   // 1 arguments in upload memory, 2 in GPU memory
 static bool g_libassoc = false;
-static bool g_gpuinst = false, g_stale = false;
+static bool g_gpuinst = false, g_stale = false, g_deserialize = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -317,7 +323,8 @@ static ComPtr<ID3D12Resource> BuildAS(Gpu& g, const D3D12_BUILD_RAYTRACING_ACCEL
 // A unit square split into geometries: A into 4 quadrants, B into 2 halves.
 // Each geometry is two triangles, so PrimitiveIndex is 0 or 1 in each.
 static ComPtr<ID3D12Resource> BuildBlas(Gpu& g, Blas which, bool opaque,
-                                        std::vector<ComPtr<ID3D12Resource>>& keep) {
+                                        std::vector<ComPtr<ID3D12Resource>>& keep,
+                                        ID3D12Resource* into = nullptr) {
     std::vector<float> v;
     auto quad = [&](float x0, float y0, float x1, float y1) {
         const float t[18] = { x0, y0, 0, x1, y0, 0, x1, y1, 0,  x0, y0, 0, x1, y1, 0, x0, y1, 0 };
@@ -347,7 +354,46 @@ static ComPtr<ID3D12Resource> BuildBlas(Gpu& g, Blas which, bool opaque,
     in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     in.NumDescs = n; in.pGeometryDescs = geo.data();
-    return BuildAS(g, in, keep);
+    return BuildAS(g, in, keep, into);
+}
+
+// --deserialize: `src` serialized and deserialized into a new structure.
+static ComPtr<ID3D12Resource> Deserialized(Gpu& g, ID3D12Resource* src,
+                                           std::vector<ComPtr<ID3D12Resource>>& keep) {
+    const D3D12_GPU_VIRTUAL_ADDRESS a = src->GetGPUVirtualAddress();
+    auto info = Buffer(g.dev.Get(), 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pd{};
+    pd.DestBuffer = info->GetGPUVirtualAddress();
+    pd.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION;
+    g.cl->EmitRaytracingAccelerationStructurePostbuildInfo(&pd, 1, &a);
+    D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = info.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g.cl->ResourceBarrier(1, &b);
+    auto rb = Buffer(g.dev.Get(), 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.cl->CopyBufferRegion(rb.Get(), 0, info.Get(), 0, 256);
+    g.flush();
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION_DESC sd{};
+    void* m = nullptr; HR(rb->Map(0, nullptr, &m), "Map serialization info");
+    std::memcpy(&sd, m, sizeof(sd)); rb->Unmap(0, nullptr);
+    if (!sd.SerializedSizeInBytes) throw std::runtime_error("serialized size 0");
+    auto ser = Buffer(g.dev.Get(), sd.SerializedSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    g.cl->CopyRaytracingAccelerationStructure(ser->GetGPUVirtualAddress(), a,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE);
+    b.Transition.pResource = ser.Get();
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    g.cl->ResourceBarrier(1, &b);
+    auto out = Buffer(g.dev.Get(), src->GetDesc().Width, D3D12_HEAP_TYPE_DEFAULT,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+    g.cl->CopyRaytracingAccelerationStructure(out->GetGPUVirtualAddress(), ser->GetGPUVirtualAddress(),
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+    UavAll(g.cl.Get());
+    g.flush();
+    keep.push_back(info); keep.push_back(rb); keep.push_back(ser);
+    return out;
 }
 
 static ComPtr<ID3D12RootSignature> RootSig(ID3D12Device* dev, const D3D12_ROOT_SIGNATURE_DESC& d) {
@@ -370,6 +416,12 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     std::vector<ComPtr<ID3D12Resource>> keep;
     auto blasA = BuildBlas(g, kA, !L.anyhit, keep);
     auto blasB = BuildBlas(g, kB, !L.anyhit, keep);
+    if (g_deserialize) {
+        auto copy = Deserialized(g, blasA.Get(), keep);
+        BuildBlas(g, kB, !L.anyhit, keep, blasA.Get());   // A's address, reused
+        keep.push_back(blasA);
+        blasA = copy;
+    }
     const UINT n = (UINT)L.inst.size();
     const UINT64 ibBytes = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * n;
     // `swap`: every instance on the other structure, for --stale.
@@ -743,6 +795,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--libassoc")) g_libassoc = true;
         else if (!std::strcmp(argv[i], "--gpuinst")) g_gpuinst = true;
         else if (!std::strcmp(argv[i], "--stale")) g_stale = g_gpuinst = true;
+        else if (!std::strcmp(argv[i], "--deserialize")) g_deserialize = true;
         else want.insert(argv[i]);
     }
     if (g_libassoc && g_mode != 0) {

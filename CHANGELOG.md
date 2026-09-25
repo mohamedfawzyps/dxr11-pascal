@@ -24,6 +24,42 @@ not.
 
 ---
 
+## 0.54.0
+
+**A `GeometryIndex()` dispatch on a scene not read from its latest build is
+deferred to submit, and the variant no longer serves such a scene blind. It
+drew a deserialized bottom-level structure WRONG, silently** (Tier 1.1 item a,
+the gap named in 0.53.0).
+
+- **The gap.** Since 0.51.0 a dispatch whose scene was unread or stale went to
+  the variant, which builds its table on the GPU from the saved instances and
+  never learns which bottom-level structures they point at. Its layout gives
+  each instance `gmax` records per trace, the most geometries of any structure
+  the shim knows. A deserialized structure's count is unknown, so one holding
+  more spilled into the next instance's records.
+- **Measured on 0.53.1 first**, with the new `gitest --deserialize`: every A
+  instance on a deserialized copy of A (4 geometries), and A's own address
+  rebuilt with 2, as a streaming engine reuses memory. With CPU-visible
+  instances refused by name, as intended. With GPU-written instances, **all 7
+  layouts drawn wrong, 8192 to 16384 pixels each, nothing logged**.
+- **The fix.** A dispatch whose scene resolves exactly and is not read from its
+  latest build waits for submit, as a RayQuery dispatch has since 0.52.0, direct
+  and CPU-visible indirect alike (`QueueStaleRays`); an indirect one from GPU
+  memory already did, and now also records its build. At the split the build
+  has run and is read exactly (`astrack::BringToBuild`), so an unknown structure
+  is refused by name before the variant is considered. The variant now serves
+  only records several geometries share, on a read of the latest build, where
+  every instance's structure is known and `gmax` covers it. A scene built again
+  after the dispatch was recorded but before it was submitted is NOT DRAWN, by
+  name. An unresolved scene that is stale is not drawn either; the variant
+  never served one.
+- **Measured:** `--deserialize` refused by name with either instance kind;
+  `--gpuinst` and `--stale` 7 of 7 through the deferral; the gitest matrix 46
+  of 46; dispatch suite 47 of 47 and every gate, with a new gate for the
+  deserialize case, checked to fail on 0.53.1.
+- **Cost:** a `GeometryIndex()` dispatch on a GPU-built scene now waits at
+  submit for its segment to run. In Unreal that is the ray tracing debug view.
+
 ## 0.53.1
 
 **An instance with a NULL bottom-level structure is inactive, not unknown.

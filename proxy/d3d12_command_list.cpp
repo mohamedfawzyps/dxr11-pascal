@@ -870,8 +870,38 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     if (!gi) { FWD(DispatchRays(d)); return; }
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
     const bool exact = GeometryIndexScenes(*gi, &srvs);
+    // Its scene not read from its latest build: at submit that build has run
+    // and is read exactly, as a RayQuery dispatch has been since 0.52.0.
+    // Until 0.54.0 the variant drew it from the GPU copy without knowing
+    // which bottom-level structures the instances point at, so one of
+    // unknown geometry (deserialized) spilled into the next instance's
+    // records, silently.
+    if (exact && !astrack::Current(srvs) && QueueStaleRays(*d, srvs)) return;
     DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact, this, *d,
                           [this] { RestoreComputeAfterCapture(); });
+}
+
+bool Dxr11CommandList::QueueStaleRays(const D3D12_DISPATCH_RAYS_DESC& d,
+                                      const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
+    if (!RealDevice() || !m_allocator || scenes.empty()) return false;
+    Dxr11PendingDispatch pend;
+    pend.giScenesSet = true;
+    pend.giExact = true;
+    pend.giScenes = scenes;
+    for (auto a : scenes) {
+        pend.giBuilds.push_back(astrack::LatestBuild(a));
+        if (!pend.giBuilds.back()) return false;   // never seen being built
+    }
+    pend.giDirect = true;
+    pend.giDesc = d;
+    pend.bindings = m_bindings;
+    pend.bindings.Retain();
+    m_openPendings.push_back(pend);
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch deferred to submit: its "
+                 "scene's latest build is not read yet\n");
+    return true;
 }
 
 // --- ID3D12GraphicsCommandList5 / 6 -----------------------------------------
@@ -1017,6 +1047,7 @@ bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     if (std::shared_ptr<gidx::Info> gi = gidx::Get(m_bindings.stateObject)) {
         pend.giScenesSet = true;
         pend.giExact = GeometryIndexScenes(*gi, &pend.giScenes);
+        for (auto a : pend.giScenes) pend.giBuilds.push_back(astrack::LatestBuild(a));
     }
     m_openPendings.push_back(pend);
     return true;
@@ -1203,6 +1234,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                                  "Nothing is drawn for it.\n", why.c_str());
                     continue;
                 }
+            } else if (pend.giDirect) {
+                desc = pend.giDesc;
             } else {
             void* p = nullptr;
             D3D12_RANGE readAll{ 0, sizeof(desc) };
@@ -1211,6 +1244,26 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 D3D12_RANGE noWrite{ 0, 0 };
                 pend.readback->Unmap(0, &noWrite);
             }
+            }
+            // A GeometryIndex() dispatch: the segment has run, so the build
+            // its scene had when it was recorded has too, and is read now.
+            // A build recorded after it, not yet run, would make the read
+            // not the latest: named, not drawn from the wrong one.
+            if (!pend.rq && pend.giScenesSet && pend.giExact) {
+                bool ok = pend.giBuilds.size() == pend.giScenes.size();
+                for (size_t k = 0; ok && k < pend.giScenes.size(); ++k)
+                    ok = pend.giBuilds[k] &&
+                         astrack::BringToBuild(pend.giScenes[k], pend.giBuilds[k], this);
+                const bool current = ok && astrack::Current(pend.giScenes);
+                if (!current) {
+                    static LONG n = 0;
+                    if (InterlockedIncrement(&n) <= 16)
+                        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch NOT DRAWN at "
+                                 "submit: %s\n", ok ? "its scene was built again after it was "
+                                 "recorded, before it was submitted"
+                                 : "the instances of the build its scene had could not be read");
+                    continue;
+                }
             }
             if (!pend.rq && (!desc.Width || !desc.Height || !desc.Depth)) {
                 ProxyLog("[dxr-tier-11-proxy-log] split: dimensions read back as %ux%ux%u, "

@@ -153,6 +153,19 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.54.0: `GeometryIndex()` ON AN UNREAD SCENE WAITS FOR SUBMIT; THE VARIANT
+DREW A DESERIALIZED STRUCTURE WRONG, SILENTLY.** The variant served a scene
+not read from its latest build from the GPU copy, blind to which bottom-level
+structures the instances point at; one of unknown geometry spilled into the
+next instance's records. `gitest --deserialize --gpuinst`: 7 of 7 layouts
+wrong on 0.53.1, nothing logged. Now such a dispatch is deferred to submit and
+read exactly, so the unknown structure is refused by name; the variant serves
+only shared records on a current read. Matrix 46 of 46, suite 47 of 47.
+Remaining for item a: a scene through a local root signature, TraceRay in a
+closest-hit or miss in the shim's layout, runtime TraceRay arguments, a
+rewritten library with its own subobjects AND an export list, and a library
+association to another library's subobject.
+
 **0.53.1 IN THE GAME (2026-09-25, 3 min 52 s): NOTHING REFUSED AGAIN.**
 Clean end marker, 162 lowered, 337 state objects hr=0, 13754 lowered
 dispatches drawn (all indirect), REFUSED 0 of every kind, "unknown

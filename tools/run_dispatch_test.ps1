@@ -517,6 +517,25 @@ if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'bottom-level struc
     $failed++
 }
 
+Write-Host '=== GeometryIndex(): a DESERIALIZED structure under GPU-written instances is refused ==='
+# The variant served a scene not read from its latest build from the GPU copy,
+# blind to which bottom-level structures the instances point at: a
+# deserialized one with more geometries than any known structure spilled into
+# the next instance's records. 0.53.1 drew all 7 layouts wrong, nothing logged.
+# 0.54.0 defers the dispatch to submit, reads that build, and refuses by name.
+$gilog = Join-Path $env:TEMP 'dxr-tier-11-gideser.log'
+Remove-Item $gilog -ErrorAction SilentlyContinue
+$prevLog = $env:DXR_TIER11_LOG
+$env:DXR_TIER11_LOG = $gilog
+& .\gitest.exe --deserialize --gpuinst mult | Out-Null
+$env:DXR_TIER11_LOG = $prevLog
+if ((Test-Path $gilog) -and (Select-String -Path $gilog -Pattern 'NOT DRAWN.*does not know' -Quiet)) {
+    Write-Host '  refused, with the reason, as it must'
+} else {
+    Write-Host '  REFUSAL MISSING: a structure of unknown geometry was drawn'
+    $failed++
+}
+
 Write-Host ''
 if ($failed -eq 0) {
     Write-Host 'DISPATCH PATH: RayQuery compute shaders run on the 1070 and match WARP.'

@@ -1550,11 +1550,15 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
                "not know (deserialized, or never seen built)";
         return false;
     }
+    // Not read from the latest build: the variant cannot serve it either,
+    // since it would not know which bottom-level structures the instances
+    // point at, and one of unknown geometry spills into the next instance's
+    // records. A resolved scene is deferred to submit before it gets here
+    // (0.54.0; until then the variant drew it from the GPU copy).
     if (!read || stale) {
         *why = !read ? (exact ? "the scene this dispatch traces has not been read yet"
                               : "no top-level structure has been read yet")
                      : "the scene changed since its instances were read";
-        *shared = true;
         return false;
     }
     for (UINT r = 0; r < records; ++r)

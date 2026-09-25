@@ -143,6 +143,14 @@ struct Dxr11PendingDispatch {
     bool                                         giScenesSet = false;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       giScenes;
     bool                                         giExact = false;
+    // Which build of each of those scenes it traces, the latest when it was
+    // recorded: the table is made from exactly that build's instances at
+    // submit (0.54.0).
+    std::vector<UINT64>                          giBuilds;
+    // A DIRECT DispatchRays deferred to submit because its scene was not read
+    // from its latest build (0.54.0): its arguments, no readback.
+    bool                                         giDirect = false;
+    D3D12_DISPATCH_RAYS_DESC                     giDesc{};
 };
 
 // A closed segment, followed by the dispatches that could not be recorded until
@@ -328,6 +336,8 @@ private:
     // The same, for ExecuteIndirect with a DISPATCH signature while a lowered
     // RayQuery pipeline is bound. See proxy/group_count.h.
     bool QueueStaleCompute(UINT x, UINT y, UINT z, const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
+    bool QueueStaleRays(const D3D12_DISPATCH_RAYS_DESC& d,
+                        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
     bool QueueIndirectCompute(ID3D12CommandSignature* sig, ID3D12Resource* args,
                               UINT64 argOffset);
     // Gets the instance descriptions of a top-level build to the CPU, so the
