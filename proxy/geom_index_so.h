@@ -163,6 +163,7 @@ struct Transformed {
     std::deque<D3D12_DXIL_LIBRARY_DESC> libs;
     std::deque<D3D12_LOCAL_ROOT_SIGNATURE> lrs;
     std::deque<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION> assoc;
+    std::deque<D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION> dxilAssoc;
     std::deque<D3D12_EXISTING_COLLECTION_DESC> colls;
     std::deque<std::vector<LPCWSTR>> exportLists;
     std::deque<std::wstring> names;

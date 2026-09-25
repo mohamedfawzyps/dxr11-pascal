@@ -31,6 +31,14 @@ cl /nologo /EHsc /std:c++17 /O2 /W4 ^
    /link d3d12.lib dxgi.lib user32.lib /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
+rem The runtime's rules for a library's own subobjects (0.58.0).
+cl /nologo /EHsc /std:c++17 /O2 /W4 ^
+   /I "%AGILITY%\build\native\include" /I "%DXC%\inc" ^
+   /Fo:"%OBJ%\\" ^
+   "%~dp0tier11\libsubprobe.cpp" /Fe:"%~dp0libsubprobe.exe" ^
+   /link d3d12.lib dxgi.lib /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
 echo.
-echo Built gitest.exe
+echo Built gitest.exe and libsubprobe.exe
 echo Run:  gitest.exe [--sm66] [layout ...]

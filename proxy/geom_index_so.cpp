@@ -457,6 +457,185 @@ std::vector<std::pair<std::wstring, uint32_t>> Exported(const D3D12_DXIL_LIBRARY
     return out;
 }
 
+// A library's own subobjects as a state object includes them, measured on
+// the D3D12 runtime (0.58.0, on WARP and the 1070 alike; the spec does not
+// say): with no export list, all of them; with one, only those it NAMES,
+// under the name it gives them, so a hit group can be renamed and exported
+// twice. Associations, their targets and hit group imports refer to names as
+// exported: nothing follows a rename.
+std::vector<std::pair<std::wstring, const LibSubobjects::Sub*>> IncludedSubobjects(
+    const D3D12_DXIL_LIBRARY_DESC* ld, const LibSubobjects& so) {
+    std::vector<std::pair<std::wstring, const LibSubobjects::Sub*>> out;
+    for (const auto& x : so.all) {
+        if (!ld->NumExports) { out.emplace_back(x.name, &x); continue; }
+        for (UINT e = 0; e < ld->NumExports; ++e) {
+            const auto& ex = ld->pExports[e];
+            if ((ex.ExportToRename ? ex.ExportToRename : ex.Name) == x.name) out.emplace_back(ex.Name, &x);
+        }
+    }
+    return out;
+}
+
+// Test knob DXR_TIER11_ASSOC_POISON, sensitivity checks only: 1 takes every
+// library local root signature as the first one met, 2 ignores the hit groups
+// libraries declare (both what 0.57.0 got wrong or refused).
+int AssocPoison() {
+    char pv[4] = {};
+    static const int v =
+        GetEnvironmentVariableA("DXR_TIER11_ASSOC_POISON", pv, sizeof(pv)) ? pv[0] - '0' : 0;
+    return v;
+}
+
+// Every hit group a state object description declares: its own, and those
+// its libraries declare and include, under the names they are exported by.
+struct HitGroupDef {
+    std::wstring name, anyHit, closestHit, intersection;
+    std::vector<std::wstring> Imports() const {
+        std::vector<std::wstring> v;
+        for (const auto* w : { &closestHit, &anyHit, &intersection })
+            if (!w->empty()) v.push_back(*w);
+        return v;
+    }
+};
+std::vector<HitGroupDef> HitGroupsOf(const D3D12_STATE_OBJECT_DESC& d) {
+    std::vector<HitGroupDef> out;
+    for (UINT i = 0; i < d.NumSubobjects; ++i) {
+        const auto& so = d.pSubobjects[i];
+        if (!so.pDesc) continue;
+        if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP) {
+            const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(so.pDesc);
+            if (!h->HitGroupExport) continue;
+            HitGroupDef g;
+            g.name = h->HitGroupExport;
+            if (h->AnyHitShaderImport) g.anyHit = h->AnyHitShaderImport;
+            if (h->ClosestHitShaderImport) g.closestHit = h->ClosestHitShaderImport;
+            if (h->IntersectionShaderImport) g.intersection = h->IntersectionShaderImport;
+            out.push_back(g);
+        } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && AssocPoison() != 2) {
+            const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(so.pDesc);
+            LibSubobjects lso;
+            if (!LibrarySubobjects(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength, &lso))
+                continue;
+            for (const auto& x : IncludedSubobjects(ld, lso)) {
+                if (x.second->kind != 11) continue;
+                HitGroupDef g;
+                g.name = x.first;
+                g.anyHit = x.second->str[0];
+                g.closestHit = x.second->str[1];
+                g.intersection = x.second->str[2];
+                out.push_back(g);
+            }
+        }
+    }
+    return out;
+}
+
+namespace {
+
+// A metadata string as LLVM prints one: bytes, anything but plain text escaped.
+std::string MdString(const std::wstring& w) {
+    std::string s = "!\"";
+    char b[4];
+    for (wchar_t c : w) {
+        const unsigned v = (unsigned)c & 0xFF;
+        if (v >= 0x20 && v < 0x7F && v != '"' && v != '\\') s.push_back((char)v);
+        else { std::snprintf(b, sizeof(b), "\\%02X", v); s += b; }
+    }
+    return s + "\"";
+}
+
+bool SameSubobjects(const LibSubobjects& a, const LibSubobjects& b) {
+    auto key = [](const LibSubobjects& l) {
+        std::vector<std::wstring> v;
+        for (const auto& x : l.all) {
+            std::wstring k = x.name + L"|" + std::to_wstring(x.kind);
+            if (x.kind == 0 || x.kind == 9 || x.kind == 10 || x.kind == 11 || x.kind == 12)
+                k += L"|" + std::to_wstring(x.w[0]);
+            if (x.kind == 9 || x.kind == 12) k += L"|" + std::to_wstring(x.w[1]);
+            for (uint8_t c : x.bytes) k += L"|" + std::to_wstring(c);
+            for (const auto& s : x.str) k += L"|" + s;
+            for (const auto& e : x.exports) k += L"|" + e;
+            v.push_back(k);
+        }
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    return key(a) == key(b);
+}
+
+}  // namespace
+
+// Assembles a rewritten library, keeping the subobjects the original
+// declares. A disassembly carries them only as comments, so they are written
+// back as the `!dx.subobjects` metadata DXC reads them from (layouts per kind
+// from DXC's DxilMDHelper::EmitSubobject), and the runtime then includes and
+// associates them exactly as it did the original's, export list and all.
+// Until 0.58.0 they were declared again at state object scope, which could
+// not follow an export list or an association into another library. The
+// result's subobject table is checked against the original's.
+bool AssembleLibrary(std::string text, const void* orig, size_t origSize, std::vector<uint8_t>* out,
+                     std::string* err) {
+    LibSubobjects so;
+    if (orig && LibrarySubobjects(orig, origSize, &so) && !so.all.empty()) {
+        unsigned next = 0;
+        for (size_t p = text.find('!'); p != std::string::npos; p = text.find('!', p + 1)) {
+            size_t q = p + 1;
+            unsigned v = 0;
+            while (q < text.size() && text[q] >= '0' && text[q] <= '9') v = v * 10 + (unsigned)(text[q++] - '0');
+            if (q > p + 1) next = (std::max)(next, v + 1);
+        }
+        std::string named = "!dx.subobjects = !{", nodes;
+        auto i32 = [](uint32_t v) { return "i32 " + std::to_string((int32_t)v); };
+        for (size_t k = 0; k < so.all.size(); ++k) {
+            const auto& x = so.all[k];
+            const unsigned id = next++;
+            named += (k ? ", !" : "!") + std::to_string(id);
+            std::string body = MdString(x.name) + ", " + i32(x.kind);
+            switch (x.kind) {
+            case 0: case 10: body += ", " + i32(x.w[0]); break;
+            case 9: case 12: body += ", " + i32(x.w[0]) + ", " + i32(x.w[1]); break;
+            case 1: case 2: {
+                const unsigned data = next++;
+                std::string arr = "!" + std::to_string(data) + " = !{[" + std::to_string(x.bytes.size()) +
+                                  " x i8] c\"";
+                char b[4];
+                for (uint8_t c : x.bytes) { std::snprintf(b, sizeof(b), "\\%02X", c); arr += b; }
+                nodes += arr + "\"}\n";
+                body += ", !" + std::to_string(data) + ", !\"\"";
+                break;
+            }
+            case 8: {
+                const unsigned list = next++;
+                std::string l = "!" + std::to_string(list) + " = !{";
+                for (size_t e = 0; e < x.exports.size(); ++e) l += (e ? ", " : "") + MdString(x.exports[e]);
+                nodes += l + "}\n";
+                body += ", " + MdString(x.str[0]) + ", !" + std::to_string(list);
+                break;
+            }
+            case 11:
+                body += ", " + i32(x.w[0]) + ", " + MdString(x.str[2]) + ", " + MdString(x.str[0]) + ", " +
+                        MdString(x.str[1]);
+                break;
+            default:
+                *err = "a library subobject of kind " + std::to_string(x.kind) + " the shim cannot write back";
+                return false;
+            }
+            nodes += "!" + std::to_string(id) + " = !{" + body + "}\n";
+        }
+        while (!text.empty() && text.back() == '\n') text.pop_back();
+        text += "\n" + named + "}\n" + nodes;
+    }
+    if (!dxch::AssembleAndSign(text, out, err)) return false;
+    if (!so.all.empty()) {
+        LibSubobjects back;
+        if (!LibrarySubobjects(out->data(), out->size(), &back) || !SameSubobjects(so, back)) {
+            *err = "the library's own subobjects did not survive the rewrite";
+            return false;
+        }
+    }
+    return true;
+}
+
 // The pipeline config's recursion depth, 0 when the object has none.
 UINT Recursion(const D3D12_STATE_OBJECT_DESC& in) {
     for (UINT i = 0; i < in.NumSubobjects; ++i) {
@@ -639,248 +818,56 @@ private:
     std::shared_ptr<Info> m_info;
 };
 
-// Extends the local root signature of each unit (exports that must share one:
-// a hit group and its shaders, or a single raygen) with the geometry index
-// constant, or (`srvs` above 0) that many root descriptors for the shim, and
-// builds the new subobject array in `out`: libraries in `code` replaced,
-// EXISTING_COLLECTIONs in `colls` pointed at a replacement, associations to a
-// local root signature losing the extended exports (one left with none is
-// dropped rather than becoming a DEFAULT association, and a signature left
-// with no association is dropped rather than becoming a default one), and one
-// new signature plus association per original signature extended.
-// `offsets[u]` is the first added parameter's offset in unit u's records.
-template <class T>
-const void* Keep(Transformed* out, const T& v) {
-    out->raw.emplace_back(sizeof(T));
-    std::memcpy(out->raw.back().data(), &v, sizeof(T));
-    return out->raw.back().data();
-}
-
-bool CarryLibrarySubobjects(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
-                            const std::map<UINT, const std::vector<uint8_t>*>& code,
-                            const std::map<UINT, LibSubobjects>& libSubs,
-                            const std::set<std::wstring>& affected,
-                            Transformed* out, std::string* why) {
-    const UINT n = in.NumSubobjects;
-    const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
-    // What the state object associates itself, per subobject type.
-    std::map<UINT, std::set<std::wstring>> soExplicit;
-    std::set<UINT> soDefault;
-    std::set<UINT> soHasType;
-    std::vector<int> refd(n, 0);
-    for (UINT i = 0; i < n; ++i) {
-        soHasType.insert((UINT)s[i].Type);
-        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION || !s[i].pDesc)
-            continue;
-        const auto* a = static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
-        const ptrdiff_t t = a->pSubobjectToAssociate - s;
-        if (t < 0 || t >= (ptrdiff_t)n) continue;
-        ++refd[t];
-        const UINT ty = (UINT)s[t].Type;
-        if (!a->NumExports) soDefault.insert(ty);
-        for (UINT e = 0; e < a->NumExports; ++e) soExplicit[ty].insert(a->pExports[e]);
-    }
-    for (UINT i = 0; i < n; ++i) {
-        const UINT ty = (UINT)s[i].Type;
-        const bool associable = ty == 1 || ty == 2 || ty == 9 || ty == 10 || ty == 12;
-        if (associable && !refd[i]) soDefault.insert(ty);
-    }
-
-    auto addAssoc = [&](size_t target, const std::vector<std::wstring>& ex) {
-        std::vector<LPCWSTR> list;
-        for (const auto& w : ex) {
-            out->names.push_back(w);
-            list.push_back(out->names.back().c_str());
-        }
-        out->exportLists.push_back(list);
-        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION na{};
-        na.NumExports = (UINT)list.size();
-        na.pExports = out->exportLists.back().data();
-        na.pSubobjectToAssociate = reinterpret_cast<const D3D12_STATE_SUBOBJECT*>((uintptr_t)target);
-        out->assoc.push_back(na);
-        out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
-                              &out->assoc.back() });
-    };
-    auto rootSig = [&](const std::vector<uint8_t>& bytes, ComPtr<ID3D12RootSignature>* rs) {
-        std::vector<uint8_t> blob;
-        if (!SerializeRts0(bytes, &blob, why)) return false;
-        if (FAILED(dev->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(rs->GetAddressOf())))) {
-            *why = "could not create a library's root signature";
-            return false;
-        }
-        NoteRootSignature(rs->Get(), blob.data(), blob.size());
-        out->sigs.push_back(*rs);
-        return true;
-    };
-
-    for (const auto& kv : libSubs) {
-        if (!code.count(kv.first)) continue;    // not rewritten: it keeps its own
-        const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[kv.first].pDesc);
-        const LibSubobjects& so = kv.second;
-        if (ld->NumExports) {
-            *why = "a library the shim rewrites declares subobjects and is included with an export "
-                   "list, and the spec does not say which of its subobjects that includes";
-            return false;
-        }
-        // Hit groups and the state object config are declared at once; an
-        // associable subobject only when an association needs it, since one
-        // left unassociated at state object scope would become a DEFAULT
-        // there and reach exports it never reached.
-        std::map<std::wstring, std::pair<const LibSubobjects::Sub*, long>> made;   // name -> (sub, index)
-        for (const auto& x : so.all) {
-            if (x.kind == 0) {
-                if (soHasType.count(0)) continue;   // the state object's own wins
-                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG,
-                                      Keep(out, D3D12_STATE_OBJECT_CONFIG{ (D3D12_STATE_OBJECT_FLAGS)x.w[0] }) });
-                soHasType.insert(0);
-            } else if (x.kind == 11) {
-                D3D12_HIT_GROUP_DESC hg{};
-                out->names.push_back(x.name);
-                hg.HitGroupExport = out->names.back().c_str();
-                hg.Type = (D3D12_HIT_GROUP_TYPE)x.w[0];
-                LPCWSTR* slot[3] = { &hg.AnyHitShaderImport, &hg.ClosestHitShaderImport,
-                                     &hg.IntersectionShaderImport };
-                for (int k = 0; k < 3; ++k)
-                    if (!x.str[k].empty()) {
-                        out->names.push_back(x.str[k]);
-                        *slot[k] = out->names.back().c_str();
-                    }
-                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, Keep(out, hg) });
-            } else if (x.kind == 1 || x.kind == 2 || x.kind == 9 || x.kind == 10 || x.kind == 12) {
-                made[x.name] = { &x, -1 };
-            }
-        }
-        auto ensure = [&](const std::wstring& name, long* index) -> bool {
-            auto& m = made[name];
-            if (m.second >= 0) { *index = m.second; return true; }
-            const LibSubobjects::Sub& x = *m.first;
-            const size_t at = out->subs.size();
-            if (x.kind == 1 || x.kind == 2) {
-                ComPtr<ID3D12RootSignature> rs;
-                if (!rootSig(x.bytes, &rs)) return false;
-                if (x.kind == 1) {
-                    out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
-                                          Keep(out, D3D12_GLOBAL_ROOT_SIGNATURE{ rs.Get() }) });
-                } else {
-                    out->lrs.push_back(D3D12_LOCAL_ROOT_SIGNATURE{ rs.Get() });
-                    out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE,
-                                          &out->lrs.back() });
-                }
-            } else if (x.kind == 9) {
-                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
-                                      Keep(out, D3D12_RAYTRACING_SHADER_CONFIG{ x.w[0], x.w[1] }) });
-            } else if (x.kind == 10) {
-                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
-                                      Keep(out, D3D12_RAYTRACING_PIPELINE_CONFIG{ x.w[0] }) });
-            } else {
-                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1,
-                                      Keep(out, D3D12_RAYTRACING_PIPELINE_CONFIG1{
-                                          x.w[0], (D3D12_RAYTRACING_PIPELINE_FLAGS)x.w[1] }) });
-            }
-            m.second = (long)at;
-            *index = m.second;
-            return true;
-        };
-
-        // This library's exports, for spelling its defaults out.
-        std::vector<std::wstring> mine;
-        for (const auto& f : Exported(ld)) mine.push_back(f.first);
-        for (const auto& x : so.all)
-            if (x.kind == 11) mine.push_back(x.name);
-
-        std::map<UINT, std::set<std::wstring>> libExplicitOfType;
-        std::set<std::wstring> associated;
-        for (const auto& x : so.all) {
-            if (x.kind != 8) continue;
-            auto m = made.find(x.str[0]);
-            if (m == made.end()) {
-                bool here = false;
-                for (const auto& y : so.all) here = here || y.name == x.str[0];
-                if (!here) {
-                    *why = "a library the shim rewrites associates a subobject declared elsewhere";
-                    return false;
-                }
-                continue;   // a subobject of a kind nothing associates
-            }
-            associated.insert(x.str[0]);
-            if (!x.exports.empty())
-                for (const auto& e : x.exports) libExplicitOfType[m->second.first->kind].insert(e);
-        }
-        auto keepExport = [&](UINT ty, const std::wstring& e) {
-            if (soExplicit[ty].count(e)) return false;
-            if (ty == 2 && affected.count(e)) return false;   // extended, associated by the shim
-            return true;
-        };
-        for (const auto& x : so.all) {
-            if (x.kind != 8) continue;
-            auto m = made.find(x.str[0]);
-            if (m == made.end()) continue;
-            const UINT ty = m->second.first->kind;
-            if (soDefault.count(ty)) continue;   // the state object's default overrides it
-            std::vector<std::wstring> ex;
-            if (x.exports.empty()) {
-                for (const auto& e : mine)
-                    if (keepExport(ty, e) && !libExplicitOfType[ty].count(e)) ex.push_back(e);
-            } else {
-                for (const auto& e : x.exports)
-                    if (keepExport(ty, e)) ex.push_back(e);
-            }
-            long at = -1;
-            if (!ex.empty()) {
-                if (!ensure(x.str[0], &at)) return false;
-                addAssoc((size_t)at, ex);
-            }
-        }
-        std::vector<std::wstring> names;
-        for (const auto& kv2 : made) names.push_back(kv2.first);
-        for (const auto& nm : names) {
-            if (associated.count(nm)) continue;   // a default: nothing here names it
-            const UINT ty = made[nm].first->kind;
-            if (soDefault.count(ty)) continue;
-            std::vector<std::wstring> ex;
-            for (const auto& e : mine)
-                if (keepExport(ty, e) && !libExplicitOfType[ty].count(e)) ex.push_back(e);
-            long at = -1;
-            if (!ex.empty()) {
-                if (!ensure(nm, &at)) return false;
-                addAssoc((size_t)at, ex);
-            }
-        }
-    }
-    return true;
-}
-
-// Which local root signature each export of a state object description has,
-// by the spec's association rules (see Rebuild). Also used at a dispatch, to
-// find where a raygen's record carries its scene (0.55.0).
+// Which local root signature each export of a state object description has:
+// the spec's "Subobject association behavior", and what the runtime was
+// measured to do with a library's own subobjects (IncludedSubobjects, 0.58.0).
+// Also used at a dispatch, to find where a record carries its scene (0.55.0).
+// A signature is a KEY: a subobject index of the description, -1 none, or
+// -2 - k for the library signature libLrs[k].
+//
+// The order, measured where the spec is not explicit: the state object's
+// explicit associations (of its own subobjects, or by name of a library's),
+// then its default, which overrides a directly included library's explicit
+// one; then the libraries' explicit associations, which reach any library's
+// exports and may name another library's signature; then a library's
+// default, which reaches that library's exports only.
 struct Assoc {
-    std::map<std::wstring, UINT> explicitLrs;   // export -> subobject index
-    std::vector<UINT> defaults;                 // default local root signatures
+    std::map<std::wstring, int> explicitLrs;
+    std::vector<int> defaults;
     std::vector<int> refs;                      // associations naming each subobject
     std::vector<std::pair<std::wstring, std::vector<uint8_t>>> libLrs;
-    std::map<std::wstring, int> libExplicit;    // export -> -2 - k
-    std::map<std::wstring, int> libDefaultOf;   // export -> -2 - k
-    std::map<UINT, LibSubobjects> libSubs;      // library subobject index -> its subobjects
+    std::map<std::wstring, int> libExplicit;
+    std::map<std::wstring, int> libDefaultOf;   // export -> its library's default
+    std::map<std::wstring, uint32_t> libKind;   // a library subobject, by exported name
+    // Associations of a subobject no library here declares, which a
+    // collection may leave to the pipeline linking it: nothing can be told
+    // about the exports they reach.
+    std::set<std::wstring> unresolved;          // named by the state object
+    bool unresolvedDefault = false;
+    std::set<std::wstring> unresolvedLib;       // reached by a library's
 
-    // The first name decides when it is associated; the others must agree.
-    // The state object's explicit associations, then its default, then a
-    // library's explicit association, then a library's default. `*idx`: a
-    // subobject index, -1 none, -2 - k the library signature libLrs[k].
+    // The first name decides when the state object associates it; the others
+    // must agree.
     bool Of(const std::vector<std::wstring>& u, int* idx) const {
     *idx = -1;
+    for (const auto& w : u)
+        if (unresolved.count(w)) return false;
     auto it = explicitLrs.find(u[0]);
-    if (it != explicitLrs.end()) { *idx = (int)it->second; return true; }
+    if (it != explicitLrs.end()) { *idx = it->second; return true; }
+    bool found = false;
     for (size_t k = 1; k < u.size(); ++k) {
         auto jt = explicitLrs.find(u[k]);
         if (jt == explicitLrs.end()) continue;
-        if (*idx >= 0 && *idx != (int)jt->second) return false;
-        *idx = (int)jt->second;
+        if (found && *idx != jt->second) return false;
+        *idx = jt->second;
+        found = true;
     }
-    if (*idx >= 0) return true;
-    if (defaults.size() > 1) return false;
-    if (defaults.size() == 1) { *idx = (int)defaults[0]; return true; }
+    if (found) return true;
+    if (unresolvedDefault || defaults.size() > 1) return false;
+    if (defaults.size() == 1) { *idx = defaults[0]; return true; }
+    for (const auto& w : u)
+        if (unresolvedLib.count(w)) return false;
     for (const std::map<std::wstring, int>* m : { &libExplicit, &libDefaultOf }) {
-        bool found = false;
         for (const auto& w : u) {
             auto jt = m->find(w);
             if (jt == m->end()) continue;
@@ -894,26 +881,11 @@ struct Assoc {
     }
 };
 
-// `affected`: exports that must not have a subobject associated from inside a
-// library (refused, not handled yet).
-bool BuildAssoc(const D3D12_STATE_OBJECT_DESC& in, const std::set<std::wstring>& affected,
-                Assoc* A, std::string* why) {
+bool BuildAssoc(const D3D12_STATE_OBJECT_DESC& in, Assoc* A, std::string* why) {
     const UINT n = in.NumSubobjects;
     const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
-    auto& explicitLrs = A->explicitLrs;
-    auto& defaults = A->defaults;
     A->refs.assign(n, 0);
-    auto& refs = A->refs;
     for (UINT i = 0; i < n; ++i) {
-        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION && s[i].pDesc) {
-            const auto* a = static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
-            for (UINT e = 0; e < a->NumExports; ++e)
-                if (affected.count(a->pExports[e])) {
-                    *why = "an extended export has a subobject associated from inside a "
-                           "library, which is not handled yet";
-                    return false;
-                }
-        }
         if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION || !s[i].pDesc)
             continue;
         const auto* a = static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
@@ -922,72 +894,126 @@ bool BuildAssoc(const D3D12_STATE_OBJECT_DESC& in, const std::set<std::wstring>&
             *why = "an association points outside the state object description";
             return false;
         }
-        ++refs[t];
+        ++A->refs[t];
         if (s[t].Type != D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE) continue;
-        if (!a->NumExports) defaults.push_back((UINT)t);
-        for (UINT e = 0; e < a->NumExports; ++e) explicitLrs[a->pExports[e]] = (UINT)t;
+        if (!a->NumExports) A->defaults.push_back((int)t);
+        for (UINT e = 0; e < a->NumExports; ++e) A->explicitLrs[a->pExports[e]] = (int)t;
     }
     for (UINT i = 0; i < n; ++i)
-        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE && !refs[i])
-            defaults.push_back(i);
-    std::sort(defaults.begin(), defaults.end());
-    defaults.erase(std::unique(defaults.begin(), defaults.end()), defaults.end());
+        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE && !A->refs[i])
+            A->defaults.push_back((int)i);
 
-    // Local root signatures the LIBRARIES declare. The D3D12 spec, "Subobject
-    // association behavior": an association declared directly in the state
-    // object, explicit OR default, overrides any association a directly
-    // included DXIL library makes for that export; a default declared inside
-    // a library (a signature nothing in the library associates, or an
-    // association with no exports) reaches that library's exports only.
-    // Keyed -2 - k in `extended` below.
-    auto& libLrs = A->libLrs;
-    auto& libExplicit = A->libExplicit;
-    auto& libDefaultOf = A->libDefaultOf;
-    auto& libSubs = A->libSubs;
-    auto keyOf = [&](const std::wstring& name, const std::vector<uint8_t>& blob) {
-        for (size_t k = 0; k < libLrs.size(); ++k)
-            if (libLrs[k].first == name) return -2 - (int)k;
-        libLrs.emplace_back(name, blob);
-        return -2 - (int)(libLrs.size() - 1);
-    };
+    // The libraries' subobjects, as included, by the names they are exported by.
+    struct Lib { const D3D12_DXIL_LIBRARY_DESC* ld; LibSubobjects so;
+                 std::vector<std::pair<std::wstring, const LibSubobjects::Sub*>> inc; };
+    std::deque<Lib> libs;
+    std::map<std::wstring, const LibSubobjects::Sub*> byName;
     for (UINT i = 0; i < n; ++i) {
         if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !s[i].pDesc) continue;
-        const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc);
-        LibSubobjects so;
-        if (!LibrarySubobjects(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength, &so) ||
-            so.all.empty())
-            continue;
-        std::set<std::wstring> associated;
-        std::vector<std::wstring> defaultsHere;
-        for (const auto& a : so.assoc) {
-            auto l = so.lrs.find(a.first);
-            if (l == so.lrs.end()) continue;
-            associated.insert(a.first);
-            if (a.second.empty()) { defaultsHere.push_back(a.first); continue; }
-            const int key = keyOf(a.first, l->second);
-            for (const auto& e : a.second) libExplicit[e] = key;
+        libs.emplace_back();
+        Lib& L = libs.back();
+        L.ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc);
+        if (!LibrarySubobjects(L.ld->DXILLibrary.pShaderBytecode, L.ld->DXILLibrary.BytecodeLength, &L.so))
+            L.so = LibSubobjects{};
+        L.inc = IncludedSubobjects(L.ld, L.so);
+        for (const auto& x : L.inc) {
+            auto it = byName.find(x.first);
+            if (it != byName.end() && (it->second->kind != x.second->kind || it->second->bytes != x.second->bytes)) {
+                *why = "two libraries declare different subobjects named " + Narrow(x.first);
+                return false;
+            }
+            byName[x.first] = x.second;
+            A->libKind[x.first] = x.second->kind;
         }
-        for (const auto& l : so.lrs)
-            if (!associated.count(l.first)) defaultsHere.push_back(l.first);
+    }
+    auto keyOf = [&](const std::wstring& name) {
+        if (AssocPoison() == 1 && !A->libLrs.empty()) return -2;
+        for (size_t k = 0; k < A->libLrs.size(); ++k)
+            if (A->libLrs[k].first == name) return -2 - (int)k;
+        A->libLrs.emplace_back(name, byName[name]->bytes);
+        return -2 - (int)(A->libLrs.size() - 1);
+    };
+
+    // The state object's associations of a library's subobject, by name.
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION || !s[i].pDesc)
+            continue;
+        const auto* a = static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
+        auto it = a->SubobjectToAssociate ? byName.find(a->SubobjectToAssociate) : byName.end();
+        if (it == byName.end()) {
+            if (!a->NumExports) A->unresolvedDefault = true;
+            for (UINT e = 0; e < a->NumExports; ++e) A->unresolved.insert(a->pExports[e]);
+            continue;
+        }
+        if (it->second->kind != 2) continue;
+        const int key = keyOf(it->first);
+        if (!a->NumExports) A->defaults.push_back(key);
+        for (UINT e = 0; e < a->NumExports; ++e) A->explicitLrs[a->pExports[e]] = key;
+    }
+    std::sort(A->defaults.begin(), A->defaults.end());
+    A->defaults.erase(std::unique(A->defaults.begin(), A->defaults.end()), A->defaults.end());
+
+    // Each library's own associations. A signature is that library's default
+    // when no association IN THAT LIBRARY names it, whatever other libraries
+    // do; a default reaches that library's exports only.
+    for (const Lib& L : libs) {
+        std::vector<std::wstring> mine;
+        for (const auto& f : Exported(L.ld)) mine.push_back(f.first);
+        for (const auto& x : L.inc)
+            if (x.second->kind == 11) mine.push_back(x.first);
+        std::set<std::wstring> named;
+        std::vector<int> defaultsHere;
+        bool unresolvedHere = false;
+        for (const auto& x : L.inc) {
+            if (x.second->kind != 8) continue;
+            const std::wstring& target = x.second->str[0];
+            named.insert(target);
+            auto it = byName.find(target);
+            if (it == byName.end()) {
+                if (x.second->exports.empty()) unresolvedHere = true;
+                for (const auto& e : x.second->exports) A->unresolvedLib.insert(e);
+                continue;
+            }
+            if (it->second->kind != 2) continue;
+            const int key = keyOf(target);
+            if (x.second->exports.empty()) { defaultsHere.push_back(key); continue; }
+            for (const auto& e : x.second->exports) {
+                auto jt = A->libExplicit.find(e);
+                if (jt != A->libExplicit.end() && jt->second != key) {
+                    *why = "two library associations give " + Narrow(e) + " different local root signatures";
+                    return false;
+                }
+                A->libExplicit[e] = key;
+            }
+        }
+        for (const auto& x : L.inc)
+            if (x.second->kind == 2 && !named.count(x.first)) defaultsHere.push_back(keyOf(x.first));
         std::sort(defaultsHere.begin(), defaultsHere.end());
         defaultsHere.erase(std::unique(defaultsHere.begin(), defaultsHere.end()), defaultsHere.end());
-        if (defaultsHere.size() > 1) {
-            *why = "a library declares two default local root signatures";
-            return false;
+        // Two defaults matter only to an export they would both reach: a
+        // library of signatures alone has none (measured valid on WARP).
+        for (const auto& e : mine) {
+            if (defaultsHere.size() == 1) A->libDefaultOf[e] = defaultsHere[0];
+            if (unresolvedHere || defaultsHere.size() > 1) A->unresolvedLib.insert(e);
         }
-        if (defaultsHere.size() == 1) {
-            const int key = keyOf(defaultsHere[0], so.lrs[defaultsHere[0]]);
-            for (const auto& f : Exported(ld)) libDefaultOf[f.first] = key;
-            if (!ld->NumExports)
-                for (const auto& x : so.all)
-                    if (x.kind == 11) libDefaultOf[x.name] = key;
-        }
-        libSubs[i] = std::move(so);
     }
-
     return true;
 }
 
+// Extends the local root signature of each unit (exports that must share one:
+// a hit group and its shaders, or a single raygen) with the geometry index
+// constant, or (`srvs` above 0) that many root descriptors for the shim, and
+// builds the new subobject array in `out`: libraries in `code` replaced (each
+// keeping its own subobjects, see AssembleLibrary), EXISTING_COLLECTIONs in
+// `colls` pointed at a replacement, the state object's associations to a
+// local root signature losing the extended exports (one left with none is
+// dropped rather than becoming a DEFAULT association, and a signature left
+// with no association is dropped rather than becoming a default one), and one
+// new signature plus association per original signature extended. A
+// library's own association of an extended export needs no change: one the
+// state object declares overrides it (the spec's exception for a directly
+// included library).
+// `offsets[u]` is the first added parameter's offset in unit u's records.
 bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
              const std::vector<std::vector<std::wstring>>& units,
              const std::map<UINT, const std::vector<uint8_t>*>& code,
@@ -999,10 +1025,9 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
     for (const auto& u : units) for (const auto& w : u) affected.insert(w);
 
     Assoc A;
-    if (!BuildAssoc(in, affected, &A, why)) return false;
+    if (!BuildAssoc(in, &A, why)) return false;
     auto& refs = A.refs;
     auto& libLrs = A.libLrs;
-    auto& libSubs = A.libSubs;
     auto lrsOf = [&](const std::vector<std::wstring>& u, int* idx) { return A.Of(u, idx); };
 
     // One extended signature per original (or per "none", keyed -1).
@@ -1059,6 +1084,20 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
         if (a->NumExports && filtered[i].empty()) keep[i] = 0;
         else ++refsAfter[t];
     }
+    // The state object's associations of a LIBRARY's local root signature,
+    // by name, lose the extended exports the same way.
+    std::vector<int> dxilLrs(n, 0);
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION || !s[i].pDesc)
+            continue;
+        const auto* a = static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
+        auto k = a->SubobjectToAssociate ? A.libKind.find(a->SubobjectToAssociate) : A.libKind.end();
+        if (k == A.libKind.end() || k->second != 2) continue;
+        dxilLrs[i] = 1;
+        for (UINT e = 0; e < a->NumExports; ++e)
+            if (!affected.count(a->pExports[e])) filtered[i].push_back(a->pExports[e]);
+        if (a->NumExports && filtered[i].empty()) keep[i] = 0;
+    }
     for (UINT i = 0; i < n; ++i)
         if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE && refs[i] && !refsAfter[i])
             keep[i] = 0;
@@ -1099,17 +1138,19 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
                 (uintptr_t)remap[a->pSubobjectToAssociate - s]);
             out->assoc.push_back(na);
             so.pDesc = &out->assoc.back();
+        } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION && dxilLrs[i]) {
+            const auto* a = static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(so.pDesc);
+            out->exportLists.push_back(filtered[i]);
+            out->names.push_back(a->SubobjectToAssociate);
+            D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION na{};
+            na.SubobjectToAssociate = out->names.back().c_str();
+            na.NumExports = (UINT)out->exportLists.back().size();
+            na.pExports = na.NumExports ? out->exportLists.back().data() : nullptr;
+            out->dxilAssoc.push_back(na);
+            so.pDesc = &out->dxilAssoc.back();
         }
         out->subs.push_back(so);
     }
-    // A library the shim rewrites loses the subobjects it declares, because a
-    // disassembly carries them only as comments. Each is declared again at
-    // state object scope, and its associations become explicit ones with the
-    // meaning the spec gives them: none where the state object associates
-    // that type itself, since that already overrode the library's; a
-    // library's default spelled out as that library's exports.
-    if (!CarryLibrarySubobjects(dev, in, code, libSubs, affected, out, why)) return false;
-
     for (auto& kv : extended) {
         out->sigs.push_back(kv.second.first);
         D3D12_LOCAL_ROOT_SIGNATURE l{ kv.second.first.Get() };
@@ -1400,7 +1441,8 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
         std::string lowered;
         if (!rq::LowerGeometryIndex(llm::Normalize(text), &lowered, &L.fns, why))
             return Outcome::kRefused;
-        if (!dxch::AssembleAndSign(lowered, &L.code, &err)) {
+        if (!AssembleLibrary(lowered, ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength,
+                             &L.code, &err)) {
             *why = "the rewritten library did not assemble: " + err;
             return Outcome::kRefused;
         }
@@ -1444,17 +1486,11 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
 
     // 2. The hit groups those functions serve, closed over shared shaders so
     //    that every shader of an extended group has the extended signature.
-    struct HG { UINT index; std::wstring name; std::vector<std::wstring> imports; };
+    //    Hit groups a library declares count too (0.58.0; until then their
+    //    records were left without the index, silently).
+    struct HG { std::wstring name; std::vector<std::wstring> imports; };
     std::vector<HG> groups;
-    for (UINT i = 0; i < n; ++i) {
-        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[i].pDesc) continue;
-        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[i].pDesc);
-        HG g{ i, h->HitGroupExport ? h->HitGroupExport : L"", {} };
-        for (LPCWSTR imp : { h->AnyHitShaderImport, h->ClosestHitShaderImport,
-                             h->IntersectionShaderImport })
-            if (imp && *imp) g.imports.push_back(imp);
-        groups.push_back(g);
-    }
+    for (const auto& h : HitGroupsOf(in)) groups.push_back({ h.name, h.Imports() });
     std::set<std::wstring> touched = readers;   // shaders whose groups extend
     std::vector<bool> ext(groups.size(), false);
     for (bool grew = true; grew;) {
@@ -1600,7 +1636,7 @@ void Gather(const D3D12_STATE_OBJECT_DESC& d, int depth, std::vector<Found>* out
     const D3D12_STATE_SUBOBJECT* s = d.pSubobjects;
     Assoc a;
     std::string aw;
-    const bool haveAssoc = BuildAssoc(d, {}, &a, &aw);
+    const bool haveAssoc = BuildAssoc(d, &a, &aw);
     auto signature = [&](const std::vector<std::wstring>& u, Found* f) {
         int idx = -1;
         if (!haveAssoc) { f->why = aw.empty() ? "the associations cannot be read" : aw; return; }
@@ -1650,18 +1686,14 @@ void Gather(const D3D12_STATE_OBJECT_DESC& d, int depth, std::vector<Found>* out
             }
         }
     }
-    for (UINT i = 0; i < n; ++i) {
-        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[i].pDesc) continue;
-        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[i].pDesc);
-        if (!h->HitGroupExport) continue;
+    for (const auto& h : HitGroupsOf(d)) {
         Found f;
-        f.name = h->HitGroupExport;
+        f.name = h.name;
         f.kind = 3;
-        std::vector<std::wstring> u{ h->HitGroupExport };
+        std::vector<std::wstring> u{ h.name };
         bool inLib = false;
         const Found* inColl = nullptr;
-        for (LPCWSTR imp : { h->ClosestHitShaderImport, h->AnyHitShaderImport, h->IntersectionShaderImport }) {
-            if (!imp) continue;
+        for (const auto& imp : h.Imports()) {
             u.push_back(imp);
             if (libNames.count(imp)) inLib = true;
             for (const auto& x : here)
@@ -2038,11 +2070,10 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
     std::vector<uint32_t> kinds;   // per unit, as Tracer::kind
     std::vector<std::pair<unsigned, unsigned>> upairs(pairs.begin(), pairs.end());
     bool any = false;
+    const std::vector<HitGroupDef> hitGroups = HitGroupsOf(d);
+    for (const auto& h : hitGroups) names->push_back(h.name);
     for (UINT i = 0; i < n; ++i) {
-        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP && s[i].pDesc) {
-            const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[i].pDesc);
-            if (h->HitGroupExport) names->push_back(h->HitGroupExport);
-        } else if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && s[i].pDesc) {
+        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && s[i].pDesc) {
             const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc);
             const auto fns = Exported(ld);
             if (GetEnvironmentVariableA("DXR_TIER11_GI_DEBUG", nullptr, 0)) {
@@ -2069,7 +2100,8 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                 return false;
             if (!calls) continue;
             codeStore.emplace_back();
-            if (!dxch::AssembleAndSign(lowered, &codeStore.back(), &err)) {
+            if (!AssembleLibrary(lowered, ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength,
+                                 &codeStore.back(), &err)) {
                 *why = "the variant library did not assemble: " + err;
                 return false;
             }
@@ -2084,16 +2116,10 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                     kinds.push_back(f.second);
                 } else if (f.second == 10 && tracingOther) {
                     bool grouped = false;
-                    for (UINT j = 0; j < n; ++j) {
-                        if (s[j].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[j].pDesc) continue;
-                        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[j].pDesc);
-                        if (!h->ClosestHitShaderImport || f.first != h->ClosestHitShaderImport ||
-                            !h->HitGroupExport)
-                            continue;
-                        std::vector<std::wstring> u{ h->HitGroupExport };
-                        for (LPCWSTR imp : { h->ClosestHitShaderImport, h->AnyHitShaderImport,
-                                             h->IntersectionShaderImport })
-                            if (imp) u.push_back(imp);
+                    for (const auto& h : hitGroups) {
+                        if (f.first != h.closestHit) continue;
+                        std::vector<std::wstring> u{ h.name };
+                        for (const auto& imp : h.Imports()) u.push_back(imp);
                         units.push_back(u);
                         kinds.push_back(3);
                         grouped = true;
@@ -2137,12 +2163,8 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                     // A closest-hit whose hit group this object defines: the
                     // group's records carry the address where the shader's do.
                     if (r.kind != 10) continue;
-                    for (UINT j = 0; j < n; ++j) {
-                        if (s[j].Type != D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP || !s[j].pDesc) continue;
-                        const auto* h = static_cast<const D3D12_HIT_GROUP_DESC*>(s[j].pDesc);
-                        if (h->ClosestHitShaderImport && w == h->ClosestHitShaderImport && h->HitGroupExport)
-                            tracers->push_back({ h->HitGroupExport, r.offset, 3 });
-                    }
+                    for (const auto& h : hitGroups)
+                        if (w == h.closestHit) tracers->push_back({ h.name, r.offset, 3 });
                 }
             }
             any = true;

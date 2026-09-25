@@ -49,7 +49,14 @@
 //
 // --libassoc declares the local root signatures and their associations IN
 // THE LIBRARY (HLSL LocalRootSignature and SubobjectToExportsAssociation)
-// instead of as state object subobjects. One state object only.
+// instead of as state object subobjects. Through collections, the library is
+// included with an EXPORT LIST, which then has to name those subobjects (the
+// runtime includes a library's subobject only when a list names it).
+// --libhg declares the hit groups in the library too. --libsplit declares
+// the signatures in a SECOND library, associated from the first.
+// --dxilassoc: the signatures in a second library, associated by the state
+// object by name (DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION); --dxildefault with
+// LrsRec as the state object's DEFAULT, so it reaches the raygen and miss.
 //
 // --gpuinst puts the instance descriptions in GPU memory, copied there on the
 // GPU, as Unreal writes them: the shim cannot read them before the dispatch.
@@ -126,7 +133,8 @@ static int g_mode = 0;
 static bool g_table = false;
 static int g_bindless = 0;   // 1 index in a root CBV, 2 in root constants
 static int g_indirect = 0;   // 1 arguments in upload memory, 2 in GPU memory
-static bool g_libassoc = false;
+// 0 none, 1 --libassoc, 2 --libhg, 3 --libsplit, 4 --dxilassoc, 5 --dxildefault
+static int g_libassoc = 0;
 static bool g_gpuinst = false, g_stale = false, g_deserialize = false;
 static int g_localScene = 0;   // 1 a root SRV in the raygen's record, 2 a descriptor table
 static bool g_gpuSbt = false;
@@ -166,11 +174,22 @@ RWStructuredBuffer<uint4> Out : register(u0);
 
 cbuffer Rec : register(b0, space1) { uint RecTag; };
 cbuffer Rec3 : register(b1, space1) { uint RecA; uint RecB; uint RecC; };
-#if LIBASSOC
+#if LIBASSOC == 1 || LIBASSOC == 2
 LocalRootSignature LrsRec = { "RootConstants(num32BitConstants=1, b0, space=1)" };
 LocalRootSignature LrsRec3 = { "RootConstants(num32BitConstants=3, b1, space=1)" };
+#endif
+#if LIBASSOC >= 1 && LIBASSOC <= 3
 SubobjectToExportsAssociation AssocRec = { "LrsRec", "HitGroup;HitGroupOther" };
 SubobjectToExportsAssociation AssocRec3 = { "LrsRec3", "HitGroup3" };
+#endif
+#if LIBASSOC == 2
+#if ANYHIT
+TriangleHitGroup HitGroup = { "AnyHit", "ClosestHit" };
+#else
+TriangleHitGroup HitGroup = { "", "ClosestHit" };
+#endif
+TriangleHitGroup HitGroup3 = { "", "ClosestHit3" };
+TriangleHitGroup HitGroupOther = { "", "ClosestHitOther" };
 #endif
 
 struct Pay {
@@ -269,7 +288,13 @@ void AnyHit(inout Pay p, BuiltInTriangleIntersectionAttributes a) {
 }
 )HLSL";
 
-static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
+// --libsplit, --dxilassoc: the local root signatures in a library of their own.
+static const char* kLrsLib = R"HLSL(
+LocalRootSignature LrsRec = { "RootConstants(num32BitConstants=1, b0, space=1)" };
+LocalRootSignature LrsRec3 = { "RootConstants(num32BitConstants=3, b1, space=1)" };
+)HLSL";
+
+static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit, const char* src = kLib) {
     if (g_dynArgs) R = M = -1;   // computed at run time, see kLib
     static HMODULE m = LoadLibraryW(L"dxcompiler.dll");
     if (!m) throw std::runtime_error("dxcompiler.dll not found");
@@ -284,14 +309,15 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
     const wchar_t* dd = g_dynArgs ? L"DYNARGS=1" : L"DYNARGS=0";
     std::wstring da = std::wstring(L"ANYHIT=") + (anyhit ? L"1" : L"0");
     const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
-    const wchar_t* dl = g_libassoc ? L"LIBASSOC=1" : L"LIBASSOC=0";
+    const std::wstring dls = L"LIBASSOC=" + std::to_wstring(g_libassoc);
+    const wchar_t* dl = dls.c_str();
     const wchar_t* ds = g_localScene ? L"LOCALSCENE=1" : L"LOCALSCENE=0";
     const wchar_t* dc = g_recurse ? L"RECURSE=1" : L"RECURSE=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
                                          L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc,
                                          L"-D", dd };
-    DxcBuffer buf{ kLib, std::strlen(kLib), DXC_CP_UTF8 };
+    DxcBuffer buf{ src, std::strlen(src), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
     HRESULT st = E_FAIL; res->GetStatus(&st);
@@ -671,10 +697,29 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     D3D12_RAYTRACING_PIPELINE_CONFIG pc{ g_recurse ? 2u : 1u };
     D3D12_GLOBAL_ROOT_SIGNATURE gsub{ grs.Get() };
     D3D12_LOCAL_ROOT_SIGNATURE lsub1{ lrs1.Get() }, lsub3{ lrs3.Get() };
+    // --libsplit, --dxilassoc: the signatures' own library.
+    ComPtr<IDxcBlob> lrsLib;
+    D3D12_DXIL_LIBRARY_DESC lrsd{};
+    if (g_libassoc >= 3) {
+        lrsLib = Compile(L.R, L.M, L.anyhit, kLrsLib);
+        lrsd.DXILLibrary = { lrsLib->GetBufferPointer(), lrsLib->GetBufferSize() };
+    }
+    // --dxilassoc, --dxildefault: the state object associates them by name.
+    const wchar_t* dx1[] = { L"HitGroup", L"HitGroupOther" };
+    const wchar_t* dx3[] = { L"HitGroup3", L"ClosestHit3" };
+    D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION da1{ L"LrsRec", g_libassoc == 5 ? 0u : 2u,
+                                                     g_libassoc == 5 ? nullptr : dx1 },
+                                                da3{ L"LrsRec3", g_libassoc == 5 ? 2u : 1u, dx3 };
     std::vector<D3D12_STATE_SUBOBJECT> sub;
     sub.reserve(16);
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libd });
-    for (auto& h : hg) sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &h });
+    if (g_libassoc >= 3) sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lrsd });
+    if (g_libassoc >= 4) {
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &da1 });
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &da3 });
+    }
+    if (g_libassoc != 2)
+        for (auto& h : hg) sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &h });
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
@@ -741,8 +786,28 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
             { L"CH_b", L"ClosestHit3", D3D12_EXPORT_FLAG_NONE },
             { L"CH_c", L"ClosestHitOther", D3D12_EXPORT_FLAG_NONE },
             { L"AH_a", L"AnyHit", D3D12_EXPORT_FLAG_NONE } };
+        std::vector<D3D12_EXPORT_DESC> hList(hExp, hExp + 4);
+        auto name = [](const wchar_t* w) { return D3D12_EXPORT_DESC{ w, nullptr, D3D12_EXPORT_FLAG_NONE }; };
+        if (g_libassoc == 2) {
+            // The library's hit groups import the shaders by their own
+            // names, and nothing follows a rename.
+            hList.clear();
+            for (const wchar_t* w : { L"ClosestHit", L"ClosestHit3", L"ClosestHitOther", L"AnyHit",
+                                      L"HitGroup", L"HitGroup3", L"HitGroupOther" })
+                hList.push_back(name(w));
+        }
+        // The subobjects the library declares are included only by name.
+        if (g_libassoc == 1 || g_libassoc == 2)
+            for (const wchar_t* w : { L"LrsRec", L"LrsRec3" }) hList.push_back(name(w));
+        if (g_libassoc >= 1 && g_libassoc <= 3)
+            for (const wchar_t* w : { L"AssocRec", L"AssocRec3" }) hList.push_back(name(w));
         D3D12_DXIL_LIBRARY_DESC hLib = libd;
-        hLib.NumExports = 4; hLib.pExports = hExp;
+        hLib.NumExports = (UINT)hList.size(); hLib.pExports = hList.data();
+        const wchar_t* cx1[] = { L"HitGroup", L"HitGroupOther" };
+        const wchar_t* cx3[] = { L"HitGroup3", L"CH_b" };
+        D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION ca1{ L"LrsRec", g_libassoc == 5 ? 0u : 2u,
+                                                         g_libassoc == 5 ? nullptr : cx1 },
+                                                    ca3{ L"LrsRec3", g_libassoc == 5 ? 2u : 1u, cx3 };
         D3D12_HIT_GROUP_DESC chg[3] = { hg[0], hg[1], hg[2] };
         chg[0].ClosestHitShaderImport = L"CH_a";
         chg[1].ClosestHitShaderImport = L"CH_b";
@@ -751,22 +816,32 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         std::vector<D3D12_STATE_SUBOBJECT> hs;
         hs.reserve(16);
         hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &hLib });
-        for (auto& h : chg) hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &h });
+        if (g_libassoc >= 3) hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lrsd });
+        if (g_libassoc >= 4) {
+            hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &ca1 });
+            hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &ca3 });
+        }
+        if (g_libassoc != 2)
+            for (auto& h : chg) hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &h });
         hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
         hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
         hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
-        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub1 });
-        const D3D12_STATE_SUBOBJECT* h1 = &hs.back();
-        hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub3 });
-        const D3D12_STATE_SUBOBJECT* h3 = &hs.back();
         // One association per SHADER, as Unreal does it: the hit groups' own
         // names are never listed.
         const wchar_t* e1[] = { L"CH_a" }; const wchar_t* e2[] = { L"CH_c" };
         const wchar_t* e3[] = { L"AH_a" }; const wchar_t* e4[] = { L"CH_b" };
-        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION x1{ h1, 1, e1 }, x2{ h1, 1, e2 }, x3{ h1, 1, e3 },
-                                               x4{ h3, 1, e4 };
-        for (auto* x : { &x1, &x2, &x3, &x4 })
-            hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, x });
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION x1{ nullptr, 1, e1 }, x2{ nullptr, 1, e2 },
+                                               x3{ nullptr, 1, e3 }, x4{ nullptr, 1, e4 };
+        if (!g_libassoc) {
+            hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub1 });
+            const D3D12_STATE_SUBOBJECT* h1 = &hs.back();
+            hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub3 });
+            const D3D12_STATE_SUBOBJECT* h3 = &hs.back();
+            x1.pSubobjectToAssociate = x2.pSubobjectToAssociate = x3.pSubobjectToAssociate = h1;
+            x4.pSubobjectToAssociate = h3;
+            for (auto* x : { &x1, &x2, &x3, &x4 })
+                hs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, x });
+        }
         D3D12_STATE_OBJECT_DESC hd{ D3D12_STATE_OBJECT_TYPE_COLLECTION, (UINT)hs.size(), hs.data() };
         ComPtr<ID3D12StateObject> hitColl;
         HR(g.dev->CreateStateObject(&hd, IID_PPV_ARGS(&hitColl)), "CreateStateObject(hit collection)");
@@ -886,7 +961,7 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     }
     // --localscene: the scene's argument in the raygen record, after the
     // identifier: its address, or the table's start (slot 1, so t0 is slot 3).
-    UINT64 rgBytes = idSz;
+    UINT64 rgBytes = g_libassoc == 5 && g_mode == 0 ? idSz + 4 : idSz;
     if (g_localScene) {
         uint64_t arg = tlas->GetGPUVirtualAddress();
         if (g_localScene == 2) arg = heap->GetGPUDescriptorHandleForHeapStart().ptr + inc;
@@ -918,8 +993,9 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     D3D12_DISPATCH_RAYS_DESC dr{};
     const auto base = tableAt;
     dr.RayGenerationShaderRecord = { base, rgBytes };
-    dr.MissShaderTable = hitScene ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, 64, 64 }
-                                  : D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, idSz, idSz };
+    dr.MissShaderTable = hitScene || (g_libassoc == 5 && g_mode == 0)
+                             ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, 64, 64 }
+                             : D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, idSz, idSz };
     dr.HitGroupTable = { base + offHit, stride * L.records, stride };
     dr.Width = W; dr.Height = kH; dr.Depth = 1;
     ComPtr<ID3D12CommandSignature> sig;   // alive until the list has run
@@ -977,7 +1053,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--bindlessrc")) g_bindless = 2, g_sm66 = true;
         else if (!std::strcmp(argv[i], "--indirect")) g_indirect = 1;
         else if (!std::strcmp(argv[i], "--indirectgpu")) g_indirect = 2;
-        else if (!std::strcmp(argv[i], "--libassoc")) g_libassoc = true;
+        else if (!std::strcmp(argv[i], "--libassoc")) g_libassoc = 1;
+        else if (!std::strcmp(argv[i], "--libhg")) g_libassoc = 2;
+        else if (!std::strcmp(argv[i], "--libsplit")) g_libassoc = 3;
+        else if (!std::strcmp(argv[i], "--dxilassoc")) g_libassoc = 4;
+        else if (!std::strcmp(argv[i], "--dxildefault")) g_libassoc = 5;
         else if (!std::strcmp(argv[i], "--gpuinst")) g_gpuinst = true;
         else if (!std::strcmp(argv[i], "--stale")) g_stale = g_gpuinst = true;
         else if (!std::strcmp(argv[i], "--deserialize")) g_deserialize = true;
@@ -999,14 +1079,6 @@ int main(int argc, char** argv) {
     }
     if (g_localScene && (g_table || g_bindless || g_libassoc)) {
         std::printf("--localscene binds the scene one way only\n");
-        return 2;
-    }
-    if (g_libassoc && g_mode != 0) {
-        // Collections include the library with an EXPORT LIST, and the spec
-        // does not say which of a library's own subobjects an export list
-        // includes, so the shim refuses that case by name.
-        std::printf("--libassoc is one state object only: see the shim's refusal for a library "
-                    "with its own subobjects and an export list\n");
         return 2;
     }
     ComPtr<IDXGIFactory6> fac;

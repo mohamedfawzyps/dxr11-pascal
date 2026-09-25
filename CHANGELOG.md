@@ -24,6 +24,58 @@ not.
 
 ---
 
+## 0.58.0
+
+**A library's own subobjects, whatever includes them** (Tier 1.1 item a, "a
+rewritten library with its own subobjects AND an export list" and "a library
+association to another library's subobject"). Both were refused by name.
+
+- **Measured first, because the spec does not say** (a probe of 35 cases,
+  identical on WARP and the 1070): with an export list, the runtime includes
+  a library's own subobject only when the list NAMES it, under the name the
+  list gives it; associations, their targets and hit group imports use names
+  as exported, and nothing follows a rename; a library's association may name
+  a signature declared in another library; a signature no association in its
+  own library names is that library's default, reaching that library's
+  exports only; the state object's associations, explicit or default, of its
+  own subobjects or of a library's by name, override a directly included
+  library's.
+- **The rewritten library keeps its own subobjects.** A disassembly carries
+  them only as comments, and 0.50.0 declared them again at state object
+  scope, which cannot follow an export list or an association into another
+  library. They are now written back into the library as the `!dx.subobjects`
+  metadata DXC reads them from (layouts per kind from DXC's
+  `DxilMDHelper::EmitSubobject`), so the runtime includes and associates them
+  exactly as it did the original's. The result's subobject table is checked
+  against the original's every time; a difference is a refusal.
+- **Which local root signature each export has is decided by those rules**,
+  for the signature the shim extends and for reading a record at a dispatch:
+  export lists, associations across libraries, and the state object's
+  `DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION` (refused before for an extended
+  export, and NOT READ AT ALL as a default, so such an export was judged
+  against the wrong signature; not measured on 0.57.0 in that form). The
+  state object's association of a library's signature
+  loses the extended exports, as its own associations already did. An
+  association of a subobject nothing here declares (a collection may leave
+  one to its pipeline) leaves the exports it reaches unknown, and those are
+  refused by name.
+- **Hit groups a library declares are hit groups.** Only the state object's
+  own were seen, so a library's group whose shader reads `GeometryIndex()`
+  had its shaders extended apart from the group, which the runtime rejects:
+  loud, not wrong.
+- **Two default signatures in one library** refused the whole state object;
+  a library holding only signatures has no export either reaches. Now only an
+  export both would reach is unknown.
+- **Measured:** `gitest` gains `--libhg` (hit groups in the library),
+  `--libsplit` (signatures in a second library), `--dxilassoc` and
+  `--dxildefault` (the state object associating a library's signatures by
+  name); `--libassoc` now runs through collections and AddToStateObject,
+  whose export lists name the subobjects. On 0.57.0 every one of these fails
+  `CreateStateObject` (the refusals above); now all match, and
+  `tools/run_gitest_matrix.ps1` is 334 of 334. Sensitivity:
+  `DXR_TIER11_ASSOC_POISON=1` (every library signature taken as the first)
+  and `=2` (a library's hit groups ignored) fail every such configuration.
+
 ## 0.57.0
 
 **`TraceRay` arguments computed at run time are served** (Tier 1.1 item a,

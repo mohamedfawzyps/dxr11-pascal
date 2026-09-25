@@ -79,6 +79,24 @@ $cfgs += ,@('--dynargs', '--localscene', '--gpusbt')
 $cfgs += ,@('--dynargs', '--recurse', '--localscene')
 $cfgs += ,@('--dynargs', '--recurse', '--bindless', '--warpglobal')
 $cfgs += ,@('--dynargs', '--perstruct', '4', '--norefine', '--indirectgpu')
+# A library's own subobjects (0.58.0): signatures and associations in the
+# library, included through an export list by collections; hit groups there
+# too; signatures in a second library; associated by the state object by
+# name, explicitly or as its default.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($m in @('--libassoc', '--libhg', '--libsplit', '--dxilassoc', '--dxildefault')) {
+        if (-not $b -and $m -eq '--libassoc') { continue }   # above
+        foreach ($s in @('', '--sm66')) { $cfgs += ,@(@($b, $m, $s) | Where-Object { $_ }) }
+    }
+}
+$cfgs += ,@('--libhg', '--recurse')
+$cfgs += ,@('--collections', '--libhg', '--recurse')
+$cfgs += ,@('--dxildefault', '--recurse')
+$cfgs += ,@('--libsplit', '--indirectgpu')
+$cfgs += ,@('--dxilassoc', '--stale')
+$cfgs += ,@('--dxildefault', '--gpuinst')
+$cfgs += ,@('--libhg', '--dynargs')
+$cfgs += ,@('--collections', '--dxildefault', '--dynargs')
 
 # A failure keeps its output and the shim's log, so an intermittent one can
 # be read afterwards rather than rerun in hope.

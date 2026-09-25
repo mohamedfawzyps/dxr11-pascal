@@ -153,6 +153,19 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.58.0: A LIBRARY'S OWN SUBOBJECTS, WHATEVER INCLUDES THEM.** The runtime's
+rules were MEASURED (35 cases, WARP and the 1070 alike): an export list
+includes a library's subobject only when it names it; associations use names
+as exported and follow no rename; a library's association may name another
+library's signature. The rewritten library now keeps its subobjects as
+`!dx.subobjects` metadata (checked against the original's), and the shim's
+own model of which signature each export has follows those rules, including
+the state object's `DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION`, which as a
+default it had never read. Hit groups a library declares now count.
+`gitest --libhg`, `--libsplit`, `--dxilassoc`, `--dxildefault`; matrix
+334 of 334. Remaining for item a: the variant with several scenes (one copy
+only).
+
 **0.57.0: TRACERAY ARGUMENTS COMPUTED AT RUN TIME.** Each call's R and M
 are followed back through the shader (`proxy/trace_args`) to literals,
 cbuffer dwords and unknowns, evaluated per dispatch with the constants read;
