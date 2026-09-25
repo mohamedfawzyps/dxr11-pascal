@@ -173,6 +173,12 @@ std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& tr
 void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                    const D3D12_RAYTRACING_INSTANCE_DESC* descs, UINT count);
 
+// A top-level build with NO instances: known without reading anything, every
+// ray misses. Until 0.52.2 such a build was never read, so a dispatch on it
+// was refused and drew nothing, where it should have drawn all misses (the
+// first frame of Escher's open world).
+void NoteEmpty(D3D12_GPU_VIRTUAL_ADDRESS tlas);
+
 // Exactly the instance descriptions the LATEST build of this structure used,
 // when they were CPU-visible; false otherwise. So a copy of the scene can be
 // built after the fact, for a pipeline created after its structure. Every

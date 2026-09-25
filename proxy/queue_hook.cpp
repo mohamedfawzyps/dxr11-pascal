@@ -80,11 +80,19 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
     // A split recording cannot go out as one submission: the dispatch in the
     // middle can only be recorded once the GPU has produced its dimensions.
     // Submit each list in turn so ordering is preserved exactly.
+    //
+    // Each list's instance reads are stamped as soon as it is submitted, not
+    // after the whole call: a split later in the same call reads the
+    // instances of a build an earlier list recorded (astrack::BringToBuild),
+    // and an unstamped read cannot be known to have run. Until 0.52.2 that
+    // dispatch was refused.
     for (UINT i = 0; i < NumCommandLists; ++i) {
         Dxr11CommandList* w = Dxr11CommandList::From(ppCommandLists[i]);
-        if (w && w->IsSplit() && w->SubmitSegmented(self, g_original)) continue;
-        ID3D12CommandList* one[] = { out[i] };
-        g_original(self, 1, one);
+        if (!(w && w->IsSplit() && w->SubmitSegmented(self, g_original))) {
+            ID3D12CommandList* one[] = { out[i] };
+            g_original(self, 1, one);
+        }
+        astrack::AfterSubmit(self, &ppCommandLists[i], 1);
     }
     astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
     gpuhold::AfterSubmit(self, ppCommandLists, NumCommandLists);

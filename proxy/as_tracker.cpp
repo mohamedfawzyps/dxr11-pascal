@@ -393,6 +393,15 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     g_snapshots[tlas].assign(descs, descs + count);
 }
 
+void NoteEmpty(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
+    if (!tlas) return;
+    std::lock_guard<std::mutex> g(g_lock);
+    ParseLocked(tlas, nullptr, 0);
+    auto b = g_lastBuilt.find(tlas);
+    if (b != g_lastBuilt.end()) g_readOf[tlas] = b->second;
+    g_snapshots[tlas].clear();
+}
+
 bool InstanceSnapshot(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                       std::vector<D3D12_RAYTRACING_INSTANCE_DESC>* out) {
     std::lock_guard<std::mutex> g(g_lock);

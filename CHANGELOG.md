@@ -24,6 +24,35 @@ not.
 
 ---
 
+## 0.52.2
+
+**IN THE GAME at 0.52.1 (2026-09-25, 2 min 21 s, debug layer forced on):**
+clean end marker, 1680 lowered dispatches drawn (all indirect), every scene
+resolved, and the two debug layer errors 0.52.1 fixed are gone (only
+Unreal's 24 native 16-bit shaders remain). ONE dispatch refused at submit,
+and it found two gaps, both fixed here:
+
+- **An EMPTY scene was never read, so a dispatch on it drew nothing.** The
+  first frame of Escher's open world builds its top-level structure with 0
+  instances, which has nothing to copy and so no read; the dispatch was
+  refused. The right answer needs no read: every ray misses. Such a build is
+  now known at once (`astrack::NoteEmpty`). This was so with CPU-visible
+  instances too, and was the one "scene not read yet" refusal of every
+  Escher run since 0.49.0. **WARP crashes tracing an empty scene** (divide
+  by zero, RayQuery and TraceRay alike), so the check is the definition:
+  `raytest --empty` (new) with `--prefill`, on the 1070, must give 0 hits.
+  0.52.1 gave 49154, the prefill left behind; 0.52.2 gives 0.
+- **A build in one list and the dispatch in another, submitted in ONE
+  ExecuteCommandLists call.** The build list's read was stamped only after
+  the whole call, so at the dispatch's split it could not be known to have
+  run, and the dispatch was refused. Each list's reads are stamped as it is
+  submitted now. `raytest --sameecl` (new) records the in-place rebuild into
+  a second list submitted with the dispatch: 9248 mismatches on 0.52.1,
+  direct and indirect, a match on 0.52.2. Not hit in Escher.
+- Suite cases `sameecl` and `sameeclind`, and a gate for the empty scene
+  with both kinds of instances: 43 of 43 and every gate. gitest 46 of 46;
+  the Phase 4 probe matches in every mode.
+
 ## 0.52.1
 
 Two D3D12 debug layer errors the shim caused, found in an Escher run

@@ -253,6 +253,13 @@ $cases = @(
        desc = 'GPU-written instances, twelve layouts in one list' },
     @{ name = 'indirectgpuinst'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--rebuild', '--indirect', '--gpuinst');
        desc = 'GPU-written instances, rebuilt in place, indirect dispatch' },
+    # The rebuild recorded in ANOTHER list, submitted in the same
+    # ExecuteCommandLists call just before the dispatch's: until 0.52.2 its
+    # read was stamped only after the whole call, and the dispatch was refused.
+    @{ name = 'sameecl'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--rebuild', '--sameecl', '--gpuinst');
+       desc = 'rebuild in another list of the same submission, GPU-written instances' },
+    @{ name = 'sameeclind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--rebuild', '--sameecl', '--gpuinst', '--indirect');
+       desc = 'the same, indirect dispatch' },
     # A second LIVE top-level structure whose layout conflicts with the real
     # one. Judged over every live structure this is refused; the shim has to
     # resolve the scene the dispatch traces (0.49.0). And the same with the
@@ -365,6 +372,25 @@ if ($diff -match 'RESULT: DIVERGE') {
 } else {
     Write-Host '  NOT SENSITIVE: preload matched with different prefilled values'
     $failed++
+}
+
+Write-Host ''
+Write-Host '=== an EMPTY scene draws all misses ==='
+# A top-level structure with no instances, as Unreal's is on the first frame
+# of a level. WARP crashes tracing one (divide by zero, RayQuery and TraceRay
+# alike), so the oracle is the definition: every ray misses. The output is
+# prefilled, so a dispatch that is not drawn leaves the pattern's hits
+# behind; until 0.52.2 it was refused and left 49154.
+foreach ($m in @(@('--gpuinst'), @())) {
+    $out = & .\raytest.exe hw rayquery alpha dp_empty.bin --cs phase5\cases\rayquery_geom.hlsl --geom --contrib --empty --prefill 7 @m 2>&1
+    Remove-Item dp_empty.bin -ErrorAction SilentlyContinue
+    $what = if ($m.Count) { 'GPU-written instances' } else { 'CPU-visible instances' }
+    if ($out -match '65536 rays, 0 hits') {
+        Write-Host "  $what : drawn, every ray missed"
+    } else {
+        Write-Host "  $what : NOT DRAWN or wrong: $(($out | Select-String 'rays,').Line)"
+        $failed++
+    }
 }
 
 Write-Host ''

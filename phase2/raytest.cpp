@@ -369,6 +369,14 @@ static bool g_geom = false;
 // them. The shim cannot read those at record time: it reads them back, a
 // submission late. With --rebuild that makes what it read the OLDER build.
 static bool g_gpuinst = false;
+// --empty, with --geom: the top-level structure holds NO instances, as
+// Unreal's does on the first frame of a level. Every ray misses. Use with
+// --prefill so a dispatch that is not drawn cannot pass for one that missed.
+static bool g_empty = false;
+// --sameecl, with --rebuild: the in-place rebuild is recorded into a SECOND
+// command list, submitted in the same ExecuteCommandLists call as the
+// dispatch, just before it. Engines submit many lists at once.
+static bool g_sameEcl = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
@@ -568,10 +576,35 @@ struct Gpu {
         evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     }
     // Close, execute, wait for completion, then reset for the next batch.
+    // --sameecl: a second list, opened on demand and submitted just before
+    // `list` in the same ExecuteCommandLists call.
+    ComPtr<ID3D12CommandAllocator> preAlloc;
+    ComPtr<ID3D12GraphicsCommandList4> pre;
+    bool preOpen = false;
+    ID3D12GraphicsCommandList4* Pre() {
+        if (!pre) {
+            HR(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&preAlloc)), "CreateCommandAllocator pre");
+            HR(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, preAlloc.Get(),
+                nullptr, IID_PPV_ARGS(&pre)), "CreateCommandList pre");
+        } else if (!preOpen) {
+            HR(preAlloc->Reset(), "pre allocator Reset");
+            HR(pre->Reset(preAlloc.Get(), nullptr), "pre Reset");
+        }
+        preOpen = true;
+        return pre.Get();
+    }
     void flush() {
         HR(list->Close(), "cmdlist Close");
-        ID3D12CommandList* lists[] = { list.Get() };
-        queue->ExecuteCommandLists(1, lists);
+        if (preOpen) {
+            HR(pre->Close(), "pre Close");
+            ID3D12CommandList* both[] = { pre.Get(), list.Get() };
+            queue->ExecuteCommandLists(2, both);
+            preOpen = false;
+        } else {
+            ID3D12CommandList* lists[] = { list.Get() };
+            queue->ExecuteCommandLists(1, lists);
+        }
         HR(queue->Signal(fence.Get(), ++fenceVal), "queue Signal");
         if (fence->GetCompletedValue() < fenceVal) {
             HR(fence->SetEventOnCompletion(fenceVal, evt), "SetEventOnCompletion");
@@ -818,7 +851,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-    ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    ti.NumDescs = g_empty ? 0 : 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
     if (g_churn || g_move || g_decoy || g_bindless || g_rebuild) { s.inst = instBuf; s.instCount = 1; }
     return s;
@@ -900,6 +933,14 @@ static void RebuildTlasInPlace(Gpu& g, Scene& s) {
     desc.Inputs = ti;
     desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     desc.DestAccelerationStructureData = s.tlas->GetGPUVirtualAddress();
+    if (g_sameEcl) {
+        // Left open; the next flush submits it together with the dispatch.
+        ID3D12GraphicsCommandList4* pre = g.Pre();
+        RecordBuild(g.device.Get(), pre, desc);
+        UavBarrier(pre, s.tlas.Get());
+        g_gpuInstCopies.push_back(scratch);   // alive until that submission
+        return;
+    }
     RecordBuild(g.device.Get(), g.list.Get(), desc);
     UavBarrier(g.list.Get(), s.tlas.Get());
     g.flush();
@@ -1949,6 +1990,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--geom") == 0) {
                 g_geom = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--empty") == 0 || std::strcmp(argv[i], "--sameecl") == 0) {
+                (argv[i][2] == 'e' ? g_empty : g_sameEcl) = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

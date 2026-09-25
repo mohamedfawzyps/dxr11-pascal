@@ -153,6 +153,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.52.1 IN THE GAME (2026-09-25, 2 min 21 s, debug layer on):** clean,
+1680 lowered dispatches drawn, the shim's debug layer errors gone, ONE
+refused: the open world's first frame builds its scene with 0 instances,
+which was never "read". 0.52.2 treats an empty build as known (every ray
+misses) and stamps each list's reads as it is submitted, for a build and a
+dispatch in two lists of one submission. **WARP crashes on an empty scene;
+there the oracle is the definition, checked with a prefilled output.**
+Note: the 0.52.0 "run" before it was still 0.49.0, the DLL never copied;
+the shim's version on the log's start line is now checked before anything
+else is read.
+
 **0.52.0: THE RAYQUERY PATH DREW FROM AN OLDER BUILD'S TABLE AFTER THE SCENE
 CHANGED, SILENTLY; FIXED.** Measured with the new `raytest --gpuinst`
 (instances written on the GPU, as Unreal does): `--geom --contrib --rebuild

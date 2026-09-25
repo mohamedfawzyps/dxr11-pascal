@@ -894,7 +894,11 @@ void Dxr11CommandList::CaptureInstances(
     const auto& in = desc->Inputs;
     // Whatever the previous build of this structure was, it is not this one.
     astrack::DropSnapshot(desc->DestAccelerationStructureData);
-    if (!in.NumDescs || !in.InstanceDescs) return;
+    if (!in.NumDescs) {
+        astrack::NoteEmpty(desc->DestAccelerationStructureData);
+        return;
+    }
+    if (!in.InstanceDescs) return;
 
     if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY) {
         static LONG once = 0;
