@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.47.0: THE SCENE A DISPATCH TRACES IS RESOLVED THROUGH DESCRIPTOR TABLES
+(item a, part 2 of the list).** Each TraceRay's register is read off the
+disassembly, descriptor writes and copies are followed (`proxy/scene_bind`),
+and the register is resolved through the bound global root signature to the
+structure. `gitest.exe --table`: 7 of 7 bit-exact in all modes at 6.5 and
+6.6 with a conflicting second scene live; one slot off diverges. Remaining
+for item a: a scene through a heap index (bindless) or a local root
+signature, TraceRay in a closest-hit or miss, runtime TraceRay arguments,
+indirect DispatchRays, the first dispatch before a GPU-built scene's copy
+exists, associations from inside a library. **CPU descriptor handles are not
+addresses on NVIDIA: small encoded numbers, interleaved between heaps. Never
+reason about descriptors by byte range, only by exact handle (start + slot *
+increment).** WARP gives real pointers, so only the hardware run shows it.
+
 **0.46.0: `GeometryIndex()` WITH RECORDS SHARED BY SEVERAL GEOMETRIES (item a,
 part 1 of the list).** The shim's own record layout: a VARIANT pipeline whose
 TraceRay calls trace the shim's copy of the scene with (pair index, pair

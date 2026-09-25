@@ -25,6 +25,7 @@
 #include "config.h"
 #include "rewriter/dxc_host.h"
 #include "geom_index_so.h"
+#include "scene_bind.h"
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
@@ -588,7 +589,20 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature
     }
     return hr;
 }
-HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) { FWD(CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap)); }
+// The descriptor writes are followed for scene_bind: which descriptors hold a
+// top-level structure, so GeometryIndex() can tell which scene a dispatch
+// traces when it arrives through a descriptor table.
+HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) {
+    const HRESULT hr = m_real->CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap);
+    if (SUCCEEDED(hr) && ppvHeap && *ppvHeap) {
+        ID3D12DescriptorHeap* h = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppvHeap)->QueryInterface(IID_PPV_ARGS(&h))) && h) {
+            scenebind::NoteHeap(m_real, h);
+            h->Release();
+        }
+    }
+    return hr;
+}
 UINT STDMETHODCALLTYPE Dxr11Device::GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) { FWD(GetDescriptorHandleIncrementSize(DescriptorHeapType)); }
 // Remembers the blob when shader dumping is on, so a lowered library can be
 // replayed offline against the root signature it was actually built with.
@@ -608,14 +622,14 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateRootSignature(UINT nodeMask, const 
     }
     return hr;
 }
-void STDMETHODCALLTYPE Dxr11Device::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateConstantBufferView(pDesc, DestDescriptor)); }
-void STDMETHODCALLTYPE Dxr11Device::CreateShaderResourceView(ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateShaderResourceView(pResource, pDesc, DestDescriptor)); }
-void STDMETHODCALLTYPE Dxr11Device::CreateUnorderedAccessView(ID3D12Resource* pResource, ID3D12Resource* pCounterResource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor)); }
+void STDMETHODCALLTYPE Dxr11Device::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { scenebind::NoteOverwrite(DestDescriptor); FWD(CreateConstantBufferView(pDesc, DestDescriptor)); }
+void STDMETHODCALLTYPE Dxr11Device::CreateShaderResourceView(ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { scenebind::NoteSrv(DestDescriptor, pDesc); FWD(CreateShaderResourceView(pResource, pDesc, DestDescriptor)); }
+void STDMETHODCALLTYPE Dxr11Device::CreateUnorderedAccessView(ID3D12Resource* pResource, ID3D12Resource* pCounterResource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { scenebind::NoteOverwrite(DestDescriptor); FWD(CreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor)); }
 void STDMETHODCALLTYPE Dxr11Device::CreateRenderTargetView(ID3D12Resource* pResource, const D3D12_RENDER_TARGET_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateRenderTargetView(pResource, pDesc, DestDescriptor)); }
 void STDMETHODCALLTYPE Dxr11Device::CreateDepthStencilView(ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateDepthStencilView(pResource, pDesc, DestDescriptor)); }
 void STDMETHODCALLTYPE Dxr11Device::CreateSampler(const D3D12_SAMPLER_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) { FWD(CreateSampler(pDesc, DestDescriptor)); }
-void STDMETHODCALLTYPE Dxr11Device::CopyDescriptors(UINT NumDestDescriptorRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts, const UINT* pDestDescriptorRangeSizes, UINT NumSrcDescriptorRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts, const UINT* pSrcDescriptorRangeSizes, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) { FWD(CopyDescriptors(NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes, NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes, DescriptorHeapsType)); }
-void STDMETHODCALLTYPE Dxr11Device::CopyDescriptorsSimple(UINT NumDescriptors, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart, D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) { FWD(CopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart, DescriptorHeapsType)); }
+void STDMETHODCALLTYPE Dxr11Device::CopyDescriptors(UINT NumDestDescriptorRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts, const UINT* pDestDescriptorRangeSizes, UINT NumSrcDescriptorRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts, const UINT* pSrcDescriptorRangeSizes, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) { scenebind::NoteCopy(m_real, NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes, NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes, DescriptorHeapsType); FWD(CopyDescriptors(NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes, NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes, DescriptorHeapsType)); }
+void STDMETHODCALLTYPE Dxr11Device::CopyDescriptorsSimple(UINT NumDescriptors, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart, D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) { const UINT n = NumDescriptors; scenebind::NoteCopy(m_real, 1, &DestDescriptorRangeStart, &n, 1, &SrcDescriptorRangeStart, &n, DescriptorHeapsType); FWD(CopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart, DescriptorHeapsType)); }
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Dxr11Device::GetResourceAllocationInfo(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) { FWD(GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs)); }
 D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE Dxr11Device::GetCustomHeapProperties(UINT nodeMask, D3D12_HEAP_TYPE heapType) { FWD(GetCustomHeapProperties(nodeMask, heapType)); }
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateCommittedResource(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) {
@@ -1069,6 +1083,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreatePlacedResource1(ID3D12Heap *pHeap, 
 
 void STDMETHODCALLTYPE Dxr11Device::CreateSamplerFeedbackUnorderedAccessView(ID3D12Resource *pTargetedResource, ID3D12Resource *pFeedbackResource, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!m_real8) return;
+    scenebind::NoteOverwrite(DestDescriptor);
     return m_real8->CreateSamplerFeedbackUnorderedAccessView(pTargetedResource, pFeedbackResource, DestDescriptor);
 }
 
@@ -1167,16 +1182,19 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::UnregisterTrimNotificationCallback(DWORD 
 
 HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateShaderResourceView(ID3D12Resource *pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!m_real15) return E_NOINTERFACE;
+    scenebind::NoteSrv(DestDescriptor, pDesc);
     return m_real15->TryCreateShaderResourceView(pResource, pDesc, DestDescriptor);
 }
 
 HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateUnorderedAccessView(ID3D12Resource *pResource, ID3D12Resource *pCounterResource, const D3D12_UNORDERED_ACCESS_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!m_real15) return E_NOINTERFACE;
+    scenebind::NoteOverwrite(DestDescriptor);
     return m_real15->TryCreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor);
 }
 
 HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!m_real15) return E_NOINTERFACE;
+    scenebind::NoteOverwrite(DestDescriptor);
     return m_real15->TryCreateConstantBufferView(pDesc, DestDescriptor);
 }
 
@@ -1197,6 +1215,7 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateDepthStencilView(ID3D12Resource 
 
 HRESULT STDMETHODCALLTYPE Dxr11Device::TryCreateSamplerFeedbackUnorderedAccessView(ID3D12Resource *pTargetedResource, ID3D12Resource *pFeedbackResource, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!m_real15) return E_NOINTERFACE;
+    scenebind::NoteOverwrite(DestDescriptor);
     return m_real15->TryCreateSamplerFeedbackUnorderedAccessView(pTargetedResource, pFeedbackResource, DestDescriptor);
 }
 

@@ -619,12 +619,12 @@ std::vector<RecordConstants> RecordConstantsTable() {
 
 std::vector<int32_t> GeometryLabels(const std::vector<std::pair<UINT, UINT>>& traceArgs,
                                     UINT records,
-                                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound,
+                                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& bound, bool exact,
                                     bool* read) {
     std::lock_guard<std::mutex> g(g_lock);
     std::vector<int32_t> out(records, -1);
     *read = false;
-    bool anyBound = false;
+    bool anyBound = exact;
     for (auto a : bound) {
         auto it = g_tlas.find(a);
         if (it != g_tlas.end() && it->second.valid) anyBound = true;

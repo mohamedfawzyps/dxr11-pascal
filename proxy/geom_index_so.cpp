@@ -6,6 +6,7 @@
 #include "geom_table_cs.h"
 #include "gpu_hold.h"
 #include "proxy_log.h"
+#include "scene_bind.h"
 #include "shim_scene.h"
 #include "shim_table_cs.h"
 #include "state_object_cache.h"
@@ -37,8 +38,113 @@ std::string Narrow(const std::wstring& s) {
     return r;
 }
 
-// The TraceRay arguments of one disassembled library.
+// A global's name from where it starts at `at` ('@'): quoted or plain.
+std::string GlobalAt(const std::string& l, size_t at) {
+    if (at == std::string::npos) return {};
+    if (at + 1 < l.size() && l[at + 1] == '"') {
+        const size_t e = l.find('"', at + 2);
+        return e == std::string::npos ? std::string() : l.substr(at, e + 1 - at);
+    }
+    size_t e = at + 1;
+    while (e < l.size() && (isalnum((unsigned char)l[e]) || l[e] == '_' || l[e] == '.' || l[e] == '$'))
+        ++e;
+    return l.substr(at, e - at);
+}
+
+void AddScene(Info* info, const Info::SceneReg& r) {
+    for (const auto& x : info->scenes)
+        if (x.space == r.space && x.lower == r.lower && x.count == r.count) return;
+    info->scenes.push_back(r);
+}
+
+// The scene register of every TraceRay in one disassembled library: its
+// handle traced back through annotateHandle and createHandleForLib to the
+// load of a resource global, maybe through a getelementptr into an array,
+// and that global's record in !dx.resources. Shapes read off DXC at lib_6_5
+// and lib_6_6. Anything else, a descriptor heap index above all, is unknown.
+void SceneRegs(const std::string& text, Info* info) {
+    struct Rec { UINT space; UINT lower; int size; };
+    std::map<std::string, Rec> recs;
+    static const std::regex kFields(R"RX(, !"[^"]*", i32 (-?\d+), i32 (-?\d+), i32 (-?\d+), i32 16,)RX");
+    static const std::regex kTrace(R"RX(@dx\.op\.traceRay\.[^(]+\(i32 157, %[^ ]+ (%[^,]+),)RX");
+    static const std::regex kOperand(R"RX(\(i32 \d+, %[^ ]+ (%[^,)]+))RX");
+    static const std::regex kConstElem(R"RX(i32 (\d+)\), align)RX");
+    static const std::regex kPtrOperand(R"RX(\* (%[^,]+), align)RX");
+    static const std::regex kLastIndex(R"RX(, i32 ([^,]+)$)RX");
+    std::vector<std::string> lines;
+    for (size_t at = 0; at < text.size();) {
+        size_t e = text.find('\n', at);
+        if (e == std::string::npos) e = text.size();
+        std::string l = text.substr(at, e - at);
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        lines.push_back(std::move(l));
+        at = e + 1;
+    }
+    std::smatch m;
+    for (const auto& l : lines)
+        if (l.rfind("!", 0) == 0 && l.find("RaytracingAccelerationStructure") != std::string::npos &&
+            std::regex_search(l, m, kFields)) {
+            const std::string g = GlobalAt(l, l.find('@'));
+            if (!g.empty())
+                recs[g] = { (UINT)std::stol(m[1].str()), (UINT)std::stol(m[2].str()),
+                            (int)std::stol(m[3].str()) };
+        }
+    std::map<std::string, const std::string*> defs;
+    for (const auto& l : lines) {
+        if (l.rfind("define ", 0) == 0) { defs.clear(); continue; }
+        const size_t eq = l.find(" = ");
+        if (l.rfind("  %", 0) == 0 && eq != std::string::npos) defs[l.substr(2, eq - 2)] = &l;
+        if (l.find("@dx.op.traceRay.") == std::string::npos || !std::regex_search(l, m, kTrace))
+            continue;
+        std::string v = m[1].str();
+        bool done = false;
+        for (int step = 0; step < 8 && !done; ++step) {
+            auto it = defs.find(v);
+            if (it == defs.end()) break;
+            const std::string& d = *it->second;
+            if (d.find("@dx.op.annotateHandle(") != std::string::npos ||
+                d.find("@dx.op.createHandleForLib") != std::string::npos) {
+                if (!std::regex_search(d, m, kOperand)) break;
+                v = m[1].str();
+                continue;
+            }
+            if (d.find("= load ") == std::string::npos) break;
+            // The global, and the element when it is an array.
+            std::string g, elem;
+            bool dynamic = false;
+            if (d.find('@') != std::string::npos) {
+                g = GlobalAt(d, d.find('@'));
+                if (d.find("getelementptr") != std::string::npos && std::regex_search(d, m, kConstElem))
+                    elem = m[1].str();
+            } else if (std::regex_search(d, m, kPtrOperand)) {
+                auto gi = defs.find(m[1].str());
+                if (gi == defs.end() || gi->second->find("getelementptr") == std::string::npos) break;
+                const std::string& gep = *gi->second;
+                g = GlobalAt(gep, gep.find('@'));
+                if (!std::regex_search(gep, m, kLastIndex)) break;
+                elem = m[1].str();
+                dynamic = elem.empty() || !isdigit((unsigned char)elem[0]);
+            }
+            auto r = recs.find(g);
+            if (r == recs.end()) break;
+            Info::SceneReg sr;
+            sr.space = r->second.space;
+            if (dynamic) {
+                sr.lower = r->second.lower;
+                sr.count = r->second.size > 0 ? (UINT)r->second.size : 0;
+            } else {
+                sr.lower = r->second.lower + (elem.empty() ? 0u : (UINT)std::stoul(elem));
+            }
+            AddScene(info, sr);
+            done = true;
+        }
+        if (!done) info->sceneUnknown = true;
+    }
+}
+
+// The TraceRay arguments of one disassembled library, and their scenes.
 void TraceArgs(const std::string& text, Info* info) {
+    SceneRegs(text, info);
     // call void @dx.op.traceRay.T(i32 157, handle, flags, mask, R, M, miss, ...)
     static const std::regex kTrace(
         R"RX(@dx\.op\.traceRay\.[^(]+\(i32 157, [^,]+, [^,]+, [^,]+, i32 ([^,]+), i32 ([^,]+),)RX");
@@ -157,7 +263,7 @@ void LibraryTraceArgs(const D3D12_DXIL_LIBRARY_DESC* ld, UINT recursion, Info* i
                           &err))
         TraceArgs(text, info);
     else
-        info->dynamicTraceArgs = true;
+        info->dynamicTraceArgs = info->sceneUnknown = true;
 }
 
 // What the collections this object links already know: their TraceRay
@@ -174,6 +280,8 @@ void MergeCollections(const D3D12_STATE_OBJECT_DESC& in, Info* info) {
             if (std::find(info->traceArgs.begin(), info->traceArgs.end(), p) == info->traceArgs.end())
                 info->traceArgs.push_back(p);
         info->dynamicTraceArgs = info->dynamicTraceArgs || ci->dynamicTraceArgs;
+        info->sceneUnknown = info->sceneUnknown || ci->sceneUnknown;
+        for (const auto& r : ci->scenes) AddScene(info, r);
         for (const auto& g : ci->groups) {
             std::vector<std::wstring> as;
             if (!c->NumExports) as.push_back(g.name);
@@ -484,6 +592,88 @@ void NoteRootSignature(ID3D12RootSignature* rs, const void* blob, size_t size) {
     if (rs && blob && size) rs->SetPrivateData(kBlobGuid, (UINT)size, blob);
 }
 
+bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
+                   ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
+                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why) {
+    out->clear();
+    if (info.sceneUnknown) {
+        *why = "a TraceRay whose scene comes from a descriptor heap index, or could not be traced "
+               "back to a declared resource";
+        return false;
+    }
+    if (info.scenes.empty()) { *why = "no TraceRay scene register was found"; return false; }
+    if (!rs) { *why = "no compute root signature is bound"; return false; }
+    UINT size = 0;
+    if (FAILED(rs->GetPrivateData(kBlobGuid, &size, nullptr)) || !size) {
+        *why = "a global root signature the shim did not see being created";
+        return false;
+    }
+    std::vector<uint8_t> blob(size);
+    rs->GetPrivateData(kBlobGuid, &size, blob.data());
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> des;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* v = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(), blob.size(), IID_PPV_ARGS(&des))) ||
+        FAILED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &v)) || !v) {
+        *why = "could not read back the global root signature";
+        return false;
+    }
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(rs->GetDevice(IID_PPV_ARGS(&dev)))) { *why = "no device"; return false; }
+    const UINT64 inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto& d = v->Desc_1_1;
+    char buf[160];
+    for (const auto& reg : info.scenes) {
+        if (!reg.count) {
+            snprintf(buf, sizeof(buf), "TraceRay on an unbounded array of scenes at t%u space%u",
+                     reg.lower, reg.space);
+            *why = buf;
+            return false;
+        }
+        for (UINT r = reg.lower; r < reg.lower + reg.count; ++r) {
+            D3D12_GPU_VIRTUAL_ADDRESS a = 0;
+            bool placed = false;
+            for (UINT p = 0; p < d.NumParameters && !placed; ++p) {
+                const auto& prm = d.pParameters[p];
+                const BoundRoot b = p < roots.size() ? roots[p] : BoundRoot{};
+                if (prm.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+                    if (prm.Descriptor.RegisterSpace == reg.space && prm.Descriptor.ShaderRegister == r) {
+                        placed = true;
+                        a = b.srv;
+                    }
+                    continue;
+                }
+                if (prm.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+                UINT64 running = 0;
+                for (UINT k = 0; k < prm.DescriptorTable.NumDescriptorRanges && !placed; ++k) {
+                    const auto& rg = prm.DescriptorTable.pDescriptorRanges[k];
+                    const UINT64 off = rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                           ? running : rg.OffsetInDescriptorsFromTableStart;
+                    const UINT64 num = rg.NumDescriptors == UINT_MAX ? (1ull << 32) : rg.NumDescriptors;
+                    running = off + num;
+                    if (rg.RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_SRV || rg.RegisterSpace != reg.space ||
+                        r < rg.BaseShaderRegister || r - rg.BaseShaderRegister >= num)
+                        continue;
+                    placed = true;
+                    if (b.table) {
+                        D3D12_GPU_DESCRIPTOR_HANDLE h{ b.table + (off + (r - rg.BaseShaderRegister)) * inc };
+                        a = scenebind::Lookup(heaps, numHeaps, h);
+                    }
+                }
+            }
+            if (!placed || !a) {
+                snprintf(buf, sizeof(buf), placed
+                             ? "the scene at t%u space%u is in a descriptor the shim saw no structure written to"
+                             : "the scene at t%u space%u is not in the global root signature (a local one?)",
+                         r, reg.space);
+                *why = buf;
+                return false;
+            }
+            if (std::find(out->begin(), out->end(), a) == out->end()) out->push_back(a);
+        }
+    }
+    return true;
+}
+
 Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
                   Transformed* out, std::string* why) {
     const UINT n = in.NumSubobjects;
@@ -750,7 +940,7 @@ ComPtr<ID3D12Resource> Acquire(ID3D12Device* dev, D3D12_HEAP_TYPE type, UINT64 s
 bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& info,
                  const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& app,
                  D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* shim,
-                 const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs,
+                 const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                  const void* owner, bool* shared, std::string* why) {
     *shared = false;
     if (info.dynamicTraceArgs) {
@@ -765,9 +955,10 @@ bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& 
     const UINT records = (UINT)(app.SizeInBytes / app.StrideInBytes);
     if (!records) { *shim = app; return true; }
     bool read = false;
-    const auto labels = astrack::GeometryLabels(info.traceArgs, records, boundSrvs, &read);
+    const auto labels = astrack::GeometryLabels(info.traceArgs, records, boundSrvs, exact, &read);
     if (!read) {
-        *why = "no top-level structure has been read yet";
+        *why = exact ? "the scene this dispatch traces has not been read yet"
+                     : "no top-level structure has been read yet";
         return false;
     }
     for (UINT r = 0; r < records; ++r)
@@ -1033,10 +1224,19 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
 
 bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
-                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs,
+                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                    const void* owner, std::string* why) {
     // The scene this dispatch traces, and the shim's copy of it: from its
-    // latest build, or from the snapshot of that build.
+    // latest build, or from the snapshot of that build. The variant traces
+    // ONE copy, so every TraceRay has to trace the same scene.
+    if (exact && boundSrvs.size() != 1) {
+        *why = "its TraceRay calls trace different scenes, and the variant has one scene copy";
+        return false;
+    }
+    if (!exact && info.scenes.size() > 1) {
+        *why = "its TraceRay calls may trace different scenes, and the variant has one scene copy";
+        return false;
+    }
     shimscene::Copy cp;
     bool found = false;
     for (auto a : boundSrvs)
@@ -1050,8 +1250,10 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                 shimscene::Lookup(a, &cp)) { found = true; break; }
         }
     if (!found) {
-        *why = "no copy of the scene this dispatch traces yet (bound through a descriptor table, "
-               "or built on the GPU before the variant existed: its copy comes with its next build)";
+        *why = exact ? "no copy of the scene this dispatch traces yet (built on the GPU before the "
+                       "variant existed: its copy comes with its next build)"
+                     : "no copy of the scene this dispatch traces yet (not resolved through the root "
+                       "signature, or built on the GPU before the variant existed)";
         return false;
     }
     const UINT k = (UINT)info.traceArgs.size();

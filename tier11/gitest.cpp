@@ -28,8 +28,14 @@
 //
 // Build:  build_tier11.bat          -> gitest.exe in the repository root,
 //                                      beside the proxy d3d12.dll and DXC
-// Run:    gitest.exe [--sm66] [--collections | --grow] [layout ...]
+// Run:    gitest.exe [--sm66] [--collections | --grow] [--table] [layout ...]
 //         default: every layout, one state object
+//
+// --table binds the scene through a DESCRIPTOR TABLE instead of a root SRV,
+// with a second scene live whose layout conflicts with the real one, and
+// that decoy's descriptor on both sides of the real one in the heap. The
+// real descriptor arrives by CopyDescriptors from a staging heap, over a
+// decoy written there first. The shim has to find WHICH scene is traced.
 //
 // Exit code 0 only when every layout matches WARP.
 
@@ -72,6 +78,7 @@ static bool g_sm66 = false;
 // 0 one state object, 1 --collections (Unreal's way), 2 --grow (the hit
 // collection linked by AddToStateObject, how Unreal grows its pipeline).
 static int g_mode = 0;
+static bool g_table = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -322,6 +329,25 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     tl.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     tl.NumDescs = n; tl.InstanceDescs = ib->GetGPUVirtualAddress();
     auto tlas = BuildAS(g, tl, keep);
+    // --table: a second live scene, instance A at contribution 2, which puts
+    // different geometries on records the real scene uses.
+    ComPtr<ID3D12Resource> decoy;
+    if (g_table) {
+        auto db = Buffer(g.dev.Get(), sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_HEAP_TYPE_UPLOAD,
+                         D3D12_RESOURCE_STATE_GENERIC_READ);
+        D3D12_RAYTRACING_INSTANCE_DESC* dd = nullptr;
+        HR(db->Map(0, nullptr, (void**)&dd), "Map decoy instances");
+        std::memset(dd, 0, sizeof(*dd));
+        dd->Transform[0][0] = dd->Transform[1][1] = dd->Transform[2][2] = 1.0f;
+        dd->InstanceMask = 0xFF;
+        dd->InstanceContributionToHitGroupIndex = 2;
+        dd->AccelerationStructure = blasA->GetGPUVirtualAddress();
+        db->Unmap(0, nullptr);
+        keep.push_back(db);
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS dl = tl;
+        dl.NumDescs = 1; dl.InstanceDescs = db->GetGPUVirtualAddress();
+        decoy = BuildAS(g, dl, keep);
+    }
     g.flush();
 
     // Global: constants b0, TLAS t0, output u0. Local: one constant at
@@ -329,6 +355,12 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     D3D12_ROOT_PARAMETER gp[3]{};
     gp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; gp[0].Constants.Num32BitValues = 4;
     gp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    // --table: t0 is the table's descriptor 2, so a wrong offset lands on a decoy.
+    D3D12_DESCRIPTOR_RANGE tr{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 2 };
+    if (g_table) {
+        gp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        gp[1].DescriptorTable = { 1, &tr };
+    }
     gp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     D3D12_ROOT_SIGNATURE_DESC gd{ 3, gp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
     auto grs = RootSig(g.dev.Get(), gd);
@@ -500,7 +532,48 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     g.cl->SetComputeRootSignature(grs.Get());
     const uint32_t c[4] = { W, kH, n, 0 };
     g.cl->SetComputeRoot32BitConstants(0, 4, c, 0);
-    g.cl->SetComputeRootShaderResourceView(1, tlas->GetGPUVirtualAddress());
+    ComPtr<ID3D12DescriptorHeap> heap, staging;
+    if (g_table) {
+        const UINT inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_DESCRIPTOR_HEAP_DESC hd{ D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+        HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap");
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE; hd.NumDescriptors = 2;
+        HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&staging)), "CreateDescriptorHeap(staging)");
+        auto srv = [&](ID3D12Resource* as, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.RaytracingAccelerationStructure.Location = as->GetGPUVirtualAddress();
+            g.dev->CreateShaderResourceView(nullptr, &sd, at);
+        };
+        auto at = [&](ID3D12DescriptorHeap* h, UINT i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE c = h->GetCPUDescriptorHandleForHeapStart();
+            c.ptr += (SIZE_T)i * inc;
+            return c;
+        };
+        // Staging: 0 decoy, 1 the real scene. Visible: the table starts at
+        // 1, so t0 is slot 3; slots 1, 2 and 4 hold the decoy, and slot 3
+        // holds a decoy written directly before the real one is copied over it.
+        srv(decoy.Get(), at(staging.Get(), 0));
+        srv(tlas.Get(), at(staging.Get(), 1));
+        srv(decoy.Get(), at(heap.Get(), 3));
+        g.dev->CopyDescriptorsSimple(1, at(heap.Get(), 1), at(staging.Get(), 0),
+                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        g.dev->CopyDescriptorsSimple(1, at(heap.Get(), 2), at(staging.Get(), 0),
+                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE dst[2] = { at(heap.Get(), 3), at(heap.Get(), 4) };
+        D3D12_CPU_DESCRIPTOR_HANDLE src[2] = { at(staging.Get(), 1), at(staging.Get(), 0) };
+        UINT ones[2] = { 1, 1 };
+        g.dev->CopyDescriptors(2, dst, ones, 2, src, ones, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        ID3D12DescriptorHeap* hs[] = { heap.Get() };
+        g.cl->SetDescriptorHeaps(1, hs);
+        D3D12_GPU_DESCRIPTOR_HANDLE tb = heap->GetGPUDescriptorHandleForHeapStart();
+        tb.ptr += inc;
+        g.cl->SetComputeRootDescriptorTable(1, tb);
+    } else {
+        g.cl->SetComputeRootShaderResourceView(1, tlas->GetGPUVirtualAddress());
+    }
     g.cl->SetComputeRootUnorderedAccessView(2, out->GetGPUVirtualAddress());
     D3D12_DISPATCH_RAYS_DESC dr{};
     const auto base = table->GetGPUVirtualAddress();
@@ -532,6 +605,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--sm66")) g_sm66 = true;
         else if (!std::strcmp(argv[i], "--collections")) g_mode = 1;
         else if (!std::strcmp(argv[i], "--grow")) g_mode = 2;
+        else if (!std::strcmp(argv[i], "--table")) g_table = true;
         else want.insert(argv[i]);
     }
     ComPtr<IDXGIFactory6> fac;
@@ -540,8 +614,8 @@ int main(int argc, char** argv) {
     fac->EnumWarpAdapter(IID_PPV_ARGS(&warp));
     fac->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&hw));
     DXGI_ADAPTER_DESC1 hd{}; hw->GetDesc1(&hd);
-    std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s, %s\n",
-                g_sm66 ? "lib_6_6" : "lib_6_5",
+    std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s%s, %s\n",
+                g_sm66 ? "lib_6_6" : "lib_6_5", g_table ? ", scene through a descriptor table" : "",
                 g_mode == 0 ? "one state object" : g_mode == 1 ? "collections"
                                                                : "collections grown by AddToStateObject");
     std::printf("ground truth WARP, against %ls\n\n", hd.Description);

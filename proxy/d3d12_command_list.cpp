@@ -689,17 +689,36 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     ID3D12Device5* dev = RealDevice();
     D3D12_DISPATCH_RAYS_DESC mine = *d;
     std::string why;
+    // The scene the dispatch traces: resolved through the bound root
+    // signature when every TraceRay's register can be, root SRV or descriptor
+    // table. Otherwise the bound root SRVs, and failing those every live
+    // scene, which can refuse a layout that was fine but never draws wrong.
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
-    for (const auto& r : m_bindings.roots)
-        if (r.kind == Dxr11RootParam::SRV && r.address) srvs.push_back(r.address);
+    std::vector<gidx::BoundRoot> roots(Dxr11Bindings::kMaxRootParams);
+    for (UINT i = 0; i < Dxr11Bindings::kMaxRootParams; ++i) {
+        const auto& r = m_bindings.roots[i];
+        if (r.kind == Dxr11RootParam::SRV) roots[i].srv = r.address;
+        if (r.kind == Dxr11RootParam::Table) roots[i].table = r.table.ptr;
+    }
+    std::string swhy;
+    const bool exact = gidx::ResolveScenes(*gi, m_bindings.rootSig, roots, m_bindings.heaps.data(),
+                                           (UINT)m_bindings.heaps.size(), &srvs, &swhy);
+    if (!exact) {
+        for (const auto& r : m_bindings.roots)
+            if (r.kind == Dxr11RootParam::SRV && r.address) srvs.push_back(r.address);
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 4)
+            ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene this dispatch traces is not "
+                     "resolved (%s); judged over the bound root SRVs, or every live scene\n", swhy.c_str());
+    }
     bool shared = false;
     if (!dev || !gidx::RecordTable(m_real, dev, *gi, d->HitGroupTable, &mine.HitGroupTable,
-                                   srvs, this, &shared, &why)) {
+                                   srvs, exact, this, &shared, &why)) {
         // A record several geometries reach: the shim's own layout, through
         // the variant pipeline and the shim's copy of the scene.
         std::string vwhy;
         if (dev && shared && gidx::EnsureVariant(dev, *gi, m_bindings.stateObject, &vwhy) &&
-            gidx::RecordVariant(m_real, dev, *gi, *d, &mine, srvs, this, &vwhy)) {
+            gidx::RecordVariant(m_real, dev, *gi, *d, &mine, srvs, exact, this, &vwhy)) {
             RestoreComputeAfterCapture();
             m_real->SetPipelineState1(gi->variant.Get());
             m_real->DispatchRays(&mine);

@@ -24,6 +24,53 @@ not.
 
 ---
 
+## 0.47.0
+
+Tier 1.1 item a, part 2 of the remaining list: **a scene bound through a
+DESCRIPTOR TABLE, with several scenes live.** Until now a dispatch knew its
+scene only from a root SRV; otherwise it judged the layout over every live
+scene, which refused layouts that were fine (NOT DRAWN) and never found the
+scene copy the shim's own layout needs. Now the shim resolves exactly which
+scene each dispatch traces:
+
+- **Which register each TraceRay traces** (`SceneRegs` in
+  `proxy/geom_index_so.cpp`): its handle followed back through
+  `annotateHandle` and `createHandleForLib` to the load of a resource global,
+  through a getelementptr for an array element (constant or dynamic), and
+  that global's `!dx.resources` record. Shapes read off DXC at lib_6_5 and
+  lib_6_6.
+- **Which descriptors hold a scene** (`proxy/scene_bind`): every SRV of
+  RAYTRACING_ACCELERATION_STRUCTURE written through the wrapped device is
+  recorded, any other view written over it forgets it, CopyDescriptors and
+  CopyDescriptorsSimple carry it along, a new heap forgets its slots.
+- **At the dispatch** (`gidx::ResolveScenes`): the register through the bound
+  global root signature, a root SRV or a descriptor table range (explicit
+  offsets and APPEND), to the descriptor, to the structure. When every
+  register resolves, only those scenes count, and the variant takes that
+  scene's copy.
+- **Found on the 1070, not on WARP: CPU descriptor handles are not
+  addresses.** NVIDIA's are small encoded numbers, interleaved between heaps
+  (one heap's slots 0x1, 0x21, 0x41, another's 0x2, 0x22), so a byte range of
+  one heap contains another heap's descriptors. The first version erased by
+  range and lost them. Everything now works on exact handles, start plus slot
+  times the increment.
+- **Measured:** `gitest.exe --table` binds the scene through a table whose t0
+  is its third descriptor, with a second scene live whose layout conflicts,
+  its descriptor on both sides of the real one, and the real descriptor
+  copied from a staging heap over a decoy. All 7 layouts bit-exact against
+  WARP in all three construction modes at 6.5 and 6.6, 42 of 42, and the root
+  SRV runs still 42 of 42. Resolving one slot off draws the decoy scene's
+  geometry indices and diverges in all 7. Dispatch suite all pass.
+- **Costs:** a hash lookup per CBV, SRV or UAV descriptor written, and per
+  descriptor copied, only once any scene descriptor has been seen.
+- **Still not resolved, and then the old rule applies (bound root SRVs, else
+  every live scene; refuses, never draws wrong):** a scene reached through a
+  descriptor HEAP index (SM 6.6 bindless, which Unreal's bindless ray tracing
+  uses), through a local root signature, or through an unbounded array.
+  Descriptors written through a device the shim did not hand out are not
+  followed. And the shim's own layout still refuses a pipeline whose TraceRay
+  calls trace different scenes, since it has one scene copy.
+
 ## 0.46.0
 
 Tier 1.1 item a, third part: **`GeometryIndex()` when one hit group record is

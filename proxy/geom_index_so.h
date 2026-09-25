@@ -19,11 +19,17 @@
 //      read out of their disassembly. The application's table is never
 //      written; the dispatch uses the copy.
 //
-// Not yet built, and each refused BY NAME rather than drawn wrong: a layout
-// where one record is reached by two geometries (a TraceRay multiplier of 0
-// over a structure with several, for instance), TraceRay arguments computed
-// at run time, hit groups coming from an EXISTING_COLLECTION, an indirect
-// DispatchRays, and local root signatures associated from inside a library.
+//   3. A record several geometries reach: a VARIANT pipeline in the shim's
+//      own record layout, tracing the shim's copy of the scene (0.46.0).
+//      Which scene a dispatch traces is resolved through its root signature,
+//      root SRV or descriptor table (ResolveScenes, 0.47.0).
+//
+// Not yet built, and each refused BY NAME rather than drawn wrong: TraceRay
+// arguments computed at run time, TraceRay in a closest-hit or miss in the
+// shim's layout, an indirect DispatchRays, local root signatures associated
+// from inside a library. A scene reached through a heap index or a local
+// root signature is judged over every live scene, which can refuse but not
+// draw wrong.
 #pragma once
 
 #include <d3d12.h>
@@ -68,6 +74,13 @@ struct Info {
     // pipeline's TraceRay calls use, low 4 bits each.
     std::vector<std::pair<UINT, UINT>> traceArgs;
     bool dynamicTraceArgs = false; // a TraceRay whose R or M is not a constant
+    // The registers the TraceRay calls take their scene from, so a dispatch
+    // can be told WHICH scene it traces (ResolveScenes). `count` 0 is an
+    // unbounded array. `sceneUnknown`: a TraceRay whose scene handle is not a
+    // declared resource (a descriptor heap index) or could not be traced back.
+    struct SceneReg { UINT space = 0, lower = 0, count = 1; };
+    std::vector<SceneReg> scenes;
+    bool sceneUnknown = false;
 
     // The shim's own record layout, for when the application's shares a
     // record between geometries: a VARIANT pipeline tracing the shim's copy
@@ -118,16 +131,30 @@ void Attach(ID3D12Device* dev, ID3D12StateObject* so, const D3D12_STATE_OBJECT_D
             const std::shared_ptr<Info>& info);
 std::shared_ptr<Info> Get(ID3D12StateObject* so);
 
+// One root argument as bound at the dispatch: a root SRV's address, or a
+// descriptor table's GPU handle, 0 when the parameter is neither.
+struct BoundRoot { D3D12_GPU_VIRTUAL_ADDRESS srv = 0; UINT64 table = 0; };
+
+// The scenes the dispatch's TraceRay calls trace, resolved through the bound
+// global root signature: a root SRV, or a descriptor table entry the shim saw
+// a structure written to (proxy/scene_bind.h). True, with `*out` exactly those
+// addresses, when every register resolves; false with *why otherwise.
+bool ResolveScenes(const Info& info, ID3D12RootSignature* rs, const std::vector<BoundRoot>& roots,
+                   ID3D12DescriptorHeap* const* heaps, UINT numHeaps,
+                   std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out, std::string* why);
+
 // Records the shim's copy of the application's hit group table into `cl`,
 // and returns the range the dispatch should use instead. Replaces the
 // compute root signature and pipeline; the CALLER restores them. `owner` is
 // the recording list, for the buffers' lifetimes (gpu_hold).
+// `boundSrvs` are the scenes the dispatch may trace; `exact` when they are
+// exactly the ones it does (ResolveScenes), otherwise the bound root SRVs.
 // `*shared` is set when it failed because the application's layout shares a
 // record between geometries, which the variant serves.
 bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& info,
                  const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& app,
                  D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE* shim,
-                 const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs,
+                 const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                  const void* owner, bool* shared, std::string* why);
 
 // The variant, built once; false with *why when it cannot be.
@@ -138,7 +165,7 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, std::s
 // variant, dispatches, and binds the application's pipeline again.
 bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
-                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs,
+                   const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
                    const void* owner, std::string* why);
 
 }  // namespace gidx
