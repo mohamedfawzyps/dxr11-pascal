@@ -24,6 +24,67 @@ not.
 
 ---
 
+## 0.50.0
+
+**FIXED: an indirect DispatchRays of a `GeometryIndex()` pipeline was drawn
+WRONG, silently.** The brief listed indirect DispatchRays as "not built,
+refused by name". It was not refused. Both indirect paths bypassed the
+shim's `DispatchRays`: with CPU-visible arguments the dispatch was forwarded
+straight to the real list, and with GPU-written ones the split issued a plain
+`DispatchRays` at submit. Either way the hit shaders ran against the
+APPLICATION's table, without the geometry index the shim writes into its
+copy, and nothing was logged.
+
+- The `GeometryIndex()` dispatch is now one function taking the list, the
+  bindings, the resolved scene and how to restore them, used by
+  `DispatchRays`, by the CPU-visible indirect path (which now calls the
+  shim's own `DispatchRays` for every pipeline) and by the split at submit,
+  whose scene is resolved when the dispatch is recorded.
+- **Measured:** `gitest.exe --indirect` (arguments in upload memory) and
+  `--indirectgpu` (in GPU memory, so the split): 7 of 7 layouts bit-exact in
+  all three construction modes at 6.5 and 6.6, and with the bindless scene.
+  The whole matrix, 33 configurations, all match. With the old paths put
+  back, both modes diverge in 7 of 7 layouts. Dispatch suite all pass; the
+  Phase 4 probe through the proxy still matches WARP on indirect
+  DispatchRays with both argument shapes.
+- The lesson, same as ever: **a gap listed as refused has to be shown
+  refused.** This one was never checked, and it drew wrong.
+
+**Also: subobjects a library declares itself** (HLSL `LocalRootSignature`,
+`SubobjectToExportsAssociation`, hit groups, configs), the last "associations
+from inside a library" gap, checked the same way first: with them,
+`CreateStateObject` FAILED on the 1070 (loud, not wrong; the debug layer:
+`ClosestHitOther` "not fully bound"). Two causes:
+
+- **A disassembly carries a library's subobjects only as comments**, so every
+  library the shim rewrites lost all of them. Now each is declared again at
+  state object scope (`CarryLibrarySubobjects`), read from the RDAT subobject
+  table (part 6; layouts of every kind read off a DXC 1.10 compile), a root
+  signature's bare RTS0 part decoded and serialized again by D3D12. Its
+  associations follow the spec's "Subobject association behavior", read from
+  the spec itself: anything the state object associates, explicit or
+  default, overrides a directly included library's association, so none is
+  carried there; a default declared in a library reaches that library's
+  exports only, so it is spelled out as them; an associable subobject is
+  declared only when an association needs it, since an unassociated one at
+  state object scope would become a default that reaches everything.
+- **The extended local root signature of a hit group whose signature comes
+  from a library** is now built from that signature, in the spec's order:
+  the state object's explicit association, its default, the library's
+  explicit association, the library's default.
+- **Measured:** `gitest.exe --libassoc` (both local root signatures, their
+  associations and all the rest declared in HLSL): 7 of 7 bit-exact at 6.5
+  and 6.6, also with the indirect split. The matrix, 34 configurations, all
+  match.
+- **Refused by name:** a rewritten library with its own subobjects included
+  through an EXPORT LIST (the spec does not say which subobjects an export
+  list includes; this is `gitest --libassoc --collections`), and a library
+  association to a subobject declared in another library.
+- **Known noise, predates this:** building the variant asks D3D12 for the
+  identifier of every export, hit shaders included, and the debug layer
+  warns for each ("not a shader type that supports producing shader
+  identifiers"). Harmless; the answer is skipped.
+
 ## 0.49.0
 
 **The lowered RayQuery path judges a dispatch against the ONE scene it

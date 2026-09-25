@@ -25,10 +25,17 @@
 //      root SRV or descriptor table (ResolveScenes, 0.47.0), or a heap index
 //      in root constants or a CPU-visible root CBV (0.48.0).
 //
+// An indirect DispatchRays gets the same treatment, at record time when the
+// arguments are CPU-visible and at submit when the command list is split
+// (0.50.0).
+//
+// Subobjects a rewritten library declares itself are declared again at state
+// object scope, with the spec's association rules (0.50.0).
+//
 // Not yet built, and each refused BY NAME rather than drawn wrong: TraceRay
 // arguments computed at run time, TraceRay in a closest-hit or miss in the
-// shim's layout, an indirect DispatchRays, local root signatures associated
-// from inside a library. A scene not resolved (a heap index in GPU-only
+// shim's layout, a rewritten library with its own subobjects included through
+// an export list, a library association to another library's subobject. A scene not resolved (a heap index in GPU-only
 // memory or a descriptor table, a local root signature) is judged over every
 // live scene, which can refuse but not draw wrong.
 #pragma once
@@ -124,6 +131,7 @@ struct Transformed {
     std::deque<std::vector<LPCWSTR>> exportLists;
     std::deque<std::wstring> names;
     std::vector<Microsoft::WRL::ComPtr<ID3D12RootSignature>> sigs;
+    std::deque<std::vector<uint8_t>> raw;   // other subobject descs, by value
     std::string summary;           // for the log
 };
 

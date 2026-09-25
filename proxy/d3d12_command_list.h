@@ -130,6 +130,11 @@ struct Dxr11PendingDispatch {
     // means not resolved, judged over every live structure.
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       rqScenes;
     bool                                         rqExact = false;
+    // An indirect DispatchRays of a GeometryIndex() pipeline: the scene it
+    // traces, resolved when recorded, for the shim's table at submit.
+    bool                                         giScenesSet = false;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       giScenes;
+    bool                                         giExact = false;
 };
 
 // A closed segment, followed by the dispatches that could not be recorded until
@@ -156,7 +161,7 @@ struct Dxr11DispatchList {
 extern const GUID IID_Dxr11CommandList;
 
 class Dxr11RayQueryPso;
-namespace gidx { struct Scenes; }
+namespace gidx { struct Scenes; struct Info; }
 
 class Dxr11CommandList : public ID3D12GraphicsCommandList10 {
 public:
@@ -333,6 +338,8 @@ private:
     // signature (gidx::ResolveScenes). False with *why when not resolved.
     bool ResolveBoundScenes(const gidx::Scenes& sc, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out,
                             std::string* why);
+    // The same for a GeometryIndex() pipeline, logged when not resolved.
+    bool GeometryIndexScenes(const gidx::Info& gi, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs);
     // The same for a lowered RayQuery pipeline, counted and logged.
     bool RayQueryScenes(Dxr11RayQueryPso* rq, std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* out);
     ID3D12Device5* RealDevice();

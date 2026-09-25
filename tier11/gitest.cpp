@@ -43,6 +43,14 @@
 // decoys as --table, and the decoy scene bound as a root SRV beside it, so a
 // shim that took a bound root SRV for the scene draws the wrong one.
 //
+// --indirect issues the dispatch through ExecuteIndirect with the arguments
+// in upload memory; --indirectgpu with them in GPU memory, copied there on
+// the GPU, which the shim serves by splitting the command list.
+//
+// --libassoc declares the local root signatures and their associations IN
+// THE LIBRARY (HLSL LocalRootSignature and SubobjectToExportsAssociation)
+// instead of as state object subobjects. One state object only.
+//
 // Exit code 0 only when every layout matches WARP.
 
 #include <windows.h>
@@ -86,6 +94,8 @@ static bool g_sm66 = false;
 static int g_mode = 0;
 static bool g_table = false;
 static int g_bindless = 0;   // 1 index in a root CBV, 2 in root constants
+static int g_indirect = 0;   // 1 arguments in upload memory, 2 in GPU memory
+static bool g_libassoc = false;
 
 // --- the application's shaders ------------------------------------------------
 // M_VAL, R_VAL: the TraceRay multiplier and ray contribution, literal as in a
@@ -100,6 +110,12 @@ RWStructuredBuffer<uint4> Out : register(u0);
 
 cbuffer Rec : register(b0, space1) { uint RecTag; };
 cbuffer Rec3 : register(b1, space1) { uint RecA; uint RecB; uint RecC; };
+#if LIBASSOC
+LocalRootSignature LrsRec = { "RootConstants(num32BitConstants=1, b0, space=1)" };
+LocalRootSignature LrsRec3 = { "RootConstants(num32BitConstants=3, b1, space=1)" };
+SubobjectToExportsAssociation AssocRec = { "LrsRec", "HitGroup;HitGroupOther" };
+SubobjectToExportsAssociation AssocRec3 = { "LrsRec3", "HitGroup3" };
+#endif
 
 struct Pay { uint4 v; };
 
@@ -151,9 +167,10 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit) {
     std::wstring dr = L"R_VAL=" + std::to_wstring(R), dm = L"M_VAL=" + std::to_wstring(M);
     std::wstring da = std::wstring(L"ANYHIT=") + (anyhit ? L"1" : L"0");
     const wchar_t* db = g_bindless ? L"BINDLESS=1" : L"BINDLESS=0";
+    const wchar_t* dl = g_libassoc ? L"LIBASSOC=1" : L"LIBASSOC=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
-                                         L"-D", db };
+                                         L"-D", db, L"-D", dl };
     DxcBuffer buf{ kLib, std::strlen(kLib), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -227,7 +244,24 @@ struct Gpu {
     UINT64 fv = 0;
     HANDLE ev = nullptr;
     void init(IDXGIAdapter1* ad) {
+        // GITEST_DEBUG=1: the D3D12 debug layer, its messages printed as they
+        // happen, so a failing call says why.
+        const bool dbg = std::getenv("GITEST_DEBUG") != nullptr;
+        if (dbg) {
+            ComPtr<ID3D12Debug> d;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&d)))) d->EnableDebugLayer();
+        }
         HR(D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev)), "D3D12CreateDevice");
+        if (dbg) {
+            ComPtr<ID3D12InfoQueue1> iq;
+            DWORD cookie = 0;
+            if (SUCCEEDED(dev.As(&iq)))
+                iq->RegisterMessageCallback(
+                    [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID,
+                       LPCSTR text, void*) {
+                        if (sev <= D3D12_MESSAGE_SEVERITY_WARNING) std::printf("  [debug] %s\n", text);
+                    }, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+        }
         D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         HR(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)), "queue");
         HR(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)), "alloc");
@@ -416,16 +450,18 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &sc });
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pc });
     sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &gsub });
-    sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub1 });
-    const D3D12_STATE_SUBOBJECT* l1 = &sub.back();
+    // --libassoc: the library carries these itself.
     const wchar_t* l1Exports[] = { L"HitGroup", L"HitGroupOther" };
-    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION a1{ l1, 2, l1Exports };
-    sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a1 });
-    sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub3 });
-    const D3D12_STATE_SUBOBJECT* l3 = &sub.back();
     const wchar_t* l3Exports[] = { L"HitGroup3" };
-    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION a3{ l3, 1, l3Exports };
-    sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a3 });
+    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION a1{ nullptr, 2, l1Exports }, a3{ nullptr, 1, l3Exports };
+    if (!g_libassoc) {
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub1 });
+        a1.pSubobjectToAssociate = &sub.back();
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a1 });
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &lsub3 });
+        a3.pSubobjectToAssociate = &sub.back();
+        sub.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &a3 });
+    }
     D3D12_STATE_OBJECT_DESC sd{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, (UINT)sub.size(), sub.data() };
     ComPtr<ID3D12StateObject> so;
     if (g_mode == 0) {
@@ -612,7 +648,33 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     dr.MissShaderTable = { base + 64, idSz, idSz };
     dr.HitGroupTable = { base + offHit, stride * L.records, stride };
     dr.Width = W; dr.Height = kH; dr.Depth = 1;
-    g.cl->DispatchRays(&dr);
+    ComPtr<ID3D12CommandSignature> sig;   // alive until the list has run
+    if (!g_indirect) {
+        g.cl->DispatchRays(&dr);
+    } else {
+        D3D12_INDIRECT_ARGUMENT_DESC ia{};
+        ia.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+        D3D12_COMMAND_SIGNATURE_DESC csd{ sizeof(D3D12_DISPATCH_RAYS_DESC), 1, &ia, 0 };
+        HR(g.dev->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&sig)), "CreateCommandSignature");
+        auto up = Buffer(g.dev.Get(), sizeof(dr), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* am = nullptr; HR(up->Map(0, nullptr, &am), "Map args");
+        std::memcpy(am, &dr, sizeof(dr)); up->Unmap(0, nullptr);
+        keep.push_back(up);
+        ID3D12Resource* args = up.Get();
+        if (g_indirect == 2) {
+            auto gpu = Buffer(g.dev.Get(), sizeof(dr), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+            g.cl->CopyBufferRegion(gpu.Get(), 0, up.Get(), 0, sizeof(dr));
+            D3D12_RESOURCE_BARRIER ab{}; ab.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            ab.Transition.pResource = gpu.Get();
+            ab.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            ab.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            ab.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g.cl->ResourceBarrier(1, &ab);
+            keep.push_back(gpu);
+            args = gpu.Get();
+        }
+        g.cl->ExecuteIndirect(sig.Get(), 1, args, 0, nullptr, 0);
+    }
     UavAll(g.cl.Get());
 
     auto rb = Buffer(g.dev.Get(), (UINT64)W * kH * 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -639,7 +701,18 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--table")) g_table = true;
         else if (!std::strcmp(argv[i], "--bindless")) g_bindless = 1, g_sm66 = true;
         else if (!std::strcmp(argv[i], "--bindlessrc")) g_bindless = 2, g_sm66 = true;
+        else if (!std::strcmp(argv[i], "--indirect")) g_indirect = 1;
+        else if (!std::strcmp(argv[i], "--indirectgpu")) g_indirect = 2;
+        else if (!std::strcmp(argv[i], "--libassoc")) g_libassoc = true;
         else want.insert(argv[i]);
+    }
+    if (g_libassoc && g_mode != 0) {
+        // Collections include the library with an EXPORT LIST, and the spec
+        // does not say which of a library's own subobjects an export list
+        // includes, so the shim refuses that case by name.
+        std::printf("--libassoc is one state object only: see the shim's refusal for a library "
+                    "with its own subobjects and an export list\n");
+        return 2;
     }
     ComPtr<IDXGIFactory6> fac;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&fac)))) { std::printf("no DXGI factory\n"); return 1; }
@@ -647,10 +720,12 @@ int main(int argc, char** argv) {
     fac->EnumWarpAdapter(IID_PPV_ARGS(&warp));
     fac->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&hw));
     DXGI_ADAPTER_DESC1 hd{}; hw->GetDesc1(&hd);
-    std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s%s, %s\n",
+    std::printf("GeometryIndex() in an application's DXR 1.0 hit shaders, %s%s%s, %s\n",
                 g_sm66 ? "lib_6_6" : "lib_6_5", g_table ? ", scene through a descriptor table"
                 : g_bindless == 1 ? ", scene through the heap, index in a root CBV"
                 : g_bindless == 2 ? ", scene through the heap, index in root constants" : "",
+                g_indirect == 1 ? ", indirect (arguments in upload memory)"
+                : g_indirect == 2 ? ", indirect (arguments in GPU memory)" : "",
                 g_mode == 0 ? "one state object" : g_mode == 1 ? "collections"
                                                                : "collections grown by AddToStateObject");
     std::printf("ground truth WARP, against %ls\n\n", hd.Description);

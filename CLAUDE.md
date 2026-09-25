@@ -153,6 +153,24 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.50.0: INDIRECT DispatchRays OF A `GeometryIndex()` PIPELINE WAS DRAWN
+WRONG, SILENTLY; FIXED.** Listed as "refused by name", it was not refused:
+both indirect paths bypassed the shim's DispatchRays and ran the hit shaders
+against the application's table. One dispatch function now serves direct,
+CPU-visible indirect and split-at-submit. `gitest.exe --indirect` and
+`--indirectgpu`: 7 of 7 in all modes; the old paths diverge 7 of 7. **A gap
+written down as "refused" has to be SHOWN refused by a test that reaches it.**
+Also in 0.50.0, a library's own subobjects: a disassembly keeps them only as
+COMMENTS, so every library the shim rewrote lost them; now re-declared at
+state object scope with the spec's association rules (read from the spec,
+"Subobject association behavior": state object associations override a
+directly included library's; a library default reaches that library only).
+`gitest.exe --libassoc` 7 of 7. Remaining for item a: a scene through a local
+root signature, TraceRay in a closest-hit or miss, runtime TraceRay
+arguments, the first dispatch before a GPU-built scene's copy exists, a
+rewritten library with its own subobjects AND an export list, and a library
+association to another library's subobject.
+
 **0.49.0: THE RAYQUERY PATH JUDGES THE ONE SCENE A DISPATCH TRACES.** The
 lowered library's scenes are scanned at creation, the scene is resolved at
 `Dispatch` (and for an indirect one at record time), and the table, record

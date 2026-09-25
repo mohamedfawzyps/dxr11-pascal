@@ -7,6 +7,8 @@
 
 #include "d3d12_command_list.h"
 #include "geom_index_so.h"
+
+#include <functional>
 #include "shim_scene.h"
 #include "proxy_log.h"
 #include "command_signature.h"
@@ -622,7 +624,9 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
                      "%ux%ux%u, read from a CPU-visible argument buffer at record time\n",
                      desc.Width, desc.Height, desc.Depth);
 
-        if (desc.Width && desc.Height && desc.Depth) FWD(DispatchRays(&desc));
+        // Through the shim's own DispatchRays, so a GeometryIndex() pipeline
+        // gets its table; forwarding drew it without one until 0.50.0.
+        if (desc.Width && desc.Height && desc.Depth) DispatchRays(&desc);
     }
 }
 
@@ -733,41 +737,31 @@ bool Dxr11CommandList::RayQueryScenes(Dxr11RayQueryPso* rq,
 // index; see proxy/geom_index_so.h. A dispatch that copy cannot serve is NOT
 // recorded, and says so: drawing it against the application's table would
 // run hit shaders with no geometry index at all.
-void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) {
-    WorkBarrier();
-    std::shared_ptr<gidx::Info> gi = d ? gidx::Get(m_bindings.stateObject) : nullptr;
-    if (!gi) { FWD(DispatchRays(d)); return; }
-    ID3D12Device5* dev = RealDevice();
-    D3D12_DISPATCH_RAYS_DESC mine = *d;
+// Records one GeometryIndex() dispatch into `cl`: the shim's table, or the
+// variant in the shim's own layout, or nothing, logged. `b` are the bindings
+// the application left, `restore` gives them back after the shim's own
+// passes. Shared by DispatchRays and by an indirect DispatchRays, CPU-visible
+// or issued at submit (0.50.0; until then both drew against the
+// application's table, without the geometry index).
+static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev,
+                                  gidx::Info& gi, ID3D12StateObject* so,
+                                  const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& srvs, bool exact,
+                                  const void* owner, const D3D12_DISPATCH_RAYS_DESC& d,
+                                  const std::function<void()>& restore) {
+    D3D12_DISPATCH_RAYS_DESC mine = d;
     std::string why;
-    // The scene the dispatch traces: resolved through the bound root
-    // signature when every TraceRay's scene can be, root SRV, descriptor
-    // table or heap index. Otherwise every live scene, which can refuse a
-    // layout that was fine but never draws wrong. (Until 0.48.0 a bound root
-    // SRV that was a known scene counted as THE scene; wrong when the shader
-    // traces another one, a heap-indexed one say, beside it.)
-    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
-    std::string swhy;
-    const bool exact = ResolveBoundScenes(gi->scenes, &srvs, &swhy);
-    if (!exact) {
-        srvs.clear();
-        static LONG n = 0;
-        if (InterlockedIncrement(&n) <= 4)
-            ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene this dispatch traces is not "
-                     "resolved (%s); judged over every live scene\n", swhy.c_str());
-    }
     bool shared = false;
-    if (!dev || !gidx::RecordTable(m_real, dev, *gi, d->HitGroupTable, &mine.HitGroupTable,
-                                   srvs, exact, this, &shared, &why)) {
+    if (!dev || !gidx::RecordTable(cl, dev, gi, d.HitGroupTable, &mine.HitGroupTable,
+                                   srvs, exact, owner, &shared, &why)) {
         // A record several geometries reach: the shim's own layout, through
         // the variant pipeline and the shim's copy of the scene.
         std::string vwhy;
-        if (dev && shared && gidx::EnsureVariant(dev, *gi, m_bindings.stateObject, &vwhy) &&
-            gidx::RecordVariant(m_real, dev, *gi, *d, &mine, srvs, exact, this, &vwhy)) {
-            RestoreComputeAfterCapture();
-            m_real->SetPipelineState1(gi->variant.Get());
-            m_real->DispatchRays(&mine);
-            m_real->SetPipelineState1(m_bindings.stateObject);
+        if (dev && shared && gidx::EnsureVariant(dev, gi, so, &vwhy) &&
+            gidx::RecordVariant(cl, dev, gi, d, &mine, srvs, exact, owner, &vwhy)) {
+            restore();
+            cl->SetPipelineState1(gi.variant.Get());
+            cl->DispatchRays(&mine);
+            cl->SetPipelineState1(so);
             static LONG firstVariant = 0;
             if (InterlockedCompareExchange(&firstVariant, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first dispatch in the shim's own "
@@ -781,10 +775,10 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
         if (InterlockedIncrement(&n) <= 16)
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() dispatch NOT DRAWN: %s\n",
                      why.empty() ? "no device" : why.c_str());
-        RestoreComputeAfterCapture();
+        restore();
         return;
     }
-    RestoreComputeAfterCapture();
+    restore();
     static LONG first = 0;
     if (InterlockedCompareExchange(&first, 1, 0) == 0)
         ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first dispatch against the shim's "
@@ -792,8 +786,36 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
                  (unsigned long long)(mine.HitGroupTable.SizeInBytes /
                                       mine.HitGroupTable.StrideInBytes),
                  (unsigned long long)mine.HitGroupTable.StrideInBytes,
-                 (unsigned long long)d->HitGroupTable.StrideInBytes);
-    m_real->DispatchRays(&mine);
+                 (unsigned long long)d.HitGroupTable.StrideInBytes);
+    cl->DispatchRays(&mine);
+}
+
+// The scene a GeometryIndex() dispatch traces: resolved through the bound
+// root signature when every TraceRay's scene can be, root SRV, descriptor
+// table or heap index. Otherwise every live scene, which can refuse a layout
+// that was fine but never draws wrong. (Until 0.48.0 a bound root SRV that
+// was a known scene counted as THE scene; wrong when the shader traces
+// another one, a heap-indexed one say, beside it.)
+bool Dxr11CommandList::GeometryIndexScenes(const gidx::Info& gi,
+                                           std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* srvs) {
+    std::string swhy;
+    if (ResolveBoundScenes(gi.scenes, srvs, &swhy)) return true;
+    srvs->clear();
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): the scene this dispatch traces is not "
+                 "resolved (%s); judged over every live scene\n", swhy.c_str());
+    return false;
+}
+
+void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) {
+    WorkBarrier();
+    std::shared_ptr<gidx::Info> gi = d ? gidx::Get(m_bindings.stateObject) : nullptr;
+    if (!gi) { FWD(DispatchRays(d)); return; }
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
+    const bool exact = GeometryIndexScenes(*gi, &srvs);
+    DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact, this, *d,
+                          [this] { RestoreComputeAfterCapture(); });
 }
 
 // --- ID3D12GraphicsCommandList5 / 6 -----------------------------------------
@@ -952,6 +974,10 @@ bool Dxr11CommandList::QueueSplit(ID3D12Resource* args, UINT64 argOffset) {
     pend.readback = readback;
     pend.bindings = m_bindings;
     pend.bindings.Retain();
+    if (std::shared_ptr<gidx::Info> gi = gidx::Get(m_bindings.stateObject)) {
+        pend.giScenesSet = true;
+        pend.giExact = GeometryIndexScenes(*gi, &pend.giScenes);
+    }
     m_openPendings.push_back(pend);
     return true;
 }
@@ -1142,8 +1168,17 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
                                         astrack::RecordKinds(pend.rqExact ? &pend.rqScenes : nullptr),
                                         slot->list.Get(), pend.rqExact ? &pend.rqScenes : nullptr);
-            else
+            else if (std::shared_ptr<gidx::Info> gi =
+                         pend.giScenesSet ? gidx::Get(pend.bindings.stateObject) : nullptr) {
+                Microsoft::WRL::ComPtr<ID3D12Device5> dev5;
+                slot->list->GetDevice(IID_PPV_ARGS(&dev5));
+                ID3D12GraphicsCommandList4* sl = slot->list.Get();
+                const Dxr11Bindings& pb = pend.bindings;
+                DispatchGeometryIndex(sl, dev5.Get(), *gi, pb.stateObject, pend.giScenes,
+                                      pend.giExact, sl, desc, [sl, &pb] { pb.Replay(sl); });
+            } else {
                 slot->list->DispatchRays(&desc);
+            }
             if (FAILED(slot->list->Close())) {
                 gpuhold::Detach(slot->list.Get());   // never submitted
                 continue;

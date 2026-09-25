@@ -258,6 +258,189 @@ bool Functions(const void* container, size_t size,
     return false;
 }
 
+// The local root signatures and associations a library declares itself (HLSL
+// LocalRootSignature and SubobjectToExportsAssociation), from its RDAT.
+// Layout read off a DXC 1.10 library: the subobject table (part type 6)
+// {count, stride 24, records}, a record {kind, name, two words}: kind 2, a
+// local root signature, {offset, size} into the raw bytes part (type 5);
+// kind 8, an association, {subobject name, exports} where exports is an
+// offset in the index arrays part (type 2), counted in dwords, holding
+// {count, string offsets...}. False when there is no readable RDAT.
+struct LibSubobjects {
+    std::map<std::wstring, std::vector<uint8_t>> lrs;                         // name -> blob
+    std::vector<std::pair<std::wstring, std::vector<std::wstring>>> assoc;    // subobject -> exports
+    // Every subobject, in order. `kind` is the DXIL subobject kind, whose
+    // values are the D3D12_STATE_SUBOBJECT_TYPE ones (8, an association, is
+    // DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION). `w` the record's two words:
+    // flags, sizes, depth and flags; `bytes` a root signature; `str` a hit
+    // group's any-hit, closest-hit and intersection names; for an
+    // association, `str[0]` its subobject and `exports` its list.
+    struct Sub {
+        uint32_t kind = 0;
+        std::wstring name;
+        uint32_t w[2] = {};
+        std::vector<uint8_t> bytes;
+        std::wstring str[3];
+        std::vector<std::wstring> exports;
+    };
+    std::vector<Sub> all;
+};
+
+bool LibrarySubobjects(const void* container, size_t size, LibSubobjects* out) {
+    const uint8_t* b = static_cast<const uint8_t*>(container);
+    auto u32 = [&](size_t at) { uint32_t v; std::memcpy(&v, b + at, 4); return v; };
+    if (!b || size < 32 || std::memcmp(b, "DXBC", 4) != 0) return false;
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts && 32 + 4 * (size_t)i + 4 <= size; ++i) {
+        const size_t o = u32(32 + 4 * (size_t)i);
+        if (o + 8 > size || std::memcmp(b + o, "RDAT", 4) != 0) continue;
+        const size_t base = o + 8, len = u32(o + 4);
+        if (base + len > size || len < 8) return false;
+        const uint32_t count = u32(base + 4);
+        size_t at[7] = {}, sz[7] = {};
+        for (uint32_t p = 0; p < count && 8 + 4 * (size_t)p + 4 <= len; ++p) {
+            const size_t po = base + u32(base + 8 + 4 * (size_t)p);
+            if (po + 8 > base + len) return false;
+            const uint32_t t = u32(po);
+            if (t < 7) {
+                at[t] = po + 8;
+                sz[t] = u32(po + 4);
+                if (at[t] + sz[t] > base + len) return false;
+            }
+        }
+        if (!at[6]) return true;   // no subobjects
+        auto str = [&](uint32_t off) {
+            std::wstring w;
+            if (!at[1] || off >= sz[1]) return w;
+            for (size_t c = at[1] + off; c < at[1] + sz[1] && b[c]; ++c) w.push_back((wchar_t)b[c]);
+            return w;
+        };
+        const uint32_t recs = u32(at[6]), stride = u32(at[6] + 4);
+        if (stride < 16 || at[6] + 8 + (size_t)recs * stride > at[6] + sz[6]) return false;
+        if (stride < 24) return false;
+        for (uint32_t r = 0; r < recs; ++r) {
+            const size_t rec = at[6] + 8 + (size_t)r * stride;
+            const uint32_t kind = u32(rec), w0 = u32(rec + 8), w1 = u32(rec + 12);
+            LibSubobjects::Sub sub;
+            sub.kind = kind;
+            sub.name = str(u32(rec + 4));
+            sub.w[0] = w0;
+            sub.w[1] = w1;
+            if (kind == 1 || kind == 2) {
+                if (!at[5] || (size_t)w0 + w1 > sz[5]) return false;
+                sub.bytes.assign(b + at[5] + w0, b + at[5] + w0 + w1);
+            } else if (kind == 11) {
+                sub.str[0] = str(w1);
+                sub.str[1] = str(u32(rec + 16));
+                sub.str[2] = str(u32(rec + 20));
+            }
+            if (kind == 2) {
+                out->lrs[sub.name] = sub.bytes;
+            } else if (kind == 8) {
+                std::vector<std::wstring> ex;
+                if (at[2]) {
+                    const size_t ia = at[2] + 4 * (size_t)w1;
+                    if (ia + 4 > at[2] + sz[2]) return false;
+                    const uint32_t n = u32(ia);
+                    if (ia + 4 + 4 * (size_t)n > at[2] + sz[2]) return false;
+                    for (uint32_t k = 0; k < n; ++k) ex.push_back(str(u32(ia + 4 + 4 * (size_t)k)));
+                }
+                out->assoc.emplace_back(str(w0), ex);
+                sub.str[0] = str(w0);
+                sub.exports = ex;
+            }
+            out->all.push_back(std::move(sub));
+        }
+        return true;
+    }
+    return false;
+}
+
+// A library stores a local root signature as the bare RTS0 part, where
+// CreateRootSignature wants the serialized container. Decoded here into a
+// version 1.1 description and serialized again by D3D12 itself, so no
+// container or checksum is built by hand. Layout (versions 1 and 2, the
+// latter being 1.1): header {version, parameters, parameter offset, static
+// samplers, sampler offset, flags}; a parameter {type, visibility, payload
+// offset}; constants {register, space, count}; a descriptor {register, space
+// [, flags at 1.1]}; a table {ranges, range offset}, a range {type, count,
+// base register, space, [flags at 1.1,] offset}; a static sampler 13 dwords.
+bool SerializeRts0(const std::vector<uint8_t>& raw, std::vector<uint8_t>* out, std::string* why) {
+    const uint8_t* b = raw.data();
+    const size_t n = raw.size();
+    auto u32 = [&](size_t at, uint32_t* v) {
+        if (at + 4 > n) return false;
+        std::memcpy(v, b + at, 4);
+        return true;
+    };
+    uint32_t ver = 0, np = 0, po = 0, ns = 0, so = 0, flags = 0;
+    if (!u32(0, &ver) || !u32(4, &np) || !u32(8, &po) || !u32(12, &ns) || !u32(16, &so) ||
+        !u32(20, &flags) || (ver != 1 && ver != 2)) {
+        *why = "a library's local root signature is not a version 1.0 or 1.1 RTS0 part";
+        return false;
+    }
+    const bool v11 = ver == 2;
+    std::vector<D3D12_ROOT_PARAMETER1> params(np);
+    std::deque<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges;
+    for (uint32_t i = 0; i < np; ++i) {
+        uint32_t type = 0, vis = 0, off = 0;
+        if (!u32(po + 12 * (size_t)i, &type) || !u32(po + 12 * (size_t)i + 4, &vis) ||
+            !u32(po + 12 * (size_t)i + 8, &off))
+            return *why = "a library's local root signature is truncated", false;
+        auto& p = params[i];
+        p.ParameterType = (D3D12_ROOT_PARAMETER_TYPE)type;
+        p.ShaderVisibility = (D3D12_SHADER_VISIBILITY)vis;
+        uint32_t a = 0, c = 0, d = 0;
+        if (type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+            if (!u32(off, &a) || !u32(off + 4, &c) || !u32(off + 8, &d))
+                return *why = "a library's local root signature is truncated", false;
+            p.Constants = { a, c, d };
+        } else if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+            uint32_t nr = 0, ro = 0;
+            if (!u32(off, &nr) || !u32(off + 4, &ro))
+                return *why = "a library's local root signature is truncated", false;
+            const size_t rs = v11 ? 24 : 20;
+            ranges.emplace_back(nr);
+            for (uint32_t r = 0; r < nr; ++r) {
+                uint32_t w[6] = {};
+                for (int k = 0; k < (v11 ? 6 : 5); ++k)
+                    if (!u32(ro + rs * r + 4 * (size_t)k, &w[k]))
+                        return *why = "a library's local root signature is truncated", false;
+                auto& g = ranges.back()[r];
+                g.RangeType = (D3D12_DESCRIPTOR_RANGE_TYPE)w[0];
+                g.NumDescriptors = w[1];
+                g.BaseShaderRegister = w[2];
+                g.RegisterSpace = w[3];
+                g.Flags = v11 ? (D3D12_DESCRIPTOR_RANGE_FLAGS)w[4] : D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+                g.OffsetInDescriptorsFromTableStart = v11 ? w[5] : w[4];
+            }
+            p.DescriptorTable = { nr, ranges.back().data() };
+        } else {
+            if (!u32(off, &a) || !u32(off + 4, &c) || (v11 && !u32(off + 8, &d)))
+                return *why = "a library's local root signature is truncated", false;
+            p.Descriptor = { a, c, v11 ? (D3D12_ROOT_DESCRIPTOR_FLAGS)d : D3D12_ROOT_DESCRIPTOR_FLAG_NONE };
+        }
+    }
+    std::vector<D3D12_STATIC_SAMPLER_DESC> samplers(ns);
+    for (uint32_t i = 0; i < ns; ++i) {
+        if ((size_t)so + 52 * ((size_t)i + 1) > n)
+            return *why = "a library's local root signature is truncated", false;
+        std::memcpy(&samplers[i], b + so + 52 * (size_t)i, 52);
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
+    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    v.Desc_1_1 = { np, np ? params.data() : nullptr, ns, ns ? samplers.data() : nullptr,
+                   (D3D12_ROOT_SIGNATURE_FLAGS)flags };
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&v, &blob, &err))) {
+        *why = "could not serialize a library's local root signature";
+        return false;
+    }
+    const uint8_t* bp = static_cast<const uint8_t*>(blob->GetBufferPointer());
+    out->assign(bp, bp + blob->GetBufferSize());
+    return true;
+}
+
 bool ShaderKinds(const void* container, size_t size, std::vector<uint32_t>* kinds) {
     std::vector<std::pair<std::string, uint32_t>> fns;
     if (!Functions(container, size, &fns)) return false;
@@ -469,6 +652,207 @@ private:
 // with no association is dropped rather than becoming a default one), and one
 // new signature plus association per original signature extended.
 // `offsets[u]` is the parameter's offset in unit u's records.
+template <class T>
+const void* Keep(Transformed* out, const T& v) {
+    out->raw.emplace_back(sizeof(T));
+    std::memcpy(out->raw.back().data(), &v, sizeof(T));
+    return out->raw.back().data();
+}
+
+bool CarryLibrarySubobjects(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
+                            const std::map<UINT, const std::vector<uint8_t>*>& code,
+                            const std::map<UINT, LibSubobjects>& libSubs,
+                            const std::set<std::wstring>& affected,
+                            Transformed* out, std::string* why) {
+    const UINT n = in.NumSubobjects;
+    const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
+    // What the state object associates itself, per subobject type.
+    std::map<UINT, std::set<std::wstring>> soExplicit;
+    std::set<UINT> soDefault;
+    std::set<UINT> soHasType;
+    std::vector<int> refd(n, 0);
+    for (UINT i = 0; i < n; ++i) {
+        soHasType.insert((UINT)s[i].Type);
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION || !s[i].pDesc)
+            continue;
+        const auto* a = static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
+        const ptrdiff_t t = a->pSubobjectToAssociate - s;
+        if (t < 0 || t >= (ptrdiff_t)n) continue;
+        ++refd[t];
+        const UINT ty = (UINT)s[t].Type;
+        if (!a->NumExports) soDefault.insert(ty);
+        for (UINT e = 0; e < a->NumExports; ++e) soExplicit[ty].insert(a->pExports[e]);
+    }
+    for (UINT i = 0; i < n; ++i) {
+        const UINT ty = (UINT)s[i].Type;
+        const bool associable = ty == 1 || ty == 2 || ty == 9 || ty == 10 || ty == 12;
+        if (associable && !refd[i]) soDefault.insert(ty);
+    }
+
+    auto addAssoc = [&](size_t target, const std::vector<std::wstring>& ex) {
+        std::vector<LPCWSTR> list;
+        for (const auto& w : ex) {
+            out->names.push_back(w);
+            list.push_back(out->names.back().c_str());
+        }
+        out->exportLists.push_back(list);
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION na{};
+        na.NumExports = (UINT)list.size();
+        na.pExports = out->exportLists.back().data();
+        na.pSubobjectToAssociate = reinterpret_cast<const D3D12_STATE_SUBOBJECT*>((uintptr_t)target);
+        out->assoc.push_back(na);
+        out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
+                              &out->assoc.back() });
+    };
+    auto rootSig = [&](const std::vector<uint8_t>& bytes, ComPtr<ID3D12RootSignature>* rs) {
+        std::vector<uint8_t> blob;
+        if (!SerializeRts0(bytes, &blob, why)) return false;
+        if (FAILED(dev->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(rs->GetAddressOf())))) {
+            *why = "could not create a library's root signature";
+            return false;
+        }
+        NoteRootSignature(rs->Get(), blob.data(), blob.size());
+        out->sigs.push_back(*rs);
+        return true;
+    };
+
+    for (const auto& kv : libSubs) {
+        if (!code.count(kv.first)) continue;    // not rewritten: it keeps its own
+        const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[kv.first].pDesc);
+        const LibSubobjects& so = kv.second;
+        if (ld->NumExports) {
+            *why = "a library the shim rewrites declares subobjects and is included with an export "
+                   "list, and the spec does not say which of its subobjects that includes";
+            return false;
+        }
+        // Hit groups and the state object config are declared at once; an
+        // associable subobject only when an association needs it, since one
+        // left unassociated at state object scope would become a DEFAULT
+        // there and reach exports it never reached.
+        std::map<std::wstring, std::pair<const LibSubobjects::Sub*, long>> made;   // name -> (sub, index)
+        for (const auto& x : so.all) {
+            if (x.kind == 0) {
+                if (soHasType.count(0)) continue;   // the state object's own wins
+                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG,
+                                      Keep(out, D3D12_STATE_OBJECT_CONFIG{ (D3D12_STATE_OBJECT_FLAGS)x.w[0] }) });
+                soHasType.insert(0);
+            } else if (x.kind == 11) {
+                D3D12_HIT_GROUP_DESC hg{};
+                out->names.push_back(x.name);
+                hg.HitGroupExport = out->names.back().c_str();
+                hg.Type = (D3D12_HIT_GROUP_TYPE)x.w[0];
+                LPCWSTR* slot[3] = { &hg.AnyHitShaderImport, &hg.ClosestHitShaderImport,
+                                     &hg.IntersectionShaderImport };
+                for (int k = 0; k < 3; ++k)
+                    if (!x.str[k].empty()) {
+                        out->names.push_back(x.str[k]);
+                        *slot[k] = out->names.back().c_str();
+                    }
+                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, Keep(out, hg) });
+            } else if (x.kind == 1 || x.kind == 2 || x.kind == 9 || x.kind == 10 || x.kind == 12) {
+                made[x.name] = { &x, -1 };
+            }
+        }
+        auto ensure = [&](const std::wstring& name, long* index) -> bool {
+            auto& m = made[name];
+            if (m.second >= 0) { *index = m.second; return true; }
+            const LibSubobjects::Sub& x = *m.first;
+            const size_t at = out->subs.size();
+            if (x.kind == 1 || x.kind == 2) {
+                ComPtr<ID3D12RootSignature> rs;
+                if (!rootSig(x.bytes, &rs)) return false;
+                if (x.kind == 1) {
+                    out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+                                          Keep(out, D3D12_GLOBAL_ROOT_SIGNATURE{ rs.Get() }) });
+                } else {
+                    out->lrs.push_back(D3D12_LOCAL_ROOT_SIGNATURE{ rs.Get() });
+                    out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE,
+                                          &out->lrs.back() });
+                }
+            } else if (x.kind == 9) {
+                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
+                                      Keep(out, D3D12_RAYTRACING_SHADER_CONFIG{ x.w[0], x.w[1] }) });
+            } else if (x.kind == 10) {
+                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
+                                      Keep(out, D3D12_RAYTRACING_PIPELINE_CONFIG{ x.w[0] }) });
+            } else {
+                out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1,
+                                      Keep(out, D3D12_RAYTRACING_PIPELINE_CONFIG1{
+                                          x.w[0], (D3D12_RAYTRACING_PIPELINE_FLAGS)x.w[1] }) });
+            }
+            m.second = (long)at;
+            *index = m.second;
+            return true;
+        };
+
+        // This library's exports, for spelling its defaults out.
+        std::vector<std::wstring> mine;
+        for (const auto& f : Exported(ld)) mine.push_back(f.first);
+        for (const auto& x : so.all)
+            if (x.kind == 11) mine.push_back(x.name);
+
+        std::map<UINT, std::set<std::wstring>> libExplicitOfType;
+        std::set<std::wstring> associated;
+        for (const auto& x : so.all) {
+            if (x.kind != 8) continue;
+            auto m = made.find(x.str[0]);
+            if (m == made.end()) {
+                bool here = false;
+                for (const auto& y : so.all) here = here || y.name == x.str[0];
+                if (!here) {
+                    *why = "a library the shim rewrites associates a subobject declared elsewhere";
+                    return false;
+                }
+                continue;   // a subobject of a kind nothing associates
+            }
+            associated.insert(x.str[0]);
+            if (!x.exports.empty())
+                for (const auto& e : x.exports) libExplicitOfType[m->second.first->kind].insert(e);
+        }
+        auto keepExport = [&](UINT ty, const std::wstring& e) {
+            if (soExplicit[ty].count(e)) return false;
+            if (ty == 2 && affected.count(e)) return false;   // extended, associated by the shim
+            return true;
+        };
+        for (const auto& x : so.all) {
+            if (x.kind != 8) continue;
+            auto m = made.find(x.str[0]);
+            if (m == made.end()) continue;
+            const UINT ty = m->second.first->kind;
+            if (soDefault.count(ty)) continue;   // the state object's default overrides it
+            std::vector<std::wstring> ex;
+            if (x.exports.empty()) {
+                for (const auto& e : mine)
+                    if (keepExport(ty, e) && !libExplicitOfType[ty].count(e)) ex.push_back(e);
+            } else {
+                for (const auto& e : x.exports)
+                    if (keepExport(ty, e)) ex.push_back(e);
+            }
+            long at = -1;
+            if (!ex.empty()) {
+                if (!ensure(x.str[0], &at)) return false;
+                addAssoc((size_t)at, ex);
+            }
+        }
+        std::vector<std::wstring> names;
+        for (const auto& kv2 : made) names.push_back(kv2.first);
+        for (const auto& nm : names) {
+            if (associated.count(nm)) continue;   // a default: nothing here names it
+            const UINT ty = made[nm].first->kind;
+            if (soDefault.count(ty)) continue;
+            std::vector<std::wstring> ex;
+            for (const auto& e : mine)
+                if (keepExport(ty, e) && !libExplicitOfType[ty].count(e)) ex.push_back(e);
+            long at = -1;
+            if (!ex.empty()) {
+                if (!ensure(nm, &at)) return false;
+                addAssoc((size_t)at, ex);
+            }
+        }
+    }
+    return true;
+}
+
 bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
              const std::vector<std::vector<std::wstring>>& units,
              const std::map<UINT, const std::vector<uint8_t>*>& code,
@@ -511,7 +895,61 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
     std::sort(defaults.begin(), defaults.end());
     defaults.erase(std::unique(defaults.begin(), defaults.end()), defaults.end());
 
+    // Local root signatures the LIBRARIES declare. The D3D12 spec, "Subobject
+    // association behavior": an association declared directly in the state
+    // object, explicit OR default, overrides any association a directly
+    // included DXIL library makes for that export; a default declared inside
+    // a library (a signature nothing in the library associates, or an
+    // association with no exports) reaches that library's exports only.
+    // Keyed -2 - k in `extended` below.
+    std::vector<std::pair<std::wstring, std::vector<uint8_t>>> libLrs;
+    std::map<std::wstring, int> libExplicit;    // export -> -2 - k
+    std::map<std::wstring, int> libDefaultOf;   // export -> -2 - k
+    std::map<UINT, LibSubobjects> libSubs;      // library subobject index -> its subobjects
+    auto keyOf = [&](const std::wstring& name, const std::vector<uint8_t>& blob) {
+        for (size_t k = 0; k < libLrs.size(); ++k)
+            if (libLrs[k].first == name) return -2 - (int)k;
+        libLrs.emplace_back(name, blob);
+        return -2 - (int)(libLrs.size() - 1);
+    };
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !s[i].pDesc) continue;
+        const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc);
+        LibSubobjects so;
+        if (!LibrarySubobjects(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength, &so) ||
+            so.all.empty())
+            continue;
+        std::set<std::wstring> associated;
+        std::vector<std::wstring> defaultsHere;
+        for (const auto& a : so.assoc) {
+            auto l = so.lrs.find(a.first);
+            if (l == so.lrs.end()) continue;
+            associated.insert(a.first);
+            if (a.second.empty()) { defaultsHere.push_back(a.first); continue; }
+            const int key = keyOf(a.first, l->second);
+            for (const auto& e : a.second) libExplicit[e] = key;
+        }
+        for (const auto& l : so.lrs)
+            if (!associated.count(l.first)) defaultsHere.push_back(l.first);
+        std::sort(defaultsHere.begin(), defaultsHere.end());
+        defaultsHere.erase(std::unique(defaultsHere.begin(), defaultsHere.end()), defaultsHere.end());
+        if (defaultsHere.size() > 1) {
+            *why = "a library declares two default local root signatures";
+            return false;
+        }
+        if (defaultsHere.size() == 1) {
+            const int key = keyOf(defaultsHere[0], so.lrs[defaultsHere[0]]);
+            for (const auto& f : Exported(ld)) libDefaultOf[f.first] = key;
+            if (!ld->NumExports)
+                for (const auto& x : so.all)
+                    if (x.kind == 11) libDefaultOf[x.name] = key;
+        }
+        libSubs[i] = std::move(so);
+    }
+
     // The first name decides when it is associated; the others must agree.
+    // The state object's explicit associations, then its default, then a
+    // library's explicit association, then a library's default.
     auto lrsOf = [&](const std::vector<std::wstring>& u, int* idx) -> bool {
         *idx = -1;
         auto it = explicitLrs.find(u[0]);
@@ -524,7 +962,18 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
         }
         if (*idx >= 0) return true;
         if (defaults.size() > 1) return false;
-        if (defaults.size() == 1) *idx = (int)defaults[0];
+        if (defaults.size() == 1) { *idx = (int)defaults[0]; return true; }
+        for (const std::map<std::wstring, int>* m : { &libExplicit, &libDefaultOf }) {
+            bool found = false;
+            for (const auto& w : u) {
+                auto jt = m->find(w);
+                if (jt == m->end()) continue;
+                if (found && *idx != jt->second) return false;
+                *idx = jt->second;
+                found = true;
+            }
+            if (found) return true;
+        }
         return true;
     };
 
@@ -542,6 +991,19 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
             ID3D12RootSignature* orig = idx >= 0
                 ? static_cast<const D3D12_LOCAL_ROOT_SIGNATURE*>(s[idx].pDesc)->pLocalRootSignature
                 : nullptr;
+            ComPtr<ID3D12RootSignature> fromLib;
+            if (idx <= -2) {
+                // A library's own signature: made an object so it can be
+                // extended like any other, its blob kept on it.
+                std::vector<uint8_t> blob;
+                if (!SerializeRts0(libLrs[(size_t)(-2 - idx)].second, &blob, why)) return false;
+                if (FAILED(dev->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&fromLib)))) {
+                    *why = "could not create a library's local root signature";
+                    return false;
+                }
+                NoteRootSignature(fromLib.Get(), blob.data(), blob.size());
+                orig = fromLib.Get();
+            }
             ComPtr<ID3D12RootSignature> rs;
             UINT offset = 0;
             if (!Extend(dev, orig, srv, &rs, &offset, why)) return false;
@@ -612,6 +1074,14 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, bool srv,
         }
         out->subs.push_back(so);
     }
+    // A library the shim rewrites loses the subobjects it declares, because a
+    // disassembly carries them only as comments. Each is declared again at
+    // state object scope, and its associations become explicit ones with the
+    // meaning the spec gives them: none where the state object associates
+    // that type itself, since that already overrode the library's; a
+    // library's default spelled out as that library's exports.
+    if (!CarryLibrarySubobjects(dev, in, code, libSubs, affected, out, why)) return false;
+
     for (auto& kv : extended) {
         out->sigs.push_back(kv.second.first);
         D3D12_LOCAL_ROOT_SIGNATURE l{ kv.second.first.Get() };
