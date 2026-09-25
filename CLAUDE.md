@@ -153,6 +153,12 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.53.1 IN THE GAME (2026-09-25, 3 min 52 s): NOTHING REFUSED AGAIN.**
+Clean end marker, 162 lowered, 337 state objects hr=0, 13754 lowered
+dispatches drawn (all indirect), REFUSED 0 of every kind, "unknown
+bottom-level structure" 0 (30 on 0.53.0), scene resolved 14612, not resolved
+0. Whether culled instances were present is not in the log.
+
 **0.53.1: A NULL INSTANCE IS INACTIVE, NOT UNKNOWN.** 0.53.0 in the game
 (2026-09-25, 3 min 12 s): clean, 162 lowered, every state object hr=0, 11663
 drawn, but 30 REFUSED as "unknown bottom-level structure". Unreal writes a
