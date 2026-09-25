@@ -412,6 +412,31 @@ foreach ($m in @(@('--gpuinst'), @())) {
 }
 
 Write-Host ''
+Write-Host '=== an instance with a NULL structure is inactive ==='
+# Unreal writes every culled instance with AccelerationStructure 0, which the
+# spec calls legal but inactive, discarded at build. 0.53.0 refused the scene
+# for it (30 dispatches in Escher). WARP access-violates on one, so the oracle
+# is the definition: the scene WITHOUT that instance, drawn on WARP.
+$prevTier = $env:DXR_TIER11
+$env:DXR_TIER11 = '1'
+$g = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib')
+& .\raytest.exe warp rayquery alpha dp_null_a.bin @g | Out-Null
+foreach ($m in @(@('--gpuinst'), @())) {
+    & .\raytest.exe hw rayquery alpha dp_null_b.bin @g --nullinst @m | Out-Null
+    $diff = & .\raytest.exe diff dp_null_a.bin dp_null_b.bin 2>&1
+    $what = if ($m.Count) { 'GPU-written instances' } else { 'CPU-visible instances' }
+    if ($diff -match 'RESULT: MATCH') {
+        Write-Host "  $what : MATCH, the inactive instance changed nothing"
+    } else {
+        Write-Host "  $what : DIVERGE or not drawn"
+        $failed++
+    }
+    Remove-Item dp_null_b.bin -ErrorAction SilentlyContinue
+}
+Remove-Item dp_null_a.bin -ErrorAction SilentlyContinue
+$env:DXR_TIER11 = $prevTier
+
+Write-Host ''
 Write-Host '=== tier 1.1 is on by default ==='
 $env:DXR_TIER11 = ''
 $out = & .\raytest.exe hw rayquery opaque dp_gate.bin 2>&1

@@ -24,6 +24,34 @@ not.
 
 ---
 
+## 0.53.1
+
+**An instance with a NULL bottom-level structure is inactive, not unknown.
+0.53.0 refused the scene for one, 30 dispatches in Escher.**
+
+- **In the game (0.53.0, 3 min 12 s):** clean end marker, 162 RayQuery
+  shaders lowered, every `CreateStateObject` hr=0, 11663 lowered dispatches
+  drawn, and 30 REFUSED, all "unknown bottom-level structure", one instance,
+  from 2 minutes in.
+- **Read from Unreal's source:** `RayTracingInstanceBufferUtil.usf` writes a
+  culled instance, and one with an invalid transform, with a structure address
+  of 0. **Read from the spec** ("Inactive primitives and instances"): an
+  instance with a NULL bottom-level pointer is legal but inactive, discarded at
+  build. The shim counted it as a structure it had never seen, which 0.53.0
+  turned into a refusal. Before that it was counted silently. INFERRED, not
+  proven, that this was the game's instance: the log did not say which one.
+- **The fix:** an instance whose structure address is 0 reaches no record and
+  is skipped. A refusal for a structure of unknown geometry now NAMES it and
+  why: never seen, deserialized, a copy of something unknown, built with no
+  readable geometry, or its first build recorded after the top-level build
+  that uses it.
+- **Measured:** `raytest --nullinst` adds an instance with a null structure
+  and contribution 7. 0.53.0 refuses it. WARP access-violates on one
+  (`d3d10warp.dll`), as it divides by zero on an empty scene, so the oracle is
+  the definition: the scene WITHOUT that instance, on WARP. 0.53.1 matches it,
+  13872 hits, with CPU-visible and GPU-written instances. New suite gate; 47
+  of 47 and every gate.
+
 ## 0.53.0
 
 **Structures made by `CopyRaytracingAccelerationStructure` are followed

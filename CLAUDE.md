@@ -153,6 +153,18 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.53.1: A NULL INSTANCE IS INACTIVE, NOT UNKNOWN.** 0.53.0 in the game
+(2026-09-25, 3 min 12 s): clean, 162 lowered, every state object hr=0, 11663
+drawn, but 30 REFUSED as "unknown bottom-level structure". Unreal writes a
+culled instance with structure address 0 (`RayTracingInstanceBufferUtil.usf`),
+and the spec calls that legal but inactive. The shim counted it as unknown,
+silently before 0.53.0 and as a refusal since. Now skipped; a refusal for an
+unknown structure names which one and why. `raytest --nullinst` matches the
+scene without it (WARP crashes on a null instance, so the definition is the
+oracle). That this was the game's instance is INFERRED. **A new refusal is a
+new measurement: check it against the spec before believing the thing it
+refuses exists.**
+
 **0.53.0: COPIED STRUCTURES ARE FOLLOWED; A COPIED BOTTOM-LEVEL STRUCTURE
 WAS DRAWN WRONG, SILENTLY.** Unreal compacts bottom-level structures and
 deserializes offline ones, and the shim knew a structure only from its

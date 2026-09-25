@@ -52,6 +52,9 @@ enum class Kind { kUnknown, kTriangles, kProcedural, kMixed };
 struct BlasInfo {
     Kind kind = Kind::kUnknown;
     UINT geometryCount = 0;
+    // How the shim learned it: 0 built, 1 CLONE or COMPACT of a known one,
+    // 2 DESERIALIZE, 3 a copy of something unknown. Said when refusing.
+    uint8_t origin = 0;
 };
 
 // Remember what a bottom-level build contains. Safe to call for any build;
@@ -135,6 +138,7 @@ struct TlasInfo {
     // Instances whose bottom-level structure was never seen being built, so
     // its type is not known. Nonzero means the answer above is incomplete.
     UINT unknownBlas = 0;
+    std::string unknownDetail;   // the first such instance, and why it is unknown
     // What reaches each record index, one entry per record. This is what lets
     // the table carry a record of the right TYPE at each slot rather than one
     // record everywhere.

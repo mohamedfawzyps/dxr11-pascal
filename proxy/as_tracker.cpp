@@ -161,7 +161,12 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         return b->geometryCount ? b->geometryCount : 1;
     };
 
+    // An instance with a NULL bottom-level structure is legal but INACTIVE,
+    // discarded at build (spec, "Inactive primitives and instances"): it
+    // reaches no record. Unreal writes every culled instance that way. Until
+    // 0.53.1 it counted as an unknown structure, which 0.53.0 refused.
     for (UINT i = 0; i < count; ++i) {
+        if (!d[i].AccelerationStructure) continue;
         const UINT ic = d[i].InstanceContributionToHitGroupIndex;
         if (ic > t.maxContribution) t.maxContribution = ic;
         const UINT end = ic + geometriesOf(d[i].AccelerationStructure);
@@ -171,16 +176,42 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     t.reach.assign(t.recordCount, kReachNone);
     t.constants.assign(t.recordCount, RecordConstants{});
 
+    auto noteUnknown = [&](UINT i, const BlasInfo* bi) {
+        if (t.unknownBlas++) return;
+        const D3D12_GPU_VIRTUAL_ADDRESS a = d[i].AccelerationStructure;
+        auto h = g_blasHist.find(a);
+        char buf[400];
+        if (bi) {
+            static const char* kOrigin[] = { "built with no readable geometry",
+                "a copy of a structure of unknown geometry", "DESERIALIZED",
+                "a copy of something never seen" };
+            std::snprintf(buf, sizeof(buf), " (first: instance %u of %u, structure 0x%llX, %s, "
+                          "%u geometries)", i, count, (unsigned long long)a,
+                          kOrigin[bi->origin < 4 ? bi->origin : 0], bi->geometryCount);
+        } else if (h == g_blasHist.end() || h->second.empty()) {
+            std::snprintf(buf, sizeof(buf), " (first: instance %u of %u, structure 0x%llX, never "
+                          "seen built or copied)", i, count, (unsigned long long)a);
+        } else {
+            std::snprintf(buf, sizeof(buf), " (first: instance %u of %u, structure 0x%llX, its "
+                          "first build of %zu remembered was RECORDED after this top-level "
+                          "build: serial %llu, top-level at %llu)", i, count,
+                          (unsigned long long)a, h->second.size(),
+                          (unsigned long long)h->second.front().first,
+                          (unsigned long long)asOf);
+        }
+        t.unknownDetail = buf;
+    };
     for (UINT i = 0; i < count; ++i) {
+        if (!d[i].AccelerationStructure) continue;   // inactive
         const UINT ic = d[i].InstanceContributionToHitGroupIndex;
         uint8_t bits = kReachNone;
         const BlasInfo* bi = BlasAtLocked(d[i].AccelerationStructure, asOf);
-        if (!bi) { ++t.unknownBlas; continue; }
+        if (!bi) { noteUnknown(i, nullptr); continue; }
         switch (bi->kind) {
             case Kind::kTriangles:  bits = kReachTriangles; break;
             case Kind::kProcedural: bits = kReachProcedural; break;
             case Kind::kMixed:      bits = kReachTriangles | kReachProcedural; break;
-            default:                ++t.unknownBlas; break;
+            default:                noteUnknown(i, bi); break;
         }
         if (bits & kReachTriangles)  t.anyTriangles = true;
         if (bits & kReachProcedural) t.anyProcedural = true;
@@ -671,7 +702,13 @@ void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
 
     // A bottom-level structure: the source's geometry, or none known.
     BlasInfo bi;   // kind unknown, no geometries: refused when an instance points at it
-    if (srcBlas) bi = hs->second.back().second;
+    if (srcBlas) {
+        bi = hs->second.back().second;
+        // A copy of one of unknown geometry keeps that one's reason.
+        if (bi.kind != Kind::kUnknown) bi.origin = 1;
+    } else {
+        bi.origin = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE ? 2 : 3;
+    }
     if (srcBlas || !srcTlas) {
         g_blas[dst] = bi;
         g_blasHist[dst].emplace_back(++g_asSerial, bi);
@@ -774,7 +811,8 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                 if (why)
                     *why = std::to_string(t.unknownBlas) + " instance(s) point at a bottom-level "
                            "structure whose geometry the shim does not know (deserialized, or "
-                           "never seen built), so the records its hits reach cannot be known";
+                           "never seen built), so the records its hits reach cannot be known" +
+                           t.unknownDetail;
                 return true;
             }
             if (t.constantsConflict) {

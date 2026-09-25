@@ -394,6 +394,10 @@ static bool g_blasReuse = false;
 // serialized and deserialized, as Unreal loads offline structures; its
 // geometry is driver-opaque, so the shim must refuse, not guess.
 static bool g_blasClone = false, g_tlasClone = false, g_deserialize = false;
+// With --geom: a second instance whose AccelerationStructure is NULL, as
+// Unreal writes a culled instance. The spec calls it legal but inactive,
+// discarded at build: it reaches no record and nothing is refused for it.
+static bool g_nullInst = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
@@ -918,16 +922,20 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     inst.InstanceMask = 0xFF;
     if (g_contrib) inst.InstanceContributionToHitGroupIndex = 2;
     inst.AccelerationStructure = s.blas->GetGPUVirtualAddress();
-    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_RAYTRACING_INSTANCE_DESC insts[2] = { inst, inst };
+    insts[1].AccelerationStructure = 0;
+    insts[1].InstanceContributionToHitGroupIndex = 7;
+    const UINT numInst = g_nullInst ? 2 : 1;
+    auto instBuf = CreateBuffer(g.device.Get(), sizeof(insts), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
-    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, &inst, sizeof(inst));
+    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, insts, sizeof(insts));
     instBuf->Unmap(0, nullptr);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
     ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-    ti.NumDescs = g_empty ? 0 : 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    ti.NumDescs = g_empty ? 0 : numInst; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
     if (g_tlasClone) {
         auto copy = CreateBuffer(g.device.Get(), s.tlas->GetDesc().Width, D3D12_HEAP_TYPE_DEFAULT,
@@ -2103,6 +2111,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--geom") == 0) {
                 g_geom = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--nullinst") == 0) {
+                g_nullInst = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;
