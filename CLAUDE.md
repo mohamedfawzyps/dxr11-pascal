@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.63.0: PAST THE LOCAL ROOT SIGNATURE LIMIT, A DESCRIPTOR TABLE; AND THE
+LIMIT WAS WRONG.** The shim's own layouts carry their scene copies in one
+descriptor table (1 dword) where root SRVs (2 each) would pass the GTX 1070's
+limit; its descriptors are in a 4096-descriptor reserve the shim adds to the
+END of every shader-visible CBV/SRV/UAV heap (`proxy/heap_reserve`, `GetDesc`
+hooked to report the asked size; heaps share one vtable; the 1070 caps a
+heap at 1,000,000, so one that large has none). **The limit rule was wrong:**
+a signature it passed at 191 removed the device. Measured again
+(`proxy/lrs_limit.h`): in parameter order, constants 1 dword, root
+descriptor 2, table 1; a constants parameter ending past dword 64 caps the
+total at its start + 128, otherwise 192. `gitest --biglrs` (191 of 192) all
+match; matrix 511 of 511 in root form and in both forced table forms, plus 2 gates. Still refused by name: an application
+signature at 192, a table needed in a 1,000,000 heap. NEXT: item b.
+
 **0.62.0: A DESERIALIZED STRUCTURE IS DECODED AND DRAWN.** What a
 DESERIALIZE made is asked of the driver: `VISUALIZATION_DECODE_FOR_TOOLS`
 works outside developer mode on WARP and the 1070 (`tier11/decodeprobe.cpp`):
@@ -161,7 +175,7 @@ The size query is recorded after the deserialize; a dispatch meeting the
 structure is deferred to its split, where the shim decodes on its own list
 and waits once (`proxy/as_decode`). Refused by name since 0.53.0, on both
 paths. Dispatch suite 59 of 59 with a decode poison that diverges; matrix
-457 of 457, plus the root signature gate. NEXT: the raygen local root signature limit, then item b.
+457 of 457, plus the root signature gate.
 
 **0.61.0: THE RAYQUERY PATH DRAWS THE LAYOUTS IT REFUSED.** A record two
 instances disagree about, two live scenes disagreeing, and both kinds on one

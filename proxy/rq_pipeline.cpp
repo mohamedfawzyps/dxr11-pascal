@@ -2,6 +2,8 @@
 
 #include "dispatch_stats.h"
 #include "gpu_hold.h"
+#include "heap_reserve.h"
+#include "lrs_limit.h"
 
 #include "config.h"
 
@@ -121,11 +123,12 @@ struct Built {
 // through a local root SRV was 0 of 30 cold compiles. See
 // phase5/cases/driver-crash/README.md.
 // `raygenSrvs` (0.61.0, the shim's own layout): the raygen gets a local root
-// signature of that many root SRVs, t0 upwards in space rq::kGeomIndexSpace,
-// where the retraced calls find the shim's scene copies and key table.
+// signature of that many SRVs, t0 upwards in space rq::kGeomIndexSpace,
+// where the retraced calls find the shim's scene copies and key table: root
+// SRVs, or the first `raygenTable` of them one descriptor table (0.63.0).
 bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
                       const Xform& x, ID3D12RootSignature* globalRs,
-                      Built* out, std::string* why, UINT raygenSrvs = 0) {
+                      Built* out, std::string* why, UINT raygenSrvs = 0, UINT raygenTable = 0) {
     const size_t copies = 1;
     auto Name = [&](const wchar_t* base, size_t) { return std::wstring(base); };
 
@@ -250,15 +253,23 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION rgAssoc{};
     const wchar_t* rgExports[1] = { L"RayGen" };
     if (raygenSrvs) {
-        std::vector<D3D12_ROOT_PARAMETER> rps(raygenSrvs);
-        for (UINT i = 0; i < raygenSrvs; ++i) {
-            rps[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        if (raygenTable > raygenSrvs) raygenTable = raygenSrvs;
+        D3D12_DESCRIPTOR_RANGE range{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, raygenTable, 0, rq::kGeomIndexSpace, 0 };
+        std::vector<D3D12_ROOT_PARAMETER> rps(raygenSrvs - (raygenTable ? raygenTable - 1 : 0));
+        for (UINT i = 0; i < (UINT)rps.size(); ++i) {
             rps[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            rps[i].Descriptor.ShaderRegister = i;
+            if (raygenTable && i == 0) {
+                rps[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                rps[i].DescriptorTable.NumDescriptorRanges = 1;
+                rps[i].DescriptorTable.pDescriptorRanges = &range;
+                continue;
+            }
+            rps[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rps[i].Descriptor.ShaderRegister = raygenTable ? raygenTable + i - 1 : i;
             rps[i].Descriptor.RegisterSpace = rq::kGeomIndexSpace;
         }
         D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = raygenSrvs;
+        rsd.NumParameters = (UINT)rps.size();
         rsd.pParameters = rps.data();
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
         ID3DBlob* blob = nullptr;
@@ -1139,15 +1150,15 @@ bool Dxr11RayQueryPso::BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<O
     }
     auto own = std::make_shared<Own>();
     own->caps = caps;
-    // One root SRV per sub-slot's copy, then the key table.
+    // One SRV per sub-slot's copy, then the key table. Root SRVs, 2 dwords
+    // each; the GTX 1070 removes its device past a local root signature size
+    // (proxy/lrs_limit.h: 96 root descriptors alone), so past that the copies
+    // go in one descriptor table and only the key table stays a root SRV:
+    // 3 dwords, however many scenes (0.63.0; until then refused past 80).
     const UINT srvs = own->Subs() + (own->Keyed() ? 1u : 0u);
-    // The GTX 1070 removes its device past a local root signature size
-    // (tier11/lrsprobe.cpp): 2 dwords a root descriptor, well under 192.
-    if (2 * srvs > 160) {
-        *why = "the shim's own layout would need a raygen local root signature of " +
-               std::to_string(srvs) + " root descriptors, past what the GTX 1070 takes";
-        return false;
-    }
+    std::vector<D3D12_ROOT_PARAMETER1> asRoots(srvs);
+    for (auto& r : asRoots) r.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    own->form = (!lrslimit::Fits(asRoots) || heapres::Forced()) ? 1u : 0u;
     Xform x;
     x.hasAnyHit = m_hasAnyHit;
     x.hasIntersection = m_hasIntersection;
@@ -1155,7 +1166,7 @@ bool Dxr11RayQueryPso::BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<O
     x.needsRecordConstants = m_recordConstants;
     x.payloadBytes = m_payloadBytes;
     Built b;
-    if (!BuildStateObject(m_dev, lib, x, m_rootSig, &b, why, srvs)) return false;
+    if (!BuildStateObject(m_dev, lib, x, m_rootSig, &b, why, srvs, own->form ? own->Subs() : 0u)) return false;
     own->so = b.so;
     own->raygenRs = b.raygenRs;
     own->localRs = b.localRs;
@@ -1170,6 +1181,7 @@ bool Dxr11RayQueryPso::BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<O
         held = ", scenes per slot";
         for (UINT c : caps) held += " " + std::to_string(c);
     }
+    if (own->form) held += ", the scene copies in a descriptor table";
     ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery shader: the shim's OWN record layout "
              "built, %zu byte library, %u scene slot(s)%s\n", lib.size(), (unsigned)caps.size(),
              held.c_str());
@@ -1219,7 +1231,7 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
                                    UINT gx, UINT gy, UINT gz, const gidx::SceneSel& sel,
                                    const std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>>* builds,
                                    const void* owner, const std::function<void()>& restore,
-                                   std::string* why) {
+                                   const std::vector<ID3D12DescriptorHeap*>& heaps, std::string* why) {
     if (!cl || !dev) { *why = "no command list or device"; return false; }
     if (m_scenes.unknown) {
         *why = "a lowered TraceRay whose scene could not be traced back to a register or the heap";
@@ -1355,6 +1367,23 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
                 kt.push_back(keyPoison ? 0u : kp.second);
             }
         }
+    }
+
+    // In the table form the raygen record carries one descriptor handle, of
+    // a range holding the copies in the shim's reserve of the bound heap
+    // (0.63.0); `bind`, the heaps to bind when none is.
+    std::vector<ID3D12DescriptorHeap*> bind;
+    if (own->form) {
+        std::vector<heapres::View> views(addrs.size());
+        for (size_t a = 0; a < addrs.size(); ++a) views[a].as = addrs[a];
+        D3D12_GPU_DESCRIPTOR_HANDLE h{};
+        std::string hw;
+        if (!heapres::Range(dev, heaps, views, owner, &h, &bind, &hw)) {
+            *why = "the shim's own layout needs its scene copies in a descriptor table, past the local "
+                   "root signature size the GTX 1070 takes, and " + hw;
+            return false;
+        }
+        addrs.assign(1, h.ptr);
     }
 
     // What the table is made from, to find one built before.
@@ -1501,8 +1530,10 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
     d.Width = gx * m_threads[0];
     d.Height = gy * m_threads[1];
     d.Depth = gz * m_threads[2];
+    if (!bind.empty()) cl->SetDescriptorHeaps((UINT)bind.size(), bind.data());
     cl->SetPipelineState1(so);
     cl->DispatchRays(&d);
+    if (!bind.empty() && !heaps.empty()) cl->SetDescriptorHeaps((UINT)heaps.size(), heaps.data());
     dstats::Add(dstats::kDrawn);
     dstats::Add(dstats::kOwnLayout);
     return true;

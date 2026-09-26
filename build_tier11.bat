@@ -55,6 +55,14 @@ cl /nologo /EHsc /std:c++17 /O2 /W4 ^
    /link d3d12.lib dxgi.lib advapi32.lib /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
+rem Reserving descriptors at the end of an application's heap (0.63.0).
+cl /nologo /EHsc /std:c++17 /O2 /W4 ^
+   /I "%AGILITY%\build\native\include" ^
+   /Fo:"%OBJ%\\" ^
+   "%~dp0tier11\heapprobe.cpp" /Fe:"%~dp0heapprobe.exe" ^
+   /link d3d12.lib dxgi.lib /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
 echo.
-echo Built gitest.exe, libsubprobe.exe, lrsprobe.exe and decodeprobe.exe
+echo Built gitest.exe, libsubprobe.exe, lrsprobe.exe, decodeprobe.exe and heapprobe.exe
 echo Run:  gitest.exe [--sm66] [layout ...]

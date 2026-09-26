@@ -154,12 +154,14 @@ public:
     // which may have been built again since (the copy is then made from that
     // build's instances, astrack::InstancesAt); null, its latest. `restore`
     // gives the application's compute bindings back after the copies are
-    // recorded. False with *why, nothing recorded but possibly copies, when
+    // recorded. `heaps`: the descriptor heaps bound at the dispatch, for the
+    // table form. False with *why, nothing recorded but possibly copies, when
     // it cannot.
     bool DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, UINT gx, UINT gy, UINT gz,
                      const gidx::SceneSel& sel,
                      const std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>>* builds,
-                     const void* owner, const std::function<void()>& restore, std::string* why);
+                     const void* owner, const std::function<void()>& restore,
+                     const std::vector<ID3D12DescriptorHeap*>& heaps, std::string* why);
 
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override;
@@ -207,6 +209,11 @@ private:
         uint8_t idRay[32]{}, idMiss[32]{}, idNullTri[32]{}, idNullProc[32]{};
         std::array<uint8_t, 32> idHit{}, idHitProc{};
         std::vector<UINT> caps;                    // scenes per slot
+        // 0: a root SRV per scene copy. 1: past the local root signature
+        // size the GTX 1070 takes, the copies in one descriptor table, in the
+        // shim's reserve of the bound heap, and the key table a root SRV
+        // after it (0.63.0, proxy/heap_reserve.h; until then refused).
+        UINT form = 0;
         bool Keyed() const { for (UINT c : caps) if (c > 1) return true; return false; }
         UINT Subs() const { UINT s = 0; for (UINT c : caps) s += c; return s; }
         ~Own();

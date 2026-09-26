@@ -26,6 +26,7 @@
 #include "rewriter/dxc_host.h"
 #include "geom_index_so.h"
 #include "scene_bind.h"
+#include "heap_reserve.h"
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
@@ -593,7 +594,8 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CheckFeatureSupport(D3D12_FEATURE Feature
 // top-level structure, so GeometryIndex() can tell which scene a dispatch
 // traces when it arrives through a descriptor table.
 HRESULT STDMETHODCALLTYPE Dxr11Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) {
-    const HRESULT hr = m_real->CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap);
+    // A shader-visible CBV/SRV/UAV heap gets the shim's reserve at its end (0.63.0).
+    const HRESULT hr = heapres::Create(m_real, pDescriptorHeapDesc, riid, ppvHeap);
     if (SUCCEEDED(hr) && ppvHeap && *ppvHeap) {
         ID3D12DescriptorHeap* h = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*ppvHeap)->QueryInterface(IID_PPV_ARGS(&h))) && h) {

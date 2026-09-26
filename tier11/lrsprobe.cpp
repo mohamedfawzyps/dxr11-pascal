@@ -3,7 +3,8 @@
 // (DXGI_ERROR_DRIVER_INTERNAL_ERROR); WARP took 520 root descriptors. So
 // every run on the hardware ends with the device removed: it is a
 // measurement, not a test to run in a suite. The shim's rule, which covers
-// every point below, is in proxy/geom_index_so.cpp (Extend).
+// every point below, is proxy/lrs_limit.h (0.63.0; until then a rule of
+// totals, which modes 8 to 10 showed wrong).
 //
 //   lrsprobe.exe [warp|hw] [mode] [constants]
 //   mode 0  root SRVs only                         1070: 96 work, 97 remove it
@@ -13,6 +14,14 @@
 //   mode 3  the same over two parameters           32:80 64:64 80:44 100:39
 //   mode 4  descriptor tables only                 192 work
 //   mode 5  32 constants, 40 root SRVs, then tables  80 work
+//   mode 6  ONE table, one range of 64 * n SRVs    all 520 work (33280 descriptors)
+//   mode 7  64 constants, 63 root SRVs, then ONE table of 64 * n SRVs   all 520 work
+//   mode 8  a root SRV, 64 constants, n root SRVs  32 work (130 dwords, not 192)
+//   mode 9  the same, then one table               31 work
+//   mode 10 [k] [c] [kind]: k root SRVs, c constants, then n root SRVs
+//           (kind 0) or descriptor tables (kind 1)
+//           1 64 1: 64   4 56 0: 64   5 56 0: 36   0 50 1: 142
+//           2 64 0: 32   1 65 0: 31   3 20 0: 83
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -64,6 +73,85 @@ int main(int argc, char** argv) {
                     p.push_back(r);
                 }
             }
+            if (mode == 7) {   // an application signature at 191, then one big table
+                D3D12_ROOT_PARAMETER1 q{};
+                q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                q.Constants.Num32BitValues = 64;
+                q.Constants.ShaderRegister = 5;
+                p.push_back(q);
+                for (UINT i = 0; i < 63; ++i) {
+                    D3D12_ROOT_PARAMETER1 r{};
+                    r.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                    r.Descriptor.ShaderRegister = 300 + i;
+                    p.push_back(r);
+                }
+            }
+            if (mode == 10) {   // k root SRVs, c constants, then n root SRVs (kind 0) or tables (1)
+                const UINT k = argc > 3 ? (UINT)atoi(argv[3]) : 1;
+                const UINT c = argc > 4 ? (UINT)atoi(argv[4]) : 64;
+                const int kind = argc > 5 ? atoi(argv[5]) : 0;
+                for (UINT i = 0; i < k; ++i) {
+                    D3D12_ROOT_PARAMETER1 s0{};
+                    s0.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                    s0.Descriptor = { 200 + i, 2, D3D12_ROOT_DESCRIPTOR_FLAG_NONE };
+                    p.push_back(s0);
+                }
+                if (c) {
+                    D3D12_ROOT_PARAMETER1 q{};
+                    q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                    q.Constants = { 10, 9, c };
+                    p.push_back(q);
+                }
+                static D3D12_DESCRIPTOR_RANGE1 rg10[600];
+                for (UINT i = 0; i < n; ++i) {
+                    D3D12_ROOT_PARAMETER1 r{};
+                    if (kind) {
+                        rg10[i] = D3D12_DESCRIPTOR_RANGE1{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 10 + i, 9,
+                                                           D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0 };
+                        r.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                        r.DescriptorTable = { 1, &rg10[i] };
+                    } else {
+                        r.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                        r.Descriptor = { 10 + i, 9, D3D12_ROOT_DESCRIPTOR_FLAG_NONE };
+                    }
+                    p.push_back(r);
+                }
+            }
+            if (mode == 8 || mode == 9) {   // gitest --biglrs: a root SRV FIRST, 64 constants, n SRVs, a table
+                D3D12_ROOT_PARAMETER1 s0{};
+                s0.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                s0.Descriptor.RegisterSpace = 2;
+                p.push_back(s0);
+                D3D12_ROOT_PARAMETER1 q{};
+                q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                q.Constants = { 10, 9, 64 };
+                p.push_back(q);
+                for (UINT i = 0; i < n; ++i) {
+                    D3D12_ROOT_PARAMETER1 r{};
+                    r.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                    r.Descriptor.ShaderRegister = 10 + i;
+                    r.Descriptor.RegisterSpace = 9;
+                    p.push_back(r);
+                }
+                if (mode == 9) {
+                    static D3D12_DESCRIPTOR_RANGE1 pad;
+                    pad = D3D12_DESCRIPTOR_RANGE1{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 100, 9,
+                                                   D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0 };
+                    D3D12_ROOT_PARAMETER1 t{};
+                    t.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                    t.DescriptorTable = { 1, &pad };
+                    p.push_back(t);
+                }
+            }
+            if (mode == 6 || mode == 7) {   // one table, one range of 64 * n
+                static D3D12_DESCRIPTOR_RANGE1 big;
+                big = D3D12_DESCRIPTOR_RANGE1{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 64 * n, 0, 0x7FFF0000,
+                                               D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0 };
+                D3D12_ROOT_PARAMETER1 q{};
+                q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                q.DescriptorTable = { 1, &big };
+                p.push_back(q);
+            }
             if (mode == 4 || mode == 5) {   // n descriptor tables instead of root SRVs
                 static D3D12_DESCRIPTOR_RANGE1 rg[600];
                 for (UINT i = 0; i < n; ++i) {
@@ -81,7 +169,7 @@ int main(int argc, char** argv) {
                 p[0].Constants.Num32BitValues = argc > 3 ? (UINT)atoi(argv[3]) : 128;
                 p[0].Constants.ShaderRegister = 5;
             }
-            for (UINT i = 0; i < n && mode != 4 && mode != 5; ++i) {
+            for (UINT i = 0; i < n && mode < 4; ++i) {
                 D3D12_ROOT_PARAMETER1 q{};
                 q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
                 q.Descriptor.ShaderRegister = i;

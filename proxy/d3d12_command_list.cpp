@@ -291,12 +291,13 @@ static bool RayQueryOwnForced() {
 static bool RayQueryOwn(Dxr11RayQueryPso* rq, ID3D12GraphicsCommandList4* cl, UINT x, UINT y, UINT z,
                         const gidx::SceneSel& sel,
                         const std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>>* builds,
-                        const void* owner, const std::function<void()>& restore, int layout,
+                        const void* owner, const std::function<void()>& restore,
+                        const std::vector<ID3D12DescriptorHeap*>& heaps, int layout,
                         const std::string& conflict) {
     Microsoft::WRL::ComPtr<ID3D12Device5> dev;
     cl->GetDevice(IID_PPV_ARGS(&dev));
     std::string ow;
-    if (dev && rq->DispatchOwn(cl, dev.Get(), x, y, z, sel, builds, owner, restore, &ow)) {
+    if (dev && rq->DispatchOwn(cl, dev.Get(), x, y, z, sel, builds, owner, restore, heaps, &ow)) {
         static LONG once = 0;
         if (layout >= 0 && InterlockedCompareExchange(&once, 1, 0) == 0)
             ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch drawn in the shim's own "
@@ -377,7 +378,8 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
             gidx::SceneSel sel;
             ScenesSel(m_rqPso->Scenes(), m_bindings, &sel);
             if (RayQueryOwn(m_rqPso, m_real, x, y, z, sel, nullptr, this,
-                            [this] { RestoreComputeAfterCapture(); }, wrong ? layout : -1, why) ||
+                            [this] { RestoreComputeAfterCapture(); }, m_bindings.heaps,
+                            wrong ? layout : -1, why) ||
                 wrong)
                 return;
         } else if (wrong) {
@@ -1201,6 +1203,7 @@ static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5*
                                   const gidx::SceneSel& sel,
                                   const std::vector<std::pair<UINT, UINT>>& pairs,
                                   const void* owner, const D3D12_DISPATCH_RAYS_DESC& d,
+                                  const std::vector<ID3D12DescriptorHeap*>& heaps,
                                   const std::function<void()>& restore) {
     D3D12_DISPATCH_RAYS_DESC mine = d;
     std::string why;
@@ -1211,12 +1214,18 @@ static void DispatchGeometryIndex(ID3D12GraphicsCommandList4* cl, ID3D12Device5*
         // the variant pipeline and the shim's copy of the scene.
         std::string vwhy;
         std::shared_ptr<gidx::Variant> var;
+        std::vector<ID3D12DescriptorHeap*> bind;
         if (dev && shared && gidx::EnsureVariant(dev, gi, so, sel.need, &var, &vwhy) &&
-            gidx::RecordVariant(cl, dev, gi, *var, pairs, d, &mine, srvs, exact, sel, owner, &vwhy)) {
+            gidx::RecordVariant(cl, dev, gi, *var, pairs, d, &mine, srvs, exact, sel, owner, heaps, &bind,
+                                &vwhy)) {
             restore();
+            // A variant in a table form, with no CBV/SRV/UAV heap bound: the
+            // shim's own, for this dispatch (0.63.0).
+            if (!bind.empty()) cl->SetDescriptorHeaps((UINT)bind.size(), bind.data());
             cl->SetPipelineState1(var->so.Get());
             cl->DispatchRays(&mine);
             cl->SetPipelineState1(so);
+            if (!bind.empty() && !heaps.empty()) cl->SetDescriptorHeaps((UINT)heaps.size(), heaps.data());
             static LONG firstVariant = 0;
             if (InterlockedCompareExchange(&firstVariant, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): first dispatch in the shim's own "
@@ -1306,7 +1315,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
         QueueStaleRays(*d, srvs, sel))
         return;
     DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact, sel,
-                          DispatchPairs(*gi, m_bindings, *d), this, *d,
+                          DispatchPairs(*gi, m_bindings, *d), this, *d, m_bindings.heaps,
                           [this] { RestoreComputeAfterCapture(); });
 }
 
@@ -1798,7 +1807,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 for (size_t k = 0; k < pend.rqScenes.size() && k < pend.rqBuilds.size(); ++k)
                     builds.push_back({ pend.rqScenes[k], pend.rqBuilds[k] });
                 if (!RayQueryOwn(pend.rq, sl, groups[0], groups[1], groups[2], pend.rqSel, &builds,
-                                 sl, [sl, &pb] { pb.Replay(sl); }, rqLayout, rqConflict) &&
+                                 sl, [sl, &pb] { pb.Replay(sl); }, pb.heaps, rqLayout, rqConflict) &&
                     rqLayout < 0)
                     pend.rq->DispatchAsRays(sl, groups[0], groups[1], groups[2],
                                             astrack::RecordKinds(&pend.rqScenes), sl, &pend.rqScenes);
@@ -1814,6 +1823,7 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 const Dxr11Bindings& pb = pend.bindings;
                 DispatchGeometryIndex(sl, dev5.Get(), *gi, pb.stateObject, pend.giScenes,
                                       pend.giExact, pend.giSel, DispatchPairs(*gi, pb, desc), sl, desc,
+                                      pb.heaps,
                                       [sl, &pb] { pb.Replay(sl); });
             } else {
                 slot->list->DispatchRays(&desc);

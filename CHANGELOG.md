@@ -24,6 +24,60 @@ not.
 
 ---
 
+## 0.63.0
+
+**The shim's own layouts past the GTX 1070's local root signature limit are
+drawn, and the limit itself was measured wrong.** The shim's own record
+layouts (the `GeometryIndex()` variant, and a lowered RayQuery dispatch in
+its own layout) give each shader that traces one root SRV per scene copy
+it can trace, 2 dwords each. Past the size the 1070's driver takes, which
+REMOVES THE DEVICE inside `CreateRootSignature`, both were refused by name:
+many scenes at once (keyed slots, TraceRay arguments computed at run time),
+or an application signature already near the limit.
+
+- **Now:** past the limit the copies go in ONE descriptor table, 1 dword
+  however many there are (form 1; the pair and key tables stay root SRVs),
+  and if that does not fit either, everything in the table (form 2). Root
+  descriptors stay wherever they fit, so Unreal's path is unchanged.
+- **The descriptors** live in a reserve at the END of the heap bound at the
+  dispatch (`proxy/heap_reserve`): every shader-visible CBV/SRV/UAV heap is
+  created 4096 descriptors larger, and `GetDesc` is hooked to report the
+  size the application asked for, so nothing of the application's reaches
+  the tail. Ranges are cached by content and reused only when no work can
+  read them (`gpu_hold`). With no heap bound, the shim binds its own for the
+  dispatch. Measured first (`tier11/heapprobe.cpp`): descriptor heaps share
+  ONE vtable (`D3D12Core.dll`, `D3D12SDKLayers.dll` with the debug layer),
+  slot 8 is `GetDesc` with the `(this, RetVal*)` ABI; the 1070 creates a
+  shader-visible heap of at most 1,000,000 descriptors, WARP 2 million. So
+  a heap is grown only up to 1,000,000, which every device takes.
+- **The variant's tables need no new shader:** in a table form each tracing
+  record's selection is a range, and the table shader, told there is one
+  sub-slot of one structure per range, writes the range's handle where the
+  addresses went.
+- **The limit was measured again, and the old rule was wrong.** A test
+  signature the rule called safe at 191 dwords removed the device. The
+  driver's rule, from 20 measured points (`tier11/lrsprobe.cpp` modes 8 to
+  10), now `proxy/lrs_limit.h`: walk the parameters in order, costing a
+  constant 1 dword, a root descriptor 2, a table 1; if a constants
+  parameter ENDS past dword 64, the total may be at most its start + 128,
+  otherwise 192. So a root descriptor before 64 constants leaves room for
+  130, not 192, and the old check could have extended an application's
+  signature into a device removal.
+- **Measured:** `gitest --biglrs` pads the raygen's own signature to 191 of
+  192 dwords (62 constants ending at dword 64, 63 root SRVs, a table), so
+  there the table is the only way: all 7 layouts match, with the heap bound
+  (`--localscenetable`, the reserve) and without (`--localscene`, the shim's
+  own heap). The 0.59.0 gate case, 129 root descriptors, refused until now,
+  matches. `DXR_TIER11_LRS_TABLE=1` or `2` forces a form everywhere:
+  `tools/run_gitest_matrix.ps1 -Form 1` and `-Form 2`. Matrix 511 of 511 in root form and in both forced table forms, plus 2 gates.
+  Dispatch suite with the own-layout cases in form 1; `DXR_TIER11_RANGE_POISON=1`
+  (every descriptor of a range its first) diverges on two scenes.
+- **Still refused by name:** an application signature with no dword left
+  (`gitest --biglrsfull`, 192 of 192; the gate), and a heap already at
+  1,000,000 descriptors when a table is needed (Unreal's bindless heap; its
+  ray tracing heap is 250,000 by default). Also still: a scene not resolved
+  through the root signature, and a build older than the last 8 kept.
+
 ## 0.62.0
 
 **A deserialized acceleration structure is decoded, and drawn.** Unreal

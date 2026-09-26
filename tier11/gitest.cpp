@@ -80,6 +80,15 @@
 // --gpusbt puts the shader table in GPU memory, copied there on the GPU, so
 // the raygen record cannot be read on the CPU at record time.
 //
+// --biglrs (with --localscene or --localscenetable, no --recurse) pads the
+// raygen's local root signature after its scene to 191 dwords of the 192 the
+// GTX 1070 takes (proxy/lrs_limit.h): 62 constants, 63 root SRVs and a
+// table, none of them read; the constants end at dword 64, not past it. So the shim's own layout cannot add a root SRV
+// (2 dwords) and has to use a descriptor table (1), in its reserve of the
+// bound heap, or of its own heap where none is bound (0.63.0).
+// --biglrsfull pads it to all 192: nothing fits, so the shim must refuse the
+// layouts needing its own by name, and the device must live.
+//
 // --recurse makes the pipeline's recursion depth 2 and traces from the hit
 // and miss shaders too: each closest-hit that reads GeometryIndex() traces a
 // second ray beside its hit and folds that ray's geometry and record into
@@ -137,6 +146,7 @@ static int g_indirect = 0;   // 1 arguments in upload memory, 2 in GPU memory
 static int g_libassoc = 0;
 static bool g_gpuinst = false, g_stale = false, g_deserialize = false;
 static int g_localScene = 0;   // 1 a root SRV in the raygen's record, 2 a descriptor table
+static int g_bigLrs = 0;       // 1 --biglrs, 2 --biglrsfull
 static bool g_gpuSbt = false;
 static bool g_recurse = false;
 // --warpglobal: WARP draws the ground truth with the scene through the global
@@ -769,7 +779,32 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         lps.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         lps.Descriptor.RegisterSpace = 2;
     }
-    D3D12_ROOT_SIGNATURE_DESC lds{ 1, &lps, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
+    // --biglrs: after it, 62 constants, 63 root SRVs and a table, to 191.
+    std::vector<D3D12_ROOT_PARAMETER> lpsAll{ lps };
+    D3D12_DESCRIPTOR_RANGE padRange{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 100, 9, 0 };
+    D3D12_DESCRIPTOR_RANGE padRange2{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 101, 9, 0 };
+    if (g_bigLrs) {
+        D3D12_ROOT_PARAMETER q{};
+        q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        q.Constants = { 10, 9, 62 };
+        lpsAll.push_back(q);
+        for (UINT i = 0; i < 63; ++i) {
+            D3D12_ROOT_PARAMETER r{};
+            r.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            r.Descriptor = { 10 + i, 9 };
+            lpsAll.push_back(r);
+        }
+        D3D12_ROOT_PARAMETER t{};
+        t.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        t.DescriptorTable = { 1, &padRange };
+        lpsAll.push_back(t);
+        if (g_bigLrs == 2) {   // 192
+            t.DescriptorTable = { 1, &padRange2 };
+            lpsAll.push_back(t);
+        }
+    }
+    D3D12_ROOT_SIGNATURE_DESC lds{ (UINT)lpsAll.size(), lpsAll.data(), 0, nullptr,
+                                   D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE };
     auto lrsS = RootSig(g.dev.Get(), lds);
     D3D12_LOCAL_ROOT_SIGNATURE lsubS{ lrsS.Get() };
     const wchar_t* sExports[] = { L"RayGen", L"Miss" };
@@ -972,14 +1007,16 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     HR(so.As(&props), "StateObjectProperties");
 
     // Shader table: raygen at 0, miss at 64, hit records at 128, stride 64.
-    // Each hit record: identifier, then its local root constants.
+    // Each hit record: identifier, then its local root constants. With
+    // --biglrs the raygen record is 800 bytes, and the rest move up.
     const UINT64 idSz = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, stride = 64;
-    const UINT64 offHit = 128, total = offHit + stride * L.records;
+    const UINT64 offMiss = g_bigLrs ? 832 : 64;
+    const UINT64 offHit = offMiss + 64, total = offHit + stride * L.records;
     auto table = Buffer(g.dev.Get(), total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     uint8_t* t = nullptr; HR(table->Map(0, nullptr, (void**)&t), "Map table");
     std::memset(t, 0, (size_t)total);
     std::memcpy(t, props->GetShaderIdentifier(L"RayGen"), idSz);
-    std::memcpy(t + 64, props->GetShaderIdentifier(L"Miss"), idSz);
+    std::memcpy(t + offMiss, props->GetShaderIdentifier(L"Miss"), idSz);
     for (UINT i = 0; i < L.records; ++i) {
         uint8_t* rec = t + offHit + stride * i;
         std::memcpy(rec, props->GetShaderIdentifier(hgName[L.group[i]]), idSz);
@@ -1090,12 +1127,12 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
             uint64_t arg2 = arg;
             if (g_twoScenes) arg2 = scene2->GetGPUVirtualAddress();
             if (keyArray) arg2 = heap->GetGPUDescriptorHandleForHeapStart().ptr + 6 * inc;
-            std::memcpy(tm + 64 + idSz, &arg2, 8);
+            std::memcpy(tm + offMiss + idSz, &arg2, 8);
             for (UINT i = 0; i < L.records; ++i)   // after 1 or 3 constants, 8-aligned
                 std::memcpy(tm + offHit + stride * i + (L.group[i] == 1 ? 48 : 40), i & 1 ? &arg2 : &arg, 8);
         }
         table->Unmap(0, nullptr);
-        rgBytes = idSz + 8;
+        rgBytes = g_bigLrs ? idSz + 8 + 248 + 63 * 8 + 8 * g_bigLrs : idSz + 8;
     }
     // --gpusbt: the table copied into GPU memory on the GPU.
     D3D12_GPU_VIRTUAL_ADDRESS tableAt = table->GetGPUVirtualAddress();
@@ -1117,8 +1154,8 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     const auto base = tableAt;
     dr.RayGenerationShaderRecord = { base, rgBytes };
     dr.MissShaderTable = hitScene || (g_libassoc == 5 && g_mode == 0)
-                             ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, 64, 64 }
-                             : D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + 64, idSz, idSz };
+                             ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + offMiss, 64, 64 }
+                             : D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + offMiss, idSz, idSz };
     dr.HitGroupTable = { base + offHit, stride * L.records, stride };
     dr.Width = W; dr.Height = kH; dr.Depth = 1;
     ComPtr<ID3D12CommandSignature> sig;   // alive until the list has run
@@ -1187,6 +1224,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--localscene")) g_localScene = 1;
         else if (!std::strcmp(argv[i], "--localscenetable")) g_localScene = 2;
         else if (!std::strcmp(argv[i], "--gpusbt")) g_gpuSbt = true;
+        else if (!std::strcmp(argv[i], "--biglrs")) g_bigLrs = 1;
+        else if (!std::strcmp(argv[i], "--biglrsfull")) g_bigLrs = 2;
         else if (!std::strcmp(argv[i], "--recurse")) g_recurse = true;
         else if (!std::strcmp(argv[i], "--warpglobal")) g_warpGlobal = true;
         else if (!std::strcmp(argv[i], "--dynargs")) g_dynArgs = true;
@@ -1213,6 +1252,10 @@ int main(int argc, char** argv) {
     }
     if (g_twoScenes && !g_sceneKey && (g_table || g_bindless || g_localScene == 2)) {
         std::printf("--twoscenes binds its second scene as a root SRV (or in root SRV records)\n");
+        return 2;
+    }
+    if (g_bigLrs && (!g_localScene || g_recurse)) {
+        std::printf("--biglrs pads the raygen's own signature: with --localscene(table), no --recurse\n");
         return 2;
     }
     if (g_localScene && (g_table || g_bindless || g_libassoc)) {

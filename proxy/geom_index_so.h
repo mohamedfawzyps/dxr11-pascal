@@ -235,6 +235,12 @@ struct Variant {
     // slot as many as a dispatch has needed, each call picking one by its key
     // from the shim's key table (@dxr11.keys, after the pair table).
     std::vector<UINT> caps;
+    // How a tracing record carries the scene copies (0.63.0): 0 a root SRV
+    // each; past the local root signature size the GTX 1070 takes, 1 one
+    // descriptor table of them, the pair and key tables still root SRVs, or
+    // 2 all of it in the table. The table's descriptors are a range in the
+    // shim's reserve of the heap bound at the dispatch (proxy/heap_reserve.h).
+    UINT form = 0;
     bool Keyed() const { for (UINT c : caps) if (c > 1) return true; return false; }
     UINT Subs() const { UINT s = 0; for (UINT c : caps) s += c; return s; }
 };
@@ -357,10 +363,15 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app,
 // layout, into `cl`, and fills `mine` with them. The caller binds the
 // variant, dispatches, and binds the application's pipeline again. `sel`:
 // which scene each of the variant's scene slots traces (0.59.0).
+// `heaps`: the descriptor heaps bound at the dispatch; with a variant in a
+// table form and no CBV/SRV/UAV heap among them, `bind` receives the heaps to
+// bind for the dispatch (empty otherwise).
 bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& info, const Variant& v,
                    const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
-                   const SceneSel& sel, const void* owner, std::string* why);
+                   const SceneSel& sel, const void* owner,
+                   const std::vector<ID3D12DescriptorHeap*>& heaps,
+                   std::vector<ID3D12DescriptorHeap*>* bind, std::string* why);
 
 }  // namespace gidx

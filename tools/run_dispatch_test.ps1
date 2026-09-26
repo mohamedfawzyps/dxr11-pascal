@@ -549,6 +549,53 @@ foreach ($o in $own) {
 }
 $env:DXR_TIER11 = ''
 
+# Past the local root signature size the GTX 1070 takes, the shim's own
+# layouts carry their scene copies in ONE descriptor table, in a reserve at
+# the end of the bound heap (0.63.0; until then refused by name).
+# DXR_TIER11_LRS_TABLE=1 uses it everywhere: the own-layout cases above must
+# still match; DXR_TIER11_RANGE_POISON=1 writes every descriptor of a range
+# as its first, so heapkey (two scenes) must diverge. gitest --biglrs pads the
+# application's raygen signature to 191 dwords of 192, so there the table is
+# the only way, and gitest --twoconflict with the table everywhere, poisoned,
+# must diverge too.
+Write-Host ''
+Write-Host '=== the scene copies in a descriptor table ==='
+$env:DXR_TIER11 = '1'
+$env:DXR_TIER11_LRS_TABLE = '1'
+foreach ($o in $own) {
+    $x = $o.x
+    & .\raytest.exe warp rayquery alpha dp_tab_a.bin @x | Out-Null
+    $env:DXR_TIER11_RQOWN = '1'
+    & .\raytest.exe hw rayquery alpha dp_tab_b.bin @x | Out-Null
+    $diff = & .\raytest.exe diff dp_tab_a.bin dp_tab_b.bin 2>&1
+    $ok = $diff -match 'RESULT: MATCH'
+    $sens = $true
+    if ($o.var -eq 'DXR_TIER11_KEY_POISON') {
+        $env:DXR_TIER11_RANGE_POISON = '1'
+        & .\raytest.exe hw rayquery alpha dp_tab_b.bin @x | Out-Null
+        Remove-Item env:DXR_TIER11_RANGE_POISON
+        $sens = (& .\raytest.exe diff dp_tab_a.bin dp_tab_b.bin 2>&1) -match 'RESULT: DIVERGE'
+    }
+    Remove-Item env:DXR_TIER11_RQOWN
+    Remove-Item dp_tab_a.bin, dp_tab_b.bin -ErrorAction SilentlyContinue
+    if ($ok -and $sens) { Write-Host "  $($o.what): matches in the table form$(if ($o.var -eq 'DXR_TIER11_KEY_POISON') { ', diverges with the range poisoned' })" }
+    else { Write-Host "  TABLE FORM FAILED: $($o.what) match=$ok sensitive=$sens"; $failed++ }
+}
+$gi = & .\gitest.exe --twoconflict 2>&1
+$ok = $gi -match 'ALL MATCH'
+$env:DXR_TIER11_RANGE_POISON = '1'
+$gi = & .\gitest.exe --twoconflict 2>&1
+Remove-Item env:DXR_TIER11_RANGE_POISON
+if ($ok -and ($gi -match 'DIVERGE')) { Write-Host '  gitest --twoconflict: matches in the table form, diverges with the range poisoned' }
+else { Write-Host "  TABLE FORM FAILED: gitest --twoconflict match=$ok"; $failed++ }
+Remove-Item env:DXR_TIER11_LRS_TABLE
+foreach ($l in @('--localscene', '--localscenetable')) {
+    $gi = & .\gitest.exe $l --biglrs 2>&1
+    if ($gi -match 'ALL MATCH') { Write-Host "  gitest $l --biglrs (191 dwords of the application's): all layouts match" }
+    else { Write-Host "  gitest $l --biglrs: NOT ALL MATCH"; $failed++ }
+}
+$env:DXR_TIER11 = ''
+
 Write-Host '=== the driver''s decode of a DESERIALIZED structure carries the result ==='
 # DXR_TIER11_DECODE_POISON=1 makes every decoded bottom-level structure one
 # geometry short and every decoded instance's contribution one higher. The

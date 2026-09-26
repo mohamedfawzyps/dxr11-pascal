@@ -4,7 +4,12 @@
 # repository root beside DXC.
 #
 # Exit code: the number of configurations that did not match.
+#
+# -Form 1 or 2 runs every configuration with DXR_TIER11_LRS_TABLE set: the
+# shim's own layout in a descriptor table even where root descriptors fit
+# (0.63.0), 1 the scene copies, 2 every addition.
 
+param([int]$Form = 0)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
@@ -146,12 +151,29 @@ $cfgs += ,@('--deserialize', '--bindless')
 $cfgs += ,@('--deserialize', '--recurse')
 $cfgs += ,@('--deserialize', '--dynargs')
 $cfgs += ,@('--deserialize', '--localscene', '--gpusbt')
+# The raygen's own signature at 191 dwords of the 192 the GTX 1070 takes
+# (0.63.0): the shim's layout needs a descriptor table there; refused by name
+# until then.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($l in @('--localscene', '--localscenetable')) {
+        foreach ($x in @('', '--gpusbt', '--indirectgpu', '--stale')) {
+            foreach ($s in @('', '--sm66')) { $cfgs += ,@(@($b, $l, '--biglrs', $x, $s) | Where-Object { $_ }) }
+        }
+    }
+}
+$cfgs += ,@('--localscene', '--biglrs', '--dynargs')
+$cfgs += ,@('--localscene', '--biglrs', '--dynargs', '--norefine', '--perstruct', '4')
+$cfgs += ,@('--localscene', '--biglrs', '--twoconflict')
+$cfgs += ,@('--localscenetable', '--biglrs', '--scenearray')
+$cfgs += ,@('--localscenetable', '--biglrs', '--scenearray', '--twoconflict', '--dynargs')
+$cfgs += ,@('--localscene', '--biglrs', '--deserialize')
 
 # A failure keeps its output and the shim's log, so an intermittent one can
 # be read afterwards rather than rerun in hope.
 $keep = Join-Path $env:TEMP 'gitest-matrix'
 New-Item -ItemType Directory -Force $keep | Out-Null
 $prevLog = $env:DXR_TIER11_LOG
+if ($Form -ge 1) { $env:DXR_TIER11_LRS_TABLE = "$Form"; Write-Host "every own layout in table form $Form" }
 $fail = @()
 $unstable = @()
 $n = 0
@@ -172,16 +194,27 @@ foreach ($c in $cfgs) {
         Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
     }
 }
-# Gate (0.59.0): a variant whose local root signature would pass the GTX
-# 1070's driver limit (two scenes of 64 structures, 129 root descriptors) is
-# refused by name, and the device lives on: before the check it was removed.
+# Gates. (0.59.0) A variant whose root descriptors would pass the GTX 1070's
+# local root signature limit (two scenes of 64 structures, 129 root
+# descriptors) removed the device before the check, and was refused by name
+# after it; since 0.63.0 it is drawn with the copies in a descriptor table.
 $env:DXR_TIER11_LOG = Join-Path $keep 'gate_rootsig.log'
 Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
 $out = & .\gitest.exe --twoconflict --dynargs --norefine --perstruct 4 zero mult 2>&1
-$refused = Select-String -Path $env:DXR_TIER11_LOG -Pattern 'measured to survive' -Quiet
+$table = Select-String -Path $env:DXR_TIER11_LOG -Pattern 'in a descriptor table' -Quiet
+if ($table -and (($out -join "`n") -match 'ALL MATCH')) { Write-Host "gate: a signature past the limit as root descriptors is drawn with a descriptor table" }
+else { Write-Host "gate FAILED: table=$table"; $out | Out-File (Join-Path $keep 'gate_rootsig.out') -Encoding utf8; $fail += '[gate: descriptor table past the limit]' }
+# (0.63.0) The application's raygen signature at all 192 dwords: not even a
+# table fits, so the layouts needing the shim's own are refused by name, and
+# the device lives.
+$env:DXR_TIER11_LOG = Join-Path $keep 'gate_full.log'
+Remove-Item $env:DXR_TIER11_LOG -ErrorAction SilentlyContinue
+$out = & .\gitest.exe --localscene --biglrsfull 2>&1
+$refused = Select-String -Path $env:DXR_TIER11_LOG -Pattern 'where the GTX 1070.s driver takes' -Quiet
 $alive = -not (($out -join "`n") -match 'hardware failed')
-if ($refused -and $alive) { Write-Host "gate: an oversized local root signature is refused by name, the device lives" }
-else { Write-Host "gate FAILED: refused=$refused device alive=$alive"; $fail += '[gate: oversized local root signature]' }
+if ($refused -and $alive) { Write-Host "gate: a signature with no room left is refused by name, the device lives" }
+else { Write-Host "gate FAILED: refused=$refused device alive=$alive"; $out | Out-File (Join-Path $keep 'gate_full.out') -Encoding utf8; $fail += '[gate: no room left]' }
+Remove-Item env:DXR_TIER11_LRS_TABLE -ErrorAction SilentlyContinue
 $env:DXR_TIER11_LOG = $prevLog
 Write-Host "gitest: $($cfgs.Count) configurations, $($cfgs.Count - $fail.Count) match WARP"
 foreach ($f in $fail) { Write-Host "  FAILED $f" }

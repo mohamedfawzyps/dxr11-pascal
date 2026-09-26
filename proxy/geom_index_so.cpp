@@ -5,6 +5,8 @@
 #include "dxil_scan.h"
 #include "geom_table_cs.h"
 #include "gpu_hold.h"
+#include "heap_reserve.h"
+#include "lrs_limit.h"
 #include "proxy_log.h"
 #include "res_tracker.h"
 #include "scene_bind.h"
@@ -748,18 +750,30 @@ UINT ArgsEnd(const D3D12_ROOT_SIGNATURE_DESC1& d) {
 
 // An extended copy of a local root signature, or one holding only the
 // additions when `rs` is null. `offset` receives the first addition's offset
-// in the record, identifier included.
-bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, UINT srvs,
-            ComPtr<ID3D12RootSignature>* out, UINT* offset, std::string* why) {
-    // Either the geometry index, a constant at b0, or `srvs` root
-    // descriptors at t0 up: the shim scene's copies, and with arguments
-    // computed at run time its pair table (0.57.0). All in kGeomIndexSpace.
-    std::vector<D3D12_ROOT_PARAMETER1> extras(srvs ? srvs : 1u);
+// in the record, identifier included. *tooBig, when given, is set when it is
+// refused for its size alone.
+bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, UINT srvs, UINT table,
+            ComPtr<ID3D12RootSignature>* out, UINT* offset, bool* tooBig, std::string* why) {
+    // Either the geometry index, a constant at b0, or `srvs` SRVs at t0 up:
+    // the shim scene's copies, and with arguments computed at run time its
+    // pair table (0.57.0), and the key table (0.60.0). All in
+    // kGeomIndexSpace. Root descriptors, 2 dwords each; or past the size the
+    // GTX 1070 takes, the first `table` of them as ONE descriptor table, 1
+    // dword, its descriptors in the shim's reserve of the heap bound at the
+    // dispatch (0.63.0, proxy/heap_reserve.h).
+    if (table > srvs) table = srvs;
+    std::vector<D3D12_ROOT_PARAMETER1> extras(srvs ? srvs - (table ? table - 1 : 0) : 1u);
+    D3D12_DESCRIPTOR_RANGE1 range{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, table, 0, rq::kGeomIndexSpace,
+                                   D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0 };
     for (UINT i = 0; i < extras.size(); ++i) {
         D3D12_ROOT_PARAMETER1& extra = extras[i];
-        if (srvs) {
+        if (srvs && table && i == 0) {
+            extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            extra.DescriptorTable.NumDescriptorRanges = 1;
+            extra.DescriptorTable.pDescriptorRanges = &range;
+        } else if (srvs) {
             extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-            extra.Descriptor.ShaderRegister = i;
+            extra.Descriptor.ShaderRegister = table ? table + i - 1 : i;
             extra.Descriptor.RegisterSpace = rq::kGeomIndexSpace;
         } else {
             extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -806,27 +820,17 @@ bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, UINT srvs,
     v.Desc_1_1.NumParameters = (UINT)params.size();
     v.Desc_1_1.pParameters = params.data();
     // A local root signature larger than the driver takes REMOVES THE DEVICE
-    // inside CreateRootSignature on a GTX 1070 (DRIVER_INTERNAL_ERROR, 0.59.0;
-    // WARP took 520 root descriptors). Measured, one parameter kind at a time
-    // and mixed: with at most 64 dwords of constants, constants + 2 per root
-    // descriptor + 1 per descriptor table up to 192 survives and 193 does
-    // not; with more constants, that sum with 2 per table up to 128 is safe
-    // (a 65 to 128 dword constant parameter leaves exactly that). So an
-    // application's signature near the limit is refused here by name rather
-    // than extended past it.
+    // inside CreateRootSignature on a GTX 1070; the measured rule is in
+    // proxy/lrs_limit.h. So an extension that would pass it is not made: the
+    // variant then tries a smaller form (a descriptor table, 0.63.0), and
+    // past that it is refused by name.
     {
-        UINT c = 0, dsc = 0, tab = 0;
-        for (const auto& p : params) {
-            if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) c += p.Constants.Num32BitValues;
-            else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) ++tab;
-            else ++dsc;
-        }
-        const bool safe = (c <= 64 && c + 2 * dsc + tab <= 192) || c + 2 * dsc + 2 * tab <= 128;
-        if (!safe) {
+        UINT used = 0, limit = 0;
+        if (!lrslimit::Fits(params, &used, &limit)) {
+            if (tooBig) *tooBig = true;
             char b[256];
-            std::snprintf(b, sizeof(b), "the extended local root signature would hold %u dwords of "
-                          "constants, %u root descriptors and %u tables, more than the GTX 1070's driver "
-                          "was measured to survive (it removes the device)", c, dsc, tab);
+            std::snprintf(b, sizeof(b), "the extended local root signature would cost %u dwords where "
+                          "the GTX 1070's driver takes %u (past it, it removes the device)", used, limit);
             *why = b;
             return false;
         }
@@ -1064,11 +1068,12 @@ bool BuildAssoc(const D3D12_STATE_OBJECT_DESC& in, Assoc* A, std::string* why) {
 // state object declares overrides it (the spec's exception for a directly
 // included library).
 // `offsets[u]` is the first added parameter's offset in unit u's records.
-bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
+bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs, UINT table,
              const std::vector<std::vector<std::wstring>>& units,
              const std::map<UINT, const std::vector<uint8_t>*>& code,
              const std::map<UINT, ID3D12StateObject*>& colls,
-             Transformed* out, std::vector<UINT>* offsets, UINT* signatures, std::string* why) {
+             Transformed* out, std::vector<UINT>* offsets, UINT* signatures, bool* tooBig,
+             std::string* why) {
     const UINT n = in.NumSubobjects;
     const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
     std::set<std::wstring> affected;
@@ -1109,7 +1114,7 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs,
             }
             ComPtr<ID3D12RootSignature> rs;
             UINT offset = 0;
-            if (!Extend(dev, orig, srvs, &rs, &offset, why)) return false;
+            if (!Extend(dev, orig, srvs, table, &rs, &offset, tooBig, why)) return false;
             extended[idx] = { rs, offset };
         }
         offsets->push_back(extended[idx].second);
@@ -1775,7 +1780,7 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in,
     for (const auto& L : rewritten) code[L.index] = &L.code;
     std::vector<UINT> offsets;
     UINT signatures = 0;
-    if (!Rebuild(dev, in, 0, units, code, {}, out, &offsets, &signatures, why))
+    if (!Rebuild(dev, in, 0, 0, units, code, {}, out, &offsets, &signatures, nullptr, why))
         return Outcome::kRefused;
     auto info = std::make_shared<Info>();
     for (size_t u = 0; u < unitGroup.size(); ++u) {
@@ -2318,11 +2323,11 @@ namespace {
 
 bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                const std::vector<std::pair<UINT, UINT>>& pairs, UINT copies,
-               const std::vector<Scenes>& slots, const std::vector<UINT>& caps,
+               const std::vector<Scenes>& slots, const std::vector<UINT>& caps, UINT form,
                ComPtr<ID3D12StateObject>* out,
                std::vector<Tracer>* tracers,
                std::vector<std::wstring>* names,
-               std::vector<ComPtr<ID3D12StateObject>>* parts, std::string* why) {
+               std::vector<ComPtr<ID3D12StateObject>>* parts, bool* tooBig, std::string* why) {
     const UINT n = d.NumSubobjects;
     const D3D12_STATE_SUBOBJECT* s = d.pSubobjects;
     const UINT recursion = Recursion(d);
@@ -2420,7 +2425,9 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
             std::vector<Tracer> subRg;
             std::vector<std::wstring> subNames;
             D3D12_STATE_OBJECT_DESC cd = ci->store->Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
-            if (!VariantOf(dev, cd, pairs, copies, slots, caps, &vc, &subRg, &subNames, parts, why)) return false;
+            if (!VariantOf(dev, cd, pairs, copies, slots, caps, form, &vc, &subRg, &subNames, parts, tooBig,
+                           why))
+                return false;
             if (!vc) continue;
             parts->push_back(vc);
             colls[i] = vc.Get();
@@ -2463,7 +2470,11 @@ bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
     bool keyed = false;
     for (UINT c : caps) { subs += c; keyed = keyed || c > 1; }
     const UINT srvs = subs * (copies ? copies : 1u) + (copies ? 1u : 0u) + (keyed ? 1u : 0u);
-    if (!Rebuild(dev, d, srvs, units, code, colls, &t, &offsets, &sigs, why))
+    // The form (0.63.0): 0 root descriptors; 1 the copies in a descriptor
+    // table, the pair and key tables still root descriptors; 2 all of them in
+    // the table. See Variant::form.
+    const UINT table = form == 0 ? 0u : form == 1 ? subs * (copies ? copies : 1u) : srvs;
+    if (!Rebuild(dev, d, srvs, table, units, code, colls, &t, &offsets, &sigs, tooBig, why))
         return false;
     for (size_t u = 0; u < units.size(); ++u) tracers->push_back({ units[u][0], offsets[u], kinds[u] });
     ComPtr<ID3D12Device5> d5;
@@ -2499,14 +2510,31 @@ bool BuildVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, const s
     v->copies = targs::Literal(info.args) && info.traceArgs.size() <= per
                     ? 0u : (UINT)((info.traceArgs.size() + per - 1) / per);
     v->caps = caps;
-    const UINT addrs = v->Subs() * (v->copies ? v->copies : 1u) + (v->copies ? 1u : 0u) +
-                       (v->Keyed() ? 1u : 0u);
+    const UINT tail = (v->copies ? 1u : 0u) + (v->Keyed() ? 1u : 0u);
+    const UINT roots = v->Subs() * (v->copies ? v->copies : 1u) + tail;
     const D3D12_STATE_OBJECT_DESC d = info.store->Desc(info.type);
     std::vector<Tracer> tracers;
     std::vector<std::wstring> names;
-    if (!VariantOf(dev, d, info.traceArgs, v->copies, info.slots, caps, &v->so, &tracers, &names,
-                   &v->parts, why))
-        return false;
+    // Root descriptors where they fit; past the local root signature size
+    // the GTX 1070 takes (it removes the device), the copies in one table,
+    // then everything in it (0.63.0; until then refused by name).
+    bool built = false;
+    for (UINT form = heapres::Forced(); form < 3 && !built; ++form) {
+        tracers.clear();
+        names.clear();
+        v->parts.clear();
+        v->so.Reset();
+        bool tooBig = false;
+        if (VariantOf(dev, d, info.traceArgs, v->copies, info.slots, caps, form, &v->so, &tracers, &names,
+                      &v->parts, &tooBig, why)) {
+            v->form = form;
+            built = true;
+        } else if (!tooBig) {
+            return false;
+        }
+    }
+    if (!built) return false;
+    const UINT addrs = v->form == 0 ? roots : v->form == 1 ? 1u + tail : 1u;
     ComPtr<ID3D12StateObjectProperties> pa, pv;
     if (FAILED(app->QueryInterface(IID_PPV_ARGS(&pa))) ||
         FAILED(v->so->QueryInterface(IID_PPV_ARGS(&pv)))) {
@@ -2541,6 +2569,11 @@ bool BuildVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app, const s
         for (UINT c : caps) held += " " + std::to_string(c);
         held += ", each call picking its scene by key";
     }
+    if (v->form)
+        held += v->form == 1 ? ", the scene copies in a descriptor table (past the local root "
+                               "signature size the GTX 1070 takes)"
+                             : ", every addition in a descriptor table (past the local root "
+                               "signature size the GTX 1070 takes)";
     ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): VARIANT pipeline built, the shim's own "
              "record layout: %zu shader(s) tracing the shim scene, %zu identifier(s) remapped, "
              "%zu collection(s) rebuilt%s%s\n", tracers.size(), v->remaps.size(), v->parts.size(),
@@ -2628,7 +2661,10 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                    const std::vector<std::pair<UINT, UINT>>& pairs,
                    const D3D12_DISPATCH_RAYS_DESC& app, D3D12_DISPATCH_RAYS_DESC* mine,
                    const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& boundSrvs, bool exact,
-                   const SceneSel& sel, const void* owner, std::string* why) {
+                   const SceneSel& sel, const void* owner,
+                   const std::vector<ID3D12DescriptorHeap*>& heaps,
+                   std::vector<ID3D12DescriptorHeap*>* bind, std::string* why) {
+    bind->clear();
     // The scenes this dispatch traces, and the shim's copy of each one's
     // latest build: made with the build, or at this dispatch from the
     // instances the shim saved then or the CPU snapshot (0.51.0; until then a
@@ -2761,8 +2797,11 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         for (UINT c = 0; c < perSlot; ++c)
             addrs.push_back(c < cps[x].tlas.size() && !(lut && StructurePoison()) ? cps[x].tlas[c]
                                                                                  : cps[x].tlas[0]);
+    ComPtr<ID3D12Resource> lutRes, keyRes;
+    UINT64 keyBytes = 0;
     if (lut) {
         auto table = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, 1024, owner);
+        lutRes = table;
         uint32_t* t = nullptr;
         D3D12_RANGE none{ 0, 0 };
         if (!table || FAILED(table->Map(0, &none, reinterpret_cast<void**>(&t)))) {
@@ -2793,6 +2832,8 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
             }
         }
         auto keys = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, (UINT64)kt.size() * 4, owner);
+        keyRes = keys;
+        keyBytes = (UINT64)kt.size() * 4;
         uint32_t* kp = nullptr;
         D3D12_RANGE none{ 0, 0 };
         if (!keys || FAILED(keys->Map(0, &none, reinterpret_cast<void**>(&kp)))) {
@@ -2814,9 +2855,73 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                                 appRecords };
     UINT selAt[3] = {};
     const UINT groups = (UINT)info.groups.size(), remaps = (UINT)v.remaps.size();
+    // The scene record r of table t names in the variant's sub-slot u.
+    auto sceneOf = [&](int t, UINT r, UINT u) -> uint32_t {
+        UINT j = 0;
+        while (j + 1 < S && subAt[j + 1] <= u) ++j;
+        const UINT p = u - subAt[j];
+        const UINT su = sel.Sub(j) + (p < sel.need[j] ? p : 0u);
+        int x = sel.fixed[su];
+        if (x < 0) {
+            const size_t at = (size_t)r * selU + su;
+            x = at < sel.rec[t].size() ? sel.rec[t][at] : -1;
+        }
+        return x >= 0 && !scenePoison ? (uint32_t)x : 0u;
+    };
+    // In a table form (0.63.0) a tracing record carries one descriptor
+    // handle: of a range holding the structures its selection names (and in
+    // form 2 the pair and key tables). The table shader is told there is one
+    // sub-slot, one structure per "scene", the ranges, and its selection per
+    // record is the range: so it writes the handle where the addresses went,
+    // then as before the pair and key tables' addresses in form 1.
+    std::vector<uint32_t> rangeOf[3];
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> handles;
+    if (v.form) {
+        std::map<std::vector<uint32_t>, uint32_t> seen;
+        for (int t = 0; t < 3; ++t) {
+            const UINT recs = (std::max)(tableRecs[t], 1u);
+            rangeOf[t].resize(recs);
+            for (UINT r = 0; r < recs; ++r) {
+                std::vector<uint32_t> xs(U);
+                for (UINT u = 0; u < U; ++u) xs[u] = sceneOf(t, r, u);
+                auto it = seen.find(xs);
+                if (it == seen.end()) {
+                    std::vector<heapres::View> views;
+                    for (UINT u = 0; u < U; ++u)
+                        for (UINT c = 0; c < perSlot; ++c) {
+                            heapres::View w;
+                            w.as = addrs[(size_t)xs[u] * perSlot + c];
+                            views.push_back(w);
+                        }
+                    if (v.form == 2) {
+                        if (lutRes) { heapres::View w; w.raw = lutRes.Get(); w.bytes = 1024; views.push_back(w); }
+                        if (keyRes) { heapres::View w; w.raw = keyRes.Get(); w.bytes = keyBytes; views.push_back(w); }
+                    }
+                    D3D12_GPU_DESCRIPTOR_HANDLE h{};
+                    std::vector<ID3D12DescriptorHeap*> b;
+                    std::string hw;
+                    if (!heapres::Range(dev, heaps, views, owner, &h, &b, &hw)) {
+                        *why = "the shim's layout needs its scene copies in a descriptor table, past the "
+                               "local root signature size the GTX 1070 takes, and " + hw;
+                        return false;
+                    }
+                    if (!b.empty()) *bind = b;
+                    it = seen.emplace(xs, (uint32_t)handles.size()).first;
+                    handles.push_back(h.ptr);
+                }
+                rangeOf[t][r] = it->second;
+            }
+        }
+        // What the table shader copies: the handles, then in form 1 the pair
+        // and key tables' addresses, which follow the scenes' in `addrs`.
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> tailAddrs(addrs.begin() + (size_t)D * perSlot, addrs.end());
+        addrs = handles;
+        if (v.form == 1) addrs.insert(addrs.end(), tailAddrs.begin(), tailAddrs.end());
+    }
+    const UINT uSel = v.form ? 1u : U;
     const UINT na = (UINT)addrs.size();
     UINT metaDwords = groups * 9 + remaps * 17 + 2 * k + 2 * na;
-    for (int t = 0; t < 3; ++t) { selAt[t] = metaDwords; metaDwords += (std::max)(tableRecs[t], 1u) * U; }
+    for (int t = 0; t < 3; ++t) { selAt[t] = metaDwords; metaDwords += (std::max)(tableRecs[t], 1u) * uSel; }
     auto meta = Acquire(dev, D3D12_HEAP_TYPE_UPLOAD, (UINT64)metaDwords * 4, owner);
     if (!meta) { *why = "could not create the variant table metadata"; return false; }
     uint32_t* m = nullptr;
@@ -2845,19 +2950,12 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         pm[2 * k + 2 * a + 1] = (uint32_t)(addrs[a] >> 32);
     }
     // Sub-slot p of slot j: the dispatch's sub-slot p, or past what it
-    // needs its first, which no key picks.
+    // needs its first, which no key picks. In a table form, the range.
     for (int t = 0; t < 3; ++t)
-        for (UINT r = 0; r < (std::max)(tableRecs[t], 1u); ++r)
-            for (UINT j = 0; j < S; ++j)
-                for (UINT p = 0; p < v.caps[j]; ++p) {
-                    const UINT su = sel.Sub(j) + (p < sel.need[j] ? p : 0u);
-                    int x = sel.fixed[su];
-                    if (x < 0) {
-                        const size_t at = (size_t)r * selU + su;
-                        x = at < sel.rec[t].size() ? sel.rec[t][at] : -1;
-                    }
-                    m[selAt[t] + r * U + subAt[j] + p] = x >= 0 && !scenePoison ? (uint32_t)x : 0u;
-                }
+        for (UINT r = 0; r < (std::max)(tableRecs[t], 1u); ++r) {
+            if (v.form) { m[selAt[t] + r] = rangeOf[t][r]; continue; }
+            for (UINT u = 0; u < U; ++u) m[selAt[t] + r * U + u] = sceneOf(t, r, u);
+        }
     meta->Unmap(0, nullptr);
 
     static const bool poison = GetEnvironmentVariableA("DXR_TIER11_GI_POISON", nullptr, 0) != 0;
@@ -2881,9 +2979,12 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                     D3D12_GPU_VIRTUAL_ADDRESS dstAt, UINT mode, UINT appRecs, UINT x, int t) {
         const shimscene::Copy& cp = cps[x];
         const UINT per = cp.kc * cp.gmax, span = cp.count * per;
+        const bool tb = v.form != 0, tailRoots = v.form == 1;
         const UINT c[20] = { records, srcStride, dstStride, groups, remaps, mode, layoutK, cp.gmax,
-                             appRecs, k, span, per, poison ? 1u : 0u, U, perSlot, D, lut ? 1u : 0u,
-                             t >= 0 ? selAt[t] : selAt[0], t >= 0 ? U : 0u, v.Keyed() ? 1u : 0u };
+                             appRecs, k, span, per, poison ? 1u : 0u, tb ? 1u : U, tb ? 1u : perSlot,
+                             tb ? (UINT)handles.size() : D, lut && (!tb || tailRoots) ? 1u : 0u,
+                             t >= 0 ? selAt[t] : selAt[0], t >= 0 ? uSel : 0u,
+                             v.Keyed() && (!tb || tailRoots) ? 1u : 0u };
         cl->SetComputeRoot32BitConstants(0, 20, c, 0);
         cl->SetComputeRootShaderResourceView(1, src);
         cl->SetComputeRootShaderResourceView(3, cp.contrib);
