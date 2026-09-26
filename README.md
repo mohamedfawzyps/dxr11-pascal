@@ -1,4 +1,4 @@
-# dxr11-pascal
+# DXR Tier 1.1 for NVIDIA Pascal
 
 A user-mode D3D12 layer that makes GPUs reporting `D3D12_RAYTRACING_TIER_1_0`
 present as Tier 1.1, by translating the Tier 1.1 features into DXR 1.0
