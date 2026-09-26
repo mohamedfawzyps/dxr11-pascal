@@ -15,6 +15,7 @@
 #include "proxy_log.h"
 #include "command_signature.h"
 #include "rq_pipeline.h"
+#include "as_decode.h"
 #include "as_tracker.h"
 #include "res_tracker.h"
 #include "group_count.h"
@@ -143,6 +144,7 @@ Dxr11CommandList::Dxr11CommandList(ID3D12GraphicsCommandList4* real)
 
 Dxr11CommandList::~Dxr11CommandList() {
     astrack::DropUnsubmitted(this);
+    asdecode::DropUnsubmitted(this);
     shimscene::DropOwner(this);
     gpuhold::Detach(this);
     m_bindings.ReleaseAll();
@@ -234,6 +236,7 @@ HRESULT STDMETHODCALLTYPE Dxr11CommandList::Reset(ID3D12CommandAllocator* a, ID3
     // A copy recorded before this Reset and never submitted will never run,
     // and nothing recorded before it can run again.
     astrack::DropUnsubmitted(this);
+    asdecode::DropUnsubmitted(this);
     shimscene::DropOwner(this);
     gpuhold::Detach(this);
     m_segments.clear();
@@ -349,6 +352,12 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
             }
             return;
         }
+        // An instance on a deserialized structure still being decoded: at
+        // submit the decode is had (asdecode::Bring, 0.61.0; until then
+        // refused as a structure of unknown geometry).
+        if (exact && asdecode::Pending() && astrack::AwaitsDecode(scenes) &&
+            QueueStaleCompute(x, y, z, scenes))
+            return;
         if (!exact && !astrack::LiveCurrent()) {
             dstats::Add(dstats::kRefusedUnread);
             static LONG onceStale = 0;
@@ -798,11 +807,18 @@ void STDMETHODCALLTYPE Dxr11CommandList::EmitRaytracingAccelerationStructurePost
 void STDMETHODCALLTYPE Dxr11CommandList::CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) {
     WorkBarrier();
     astrack::NoteCopy(d, s, m);
-    if (m != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE &&
-        m != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS)
+    const bool deser = m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE;
+    // A deserialized structure may be a top-level one: a new build of it,
+    // whose instances the decode gives (0.61.0).
+    if (deser)
+        shimscene::NoteBuild(d);
+    else if (m != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE &&
+             m != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS)
         shimscene::NoteCopy(d, s, m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE ||
                                   m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
     FWD(CopyRaytracingAccelerationStructure(d, s, m));
+    // What it holds, asked of the driver once it has run (proxy/as_decode.h).
+    if (deser) asdecode::Note(m_real, RealDevice(), d, this, (UINT)m_segments.size());
 }
 void STDMETHODCALLTYPE Dxr11CommandList::SetPipelineState1(ID3D12StateObject* s) {
     if (m_bindings.stateObject) m_bindings.stateObject->Release();
@@ -1285,6 +1301,10 @@ void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_
     // unknown geometry (deserialized) spilled into the next instance's
     // records, silently.
     if (exact && !astrack::Current(srvs) && QueueStaleRays(*d, srvs, sel)) return;
+    // An instance on a deserialized structure still being decoded (0.61.0).
+    if (exact && asdecode::Pending() && astrack::AwaitsDecode(srvs) &&
+        QueueStaleRays(*d, srvs, sel))
+        return;
     DispatchGeometryIndex(m_real, RealDevice(), *gi, m_bindings.stateObject, srvs, exact, sel,
                           DispatchPairs(*gi, m_bindings, *d), this, *d,
                           [this] { RestoreComputeAfterCapture(); });
@@ -1603,6 +1623,9 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             m_fence->SetEventOnCompletion(m_fenceValue, evt);
             WaitForSingleObject(evt, INFINITE);
         }
+        // Deserialized structures whose size query has run: decoded now,
+        // before anything below judges a scene (0.61.0).
+        asdecode::Bring(queue, submit, this, (UINT)i);
 
         for (Dxr11PendingDispatch& pend : seg.pendings) {
             D3D12_DISPATCH_RAYS_DESC desc{};

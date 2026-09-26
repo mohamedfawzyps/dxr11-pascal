@@ -3,6 +3,7 @@
 #include "queue_hook.h"
 #include "proxy_log.h"
 #include "d3d12_command_list.h"
+#include "as_decode.h"
 #include "as_tracker.h"
 #include "dispatch_stats.h"
 #include "gpu_hold.h"
@@ -72,6 +73,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
         // be stamped with a fence, and anything stamped earlier read. Returns
         // immediately when there is nothing pending, which is the normal case.
         astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
+        asdecode::AfterSubmit(self, ppCommandLists, NumCommandLists);
         gpuhold::AfterSubmit(self, ppCommandLists, NumCommandLists);
         dstats::Tick(astrack::DescribeLive);
         return;
@@ -93,6 +95,7 @@ void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
             g_original(self, 1, one);
         }
         astrack::AfterSubmit(self, &ppCommandLists[i], 1);
+        asdecode::AfterSubmit(self, &ppCommandLists[i], 1);
     }
     astrack::AfterSubmit(self, ppCommandLists, NumCommandLists);
     gpuhold::AfterSubmit(self, ppCommandLists, NumCommandLists);

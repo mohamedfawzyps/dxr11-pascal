@@ -135,6 +135,17 @@ $cfgs += ,@('--heapdyn', '--dynargs')
 $cfgs += ,@('--heapgpu', '--indirectgpu')
 $cfgs += ,@('--heapdyn', '--stale')
 $cfgs += ,@('--scenearray', '--libhg')
+# A DESERIALIZED structure (0.61.0): what it holds decoded by the driver for
+# tools, at the split of a dispatch waiting for it; refused by name until then.
+foreach ($b in @('', '--collections', '--grow')) {
+    foreach ($x in @('', '--gpuinst', '--stale', '--indirect', '--indirectgpu', '--table')) {
+        foreach ($s in @('', '--sm66')) { $cfgs += ,@(@($b, '--deserialize', $x, $s) | Where-Object { $_ }) }
+    }
+}
+$cfgs += ,@('--deserialize', '--bindless')
+$cfgs += ,@('--deserialize', '--recurse')
+$cfgs += ,@('--deserialize', '--dynargs')
+$cfgs += ,@('--deserialize', '--localscene', '--gpusbt')
 
 # A failure keeps its output and the shim's log, so an intermittent one can
 # be read afterwards rather than rerun in hope.

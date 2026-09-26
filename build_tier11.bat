@@ -47,6 +47,14 @@ cl /nologo /EHsc /std:c++17 /O2 /W4 ^
    /link d3d12.lib dxgi.lib /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
+rem What a deserialized acceleration structure contains, decoded for tools (0.61.0).
+cl /nologo /EHsc /std:c++17 /O2 /W4 ^
+   /I "%AGILITY%\build\native\include" ^
+   /Fo:"%OBJ%\\" ^
+   "%~dp0tier11\decodeprobe.cpp" /Fe:"%~dp0decodeprobe.exe" ^
+   /link d3d12.lib dxgi.lib advapi32.lib /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
 echo.
-echo Built gitest.exe, libsubprobe.exe and lrsprobe.exe
+echo Built gitest.exe, libsubprobe.exe, lrsprobe.exe and decodeprobe.exe
 echo Run:  gitest.exe [--sm66] [layout ...]

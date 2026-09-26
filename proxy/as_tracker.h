@@ -163,6 +163,26 @@ struct TlasInfo {
 // The instance rows of the build of `tlas` last read; false when it has not
 // been read (0.61.0). astrack::Current says whether that is its latest build.
 bool Rows(D3D12_GPU_VIRTUAL_ADDRESS tlas, std::vector<TlasInfo::Row>* rows);
+// A structure made by DESERIALIZE, decoded by the driver for tools
+// (VISUALIZATION_DECODE_FOR_TOOLS, proxy/as_decode.h, 0.61.0): `data` is the
+// decode, a header then the geometry or instance descriptions. A bottom-level
+// one gets its geometry count and kind, and every top-level read that met it
+// unknown is read again from its kept instances; a top-level one is read.
+// Until 0.61.0 both were refused by name. `*what` says what it was, or why
+// not; false when it was not applied.
+// `at`: the serials the deserialize was given (DeserializedNow, taken when it
+// was recorded), so a decode is filed under the deserialize it is of.
+struct DeserializedAt {
+    UINT64 blasSerial = 0, tlasSerial = 0;
+    bool wasTlas = false;
+};
+bool DeserializedNow(D3D12_GPU_VIRTUAL_ADDRESS dst, DeserializedAt* out);
+bool ApplyDecoded(D3D12_GPU_VIRTUAL_ADDRESS dst, const DeserializedAt& at, const uint8_t* data,
+                  size_t size, std::string* what);
+// Does any of `scenes` wait for a decode: a deserialized one itself, or an
+// instance of its current read on a deserialized structure not decoded yet?
+bool AwaitsDecode(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes);
+
 // The instance descriptions and rows of build `build` of `tlas` (a
 // LatestBuild serial), when that build was read and is among the last few
 // (0.61.0): what the shim's own layout copies, for a dispatch recorded

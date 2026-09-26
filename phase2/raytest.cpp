@@ -394,6 +394,10 @@ static bool g_blasReuse = false;
 // serialized and deserialized, as Unreal loads offline structures; its
 // geometry is driver-opaque, so the shim must refuse, not guess.
 static bool g_blasClone = false, g_tlasClone = false, g_deserialize = false;
+// --tlasdeser, with --geom: the dispatch traces a DESERIALIZED copy of the
+// top-level structure, whose instances only the driver's decode for tools
+// gives (0.61.0; until then not read, so refused).
+static bool g_tlasDeser = false;
 // With --geom: a second instance whose AccelerationStructure is NULL, as
 // Unreal writes a culled instance. The spec calls it legal but inactive,
 // discarded at build: it reaches no record and nothing is refused for it.
@@ -833,6 +837,41 @@ static Scene BuildSceneMixed(Gpu& g, bool opaque) {
 // The quads stop short of the axes so no ray lands exactly on a shared edge,
 // where which geometry is hit would be a tie and the oracle could legitimately
 // disagree with the hardware.
+// --deserialize, --tlasdeser: `src` serialized, then deserialized into `copy`,
+// recorded into the list (the serialize itself after a flush that reads its
+// size).
+static void SerializeInto(Gpu& g, ID3D12Resource* src, ID3D12Resource* copy) {
+    // The serialized size, from the postbuild info.
+    auto info = CreateBuffer(g.device.Get(), 256, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pd{};
+    pd.DestBuffer = info->GetGPUVirtualAddress();
+    pd.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION;
+    const D3D12_GPU_VIRTUAL_ADDRESS a = src->GetGPUVirtualAddress();
+    g.list->EmitRaytracingAccelerationStructurePostbuildInfo(&pd, 1, &a);
+    Transition(g.list.Get(), info.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto rb = CreateBuffer(g.device.Get(), 256, D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    g.list->CopyBufferRegion(rb.Get(), 0, info.Get(), 0, 256);
+    g.flush();
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION_DESC sd{};
+    void* m = nullptr;
+    HR(rb->Map(0, nullptr, &m), "map serialization info");
+    std::memcpy(&sd, m, sizeof(sd));
+    rb->Unmap(0, nullptr);
+    if (!sd.SerializedSizeInBytes) throw std::runtime_error("serialized size 0");
+    auto ser = CreateBuffer(g.device.Get(), sd.SerializedSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g.list->CopyRaytracingAccelerationStructure(ser->GetGPUVirtualAddress(), a,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE);
+    Transition(g.list.Get(), ser.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g.list->CopyRaytracingAccelerationStructure(copy->GetGPUVirtualAddress(),
+        ser->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+    g_gpuInstCopies.push_back(ser);
+}
+
 static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     Scene s;
     const float lo = 0.1f, hi = 0.9f;
@@ -885,35 +924,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
             g.list->CopyRaytracingAccelerationStructure(copy->GetGPUVirtualAddress(),
                 s.blas->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
         } else {
-            // The serialized size, from the postbuild info.
-            auto info = CreateBuffer(g.device.Get(), 256, D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pd{};
-            pd.DestBuffer = info->GetGPUVirtualAddress();
-            pd.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION;
-            const D3D12_GPU_VIRTUAL_ADDRESS src = s.blas->GetGPUVirtualAddress();
-            g.list->EmitRaytracingAccelerationStructurePostbuildInfo(&pd, 1, &src);
-            Transition(g.list.Get(), info.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                       D3D12_RESOURCE_STATE_COPY_SOURCE);
-            auto rb = CreateBuffer(g.device.Get(), 256, D3D12_HEAP_TYPE_READBACK,
-                D3D12_RESOURCE_STATE_COPY_DEST);
-            g.list->CopyBufferRegion(rb.Get(), 0, info.Get(), 0, 256);
-            g.flush();
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION_DESC sd{};
-            void* m = nullptr;
-            HR(rb->Map(0, nullptr, &m), "map serialization info");
-            std::memcpy(&sd, m, sizeof(sd));
-            rb->Unmap(0, nullptr);
-            if (!sd.SerializedSizeInBytes) throw std::runtime_error("serialized size 0");
-            auto ser = CreateBuffer(g.device.Get(), sd.SerializedSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-            g.list->CopyRaytracingAccelerationStructure(ser->GetGPUVirtualAddress(), src,
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE);
-            Transition(g.list.Get(), ser.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            g.list->CopyRaytracingAccelerationStructure(copy->GetGPUVirtualAddress(),
-                ser->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
-            g_gpuInstCopies.push_back(ser);
+            SerializeInto(g, s.blas.Get(), copy.Get());
         }
         UavBarrier(g.list.Get(), copy.Get());
         g.flush();
@@ -952,12 +963,15 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     ti.NumDescs = g_empty ? 0 : numInst; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
-    if (g_tlasClone) {
+    if (g_tlasClone || g_tlasDeser) {
         auto copy = CreateBuffer(g.device.Get(), s.tlas->GetDesc().Width, D3D12_HEAP_TYPE_DEFAULT,
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        g.list->CopyRaytracingAccelerationStructure(copy->GetGPUVirtualAddress(),
-            s.tlas->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+        if (g_tlasDeser)
+            SerializeInto(g, s.tlas.Get(), copy.Get());
+        else
+            g.list->CopyRaytracingAccelerationStructure(copy->GetGPUVirtualAddress(),
+                s.tlas->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
         UavBarrier(g.list.Get(), copy.Get());
         g.flush();
         g_gpuInstCopies.push_back(s.tlas);
@@ -2138,6 +2152,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--nullinst") == 0) {
                 g_nullInst = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--tlasdeser") == 0) {
+                g_tlasDeser = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

@@ -327,7 +327,22 @@ $cases = @(
     # Two live scenes that disagree about a record, BOTH traced: the scene
     # picked per ray from the heap (a keyed slot), slot 3 or 4.
     @{ name = 'heapkey'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom_heapkey_sm66.hlsl', '--geom', '--contrib', '--bindless');
-       desc = 'two conflicting scenes, picked per ray from the heap' }
+       desc = 'two conflicting scenes, picked per ray from the heap' },
+    # DESERIALIZED structures, as Unreal loads offline ones: what they hold is
+    # decoded by the driver for tools (0.61.0). 0.52.3 drew the first with 0
+    # hits of 13872; 0.53.0 to 0.61.0 refused them by name.
+    @{ name = 'deser'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--deserialize');
+       desc = 'an instance on a deserialized bottom-level structure' },
+    @{ name = 'desergpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--deserialize', '--gpuinst');
+       desc = 'the same, GPU-written instances' },
+    @{ name = 'deserind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--deserialize', '--indirect');
+       desc = 'the same, indirect dispatch' },
+    @{ name = 'tlasdeser'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasdeser');
+       desc = 'the dispatch traces a deserialized top-level structure' },
+    @{ name = 'tlasdesergpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasdeser', '--gpuinst');
+       desc = 'the same, GPU-written instances' },
+    @{ name = 'deserboth'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasdeser', '--deserialize');
+       desc = 'a deserialized top-level structure over a deserialized bottom-level one' }
 )
 
 $failed = 0
@@ -534,42 +549,32 @@ foreach ($o in $own) {
 }
 $env:DXR_TIER11 = ''
 
-Write-Host '=== a DESERIALIZED bottom-level structure is refused ==='
-# Unreal loads offline structures by DESERIALIZE. Their geometry is inside a
-# driver-opaque blob, so the records a hit reaches cannot be known: refused
-# by name, never guessed. 0.52.3 drew it with 0 hits of 13872.
-$log = Join-Path $env:TEMP 'dxr-tier-11-proxy.log'
-Remove-Item $log -ErrorAction SilentlyContinue
+Write-Host '=== the driver''s decode of a DESERIALIZED structure carries the result ==='
+# DXR_TIER11_DECODE_POISON=1 makes every decoded bottom-level structure one
+# geometry short and every decoded instance's contribution one higher. The
+# deserialize cases above, and gitest --deserialize (the GeometryIndex() side,
+# 7 layouts; until 0.61.0 refused by name), must then DIVERGE.
 $env:DXR_TIER11 = '1'
-& .\raytest.exe hw rayquery alpha dp_deser.bin --cs phase5\cases\rayquery_geom.hlsl --geom --contrib --deserialize |
-    Out-Null
+foreach ($x in @(@('--deserialize'), @('--tlasdeser'))) {
+    $args3 = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib') + $x
+    & .\raytest.exe warp rayquery alpha dp_dec_a.bin @args3 | Out-Null
+    $env:DXR_TIER11_DECODE_POISON = '1'
+    & .\raytest.exe hw rayquery alpha dp_dec_b.bin @args3 | Out-Null
+    Remove-Item env:DXR_TIER11_DECODE_POISON
+    $diff = & .\raytest.exe diff dp_dec_a.bin dp_dec_b.bin 2>&1
+    Remove-Item dp_dec_a.bin, dp_dec_b.bin -ErrorAction SilentlyContinue
+    if ($diff -match 'RESULT: DIVERGE') { Write-Host "  raytest $x : diverges poisoned, so the case can see it" }
+    else { Write-Host "  NOT SENSITIVE: raytest $x matched with the decode poisoned"; $failed++ }
+}
 $env:DXR_TIER11 = ''
-Remove-Item dp_deser.bin -ErrorAction SilentlyContinue
-if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'bottom-level structure whose geometry the shim does not know' -Quiet)) {
-    Write-Host '  refused, with the reason, as it must'
-} else {
-    Write-Host '  REFUSAL MISSING: a structure of unknown geometry was drawn'
-    $failed++
-}
-
-Write-Host '=== GeometryIndex(): a DESERIALIZED structure under GPU-written instances is refused ==='
-# The variant served a scene not read from its latest build from the GPU copy,
-# blind to which bottom-level structures the instances point at: a
-# deserialized one with more geometries than any known structure spilled into
-# the next instance's records. 0.53.1 drew all 7 layouts wrong, nothing logged.
-# 0.54.0 defers the dispatch to submit, reads that build, and refuses by name.
-$gilog = Join-Path $env:TEMP 'dxr-tier-11-gideser.log'
-Remove-Item $gilog -ErrorAction SilentlyContinue
-$prevLog = $env:DXR_TIER11_LOG
-$env:DXR_TIER11_LOG = $gilog
-& .\gitest.exe --deserialize --gpuinst mult | Out-Null
-$env:DXR_TIER11_LOG = $prevLog
-if ((Test-Path $gilog) -and (Select-String -Path $gilog -Pattern 'NOT DRAWN.*does not know' -Quiet)) {
-    Write-Host '  refused, with the reason, as it must'
-} else {
-    Write-Host '  REFUSAL MISSING: a structure of unknown geometry was drawn'
-    $failed++
-}
+$gi = & .\gitest.exe --deserialize --gpuinst 2>&1
+if ($gi -match 'ALL MATCH') { Write-Host '  gitest --deserialize --gpuinst : all layouts match WARP' }
+else { Write-Host '  gitest --deserialize --gpuinst : NOT ALL MATCH'; $failed++ }
+$env:DXR_TIER11_DECODE_POISON = '1'
+$gi = & .\gitest.exe --deserialize --gpuinst 2>&1
+Remove-Item env:DXR_TIER11_DECODE_POISON
+if ($gi -match 'DIVERGE') { Write-Host '  gitest --deserialize --gpuinst : diverges poisoned' }
+else { Write-Host '  NOT SENSITIVE: gitest --deserialize matched with the decode poisoned'; $failed++ }
 
 Write-Host ''
 if ($failed -eq 0) {

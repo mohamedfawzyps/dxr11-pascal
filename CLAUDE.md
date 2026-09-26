@@ -153,6 +153,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.62.0: A DESERIALIZED STRUCTURE IS DECODED AND DRAWN.** What a
+DESERIALIZE made is asked of the driver: `VISUALIZATION_DECODE_FOR_TOOLS`
+works outside developer mode on WARP and the 1070 (`tier11/decodeprobe.cpp`):
+a bottom-level one's geometry count and kinds, a top-level one's instances.
+The size query is recorded after the deserialize; a dispatch meeting the
+structure is deferred to its split, where the shim decodes on its own list
+and waits once (`proxy/as_decode`). Refused by name since 0.53.0, on both
+paths. Dispatch suite 59 of 59 with a decode poison that diverges; matrix
+457 of 457, plus the root signature gate. NEXT: the raygen local root signature limit, then item b.
+
 **0.61.0: THE RAYQUERY PATH DRAWS THE LAYOUTS IT REFUSED.** A record two
 instances disagree about, two live scenes disagreeing, and both kinds on one
 record were refused for a lowered RayQuery dispatch and drew nothing

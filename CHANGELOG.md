@@ -24,6 +24,49 @@ not.
 
 ---
 
+## 0.62.0
+
+**A deserialized acceleration structure is decoded, and drawn.** Unreal
+loads offline structures by `CopyRaytracingAccelerationStructure(DESERIALIZE)`,
+and what one holds is a driver-opaque blob: a bottom-level one's geometry
+count and kinds, a top-level one's instances. 0.52.3 drew an instance on one
+wrong (0 hits of 13872, nothing logged); since 0.53.0 both were refused by
+name, the RayQuery path and the `GeometryIndex()` path alike.
+
+- **Measured first**, `tier11/decodeprobe.cpp`, developer mode off: the
+  copy mode `VISUALIZATION_DECODE_FOR_TOOLS` decodes a deserialized
+  structure on WARP and on the GTX 1070 alike. A bottom-level one: its
+  geometries' count and kinds (flags differ, 0 on the 1070 where WARP gives
+  NO_DUPLICATE_ANYHIT; the spec says the geometry data only "roughly"
+  matches). A top-level one: its instances exactly, as built. The spec says
+  since its v1.19 that no copy mode needs developer mode. The probe's first
+  version put triangles and boxes in one bottom-level structure, which DXR
+  does not allow: WARP built it, the 1070 removed its device.
+- **How** (`proxy/as_decode`): right after a DESERIALIZE the shim records
+  the decode's size query into the application's list (8 bytes, in pooled
+  buffers). A dispatch meeting the structure is deferred to its split
+  instead of refused; there, the query having run, the shim decodes on a
+  list of its own on the same queue, waits once, and the tracker takes the
+  result (`astrack::ApplyDecoded`): a bottom-level structure's geometry count
+  and kind, every top-level read that met it unknown read again from the
+  instances it keeps; a top-level structure's instances, as a read of that
+  build. Until decoded a deserialized structure counts as both levels.
+- **Measured:** dispatch suite 59 of 59, 6 of them new: `deser`,
+  `desergpu`, `deserind`, `tlasdeser` (a new `raytest --tlasdeser`: the
+  dispatch traces a deserialized top-level structure), `tlasdesergpu`,
+  `deserboth`. The two gates that expected a refusal now expect a match, and
+  a poison (every decoded bottom-level structure one geometry short, every
+  decoded instance's contribution one higher, `DXR_TIER11_DECODE_POISON=1`)
+  must diverge: `raytest --deserialize` and `--tlasdeser` 4624 mismatches
+  each, `gitest --deserialize` 4096 pixels a layout.
+  `tools/run_gitest_matrix.ps1 457 of 457, plus the root signature gate`, 40 of them new
+  `--deserialize` configurations, each refused until now.
+- **Cost:** one wait at a split, once per deserialized structure a lowered
+  or `GeometryIndex()` dispatch meets, which an engine does at load.
+- **Still refused by name:** a scene not resolved through the root
+  signature (judged over every live one), a build older than the last 8
+  kept, and a raygen local root signature past the GTX 1070's limit.
+
 ## 0.61.0
 
 **The RayQuery path draws the record layouts it used to refuse.** A lowered

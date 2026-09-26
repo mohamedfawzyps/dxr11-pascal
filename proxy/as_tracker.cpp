@@ -489,13 +489,22 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<D3D12_RAYTRACING_INSTANCE_DESC>>
 // in a later list, or later in the same one.
 struct BuildInstances {
     UINT64 build = 0;
+    UINT64 asOf = 0;   // ParseLocked's, for a re-parse (ApplyDecoded)
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
     std::vector<TlasInfo::Row> rows;
 };
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<BuildInstances>> g_instHist;
 const size_t kInstHist = 8;
 
-void RememberLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build,
+// A structure made by DESERIALIZE and not decoded yet: the serials NoteCopy
+// gave it at both levels, and whether it was a top-level structure before.
+struct Deserialized {
+    UINT64 blasSerial = 0, tlasSerial = 0;
+    bool wasTlas = false;
+};
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, Deserialized> g_deserialized;
+
+void RememberLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, UINT64 asOf,
                     const D3D12_RAYTRACING_INSTANCE_DESC* d, UINT count,
                     const std::vector<TlasInfo::Row>& rows) {
     if (!build) return;
@@ -504,6 +513,7 @@ void RememberLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build,
         if (e.build == build) return;   // read already
     BuildInstances e;
     e.build = build;
+    e.asOf = asOf;
     if (d && count) e.descs.assign(d, d + count);
     e.rows = rows;
     h.push_back(std::move(e));
@@ -522,7 +532,8 @@ void RememberCopyLocked(D3D12_GPU_VIRTUAL_ADDRESS dst, UINT64 build,
     for (const auto& e : h->second)
         if (e.build == srcBuild) {
             const BuildInstances copy = e;
-            RememberLocked(dst, build, copy.descs.data(), (UINT)copy.descs.size(), copy.rows);
+            RememberLocked(dst, build, copy.asOf, copy.descs.data(), (UINT)copy.descs.size(),
+                           copy.rows);
             return;
         }
 }
@@ -535,7 +546,7 @@ void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     auto b = g_lastBuilt.find(tlas);
     if (b != g_lastBuilt.end()) {
         g_readOf[tlas] = b->second;
-        RememberLocked(tlas, b->second, descs, count, g_tlas[tlas].rows);
+        RememberLocked(tlas, b->second, g_tlasAsSerial[tlas], descs, count, g_tlas[tlas].rows);
     }
     g_snapshots[tlas].assign(descs, descs + count);
 }
@@ -547,7 +558,7 @@ void NoteEmpty(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     auto b = g_lastBuilt.find(tlas);
     if (b != g_lastBuilt.end()) {
         g_readOf[tlas] = b->second;
-        RememberLocked(tlas, b->second, nullptr, 0, {});
+        RememberLocked(tlas, b->second, 0, nullptr, 0, {});
     }
     g_snapshots[tlas].clear();
 }
@@ -658,11 +669,11 @@ void AfterSubmit(ID3D12CommandQueue* queue,
             if (r == g_readOf.end() || r->second <= pr.build) {
                 ParseLocked(pr.tlas, descs, pr.count, pr.asOf);
                 g_readOf[pr.tlas] = pr.build;
-                RememberLocked(pr.tlas, pr.build, descs, pr.count, g_tlas[pr.tlas].rows);
+                RememberLocked(pr.tlas, pr.build, pr.asOf, descs, pr.count, g_tlas[pr.tlas].rows);
             } else {
                 TlasInfo older;
                 ParseLocked(pr.tlas, descs, pr.count, pr.asOf, &older);
-                RememberLocked(pr.tlas, pr.build, descs, pr.count, older.rows);
+                RememberLocked(pr.tlas, pr.build, pr.asOf, descs, pr.count, older.rows);
             }
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
@@ -745,7 +756,7 @@ bool BringToBuildLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void
             ParseLocked(tlas, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count,
                         pr.asOf);
             g_readOf[tlas] = build;
-            RememberLocked(tlas, build, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p),
+            RememberLocked(tlas, build, pr.asOf, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p),
                            pr.count, g_tlas[tlas].rows);
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
@@ -755,6 +766,153 @@ bool BringToBuildLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void
         return ok;
     }
     return false;
+}
+
+bool DeserializedNow(D3D12_GPU_VIRTUAL_ADDRESS dst, DeserializedAt* out) {
+    std::lock_guard<std::mutex> g(g_lock);
+    auto d = g_deserialized.find(dst);
+    if (d == g_deserialized.end()) return false;
+    out->blasSerial = d->second.blasSerial;
+    out->tlasSerial = d->second.tlasSerial;
+    out->wasTlas = d->second.wasTlas;
+    return true;
+}
+
+bool AwaitsDecode(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
+    std::lock_guard<std::mutex> g(g_lock);
+    if (g_deserialized.empty()) return false;
+    for (auto a : scenes) {
+        if (g_deserialized.count(a)) return true;
+        auto t = g_tlas.find(a);
+        if (t == g_tlas.end() || !t->second.valid || !t->second.unknownBlas) continue;
+        auto rd = g_readOf.find(a);
+        auto h = g_instHist.find(a);
+        if (rd == g_readOf.end() || h == g_instHist.end()) continue;
+        for (const auto& e : h->second) {
+            if (e.build != rd->second) continue;
+            for (size_t i = 0; i < e.rows.size() && i < e.descs.size(); ++i)
+                if (e.rows[i].active && !e.rows[i].geometries &&
+                    g_deserialized.count(e.descs[i].AccelerationStructure))
+                    return true;
+        }
+    }
+    return false;
+}
+
+bool ApplyDecoded(D3D12_GPU_VIRTUAL_ADDRESS dst, const DeserializedAt& at, const uint8_t* data,
+                  size_t size, std::string* what) {
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_TOOLS_VISUALIZATION_HEADER hdr{};
+    if (!data || size < sizeof(hdr)) { *what = "a decode shorter than its header"; return false; }
+    std::memcpy(&hdr, data, sizeof(hdr));
+    std::lock_guard<std::mutex> g(g_lock);
+    // The serials of the deserialize this decode is of. It stands for the
+    // structure until its next deserialize, which its own query decodes.
+    Deserialized ds;
+    ds.blasSerial = at.blasSerial;
+    ds.tlasSerial = at.tlasSerial;
+    ds.wasTlas = at.wasTlas;
+    auto d = g_deserialized.find(dst);
+    if (d != g_deserialized.end() && d->second.tlasSerial == ds.tlasSerial) g_deserialized.erase(d);
+    char buf[160];
+    if (hdr.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+        // "4 bytes of padding between GeometryDesc structs" (d3d12.h): each
+        // at the next 8-byte boundary, as measured on WARP and the GTX 1070
+        // (tier11/decodeprobe.cpp).
+        BlasInfo bi;
+        bi.geometryCount = hdr.NumDescs;
+        size_t at = sizeof(hdr);
+        bool tri = false, proc = false;
+        for (UINT i = 0; i < hdr.NumDescs; ++i) {
+            at = (at + 7) & ~(size_t)7;
+            if (at + sizeof(D3D12_RAYTRACING_GEOMETRY_DESC) > size) {
+                *what = "a bottom-level decode shorter than its geometry descriptions";
+                return false;
+            }
+            D3D12_RAYTRACING_GEOMETRY_DESC gd{};
+            std::memcpy(&gd, data + at, sizeof(gd));
+            (gd.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES ? tri : proc) = true;
+            at += sizeof(gd);
+        }
+        bi.kind = tri && proc ? Kind::kMixed : tri ? Kind::kTriangles : proc ? Kind::kProcedural
+                                                                        : Kind::kUnknown;
+        bi.origin = 2;
+        // Its entry from the deserialize, and its current state if nothing
+        // has been built there since.
+        auto& h = g_blasHist[dst];
+        for (auto& e : h)
+            if (e.first == ds.blasSerial) e.second = bi;
+        if (!h.empty() && h.back().first == ds.blasSerial) g_blas[dst] = bi;
+        // Not a top-level structure after all.
+        if (!ds.wasTlas && g_lastBuilt.count(dst) && g_lastBuilt[dst] == ds.tlasSerial) {
+            g_lastBuilt.erase(dst);
+            g_firstBuilt.erase(dst);
+            g_buildCount.erase(dst);
+            g_tlas.erase(dst);
+            g_tlasAsSerial.erase(dst);
+        }
+        // Every read that met it unknown, read again from its instances.
+        UINT reparsed = 0;
+        for (auto& kv : g_instHist) {
+            for (auto& e : kv.second) {
+                bool meets = false;
+                for (const auto& r : e.rows) meets = meets || (r.active && !r.geometries);
+                if (!meets || e.descs.empty()) continue;
+                auto rd = g_readOf.find(kv.first);
+                if (rd != g_readOf.end() && rd->second == e.build) {
+                    ParseLocked(kv.first, e.descs.data(), (UINT)e.descs.size(), e.asOf);
+                    e.rows = g_tlas[kv.first].rows;
+                } else {
+                    TlasInfo t;
+                    ParseLocked(kv.first, e.descs.data(), (UINT)e.descs.size(), e.asOf, &t);
+                    e.rows = t.rows;
+                }
+                ++reparsed;
+            }
+        }
+        std::snprintf(buf, sizeof(buf), "bottom-level, %u %s geometr%s; %u top-level read(s) "
+                      "read again", bi.geometryCount, KindName(bi.kind),
+                      bi.geometryCount == 1 ? "y" : "ies", reparsed);
+        *what = buf;
+        return true;
+    }
+    if (hdr.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+        *what = "a decode of neither level";
+        return false;
+    }
+    // Top-level: the instance descriptions right after the header.
+    const size_t need = sizeof(hdr) + (size_t)hdr.NumDescs * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+    if (size < need) { *what = "a top-level decode shorter than its instances"; return false; }
+    const auto* descs = reinterpret_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(data + sizeof(hdr));
+    const UINT n = hdr.NumDescs;
+    // Not a bottom-level structure after all.
+    auto h = g_blasHist.find(dst);
+    if (h != g_blasHist.end()) {
+        auto& v = h->second;
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const std::pair<UINT64, BlasInfo>& e) {
+            return e.first == ds.blasSerial;
+        }), v.end());
+        if (v.empty()) { g_blasHist.erase(h); g_blas.erase(dst); }
+    }
+    const UINT64 asOf = g_tlasAsSerial.count(dst) ? g_tlasAsSerial[dst] : 0;
+    auto lb = g_lastBuilt.find(dst);
+    if (lb != g_lastBuilt.end() && lb->second == ds.tlasSerial) {
+        if (n) {
+            ParseLocked(dst, descs, n, asOf);
+            g_snapshots[dst].assign(descs, descs + n);
+        } else {
+            ParseLocked(dst, nullptr, 0, 0);
+            g_snapshots[dst].clear();
+        }
+        g_readOf[dst] = ds.tlasSerial;
+        RememberLocked(dst, ds.tlasSerial, asOf, n ? descs : nullptr, n, g_tlas[dst].rows);
+    } else {
+        TlasInfo t;
+        ParseLocked(dst, n ? descs : nullptr, n, asOf, &t);
+        RememberLocked(dst, ds.tlasSerial, asOf, n ? descs : nullptr, n, t.rows);
+    }
+    std::snprintf(buf, sizeof(buf), "top-level, %u instance(s)", n);
+    *what = buf;
+    return true;
 }
 
 void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
@@ -770,6 +928,31 @@ void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
     auto hs = g_blasHist.find(src);
     const bool srcBlas = same && hs != g_blasHist.end() && !hs->second.empty();
     const bool srcTlas = same && g_lastBuilt.count(src) != 0;
+
+    // DESERIALIZE: which level it is, and what it holds, the driver says only
+    // when asked for the tools decode (asdecode, 0.61.0). Until then it is
+    // both: a bottom-level structure of unknown geometry, and a new build of
+    // a top-level structure not read yet, so a dispatch tracing it can wait
+    // for the decode at submit.
+    if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE) {
+        Deserialized ds;
+        ds.wasTlas = g_lastBuilt.count(dst) != 0;
+        BlasInfo unknown;
+        unknown.origin = 2;
+        g_blas[dst] = unknown;
+        ds.blasSerial = ++g_asSerial;
+        g_blasHist[dst].emplace_back(ds.blasSerial, unknown);
+        g_tlasAsSerial[dst] = ++g_asSerial;
+        ds.tlasSerial = g_lastBuilt[dst] = ++g_tlasSerial;
+        g_firstBuilt.emplace(dst, g_tlasSerial);
+        ++g_buildCount[dst];
+        g_snapshots.erase(dst);
+        g_alias.erase(dst);
+        g_tlas[dst].valid = false;
+        g_readOf.erase(dst);
+        g_deserialized[dst] = ds;
+        return;
+    }
 
     // A bottom-level structure: the source's geometry, or none known.
     BlasInfo bi;   // kind unknown, no geometries: refused when an instance points at it
