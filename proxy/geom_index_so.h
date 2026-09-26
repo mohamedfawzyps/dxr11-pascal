@@ -105,6 +105,11 @@ struct Scenes {
 // Adds the scenes of every TraceRay in one disassembled library to `*out`.
 // Used for the application's own DXR libraries and for lowered RayQuery ones.
 void ScanScenes(const std::string& text, Scenes* out);
+// Each TraceRay's own scene, in the order the rewriter meets them, and the
+// slot of `slots` one is (-1: none): what RetraceToShimScene's slotOf needs
+// (0.61.0, for a lowered RayQuery library in the shim's own layout).
+void ScanCallScenes(const std::string& text, std::vector<Scenes>* calls);
+int SlotOfCall(const std::vector<Scenes>& slots, const Scenes& call);
 
 // The variant's scene slots for a pipeline's scenes: each register, then
 // each heap index, one Scenes each (0.59.0).

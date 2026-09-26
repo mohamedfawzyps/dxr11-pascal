@@ -21,7 +21,8 @@ uint64_t g_printed[kCount] = {};
 void Line(const uint64_t* c, const char* when, const std::string& live) {
     const uint64_t refused = c[kRefusedCrossLive] + c[kRefusedOneTlas] + c[kRefusedProcedural] +
                              c[kRefusedUnread] + c[kRefusedUnknownBlas];
-    ProxyLog("[dxr-tier-11-proxy-log] stats%s: lowered dispatches DRAWN %llu (%llu indirect), "
+    ProxyLog("[dxr-tier-11-proxy-log] stats%s: lowered dispatches DRAWN %llu (%llu indirect, "
+             "%llu in the shim's own record layout), "
              "REFUSED %llu (two live structures disagree %llu, one structure disagrees %llu, "
              "procedural collapse %llu, scene not read yet %llu, unknown bottom-level "
              "structure %llu), scene resolved %llu, not "
@@ -31,6 +32,7 @@ void Line(const uint64_t* c, const char* when, const std::string& live) {
              "%llu, changed %llu, unchanged %llu%s%s\n",
              when,
              (unsigned long long)c[kDrawn], (unsigned long long)c[kIndirect],
+             (unsigned long long)c[kOwnLayout],
              (unsigned long long)refused, (unsigned long long)c[kRefusedCrossLive],
              (unsigned long long)c[kRefusedOneTlas], (unsigned long long)c[kRefusedProcedural],
              (unsigned long long)c[kRefusedUnread], (unsigned long long)c[kRefusedUnknownBlas],

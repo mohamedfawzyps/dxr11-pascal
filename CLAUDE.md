@@ -153,6 +153,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.61.0: THE RAYQUERY PATH DRAWS THE LAYOUTS IT REFUSED.** A record two
+instances disagree about, two live scenes disagreeing, and both kinds on one
+record were refused for a lowered RayQuery dispatch and drew nothing
+(`raytest --overlap`: WARP 6936 hits, 0.60.0 none). Now drawn in the shim's
+own record layout, the variant's machinery reused: a second state object
+whose raygen traces the shim's scene copies, one typed record per (instance,
+geometry) with its own pair, built only where the application's layout
+cannot serve, so Unreal's path is unchanged. Deferred dispatches copy the
+build they were recorded against (the tracker keeps each structure's last 8
+builds' instances). Dispatch suite 53 of 53 with 3 poison gates; forced on,
+117 of 117 dispatches drew in it and matched; matrix 417 of 417, plus the root signature gate. NEXT: a
+deserialized structure's geometry (`tier11/decodeprobe.cpp`, written, not
+run), then the root signature limit, then item b.
+
 **0.60.0: A SCENE PICKED PER RAY, AND ONE THE CPU CANNOT READ, ARE DRAWN.**
 An array of scenes at a dynamic element and the descriptor heap are KEYED
 scene slots: the element or heap index is the key, a dispatch resolves every

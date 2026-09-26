@@ -305,7 +305,29 @@ $cases = @(
     # measured on WARP, swapping them changes 11536 rays, so running the wrong
     # one for either trace cannot match.
     @{ name = 'twoq'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoq_sm66.hlsl', '--multi', '--prefill', '1');
-       desc = 'two queries in sequence, one any-hit picking the loop body by query id' }
+       desc = 'two queries in sequence, one any-hit picking the loop body by query id' },
+    # The shim's OWN record layout (0.61.0), for scenes the application's
+    # records cannot serve, each refused and drawn as nothing until then. Two
+    # instances of a four-geometry structure, the second's contribution one
+    # past the first's, so record c + 1 is geometry 1 of one and geometry 0 of
+    # the other: 6936 hits on WARP, 0 drawn on 0.60.0.
+    @{ name = 'overlap'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--overlap');
+       desc = 'two instances disagree about a record: the shim''s own layout' },
+    @{ name = 'overlapgpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--overlap', '--gpuinst');
+       desc = 'the same, GPU-written instances, drawn at submit' },
+    @{ name = 'overlapind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--overlap', '--indirect');
+       desc = 'the same, indirect dispatch' },
+    # Triangles and procedural primitives on ONE record, which a record
+    # cannot serve for a shader committing procedural hits: in the shim's
+    # layout each (instance, geometry) has a record of its own kind.
+    @{ name = 'collapse'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--mixed');
+       desc = 'both kinds on one record, procedural shader' },
+    @{ name = 'collapseboth'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_both.hlsl', '--mixed');
+       desc = 'both kinds on one record, a shader committing both' },
+    # Two live scenes that disagree about a record, BOTH traced: the scene
+    # picked per ray from the heap (a keyed slot), slot 3 or 4.
+    @{ name = 'heapkey'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom_heapkey_sm66.hlsl', '--geom', '--contrib', '--bindless');
+       desc = 'two conflicting scenes, picked per ray from the heap' }
 )
 
 $failed = 0
@@ -477,27 +499,40 @@ if ($out -match 'needs Tier 1\.1') {
 
 $ErrorActionPreference = 'Stop'
 
-# What CANNOT be served, and this proves the refusal covering it is reachable
-# rather than dead code. When the application routes both geometry kinds to the
-# SAME hit group record, that slot would need a procedural record for the
-# procedural geometry and a rejecting triangle record for the triangles. A
-# record is one or the other, so there is no table that works and refusing is
-# the only honest answer.
+# The shim's own record layout (0.61.0) carries the cases above that the
+# application's records cannot serve, which were refused until then. Each of
+# its three parts is shown to carry the result: a poison that touches only the
+# own layout must turn a MATCH into a DIVERGE.
+#   DXR_TIER11_RQOWN_POISON=1  every record's pair from the first instance
+#   DXR_TIER11_RQOWN_POISON=2  every record the shader's own hit group, whatever its kind
+#   DXR_TIER11_KEY_POISON=1    every key to the first scene
 Write-Host ''
-Write-Host '=== both kinds collapsed onto one hit group record is refused ==='
-$log = Join-Path $env:TEMP 'dxr-tier-11-proxy.log'
-Remove-Item $log -ErrorAction SilentlyContinue
+Write-Host '=== the shim''s own record layout carries the result ==='
 $env:DXR_TIER11 = '1'
-& .\raytest.exe hw rayquery alpha dp_mix.bin --cs phase5\cases\rayquery_proc.hlsl --mixed |
-    Out-Null
-$env:DXR_TIER11 = ''
-Remove-Item dp_mix.bin -ErrorAction SilentlyContinue
-if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'routes BOTH triangle and procedural geometry to the same' -Quiet)) {
-    Write-Host '  refused, with the reason, as it must'
-} else {
-    Write-Host '  REFUSAL MISSING: the unservable layout was allowed through'
-    $failed++
+$own = @(
+    @{ what = 'record pairs (overlap)'; var = 'DXR_TIER11_RQOWN_POISON'; val = '1';
+       x = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--overlap') },
+    @{ what = 'record kinds (collapse)'; var = 'DXR_TIER11_RQOWN_POISON'; val = '2';
+       x = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--mixed') },
+    @{ what = 'scene keys (heapkey)'; var = 'DXR_TIER11_KEY_POISON'; val = '1';
+       x = @('--cs', 'phase5\cases\rayquery_geom_heapkey_sm66.hlsl', '--geom', '--contrib', '--bindless') }
+)
+foreach ($o in $own) {
+    $x = $o.x
+    & .\raytest.exe warp rayquery alpha dp_own_a.bin @x | Out-Null
+    Set-Item "env:$($o.var)" $o.val
+    & .\raytest.exe hw rayquery alpha dp_own_b.bin @x | Out-Null
+    Remove-Item "env:$($o.var)"
+    $diff = & .\raytest.exe diff dp_own_a.bin dp_own_b.bin 2>&1
+    Remove-Item dp_own_a.bin, dp_own_b.bin -ErrorAction SilentlyContinue
+    if ($diff -match 'RESULT: DIVERGE') {
+        Write-Host "  $($o.what): diverges poisoned, so the case can see it"
+    } else {
+        Write-Host "  NOT SENSITIVE: $($o.what) matched poisoned"
+        $failed++
+    }
 }
+$env:DXR_TIER11 = ''
 
 Write-Host '=== a DESERIALIZED bottom-level structure is refused ==='
 # Unreal loads offline structures by DESERIALIZE. Their geometry is inside a

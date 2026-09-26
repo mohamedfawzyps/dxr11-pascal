@@ -356,6 +356,26 @@ foreach ($sm in @('lib_6_5', 'lib_6_6')) {
     }
 }
 
+# A LOWERED RayQuery library pointed at the shim's scene (0.61.0): the
+# RayQuery path's own record layout retraces its one raygen's TraceRay calls,
+# (0, 1) with record data; the heap case by key.
+foreach ($lq in @(@{ n = 'geom'; sm = 'cs_6_5'; src = 'phase5\cases\rayquery_geom.hlsl'; a = @('0,1') },
+                  @{ n = 'heapkey'; sm = 'cs_6_6'; src = 'phase5\cases\rayquery_geom_heapkey_sm66.hlsl';
+                     a = @('0,1', '--caps', '2') })) {
+    $cs = "phase5\out\rqown_$($lq.n).cs.ll"
+    $lo = "phase5\out\rqown_$($lq.n).lowered.ll"
+    & 'C:\DW\DXC\bin\x64\dxc.exe' -T $lq.sm -Fc $cs $lq.src | Out-Null
+    & .\phase5out\dxrw.exe lower $cs $lo | Out-Null
+    $la = $lq.a
+    & python phase5\rewriter\shimtrace.py $lo "phase5\out\rqown_$($lq.n).py.ll" @la | Out-Null
+    & .\phase5out\dxrw.exe shimtrace $lo "phase5\out\rqown_$($lq.n).cpp.ll" @la | Out-Null
+    $same = (Get-FileHash "phase5\out\rqown_$($lq.n).py.ll").Hash -eq (Get-FileHash "phase5\out\rqown_$($lq.n).cpp.ll").Hash
+    $asm = (& .\phase5out\dxilrt.exe asm "phase5\out\rqown_$($lq.n).py.ll" "phase5\out\rqown_$($lq.n).dxil" 2>&1) -join "`n"
+    $valid = $asm -match 'validated and signed ok'
+    if ($same -and $valid) { Write-Host "  shimtrace lowered RayQuery, $($lq.n) : PASS (byte-identical, validates and signs)" }
+    else { Write-Host "  shimtrace lowered RayQuery, $($lq.n) : FAIL (identical=$same valid=$valid)"; $failed++ }
+}
+
 Write-Host ''
 Write-Host '=== refusal checks ==='
 & python phase5\rewriter\test_reject.py

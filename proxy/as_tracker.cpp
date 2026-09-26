@@ -144,8 +144,11 @@ std::map<ID3D12CommandQueue*, QueueFence> g_fences;
 // Fills in a TlasInfo from the descriptions themselves. Caller holds g_lock,
 // because this reads the bottom-level history to learn what each instance
 // points at, as of `asOf`, the serial of the top-level build (0: now).
+// With `into`, the result goes there and nothing else changes: an older
+// build's read, kept for InstancesAt (0.61.0).
 void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
-                 const D3D12_RAYTRACING_INSTANCE_DESC* d, UINT count, UINT64 asOf) {
+                 const D3D12_RAYTRACING_INSTANCE_DESC* d, UINT count, UINT64 asOf,
+                 TlasInfo* into = nullptr) {
     if (!asOf) asOf = g_asSerial + 1;
     TlasInfo t;
     t.valid = true;
@@ -201,10 +204,13 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         }
         t.unknownDetail = buf;
     };
+    t.rows.assign(count, TlasInfo::Row{});
     for (UINT i = 0; i < count; ++i) {
         if (!d[i].AccelerationStructure) continue;   // inactive
         const UINT ic = d[i].InstanceContributionToHitGroupIndex;
         uint8_t bits = kReachNone;
+        t.rows[i].active = true;
+        t.rows[i].contribution = ic;
         const BlasInfo* bi = BlasAtLocked(d[i].AccelerationStructure, asOf);
         if (!bi) { noteUnknown(i, nullptr); continue; }
         switch (bi->kind) {
@@ -217,6 +223,8 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         if (bits & kReachProcedural) t.anyProcedural = true;
 
         const UINT geoms = geometriesOf(d[i].AccelerationStructure);
+        t.rows[i].reach = bits;
+        t.rows[i].geometries = bi->kind == Kind::kUnknown ? 0u : geoms;
         t.classes.emplace_back(ic, geoms);
         for (UINT gi = 0; gi < geoms; ++gi) {
             const UINT slot = ic + gi;
@@ -255,6 +263,7 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
     std::sort(t.classes.begin(), t.classes.end());
     t.classes.erase(std::unique(t.classes.begin(), t.classes.end()), t.classes.end());
 
+    if (into) { *into = t; return; }
     auto prev = g_tlas.find(tlas);
     const bool isNew = prev == g_tlas.end();
     if (!isNew && (prev->second.recordCount != t.recordCount ||
@@ -474,13 +483,60 @@ BlasInfo Lookup(D3D12_GPU_VIRTUAL_ADDRESS address) {
 
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<D3D12_RAYTRACING_INSTANCE_DESC>> g_snapshots;
 
+// The instances of each structure's last few builds that were read, and
+// their rows, by build (0.61.0): what the shim's own layout copies for a
+// dispatch recorded against a build the application has since built again
+// in a later list, or later in the same one.
+struct BuildInstances {
+    UINT64 build = 0;
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
+    std::vector<TlasInfo::Row> rows;
+};
+std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::vector<BuildInstances>> g_instHist;
+const size_t kInstHist = 8;
+
+void RememberLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build,
+                    const D3D12_RAYTRACING_INSTANCE_DESC* d, UINT count,
+                    const std::vector<TlasInfo::Row>& rows) {
+    if (!build) return;
+    auto& h = g_instHist[tlas];
+    for (auto& e : h)
+        if (e.build == build) return;   // read already
+    BuildInstances e;
+    e.build = build;
+    if (d && count) e.descs.assign(d, d + count);
+    e.rows = rows;
+    h.push_back(std::move(e));
+    std::sort(h.begin(), h.end(), [](const BuildInstances& x, const BuildInstances& y) {
+        return x.build < y.build;
+    });
+    if (h.size() > kInstHist) h.erase(h.begin(), h.begin() + (h.size() - kInstHist));
+}
+
+// The entry of `src`'s build `srcBuild`, as `dst`'s build `build`: a copy of
+// the same scene.
+void RememberCopyLocked(D3D12_GPU_VIRTUAL_ADDRESS dst, UINT64 build,
+                        D3D12_GPU_VIRTUAL_ADDRESS src, UINT64 srcBuild) {
+    auto h = g_instHist.find(src);
+    if (h == g_instHist.end()) return;
+    for (const auto& e : h->second)
+        if (e.build == srcBuild) {
+            const BuildInstances copy = e;
+            RememberLocked(dst, build, copy.descs.data(), (UINT)copy.descs.size(), copy.rows);
+            return;
+        }
+}
+
 void NoteInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                    const D3D12_RAYTRACING_INSTANCE_DESC* descs, UINT count) {
     if (!tlas || !descs || !count) return;
     std::lock_guard<std::mutex> g(g_lock);
     ParseLocked(tlas, descs, count, g_tlasAsSerial[tlas]);
     auto b = g_lastBuilt.find(tlas);
-    if (b != g_lastBuilt.end()) g_readOf[tlas] = b->second;
+    if (b != g_lastBuilt.end()) {
+        g_readOf[tlas] = b->second;
+        RememberLocked(tlas, b->second, descs, count, g_tlas[tlas].rows);
+    }
     g_snapshots[tlas].assign(descs, descs + count);
 }
 
@@ -489,7 +545,10 @@ void NoteEmpty(D3D12_GPU_VIRTUAL_ADDRESS tlas) {
     std::lock_guard<std::mutex> g(g_lock);
     ParseLocked(tlas, nullptr, 0, 0);
     auto b = g_lastBuilt.find(tlas);
-    if (b != g_lastBuilt.end()) g_readOf[tlas] = b->second;
+    if (b != g_lastBuilt.end()) {
+        g_readOf[tlas] = b->second;
+        RememberLocked(tlas, b->second, nullptr, 0, {});
+    }
     g_snapshots[tlas].clear();
 }
 
@@ -594,12 +653,16 @@ void AfterSubmit(ID3D12CommandQueue* queue,
             // An older build's read never replaces a newer one's: since
             // 0.52.0 every build is read, and one may have been parsed on
             // demand at a split (BringToBuild).
+            const auto* descs = static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p);
             auto r = g_readOf.find(pr.tlas);
             if (r == g_readOf.end() || r->second <= pr.build) {
-                ParseLocked(pr.tlas,
-                            static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count,
-                            pr.asOf);
+                ParseLocked(pr.tlas, descs, pr.count, pr.asOf);
                 g_readOf[pr.tlas] = pr.build;
+                RememberLocked(pr.tlas, pr.build, descs, pr.count, g_tlas[pr.tlas].rows);
+            } else {
+                TlasInfo older;
+                ParseLocked(pr.tlas, descs, pr.count, pr.asOf, &older);
+                RememberLocked(pr.tlas, pr.build, descs, pr.count, older.rows);
             }
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
@@ -659,6 +722,7 @@ bool BringToBuildLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void
         if (st == g_tlas.end()) return false;
         g_tlas[tlas] = st->second;
         g_readOf[tlas] = build;
+        RememberCopyLocked(tlas, build, a.src, a.srcBuild);
         return true;
     }
     for (auto it = g_pending.begin(); it != g_pending.end(); ++it) {
@@ -681,6 +745,8 @@ bool BringToBuildLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build, const void
             ParseLocked(tlas, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p), pr.count,
                         pr.asOf);
             g_readOf[tlas] = build;
+            RememberLocked(tlas, build, static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(p),
+                           pr.count, g_tlas[tlas].rows);
             D3D12_RANGE noWrite{ 0, 0 };
             pr.readback->Unmap(0, &noWrite);
             ok = true;
@@ -737,6 +803,7 @@ void NoteCopy(D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
         if (CurrentLocked(src)) {
             g_tlas[dst] = g_tlas[src];
             g_readOf[dst] = g_lastBuilt[dst];
+            RememberCopyLocked(dst, g_lastBuilt[dst], src, g_lastBuilt[src]);
             auto sn = g_snapshots.find(src);
             if (sn != g_snapshots.end()) g_snapshots[dst] = sn->second;
         } else {
@@ -789,8 +856,36 @@ bool AnyRead(const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& scenes) {
     return false;
 }
 
+bool InstancesAt(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build,
+                 std::vector<D3D12_RAYTRACING_INSTANCE_DESC>* descs,
+                 std::vector<TlasInfo::Row>* rows) {
+    std::lock_guard<std::mutex> g(g_lock);
+    auto h = g_instHist.find(tlas);
+    if (h == g_instHist.end()) return false;
+    for (const auto& e : h->second)
+        if (e.build == build) {
+            if (descs) *descs = e.descs;
+            if (rows) *rows = e.rows;
+            return true;
+        }
+    return false;
+}
+
+bool Rows(D3D12_GPU_VIRTUAL_ADDRESS tlas, std::vector<TlasInfo::Row>* rows) {
+    std::lock_guard<std::mutex> g(g_lock);
+    auto it = g_tlas.find(tlas);
+    if (it == g_tlas.end() || !it->second.valid) return false;
+    *rows = it->second.rows;
+    return true;
+}
+
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
-                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only) {
+                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only, int* layout) {
+    // A layout refusal: counted here, or handed to the caller to count.
+    auto refuseLayout = [layout](dstats::Counter c) {
+        if (layout) *layout = (int)c;
+        else dstats::Add(c);
+    };
     // Nonzero contributions are not a refusal: the table is sized to the scene
     // and each slot carries a record of the right TYPE, so a hit resolves to a
     // usable record whichever slot the application chose.
@@ -821,7 +916,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                 return true;
             }
             if (t.constantsConflict) {
-                dstats::Add(dstats::kRefusedOneTlas);
+                refuseLayout(dstats::kRefusedOneTlas);
                 if (why)
                     *why = "two instances put different (contribution, geometry) "
                            "pairs on hit group record " +
@@ -844,7 +939,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                 if (!m.assigned) { m = a; from[i] = kv.first; continue; }
                 if (m.geometryIndex != a.geometryIndex ||
                     m.instanceContribution != a.instanceContribution) {
-                    dstats::Add(dstats::kRefusedCrossLive);
+                    refuseLayout(dstats::kRefusedCrossLive);
                     // Which two, once per pair of addresses: whether they are
                     // one scene double-buffered or two different scenes decides
                     // the fix, and the refusal line alone cannot say.
@@ -890,7 +985,7 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
         if (!t.valid || !CountsLocked(kv.first, only)) continue;
         for (size_t i = 0; i < t.reach.size(); ++i) {
             if ((t.reach[i] & kReachTriangles) && (t.reach[i] & kReachProcedural)) {
-                dstats::Add(dstats::kRefusedProcedural);
+                refuseLayout(dstats::kRefusedProcedural);
                 if (why)
                     *why = "this shader commits procedural hits, and the scene "
                            "routes BOTH triangle and procedural geometry to the "

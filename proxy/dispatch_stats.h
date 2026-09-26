@@ -31,6 +31,7 @@ enum Counter {
     kSceneUnresolved,     // not resolved: judged over every live structure
     kRefusedUnread,       // resolved to a structure whose instances are not read yet
     kRefusedUnknownBlas,  // an instance on a bottom-level structure of unknown geometry
+    kOwnLayout,           // of those drawn, in the shim's own record layout (0.61.0)
     kCount
 };
 

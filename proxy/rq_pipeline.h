@@ -21,6 +21,8 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -129,6 +131,36 @@ public:
                         const void* owner,
                         const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* scenes = nullptr);
 
+    // The same work in the SHIM'S OWN record layout (0.61.0), for a scene
+    // whose layout the table above cannot serve: a record two instances, or
+    // two live structures, disagree about, or triangles and procedural
+    // primitives on one record. Until 0.61.0 all three were refused and
+    // drew nothing.
+    //
+    // A second state object, built on first need, whose raygen traces the
+    // shim's copy of each scene (proxy/shim_scene.h) instead of the
+    // application's: the lowered TraceRay calls are retraced exactly as a
+    // GeometryIndex() variant's are (rq::RetraceToShimScene), their scenes
+    // in root SRVs of a raygen local root signature. In a copy instance i
+    // sits at contribution base + i * gmax, so every (instance, geometry)
+    // has a record of its own, of the one kind its bottom-level structure
+    // holds, carrying its own (geometry, contribution) pair. Nothing can
+    // collide.
+    //
+    // `sel`: which scene each scene slot traces (the command list's
+    // ScenesSel), keys included; a slot holding several scenes grows the
+    // state object on demand, as the variant does. `builds`, at submit: the
+    // build each scene had when the dispatch was recorded, (scene, serial),
+    // which may have been built again since (the copy is then made from that
+    // build's instances, astrack::InstancesAt); null, its latest. `restore`
+    // gives the application's compute bindings back after the copies are
+    // recorded. False with *why, nothing recorded but possibly copies, when
+    // it cannot.
+    bool DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, UINT gx, UINT gy, UINT gz,
+                     const gidx::SceneSel& sel,
+                     const std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>>* builds,
+                     const void* owner, const std::function<void()>& restore, std::string* why);
+
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -165,6 +197,35 @@ private:
     bool BuildTable(const std::vector<uint8_t>& kinds,
                     const std::vector<rq::RecordPair>& recPairs,
                     std::string* why);
+
+    // The shim's own layout: its state object at some capacity per scene
+    // slot, built from the lowered library kept here.
+    struct Own {
+        ID3D12StateObject* so = nullptr;
+        ID3D12RootSignature* raygenRs = nullptr;   // the copies' root SRVs, and the key table
+        ID3D12RootSignature* localRs = nullptr;    // the hit groups' pair, as m_localRs
+        uint8_t idRay[32]{}, idMiss[32]{}, idNullTri[32]{}, idNullProc[32]{};
+        std::array<uint8_t, 32> idHit{}, idHitProc{};
+        std::vector<UINT> caps;                    // scenes per slot
+        bool Keyed() const { for (UINT c : caps) if (c > 1) return true; return false; }
+        UINT Subs() const { UINT s = 0; for (UINT c : caps) s += c; return s; }
+        ~Own();
+    };
+    bool EnsureOwn(const std::vector<UINT>& need, std::shared_ptr<Own>* out, std::string* why);
+    bool BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<Own>* out, std::string* why);
+    std::vector<uint8_t> m_lib;                    // the lowered library
+    UINT m_payloadBytes = 0;
+    std::shared_ptr<Own> m_own;
+    std::vector<std::shared_ptr<Own>> m_ownRetired;   // grown out of; lists may hold them
+    std::vector<std::vector<UINT>> m_ownFailed;       // capacities that did not build
+    std::string m_ownWhy;
+    struct OwnTable {
+        std::vector<uint64_t> key;
+        ID3D12Resource* sbt = nullptr;
+        D3D12_DISPATCH_RAYS_DESC desc{};
+        std::shared_ptr<Own> own;
+    };
+    std::vector<OwnTable> m_ownTables;
 
     ID3D12Device5* m_dev = nullptr;
     ID3D12StateObject* m_so = nullptr;

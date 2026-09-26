@@ -56,6 +56,9 @@ std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT64> g_builds;                    // buil
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> g_buildGmax;
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, Held> g_copies;                       // built with the build
 std::map<std::tuple<const void*, D3D12_GPU_VIRTUAL_ADDRESS, UINT>, Held> g_local;  // built at a dispatch
+// Built at a dispatch from a given build's instances, by (list, structure,
+// base, astrack build): EnsureFrom (0.61.0).
+std::map<std::tuple<const void*, D3D12_GPU_VIRTUAL_ADDRESS, UINT, UINT64>, Held> g_localAt;
 // The base each scene's copy was last asked for: the copies made with its
 // later builds take it (0.59.0).
 std::map<D3D12_GPU_VIRTUAL_ADDRESS, UINT> g_base;
@@ -69,6 +72,8 @@ bool Latest(ID3D12Resource* r) {
     for (const auto& kv : g_copies)
         if (Holds(kv.second.copy, r)) return true;
     for (const auto& kv : g_local)
+        if (Holds(kv.second.copy, r)) return true;
+    for (const auto& kv : g_localAt)
         if (Holds(kv.second.copy, r)) return true;
     for (const auto& kv : g_saved)
         if (kv.second.res == r) return true;
@@ -499,10 +504,38 @@ bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUA
     return true;
 }
 
+bool EnsureFrom(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
+                UINT64 build, const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs, UINT k,
+                UINT base, const void* owner, Copy* out, std::string* why) {
+    if (descs.empty()) { *why = "an empty scene"; return false; }
+    std::lock_guard<std::mutex> g(g_lock);
+    const auto key = std::make_tuple(owner, appTlas, base, build);
+    auto l = g_localAt.find(key);
+    if (l != g_localAt.end() && l->second.copy.k >= k) {
+        *out = l->second.copy;
+        return true;
+    }
+    Held h;
+    h.build = build;
+    if (!BuildFromCpuLocked(cl, dev, descs, (std::max)(k, g_k ? g_k : 1u), g_buildGmax[appTlas], base,
+                            owner, &h.copy, why))
+        return false;
+    g_localAt[key] = h;
+    *out = h.copy;
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        ProxyLog("[dxr-tier-11-proxy-log] scene copy built at a dispatch from the instances of an "
+                 "earlier build, %u instances\n", h.copy.count);
+    return true;
+}
+
 void DropOwner(const void* owner) {
     std::lock_guard<std::mutex> g(g_lock);
     for (auto it = g_local.begin(); it != g_local.end();)
         if (std::get<0>(it->first) == owner) it = g_local.erase(it);
+        else ++it;
+    for (auto it = g_localAt.begin(); it != g_localAt.end();)
+        if (std::get<0>(it->first) == owner) it = g_localAt.erase(it);
         else ++it;
 }
 

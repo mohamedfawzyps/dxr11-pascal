@@ -398,6 +398,13 @@ static bool g_blasClone = false, g_tlasClone = false, g_deserialize = false;
 // Unreal writes a culled instance. The spec calls it legal but inactive,
 // discarded at build: it reaches no record and nothing is refused for it.
 static bool g_nullInst = false;
+// --overlap, with --geom: TWO instances of the four-geometry structure, side
+// by side at half size, the second's contribution one past the first's, so
+// their records overlap: record c + 1 is geometry 1 of the first and
+// geometry 0 of the second. One record cannot answer both, so the table the
+// application's layout implies cannot serve this; the shim's own layout,
+// every (instance, geometry) on a record of its own, can.
+static bool g_overlap = false;
 static const UINT kTableSize = 4;
 static const UINT kTableSlot = 2;
 static std::vector<uint8_t> ReadAll(const char* path) {
@@ -925,7 +932,15 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     D3D12_RAYTRACING_INSTANCE_DESC insts[2] = { inst, inst };
     insts[1].AccelerationStructure = 0;
     insts[1].InstanceContributionToHitGroupIndex = 7;
-    const UINT numInst = g_nullInst ? 2 : 1;
+    if (g_overlap) {
+        for (int i = 0; i < 2; ++i) {
+            insts[i] = inst;
+            insts[i].Transform[0][0] = insts[i].Transform[1][1] = 0.5f;
+            insts[i].Transform[0][3] = i ? 0.5f : -0.5f;
+        }
+        insts[1].InstanceContributionToHitGroupIndex = inst.InstanceContributionToHitGroupIndex + 1;
+    }
+    const UINT numInst = g_nullInst || g_overlap ? 2 : 1;
     auto instBuf = CreateBuffer(g.device.Get(), sizeof(insts), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
     HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, insts, sizeof(insts));
@@ -2111,6 +2126,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--geom") == 0) {
                 g_geom = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--overlap") == 0) {
+                g_overlap = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
                 continue;

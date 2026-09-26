@@ -96,6 +96,14 @@ struct Copy {
 bool Ensure(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
             UINT k, UINT base, const void* owner, Copy* out, std::string* why);
 
+// The same from the instances `descs` of an EARLIER build of `appTlas`,
+// `build` its astrack::LatestBuild serial (astrack::InstancesAt), for a
+// dispatch recorded against a build the application has built again since
+// (0.61.0). Recorded into `cl`, this list's alone. Same contract as Ensure.
+bool EnsureFrom(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, D3D12_GPU_VIRTUAL_ADDRESS appTlas,
+                UINT64 build, const std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& descs, UINT k,
+                UINT base, const void* owner, Copy* out, std::string* why);
+
 // The list was reset or destroyed: the copies it built are forgotten.
 void DropOwner(const void* owner);
 

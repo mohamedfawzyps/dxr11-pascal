@@ -271,6 +271,53 @@ void STDMETHODCALLTYPE Dxr11CommandList::ClearState(ID3D12PipelineState* p) {
 }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawInstanced(UINT a, UINT b, UINT c, UINT d) { WorkBarrier(); FWD(DrawInstanced(a, b, c, d)); }
 void STDMETHODCALLTYPE Dxr11CommandList::DrawIndexedInstanced(UINT a, UINT b, UINT c, INT d, UINT e) { WorkBarrier(); FWD(DrawIndexedInstanced(a, b, c, d, e)); }
+// DXR_TIER11_RQOWN=1 draws every lowered RayQuery dispatch whose scene is
+// resolved in the shim's own record layout, not only the ones its
+// application's layout cannot serve: the check that the own layout draws
+// every case the ordinary table does (0.61.0).
+static bool RayQueryOwnForced() {
+    static const bool f = GetEnvironmentVariableA("DXR_TIER11_RQOWN", nullptr, 0) != 0;
+    return f;
+}
+
+// A lowered RayQuery dispatch in the shim's own record layout (0.61.0), for
+// a scene whose layout the ordinary table cannot serve (`layout`, the
+// refusal counter TableWouldBeWrong handed back, `conflict` its reason), or
+// forced (`layout` -1). False when it could not be drawn so: a refusal is
+// then counted and logged here, a forced one falls back to the caller.
+static bool RayQueryOwn(Dxr11RayQueryPso* rq, ID3D12GraphicsCommandList4* cl, UINT x, UINT y, UINT z,
+                        const gidx::SceneSel& sel,
+                        const std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>>* builds,
+                        const void* owner, const std::function<void()>& restore, int layout,
+                        const std::string& conflict) {
+    Microsoft::WRL::ComPtr<ID3D12Device5> dev;
+    cl->GetDevice(IID_PPV_ARGS(&dev));
+    std::string ow;
+    if (dev && rq->DispatchOwn(cl, dev.Get(), x, y, z, sel, builds, owner, restore, &ow)) {
+        static LONG once = 0;
+        if (layout >= 0 && InterlockedCompareExchange(&once, 1, 0) == 0)
+            ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch drawn in the shim's own "
+                     "record layout, where the application's could not serve it: %s\n",
+                     conflict.c_str());
+        return true;
+    }
+    if (layout >= 0) {
+        dstats::Add(static_cast<dstats::Counter>(layout));
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 8)
+            ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s, and the "
+                     "shim's own record layout could not draw it either: %s. Nothing is drawn "
+                     "for it.\n", conflict.c_str(), ow.c_str());
+    } else {
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 4)
+            ProxyLog("[dxr-tier-11-proxy-log] DXR_TIER11_RQOWN: the shim's own record layout "
+                     "could not draw a lowered RayQuery dispatch (%s); drawn in the ordinary "
+                     "one\n", ow.c_str());
+    }
+    return false;
+}
+
 void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
     WorkBarrier();
     // If the bound pipeline is a lowered RayQuery shader, the application's
@@ -312,7 +359,19 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
             return;
         }
         std::string why;
-        if (astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why, only)) {
+        int layout = -1;
+        const bool wrong = astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why, only,
+                                                      exact ? &layout : nullptr);
+        // A layout the table cannot serve: the shim's own, where every
+        // (instance, geometry) has a record (0.61.0; until then refused).
+        if (exact && (wrong ? layout >= 0 : RayQueryOwnForced())) {
+            gidx::SceneSel sel;
+            ScenesSel(m_rqPso->Scenes(), m_bindings, &sel);
+            if (RayQueryOwn(m_rqPso, m_real, x, y, z, sel, nullptr, this,
+                            [this] { RestoreComputeAfterCapture(); }, wrong ? layout : -1, why) ||
+                wrong)
+                return;
+        } else if (wrong) {
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
@@ -869,9 +928,14 @@ int Dxr11CommandList::ReadRecords(const D3D12_DISPATCH_RAYS_DESC& d, bool all,
 }
 
 void Dxr11CommandList::GlobalSel(gidx::Info& gi, const Dxr11Bindings& b, gidx::SceneSel* sel) {
+    ScenesSel(gi.scenes, b, sel);
+}
+
+void Dxr11CommandList::ScenesSel(const gidx::Scenes& scenes, const Dxr11Bindings& b,
+                                 gidx::SceneSel* sel) {
     *sel = gidx::SceneSel{};
     sel->valid = true;
-    const auto slots = gidx::SceneSlots(gi.scenes);
+    const auto slots = gidx::SceneSlots(scenes);
     sel->global.assign(slots.size(), {});
     sel->perRecord.assign(slots.size(), false);
     for (size_t j = 0; j < slots.size(); ++j) {
@@ -1429,6 +1493,7 @@ bool Dxr11CommandList::QueueIndirectCompute(ID3D12CommandSignature* sig,
     // Resolved now, from the bindings as recorded; judged at submit, from the
     // builds that are the latest now.
     if (m_rqPso) pend.rqExact = RayQueryScenes(m_rqPso, &pend.rqScenes);
+    if (pend.rqExact) ScenesSel(m_rqPso->Scenes(), m_bindings, &pend.rqSel);
     for (auto a : pend.rqScenes) pend.rqBuilds.push_back(astrack::LatestBuild(a));
     pend.bindings = m_bindings;
     pend.bindings.Retain();
@@ -1447,6 +1512,7 @@ bool Dxr11CommandList::QueueStaleCompute(UINT x, UINT y, UINT z,
     pend.rqRef = static_cast<ID3D12PipelineState*>(m_rqPso);
     pend.rqExact = true;
     pend.rqScenes = scenes;
+    ScenesSel(m_rqPso->Scenes(), m_bindings, &pend.rqSel);
     for (auto a : scenes) pend.rqBuilds.push_back(astrack::LatestBuild(a));
     for (auto b : pend.rqBuilds)
         if (!b) return false;   // never seen being built
@@ -1540,6 +1606,11 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
 
         for (Dxr11PendingDispatch& pend : seg.pendings) {
             D3D12_DISPATCH_RAYS_DESC desc{};
+            // A lowered RayQuery dispatch in the shim's own record layout
+            // (0.61.0), and why the ordinary one could not serve it.
+            bool rqOwn = false;
+            int rqLayout = -1;
+            std::string rqConflict;
             UINT groups[3] = { 0, 0, 0 };
             if (pend.rq) {
                 // An indirect compute dispatch of a lowered pipeline. Zeros are
@@ -1575,7 +1646,14 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                     continue;
                 }
                 std::string why;
-                if (astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why, only)) {
+                int layout = -1;
+                const bool wrong = astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why,
+                                                              only, only ? &layout : nullptr);
+                if (only && (wrong ? layout >= 0 : RayQueryOwnForced())) {
+                    rqOwn = true;
+                    rqLayout = wrong ? layout : -1;
+                    rqConflict = why;
+                } else if (wrong) {
                     static LONG onceWrong = 0;
                     if (InterlockedCompareExchange(&onceWrong, 1, 0) == 0)
                         ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
@@ -1690,7 +1768,18 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
 
             pend.bindings.Replay(slot->list.Get());
             if (pend.rq && !pend.rqDirect) dstats::Add(dstats::kIndirect);
-            if (pend.rq)
+            if (pend.rq && rqOwn) {
+                ID3D12GraphicsCommandList4* sl = slot->list.Get();
+                const Dxr11Bindings& pb = pend.bindings;
+                std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>> builds;
+                for (size_t k = 0; k < pend.rqScenes.size() && k < pend.rqBuilds.size(); ++k)
+                    builds.push_back({ pend.rqScenes[k], pend.rqBuilds[k] });
+                if (!RayQueryOwn(pend.rq, sl, groups[0], groups[1], groups[2], pend.rqSel, &builds,
+                                 sl, [sl, &pb] { pb.Replay(sl); }, rqLayout, rqConflict) &&
+                    rqLayout < 0)
+                    pend.rq->DispatchAsRays(sl, groups[0], groups[1], groups[2],
+                                            astrack::RecordKinds(&pend.rqScenes), sl, &pend.rqScenes);
+            } else if (pend.rq)
                 pend.rq->DispatchAsRays(slot->list.Get(), groups[0], groups[1], groups[2],
                                         astrack::RecordKinds(pend.rqExact ? &pend.rqScenes : nullptr),
                                         slot->list.Get(), pend.rqExact ? &pend.rqScenes : nullptr);

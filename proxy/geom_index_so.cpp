@@ -1236,6 +1236,10 @@ void NoteRootSignature(ID3D12RootSignature* rs, const void* blob, size_t size) {
 }
 
 void ScanScenes(const std::string& text, Scenes* out) { SceneRegs(text, out); }
+void ScanCallScenes(const std::string& text, std::vector<Scenes>* calls) {
+    Scenes all;
+    SceneRegs(text, &all, calls);
+}
 
 std::vector<Scenes> SceneSlots(const Scenes& sc) {
     std::vector<Scenes> v;
@@ -2305,6 +2309,12 @@ int SlotOf(const std::vector<Scenes>& slots, const Scenes& call) {
     }
     return -1;
 }
+
+}  // namespace
+
+int SlotOfCall(const std::vector<Scenes>& slots, const Scenes& call) { return SlotOf(slots, call); }
+
+namespace {
 
 bool VariantOf(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& d,
                const std::vector<std::pair<UINT, UINT>>& pairs, UINT copies,

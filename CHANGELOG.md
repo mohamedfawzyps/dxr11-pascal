@@ -24,6 +24,55 @@ not.
 
 ---
 
+## 0.61.0
+
+**The RayQuery path draws the record layouts it used to refuse.** A lowered
+RayQuery dispatch whose scene the application's records cannot serve was
+refused, and drew nothing, in three cases: a record two instances put
+different (contribution, geometry) pairs on, two live scenes that disagree
+about a record when the dispatch traces both, and triangles and procedural
+primitives on one record for a shader that commits procedural hits.
+
+- **Measured first**, with a new `raytest --overlap` (with `--geom`: two
+  instances of the four-geometry structure, the second's contribution one
+  past the first's, so record c + 1 is geometry 1 of one and geometry 0 of
+  the other): WARP 6936 hits, the GTX 1070 on 0.60.0 none, refused by name.
+- **The shim's own record layout, as the GeometryIndex() variant has had
+  since 0.46.0.** A second state object, built on first need: the lowered
+  library's TraceRay calls are retraced to the shim's copy of each scene
+  (`rq::RetraceToShimScene`, the variant's own pass), the copies in root SRVs
+  of a raygen local root signature. In a copy instance i sits at contribution
+  base + i * gmax, so every (instance, geometry) has a record of its own: of
+  the one kind its bottom-level structure holds, carrying its own (geometry,
+  contribution) pair, written on the CPU from the instances the shim read.
+  Several scenes and scenes picked per ray by key work as in 0.59.0 and
+  0.60.0, and the state object grows on demand the same way.
+- **Only where it is needed.** A layout the application's records serve is
+  drawn exactly as before, so nothing changes for Unreal's (0 refusals in the
+  last Escher run). `DXR_TIER11_RQOWN=1` forces the own layout on every
+  dispatch whose scene is resolved, as a check.
+- **Deferred and indirect dispatches** get a copy of the build they were
+  recorded against, not the latest: the tracker now keeps the instances of
+  each structure's last 8 read builds (`astrack::InstancesAt`), and
+  `shimscene::EnsureFrom` copies one of them. Forcing the own layout found
+  both this and an empty scene (traced as it is: every ray misses).
+- **Measured:** the dispatch suite 53 of 53, 6 of them new (`overlap`,
+  `overlapgpu`, `overlapind`, `collapse`, `collapseboth` and `heapkey`, the
+  scene picked per ray from two conflicting ones in the heap,
+  `rayquery_geom_heapkey_sm66.hlsl`). The gate "both kinds collapsed onto one
+  record is refused" is now the `collapse` cases. Three new gates, each a
+  poison that touches only the own layout and must diverge: every record's
+  pair from the first instance (2312 mismatches), every record the shader's
+  own hit group whatever its kind (8022, exactly the triangle hits), every
+  key to the first scene (4624). With `DXR_TIER11_RQOWN=1` all 117
+  dispatches of the suite drew in the own layout and every case matched.
+  Rewriter suite: the retrace of a lowered RayQuery library is byte-identical
+  between Python and C++ and validates. `tools/run_gitest_matrix.ps1 417 of 417, plus the root signature gate`.
+- **Still refused by name:** an instance on a bottom-level structure of
+  unknown geometry (deserialized: next), a scene not resolved through the
+  root signature (then judged over every live one), a build older than the
+  last 8 kept, and a raygen local root signature past the GTX 1070's limit.
+
 ## 0.60.0
 
 **A scene picked per ray at run time, and a scene the CPU cannot read, are

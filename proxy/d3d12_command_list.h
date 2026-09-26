@@ -136,6 +136,9 @@ struct Dxr11PendingDispatch {
     // when it was recorded): its table is made from exactly that build's
     // instances at submit (0.52.0).
     std::vector<UINT64>                          rqBuilds;
+    // Which scene each of its scene slots traces, keys included, from the
+    // bindings as recorded: for the shim's own layout (0.61.0).
+    gidx::SceneSel                               rqSel;
     // A DIRECT Dispatch deferred to submit because what was known about its
     // scene was an older build's (0.52.0): its group counts, no readback.
     bool                                         rqDirect = false;
@@ -370,6 +373,9 @@ private:
     // global root signature `b` binds; a slot that is not there is left to
     // the records (-1).
     void GlobalSel(gidx::Info& gi, const Dxr11Bindings& b, gidx::SceneSel* sel);
+    // The same for any scene scan: a lowered RayQuery library's, which has
+    // no records of the application's to leave a slot to (0.61.0).
+    void ScenesSel(const gidx::Scenes& scenes, const Dxr11Bindings& b, gidx::SceneSel* sel);
     // At submit: every range of `rec` still empty, read from CPU-visible
     // memory, or copied from GPU memory, submitted and waited for once. Only
     // with GPU-written arguments, whose ranges are not known before.

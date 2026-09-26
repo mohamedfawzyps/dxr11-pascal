@@ -148,7 +148,29 @@ struct TlasInfo {
     // answer GeometryIndex(), for whatever TraceRay arguments it uses; see
     // GeometryLabels.
     std::vector<std::pair<UINT, UINT>> classes;
+    // Every instance, in the order the build took them, inactive ones too:
+    // what the shim's own layout needs, where each (instance, geometry) has a
+    // record of its own (the RayQuery path's, 0.61.0).
+    struct Row {
+        bool active = false;
+        UINT contribution = 0;
+        UINT geometries = 0;          // 0: its structure is not known
+        uint8_t reach = kReachNone;   // the kind its geometries are
+    };
+    std::vector<Row> rows;
 };
+
+// The instance rows of the build of `tlas` last read; false when it has not
+// been read (0.61.0). astrack::Current says whether that is its latest build.
+bool Rows(D3D12_GPU_VIRTUAL_ADDRESS tlas, std::vector<TlasInfo::Row>* rows);
+// The instance descriptions and rows of build `build` of `tlas` (a
+// LatestBuild serial), when that build was read and is among the last few
+// (0.61.0): what the shim's own layout copies, for a dispatch recorded
+// against a build the application has built again since. An empty build is
+// kept too, with no instances.
+bool InstancesAt(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT64 build,
+                 std::vector<D3D12_RAYTRACING_INSTANCE_DESC>* descs,
+                 std::vector<TlasInfo::Row>* rows);
 
 // GeometryIndex() in an application's own hit shaders: which geometry index a
 // hit on each of the first `records` records of its hit group table has, when
@@ -315,8 +337,17 @@ bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap);
 // It can also only see what has been READ. When the descriptions live in GPU
 // memory the answer arrives a submission late, so the first dispatch of a run
 // may not be covered.
+//
+// With `layout` (0.61.0): a refusal that only the application's record
+// layout causes, a record two instances or two live structures disagree
+// about or both kinds on one record, sets *layout to the counter it would
+// have added and adds none; the caller then draws the dispatch in the shim's
+// own layout (Dxr11RayQueryPso::DispatchOwn), where every (instance,
+// geometry) has a record of its own, and counts the refusal only if that
+// fails. An unknown bottom-level structure is refused either way.
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
-                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = nullptr);
+                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = nullptr,
+                       int* layout = nullptr);
 
 // True when at least one of `scenes` is a top-level structure whose instance
 // data has been read.
